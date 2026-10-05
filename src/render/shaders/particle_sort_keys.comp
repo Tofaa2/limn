@@ -1,0 +1,30 @@
+#version 460
+#include "common.glsl"
+#include "particles.glsl"
+
+// First step of sorting an emitter's particles for drawing: one entry per
+// slot, keyed so that sorting upward puts the farthest particle first and
+// everything dead last.
+layout(local_size_x = 64) in;
+
+layout(push_constant, scalar) uniform Push {
+    FrameConstants frame;
+    Particles particles;
+    ParticleOrder order;
+    uint capacity;
+    uint count;
+} push;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= push.count) return;
+    SortEntry entry = SortEntry(1e30, 0xffffffffu);
+    if (index < push.capacity) {
+        Particle particle = push.particles.data[index];
+        if (particle.age < particle.lifetime) {
+            vec3 away = particle.position - push.frame.camera_position;
+            entry = SortEntry(-dot(away, away), index);
+        }
+    }
+    push.order.data[index] = entry;
+}

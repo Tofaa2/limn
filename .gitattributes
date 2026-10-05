@@ -1,0 +1,9 @@
+# Large binary assets are kept in Git LFS (`git lfs install` once per clone).
+# `src/render/fonts/DejaVuSans.ttf` is compiled into the library and stays a
+# regular file, so that the package builds without LFS.
+examples/assets/**/*.glb filter=lfs diff=lfs merge=lfs -text
+examples/assets/**/*.hdr filter=lfs diff=lfs merge=lfs -text
+examples/assets/**/*.ktx2 filter=lfs diff=lfs merge=lfs -text
+examples/assets/**/*.ttf filter=lfs diff=lfs merge=lfs -text
+examples/assets/**/*.png filter=lfs diff=lfs merge=lfs -text
+examples/assets/**/*.bin filter=lfs diff=lfs merge=lfs -text
