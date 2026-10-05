@@ -1,5 +1,5 @@
 # Limn
-A high quality realtime concurrency-first physically based renderer written in zig with Vulkan 1.3
+A high quality, performant, realtime, concurrency-first, physically based renderer written in zig with Vulkan 1.3
 
 ![Sponza, path traced](.github/images/rtx_path.png)
 
