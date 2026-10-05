@@ -70,6 +70,12 @@ pub const Window = struct {
             .instance = @ptrCast(glfw.GetModuleHandleW(null)),
             .window = @ptrCast(glfw.glfwGetWin32Window(self.handle) orelse return error.NativeWindowUnavailable),
         } };
+        // GLFW before 3.4 is built for one window system and cannot be asked
+        // which; the libraries distributions ship of it are X11 ones.
+        if (comptime !@hasDecl(glfw, "glfwGetPlatform")) return .{ .xlib = .{
+            .display = @ptrCast(glfw.glfwGetX11Display() orelse return error.NativeWindowUnavailable),
+            .window = @intCast(glfw.glfwGetX11Window(self.handle)),
+        } };
         return switch (glfw.glfwGetPlatform()) {
             glfw.GLFW_PLATFORM_X11 => .{ .xlib = .{
                 .display = @ptrCast(glfw.glfwGetX11Display() orelse return error.NativeWindowUnavailable),
