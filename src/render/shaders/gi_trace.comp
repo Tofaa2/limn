@@ -1,0 +1,83 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#include "common.glsl"
+#include "rt.glsl"
+
+// Traces a fixed set of rays from every irradiance probe and stores the
+// radiance arriving along each ray together with the hit distance. Hits are
+// shaded with sun light (shadowed by another ray) plus last frame's probe
+// irradiance, which gives multiple bounces over time.
+layout(local_size_x = 64) in;
+
+
+layout(buffer_reference, scalar) buffer Rays { vec4 data[]; };
+
+layout(push_constant, scalar) uniform Push {
+    FrameConstants frame;
+    Rays rays;
+    // Device address of the scene's top-level acceleration structure.
+    uint64_t tlas;
+    // Random rotation of the ray set, changed every frame.
+    vec4 rotation[3];
+    uint rays_per_probe;
+    uint probe_count;
+    uint multibounce;
+    float max_distance;
+    // Only probes with index % stride == phase are traced this frame.
+    uint probe_stride;
+    uint probe_phase;
+    // Which grid is being traced: 0 main, 1 coarse.
+    uint grid;
+    // 1 to leave probes that sit inside geometry untraced most frames.
+    uint skip_buried;
+} push;
+
+vec3 sphericalFibonacci(float i, float n) {
+    const float golden = 1.618033988749895;
+    float phi = 2.0 * PI * fract(i * (golden - 1.0));
+    float cos_theta = 1.0 - (2.0 * i + 1.0) / n;
+    float sin_theta = sqrt(clamp(1.0 - cos_theta * cos_theta, 0.0, 1.0));
+    return vec3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint probe = (index / push.rays_per_probe) * push.probe_stride + push.probe_phase;
+    if (probe >= push.probe_count) return;
+    FrameConstants frame = push.frame;
+    uint ray = index % push.rays_per_probe;
+    uint slot = probe * push.rays_per_probe + ray;
+    if (push.skip_buried != 0u && (frame.frame_index / max(push.probe_stride, 1u) + probe) % 8u != 0u) {
+        // A probe most of whose rays met the backs of surfaces last time
+        // is inside a wall or under the floor: nothing reads its light,
+        // so it keeps what it has and is looked at again every eighth
+        // turn in case the wall has gone.
+        uint backs = 0u;
+        uint spread = max(push.rays_per_probe / 8u, 1u);
+        for (uint k = 0u; k < 8u; k++) backs += uint(push.rays.data[probe * push.rays_per_probe + min(k * spread, push.rays_per_probe - 1u)].w < 0.0);
+        if (backs >= 6u) return;
+    }
+    GiGrid grid = giGrid(frame, push.grid);
+    vec3 origin = giProbePosition(grid, giGridCoord(grid, giProbeCoord(int(probe), grid.counts)));
+    mat3 rotation = mat3(push.rotation[0].xyz, push.rotation[1].xyz, push.rotation[2].xyz);
+    vec3 direction = rotation * sphericalFibonacci(float(ray), float(push.rays_per_probe));
+
+    vec3 radiance;
+    float t;
+    int met = rtTrace(frame, push.tlas, origin, direction, push.max_distance, 3.0, push.multibounce != 0u, radiance, t);
+    if (met == RT_MISS) {
+        vec3 sky = vec3(0.0);
+        if ((frame.flags & FRAME_ENVIRONMENT) != 0u) {
+            // A blurred level keeps a small bright sun from turning into noise.
+            sky = textureLod(TEX_CUBE(frame.env_specular, frame.sampler_linear_clamp), direction, 2.0).rgb * frame.env_intensity;
+        }
+        push.rays.data[slot] = vec4(rtThroughFluids(frame, origin, direction, push.max_distance, sky), push.max_distance);
+    } else if (met == RT_BACK) {
+        // The probe is looking at the inside of a wall. Record a shortened
+        // negative distance so the probe's visibility closes off quickly.
+        push.rays.data[slot] = vec4(0.0, 0.0, 0.0, -0.2 * t);
+    } else {
+        push.rays.data[slot] = vec4(rtThroughFluids(frame, origin, direction, t, radiance), t);
+    }
+}

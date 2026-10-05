@@ -1,0 +1,34 @@
+#version 460
+#include "common.glsl"
+
+// Reports what the visibility buffer holds under one pixel.
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, scalar) writeonly buffer PickResult {
+    uint instance;
+    uint triangle;
+    float depth;
+    uint pad;
+    vec3 position;
+    uint pad1;
+};
+
+layout(push_constant, scalar) uniform Push {
+    FrameConstants frame;
+    PickResult result;
+    uint visibility_texture;
+    uint depth_texture;
+    ivec2 pixel;
+} push;
+
+void main() {
+    FrameConstants frame = push.frame;
+    uint nearest = frame.sampler_nearest_clamp;
+    uint id = texelFetch(TEX_UINT(push.visibility_texture, nearest), push.pixel, 0).r;
+    float depth = texelFetch(TEX(push.depth_texture, nearest), push.pixel, 0).r;
+    vec2 uv = (vec2(push.pixel) + 0.5) * frame.inv_resolution;
+    push.result.instance = id == INVALID_ID ? INVALID_ID : frame.meshlet_refs.data[id >> 7].instance;
+    push.result.triangle = id;
+    push.result.depth = depth;
+    push.result.position = worldPositionFromDepth(uv, max(depth, 1e-7), frame.inv_view_proj);
+}

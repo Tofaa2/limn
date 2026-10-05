@@ -1,0 +1,84 @@
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, scalar) buffer SkinnedVertices { Vertex data[]; };
+layout(buffer_reference, scalar) readonly buffer SkinVertices { SkinVertex data[]; };
+layout(buffer_reference, scalar) readonly buffer Joints { mat4 data[]; };
+
+// How far one morph target moves a vertex and turns its normal and tangent.
+struct MorphDelta {
+    vec3 position;
+    vec3 normal;
+    vec3 tangent;
+};
+layout(buffer_reference, scalar) readonly buffer MorphDeltas { MorphDelta data[]; };
+
+// One mesh to deform. All of a frame's jobs are done by one dispatch: each
+// work group of 64 vertices looks up which job it belongs to.
+struct SkinJob {
+    uint source_offset;
+    uint destination_offset;
+    uint skin_offset;
+    uint joint_offset;
+    uint vertex_count;
+    // Morph targets: runs of vertex_count deltas from morph_offset.
+    uint morph_offset;
+    uint target_count;
+    // The first work group that belongs to this job.
+    uint first_group;
+    // Where this job's target weights start in the weights list.
+    uint weights_offset;
+    uint job_pad0;
+    uint job_pad1;
+    uint job_pad2;
+};
+layout(buffer_reference, scalar) readonly buffer SkinJobs { SkinJob data[]; };
+layout(buffer_reference, scalar) readonly buffer GroupJobs { uint data[]; };
+layout(buffer_reference, scalar) readonly buffer MorphWeights { float data[]; };
+
+// Work groups are laid out in rows of this many.
+const uint GROUPS_PER_ROW = 1024u;
+
+layout(push_constant, scalar) uniform Push {
+    SkinnedVertices vertices;
+    SkinVertices skin;
+    Joints joints;
+    MorphDeltas morph;
+    SkinJobs jobs;
+    // Which job each work group belongs to.
+    GroupJobs group_jobs;
+    // Morph target weights of every job, back to back.
+    MorphWeights weights;
+    uint group_count;
+} push;
+
+void main() {
+    uint group = gl_WorkGroupID.y * GROUPS_PER_ROW + gl_WorkGroupID.x;
+    if (group >= push.group_count) return;
+    SkinJob job = push.jobs.data[push.group_jobs.data[group]];
+    uint index = (group - job.first_group) * 64u + gl_LocalInvocationID.x;
+    if (index >= job.vertex_count) return;
+    Vertex vertex = push.vertices.data[job.source_offset + index];
+    // Morph first, in the mesh's own space, then bend with the skeleton.
+    for (uint target = 0u; target < job.target_count; target++) {
+        float weight = push.weights.data[job.weights_offset + target];
+        if (weight == 0.0) continue;
+        MorphDelta delta = push.morph.data[job.morph_offset + target * job.vertex_count + index];
+        vertex.position += delta.position * weight;
+        vertex.normal += delta.normal * weight;
+        vertex.tangent.xyz += delta.tangent * weight;
+    }
+    SkinVertex influence = push.skin.data[job.skin_offset + index];
+    mat4 blend =
+        push.joints.data[job.joint_offset + influence.joints.x] * influence.weights.x +
+        push.joints.data[job.joint_offset + influence.joints.y] * influence.weights.y +
+        push.joints.data[job.joint_offset + influence.joints.z] * influence.weights.z +
+        push.joints.data[job.joint_offset + influence.joints.w] * influence.weights.w;
+    mat3 rotation = mat3(blend);
+    vertex.position = (blend * vec4(vertex.position, 1.0)).xyz;
+    vertex.normal = normalize(rotation * vertex.normal);
+    vertex.tangent.xyz = normalize(rotation * vertex.tangent.xyz);
+    push.vertices.data[job.destination_offset + index] = vertex;
+}

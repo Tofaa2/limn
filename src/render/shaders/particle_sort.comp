@@ -1,0 +1,29 @@
+#version 460
+#include "common.glsl"
+#include "particles.glsl"
+
+// One compare-and-swap round of a bitonic sort. Each pair of entries is
+// handled by exactly one invocation, so rounds need no locking; the CPU
+// issues the rounds in order.
+layout(local_size_x = 64) in;
+
+layout(push_constant, scalar) uniform Push {
+    ParticleOrder order;
+    uint count;
+    // Size of the runs being merged, and the distance between partners.
+    uint run;
+    uint stride;
+} push;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint partner = index ^ push.stride;
+    if (partner <= index || partner >= push.count) return;
+    SortEntry a = push.order.data[index];
+    SortEntry b = push.order.data[partner];
+    bool ascending = (index & push.run) == 0u;
+    if ((a.key > b.key) == ascending) {
+        push.order.data[index] = b;
+        push.order.data[partner] = a;
+    }
+}

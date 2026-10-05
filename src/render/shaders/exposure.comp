@@ -1,0 +1,67 @@
+#version 460
+#include "common.glsl"
+
+// Automatic exposure. Measures the log-average luminance of a small bloom
+// level and eases the stored exposure toward the value that maps it to
+// middle grey. Runs as a single invocation; the image is tiny.
+layout(local_size_x = 1) in;
+
+layout(push_constant, scalar) uniform Push {
+    FrameConstants frame;
+    uint source_texture;
+    uint automatic;
+    float compensation;   // exposure multiplier, 2^EV
+    float min_luminance;
+    float max_luminance;
+    float speed;
+    uint reset;
+    // For autofocus: the depth buffer, and how quickly focus follows what
+    // is at the middle of the picture, per second.
+    uint depth_texture;
+    float focus_speed;
+} push;
+
+void main() {
+    FrameConstants frame = push.frame;
+    // Autofocus: ease toward the distance at the middle of the picture.
+    float seen = 0.0;
+    for (int i = 0; i < 5; i++) {
+        vec2 offset = vec2(i == 1 ? 0.03 : (i == 2 ? -0.03 : 0.0), i == 3 ? 0.03 : (i == 4 ? -0.03 : 0.0));
+        seen += min(linearDepth(textureLod(TEX(push.depth_texture, frame.sampler_nearest_clamp), vec2(0.5) + offset, 0.0).r, frame.near), 1000.0);
+    }
+    seen /= 5.0;
+    float focus = frame.exposure.focus;
+    if (push.reset != 0u || !(focus > 0.0)) focus = seen;
+    frame.exposure.focus = focus + (seen - focus) * (1.0 - exp(-frame.delta_time * push.focus_speed));
+    if (push.automatic == 0u) {
+        frame.exposure.exposure = push.compensation;
+        return;
+    }
+    ivec2 size = textureSize(TEX(push.source_texture, frame.sampler_nearest_clamp), 0);
+    float total = 0.0;
+    float weight_total = 0.0;
+    for (int y = 0; y < size.y; y++) {
+        for (int x = 0; x < size.x; x++) {
+            vec3 color = texelFetch(TEX(push.source_texture, frame.sampler_nearest_clamp), ivec2(x, y), 0).rgb;
+            // Center-weighted metering.
+            vec2 centered = (vec2(x, y) + 0.5) / vec2(size) * 2.0 - 1.0;
+            float weight = 1.0 - 0.6 * clamp(dot(centered, centered), 0.0, 1.0);
+            total += log2(max(luminance(color), 1e-5)) * weight;
+            weight_total += weight;
+        }
+    }
+    float average = clamp(exp2(total / max(weight_total, 1e-5)), push.min_luminance, push.max_luminance);
+    float previous = frame.exposure.average_luminance;
+    if (push.reset != 0u || !(previous > 0.0)) previous = average;
+    // Adapt in log space; eyes adjust faster to brightening than darkening.
+    float rate = average > previous ? push.speed * 1.6 : push.speed;
+    // The metered value wobbles a little from frame to frame with sampling
+    // noise; following that would make the whole picture shimmer. Changes
+    // inside a small dead band (about 3%) are ignored.
+    const float dead_band = 0.04;
+    float stops = log2(average) - log2(previous);
+    stops = sign(stops) * max(abs(stops) - dead_band, 0.0);
+    float adapted = exp2(log2(previous) + stops * (1.0 - exp(-frame.delta_time * rate)));
+    frame.exposure.average_luminance = adapted;
+    frame.exposure.exposure = push.compensation * 0.18 / adapted;
+}

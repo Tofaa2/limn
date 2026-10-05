@@ -1,0 +1,59 @@
+#version 460
+#include "common.glsl"
+#include "fluid.glsl"
+
+// Turns a fluid's fire into a light: adds up the glow of the hot gas over
+// a coarse grid of samples and writes its color and where it is centered
+// into one of the frame's light records, so the scene around a fire is lit
+// by it without anyone placing a lamp there.
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, scalar) buffer LightsOut { Light data[]; };
+
+layout(push_constant, scalar) uniform Push {
+    FluidRef fluid;
+    LightsOut lights;
+    uint index;
+    // Brightness of the light per unit of glow per cubic world unit.
+    float scale;
+    // 1 makes the light as tall as the flames, 0 keeps it a point.
+    float tall;
+} push;
+
+void main() {
+    FluidRef fluid = push.fluid;
+    ivec3 size = fluid.data.size;
+    const ivec3 samples = ivec3(10, 14, size.z == 1 ? 1 : 10);
+    vec3 total = vec3(0.0);
+    vec3 center = vec3(0.0);
+    float weight = 0.0;
+    // For how tall the fire is: the spread of the glow along the box's
+    // height.
+    float height_sum = 0.0;
+    float height_squared = 0.0;
+    for (int z = 0; z < samples.z; z++)
+    for (int y = 0; y < samples.y; y++)
+    for (int x = 0; x < samples.x; x++) {
+        vec3 uvw = (vec3(x, y, z) + 0.5) / vec3(samples);
+        float temperature = sampleVolume(fluid.data.scalars_texture, fluid.data.sampler_linear, uvw, size, fluid.data.tiles_x).y;
+        vec3 glow = fireGlow(temperature);
+        float brightness = dot(glow, vec3(0.3, 0.5, 0.2));
+        total += glow;
+        center += uvw * brightness;
+        weight += brightness;
+        height_sum += uvw.y * brightness;
+        height_squared += uvw.y * uvw.y * brightness;
+    }
+    mat4 box_to_world = fluid.data.box_to_world;
+    float volume = abs(determinant(mat3(box_to_world)));
+    vec3 mean_glow = total / float(samples.x * samples.y * samples.z);
+    vec3 where = weight > 1e-6 ? center / weight : vec3(0.5);
+    push.lights.data[push.index].position = (box_to_world * vec4(where, 1.0)).xyz;
+    // A tube standing along the box: two standard deviations either side
+    // of the middle hold most of the glow.
+    float mean_height = weight > 1e-6 ? height_sum / weight : 0.5;
+    float spread = weight > 1e-6 ? sqrt(max(height_squared / weight - mean_height * mean_height, 0.0)) : 0.0;
+    push.lights.data[push.index].direction = normalize(box_to_world[1].xyz);
+    push.lights.data[push.index].source_length = 4.0 * spread * length(box_to_world[1].xyz) * push.tall;
+    push.lights.data[push.index].color = mean_glow * fluid.data.fire_color * (fluid.data.fire_intensity * volume * push.scale);
+}
