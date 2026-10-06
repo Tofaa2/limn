@@ -73,7 +73,6 @@ fn packDirection(direction: [3]f32) [2]i16 {
     if (!(sum > 1e-20)) return .{ 32767, 0 };
     var point = [2]f32{ direction[0] / sum, direction[1] / sum };
     if (direction[2] < 0) {
-        // The lower half is folded outward over the corners.
         const folded = [2]f32{ 1 - @abs(point[1]), 1 - @abs(point[0]) };
         point = .{ std.math.copysign(folded[0], point[0]), std.math.copysign(folded[1], point[1]) };
     }

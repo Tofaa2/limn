@@ -54,27 +54,29 @@ pub fn ensureGiVolume(renderer: *Renderer, slot: *?GiVolume, scene_origin: [3]f6
     const color = rhi.TextureUsage{ .sampled = true, .color_attachment = true };
     const tiles_x = counts[0] * counts[2];
     const probe_count = counts[0] * counts[1] * counts[2];
+    var made = render.MadeTextures{ .device = device };
+    errdefer made.destroy();
     slot.* = .{
         .origin = origin,
         .cell = cell,
         .spacing = spacing,
         .counts = counts,
         .rays_per_probe = rays_per_probe,
-        .irradiance = try device.createTexture(.{
+        .irradiance = try made.texture(.{
             .name = "gi irradiance",
             .width = tiles_x * gi_irradiance_texels,
             .height = counts[1] * gi_irradiance_texels,
             .format = hdr_format,
             .usage = color,
         }),
-        .irradiance_fast = try device.createTexture(.{
+        .irradiance_fast = try made.texture(.{
             .name = "gi irradiance (fast)",
             .width = tiles_x * gi_irradiance_texels,
             .height = counts[1] * gi_irradiance_texels,
             .format = hdr_format,
             .usage = color,
         }),
-        .visibility = try device.createTexture(.{
+        .visibility = try made.texture(.{
             .name = "gi visibility",
             .width = tiles_x * gi_visibility_texels,
             .height = counts[1] * gi_visibility_texels,
@@ -82,8 +84,8 @@ pub fn ensureGiVolume(renderer: *Renderer, slot: *?GiVolume, scene_origin: [3]f6
             .usage = color,
         }),
         .offsets = .{
-            try device.createTexture(.{ .name = "gi probe offsets", .width = tiles_x, .height = counts[1], .format = .rgba16_float, .usage = color }),
-            try device.createTexture(.{ .name = "gi probe offsets", .width = tiles_x, .height = counts[1], .format = .rgba16_float, .usage = color }),
+            try made.texture(.{ .name = "gi probe offsets", .width = tiles_x, .height = counts[1], .format = .rgba16_float, .usage = color }),
+            try made.texture(.{ .name = "gi probe offsets", .width = tiles_x, .height = counts[1], .format = .rgba16_float, .usage = color }),
         },
         .rays = try device.createBuffer(.{
             .name = "gi rays",

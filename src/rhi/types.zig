@@ -500,6 +500,31 @@ pub const PassTiming = struct {
     depth: u8,
 };
 
+/// What kind of GPU a device runs on; see `AdapterInfo.kind`.
+pub const AdapterKind = enum {
+    /// A graphics card with memory of its own.
+    discrete,
+    /// Built into the processor and sharing the system's memory.
+    integrated,
+    /// A GPU handed through by a virtual machine.
+    virtual,
+    /// A rasterizer running on the CPU, such as Mesa's lavapipe.
+    software,
+    other,
+};
+
+/// The GPU a device was created on, from `Device.adapterInfo`.
+pub const AdapterInfo = struct {
+    kind: AdapterKind,
+    /// PCI vendor identifier: 0x10de NVIDIA, 0x1002 AMD, 0x8086 Intel.
+    vendor_id: u32,
+    /// Bytes of memory the driver reports as the GPU's own, summed over
+    /// its heaps. For an integrated GPU this is a share of system memory.
+    memory_bytes: u64,
+    /// Ray queries and acceleration structures are available.
+    ray_tracing: bool,
+};
+
 /// Totals of device memory managed by the RHI, from `Device.memoryStats`.
 pub const MemoryStats = struct {
     /// Bytes reserved from the driver.

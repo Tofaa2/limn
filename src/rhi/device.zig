@@ -142,6 +142,10 @@ pub const FrameData = struct {
     /// The slot has been submitted at least once, so its queries can be
     /// read back.
     submitted: bool = false,
+    /// A swapchain image was acquired for the slot and never presented:
+    /// `image_available` is left signaled and the image is held until the
+    /// swapchain is made again. See `Device.abandonAcquiredImage`.
+    acquire_abandoned: bool = false,
 };
 
 const Swapchain = struct {
@@ -596,6 +600,28 @@ pub const Device = struct {
     pub fn memoryStats(self: *const Device) types.MemoryStats {
         const stats = self.allocator.stats();
         return .{ .reserved_bytes = stats.reserved_bytes, .used_bytes = stats.used_bytes };
+    }
+
+    /// What the GPU this device runs on is, for choosing how much to ask
+    /// of it; see `AdapterInfo`.
+    pub fn adapterInfo(self: *const Device) types.AdapterInfo {
+        var memory_bytes: u64 = 0;
+        const heaps = self.allocator.properties;
+        for (heaps.memory_heaps[0..heaps.memory_heap_count]) |heap| {
+            if (heap.flags.device_local_bit) memory_bytes += heap.size;
+        }
+        return .{
+            .kind = switch (self.properties.device_type) {
+                .discrete_gpu => .discrete,
+                .integrated_gpu => .integrated,
+                .virtual_gpu => .virtual,
+                .cpu => .software,
+                else => .other,
+            },
+            .vendor_id = self.properties.vendor_id,
+            .memory_bytes = memory_bytes,
+            .ray_tracing = self.ray_tracing,
+        };
     }
 
     /// GPU time of each `CommandEncoder.beginScope` region, from the most
@@ -1595,9 +1621,12 @@ pub const Device = struct {
     }
 
     /// Begins recording the frame after `waitForFrame` and `acquireImage`.
+    /// If it fails, the image that was acquired is abandoned (see
+    /// `abandonAcquiredImage`) and the next frame starts cleanly.
     pub fn startFrame(self: *Device) !Frame {
         std.debug.assert(!self.in_frame);
         const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
+        errdefer self.abandonAcquiredImage(frame);
         self.collectTimings(frame);
         self.collectGarbage(false);
         var backbuffer: ?types.Texture = null;
@@ -1617,17 +1646,29 @@ pub const Device = struct {
         return .{ .cmd = &self.encoder, .backbuffer = backbuffer, .index = self.frame_number };
     }
 
-    /// Ends recording and submits the frame to the GPU.
+    /// Ends recording and submits the frame to the GPU. If that fails the
+    /// frame is over all the same: its image is abandoned (see
+    /// `abandonAcquiredImage`) and the slot's fence is left signaled, so
+    /// that the next frame to use the slot does not wait for a submit that
+    /// never happened.
     pub fn submitFrame(self: *Device) !void {
         std.debug.assert(self.in_frame);
         const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
         std.debug.assert(self.encoder.scope_depth == 0);
+        errdefer {
+            self.in_frame = false;
+            self.abandonAcquiredImage(frame);
+        }
         const presenting = self.swapchain != null;
         if (presenting) self.encoder.transition(self.swapchain.?.textures.items[self.swapchain.?.image_index], .present);
         try self.vkd.endCommandBuffer(frame.command);
         self.in_frame = false;
 
         try self.vkd.resetFences(&.{frame.fence});
+        errdefer if (self.vkd.createFence(&.{ .flags = .{ .signaled_bit = true } }, null)) |signaled| {
+            self.vkd.destroyFence(frame.fence, null);
+            frame.fence = signaled;
+        } else |_| {};
         const command_info = vk.CommandBufferSubmitInfo{ .command_buffer = frame.command, .device_mask = 0 };
         var wait_info: vk.SemaphoreSubmitInfo = undefined;
         var signal_info: vk.SemaphoreSubmitInfo = undefined;
@@ -1639,7 +1680,6 @@ pub const Device = struct {
                 .stage_mask = .{ .all_commands_bit = true },
                 .device_index = 0,
             };
-            swapchain.present_pending = true;
         }
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
@@ -1651,8 +1691,20 @@ pub const Device = struct {
             .signal_semaphore_info_count = if (presenting) 1 else 0,
             .p_signal_semaphore_infos = @ptrCast(&signal_info),
         }}, frame.fence);
+        if (self.swapchain) |*swapchain| swapchain.present_pending = true;
         frame.submitted = true;
         self.frame_number += 1;
+    }
+
+    /// Notes that the swapchain image acquired for `frame` will not be
+    /// presented. Vulkan has no way to hand one back, so the swapchain is
+    /// made again before the next frame, which releases it, and the
+    /// semaphore the acquire signaled, which no other acquire may wait
+    /// on, is replaced then.
+    fn abandonAcquiredImage(self: *Device, frame: *FrameData) void {
+        const swapchain = if (self.swapchain) |*value| value else return;
+        swapchain.stale = true;
+        frame.acquire_abandoned = true;
     }
 
     /// Presents the image submitted by `submitFrame`; may block on vsync.
@@ -1957,6 +2009,13 @@ pub const Device = struct {
         }, null);
         self.releaseSwapchainImages();
         if (old != .null_handle) self.vkd.destroySwapchainKHR(old, null);
+        for (&self.frames) |*frame| {
+            if (!frame.acquire_abandoned) continue;
+            const fresh = try self.vkd.createSemaphore(&.{}, null);
+            self.vkd.destroySemaphore(frame.image_available, null);
+            frame.image_available = fresh;
+            frame.acquire_abandoned = false;
+        }
         swapchain.handle = handle;
         swapchain.format = format;
         swapchain.extent = extent;

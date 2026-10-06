@@ -83,7 +83,6 @@ struct Vertex {
 vec3 unpackDirection(uint packed) {
     vec2 point = unpackSnorm2x16(packed);
     vec3 direction = vec3(point, 1.0 - abs(point.x) - abs(point.y));
-    // The lower half is folded outward over the corners.
     float fold = max(-direction.z, 0.0);
     direction.x += direction.x >= 0.0 ? -fold : fold;
     direction.y += direction.y >= 0.0 ? -fold : fold;

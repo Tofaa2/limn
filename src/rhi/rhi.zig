@@ -104,6 +104,10 @@ pub const IndexType = types.IndexType;
 pub const PassTiming = types.PassTiming;
 /// Device memory reserved from the driver and in use by resources.
 pub const MemoryStats = types.MemoryStats;
+/// The kind, vendor, memory and ray tracing support of a device's GPU.
+pub const AdapterInfo = types.AdapterInfo;
+/// Discrete, integrated, virtual or software; see `AdapterInfo.kind`.
+pub const AdapterKind = types.AdapterKind;
 /// Handle to a bottom-level or top-level acceleration structure.
 pub const AccelerationStructure = types.AccelerationStructure;
 /// Triangle geometry for building a bottom-level acceleration structure.

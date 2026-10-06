@@ -127,8 +127,6 @@ pub fn ambientOcclusion(renderer: *Renderer, p: *const ScenePass) !void {
         // Write into the older of the two; the other is last frame's.
         std.mem.swap(rhi.Texture, &view.ao, &view.ao_history);
         const ao_temporal = settings.ao_temporal_filter and view.ao_history_valid;
-        // Both are upsampled and joined with their histories in one pass:
-        // they share its taps and its reprojection.
         cmd.beginScope("ao filter");
         const FilterPush = extern struct { frame: u64, ao: u32, depth: u32, history: u32, blend: f32, bounce: u32 = gpu.invalid_id, bounce_history: u32 = gpu.invalid_id };
         var filter_push = FilterPush{

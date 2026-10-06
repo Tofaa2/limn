@@ -122,6 +122,9 @@ pub const Pose = renderer.Pose;
 /// illumination, fog, antialiasing, tone mapping and the rest; see
 /// `ViewDesc.settings`. May differ between views and change every frame.
 pub const Settings = renderer.Settings;
+/// A level of effect quality, low to ultra, to start `Settings` from; see
+/// `Settings.preset` and `Renderer.recommendedQuality`.
+pub const Quality = renderer.Quality;
 /// Where a view's picture goes: the window or a color texture; see
 /// `ViewDesc.target` and `Renderer.createTarget`.
 pub const Target = renderer.Target;
@@ -294,6 +297,7 @@ test {
     _ = @import("asset/ktx2.zig");
     _ = @import("render/text_layout.zig");
     _ = @import("render/renderer.zig");
+    _ = @import("render/api.zig");
     _ = @import("render/gpu.zig");
     _ = @import("render/animation.zig");
     _ = @import("render/draw_list.zig");
