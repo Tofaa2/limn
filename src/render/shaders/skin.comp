@@ -61,14 +61,16 @@ void main() {
     uint index = (group - job.first_group) * 64u + gl_LocalInvocationID.x;
     if (index >= job.vertex_count) return;
     Vertex vertex = push.vertices.data[job.source_offset + index];
+    vec3 normal = vertexNormal(vertex);
+    vec4 tangent = vertexTangent(vertex);
     // Morph first, in the mesh's own space, then bend with the skeleton.
     for (uint target = 0u; target < job.target_count; target++) {
         float weight = push.weights.data[job.weights_offset + target];
         if (weight == 0.0) continue;
         MorphDelta delta = push.morph.data[job.morph_offset + target * job.vertex_count + index];
         vertex.position += delta.position * weight;
-        vertex.normal += delta.normal * weight;
-        vertex.tangent.xyz += delta.tangent * weight;
+        normal += delta.normal * weight;
+        tangent.xyz += delta.tangent * weight;
     }
     SkinVertex influence = push.skin.data[job.skin_offset + index];
     mat4 blend =
@@ -78,7 +80,7 @@ void main() {
         push.joints.data[job.joint_offset + influence.joints.w] * influence.weights.w;
     mat3 rotation = mat3(blend);
     vertex.position = (blend * vec4(vertex.position, 1.0)).xyz;
-    vertex.normal = normalize(rotation * vertex.normal);
-    vertex.tangent.xyz = normalize(rotation * vertex.tangent.xyz);
+    vertex.normal = packDirection(rotation * normal);
+    vertex.tangent = packTangent(vec4(rotation * tangent.xyz, tangent.w));
     push.vertices.data[job.destination_offset + index] = vertex;
 }

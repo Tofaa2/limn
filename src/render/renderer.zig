@@ -28,8 +28,30 @@ const draw_list = @import("draw_list.zig");
 const font_module = @import("font_baker").font;
 const text_layout = @import("text_layout.zig");
 
+const scene_pass = @import("scene_pass.zig");
+const geometry_passes = @import("passes/geometry.zig");
+const shadow_passes = @import("passes/shadows.zig");
+const shading_passes = @import("passes/shading.zig");
+const transparency_passes = @import("passes/transparency.zig");
+const volume_passes = @import("passes/volumes.zig");
+const path_tracing_pass = @import("passes/path_tracing.zig");
+const post_passes = @import("passes/post.zig");
+const simulation_passes = @import("passes/simulation.zig");
+const particle_passes = @import("passes/particles.zig");
+const gi_passes = @import("passes/gi.zig");
+
 const Mat4 = math.Mat4;
 const Vec3 = math.Vec3;
+const ScenePass = scene_pass.ScenePass;
+const SceneFrame = scene_pass.SceneFrame;
+const SunShadows = scene_pass.SunShadows;
+const CascadePlan = scene_pass.CascadePlan;
+const LocalShadows = scene_pass.LocalShadows;
+const ProbeList = scene_pass.ProbeList;
+const CullState = scene_pass.CullState;
+const DrawPush = scene_pass.DrawPush;
+const CullPush = scene_pass.CullPush;
+const Lighting = scene_pass.Lighting;
 
 /// Marker type that makes `Model` a distinct handle type.
 pub const ModelTag = opaque {};
@@ -1865,20 +1887,27 @@ pub const Stats = struct {
     gi_probes: u32 = 0,
 };
 
-const hdr_format = scene_color_format;
+/// Format of the targets the scene is lit into, before tone mapping.
+pub const hdr_format = scene_color_format;
 const bloom_format: rhi.Format = .b10g11r11_float;
-const bloom_levels = 6;
+/// Most levels a bloom chain can have; see `Settings.bloom_levels`.
+pub const bloom_levels = 6;
 const ao_depth_mips = 5;
-/// Culling views: the main view, the shadow cascades, and the main view's
-/// late (post-occlusion) phase.
-const view_count = 2 + gpu.cascade_count + max_local_shadow_views;
-const main_late_view = 1 + gpu.cascade_count;
-const local_view_base = main_late_view + 1;
-const max_local_shadow_views = 16;
+/// Culling views of a frame: the main view, the shadow cascades, the main
+/// view's late (post-occlusion) phase and the local lights' shadow views.
+pub const view_count = 2 + gpu.cascade_count + max_local_shadow_views;
+/// Index of the culling view that is the main view's late phase.
+pub const main_late_view = 1 + gpu.cascade_count;
+/// Index of the first of the local lights' culling views.
+pub const local_view_base = main_late_view + 1;
+/// Most shadow-casting views that local lights can have between them;
+/// each fills a tile of their shadow atlas.
+pub const max_local_shadow_views = 16;
 /// Moving things listed per scene before giving up and calling all of it moving.
 const max_movers = 256;
 
-const local_shadow_tiles_per_side = 4;
+/// Most tiles along one side of the local lights' shadow atlas.
+pub const local_shadow_tiles_per_side = 4;
 /// Clusters are spaced exponentially in depth between these distances.
 const cluster_near: f32 = 0.3;
 const cluster_far: f32 = 200;
@@ -2031,9 +2060,10 @@ const Pool = struct {
     }
 };
 
-/// Bump allocator over a mapped buffer for data rewritten every frame.
 const arena_usage = rhi.BufferUsage{ .storage = true, .acceleration_input = true, .copy_src = true };
-const FrameArena = struct {
+
+/// Bump allocator over a mapped buffer for data rewritten every frame.
+pub const FrameArena = struct {
     buffer: rhi.Buffer,
     capacity: u64,
     cursor: u64 = 0,
@@ -2074,7 +2104,9 @@ const FrameArena = struct {
         device.destroyBuffer(self.buffer);
     }
 
-    fn alloc(self: *FrameArena, device: *rhi.Device, comptime T: type, count: usize) !Allocation(T) {
+    /// Room for `count` values of `T`, good until the arena is next reset:
+    /// the mapped memory to fill and the address shaders find it at.
+    pub fn alloc(self: *FrameArena, device: *rhi.Device, comptime T: type, count: usize) !Allocation(T) {
         const size = @sizeOf(T) * @max(count, 1);
         var offset = std.mem.alignForward(u64, self.cursor, 16);
         if (offset + size > self.capacity) {
@@ -2139,7 +2171,8 @@ const ShadeVariant = struct {
     job: ?*ShadeVariantJob = null,
 };
 
-const ShadeVariantJob = struct {
+/// The compiling of one `ShadeVariant` on a worker thread.
+pub const ShadeVariantJob = struct {
     device: *const rhi.Device,
     io: std.Io,
     reflective: bool,
@@ -2150,7 +2183,8 @@ const ShadeVariantJob = struct {
     failure: ?anyerror = null,
 };
 
-fn shadeVariantDesc(device: *const rhi.Device, reflective: bool, constants: []const u32) rhi.GraphicsPipelineDesc {
+/// The pipeline of a shading pass built with the features in `constants`.
+pub fn shadeVariantDesc(device: *const rhi.Device, reflective: bool, constants: []const u32) rhi.GraphicsPipelineDesc {
     return .{
         .name = if (reflective) "shading (reflective, variant)" else "shading (variant)",
         .vertex = shaderCode("fullscreen.vert.spv"),
@@ -2164,7 +2198,7 @@ fn shadeVariantDesc(device: *const rhi.Device, reflective: bool, constants: []co
 /// Runs on a worker thread. Compiling touches nothing the render thread
 /// changes (see `Device.compileGraphicsPipeline`), and the shader code it
 /// reads is only replaced after every job has been waited for.
-fn runShadeVariantJob(job: *ShadeVariantJob) std.Io.Cancelable!void {
+pub fn runShadeVariantJob(job: *ShadeVariantJob) std.Io.Cancelable!void {
     if (job.device.compileGraphicsPipeline(std.heap.smp_allocator, shadeVariantDesc(job.device, job.reflective, &job.constants))) |compiled| {
         job.compiled = compiled;
     } else |err| job.failure = err;
@@ -2236,7 +2270,8 @@ fn brightestCubeDirection(cube: ktx2.Texture) Vec3 {
     return best_direction;
 }
 
-const ModelMesh = struct {
+/// Where one mesh of a loaded model lies in the shared geometry buffers.
+pub const ModelMesh = struct {
     vertex_offset: u32,
     vertex_count: u32,
     skin_offset: ?u32,
@@ -2368,7 +2403,9 @@ const LayoutEntry = struct {
     first_of_entity: bool,
 };
 
-const SceneData = struct {
+/// Everything that belongs to one scene: its entities, lights and effects,
+/// and the GPU buffers they are laid out in.
+pub const SceneData = struct {
     /// Bounds (center, radius) of what moved this frame, for deciding
     /// which shadow tiles to redraw; `movers_overflow` if there were too
     /// many to list.
@@ -2440,7 +2477,7 @@ const SceneData = struct {
     /// Renderer frame the per-frame data below was written for; a scene
     /// shown by several views is prepared once.
     prepared_frame: u64 = std.math.maxInt(u64),
-    prepared: Renderer.SceneFrame = undefined,
+    prepared: SceneFrame = undefined,
     gi_frame: u64 = std.math.maxInt(u64),
     gi_updated_frame: u64 = std.math.maxInt(u64),
     ref_count: u32 = 0,
@@ -2520,7 +2557,8 @@ const EntityData = struct {
     resolved: bool = false,
 };
 
-const TransparentDraw = struct {
+/// One see-through mesh of a scene, as the transparency pass draws it.
+pub const TransparentDraw = struct {
     instance: u32,
     first_index: u32,
     index_count: u32,
@@ -2534,7 +2572,7 @@ const TransparentDraw = struct {
 const BlasJob = struct { blas: rhi.AccelerationStructure, vertex_offset: u32, mesh: ModelMesh };
 /// `BoundsJob` in skin_bounds.comp: one deformed mesh to take the meshlet
 /// bounds of.
-const BoundsJob = extern struct {
+pub const BoundsJob = extern struct {
     vertex_offset: u32,
     meshlet_offset: u32,
     meshlet_count: u32,
@@ -2544,7 +2582,7 @@ const BoundsJob = extern struct {
 };
 
 /// `SkinJob` in skin.comp: one mesh to deform.
-const SkinJob = extern struct {
+pub const SkinJob = extern struct {
     source_offset: u32,
     destination_offset: u32,
     skin_offset: u32,
@@ -2566,7 +2604,9 @@ comptime {
 
 // ----------------------------------------------------------- render targets
 
-const ViewState = struct {
+/// The render targets of one view at one resolution. Made again when the
+/// size or the resolutions of the effects change.
+pub const ViewState = struct {
     width: u32,
     height: u32,
     depth: rhi.Texture,
@@ -2759,7 +2799,7 @@ const ViewState = struct {
 
 /// Everything that belongs to one camera rather than to a scene or to the
 /// renderer: its render targets and whatever it carries from frame to frame.
-const ViewData = struct {
+pub const ViewData = struct {
     state: ?ViewState = null,
     /// Display-referred picture of a view drawn into part of a target;
     /// copied into place once its draw lists are done.
@@ -2930,7 +2970,7 @@ const GiPipelines = struct {
 };
 
 /// A grid of irradiance probes covering the scene's static geometry.
-const GiVolume = struct {
+pub const GiVolume = struct {
     origin: Vec3,
     /// The origin in whole grid cells, and how far it moved this frame.
     cell: [3]i32 = .{ 0, 0, 0 },
@@ -2954,11 +2994,12 @@ const GiVolume = struct {
     /// Updates since creation; drives how quickly new data replaces old.
     frames: u32 = 0,
 
-    fn probeCount(self: GiVolume) u32 {
+    /// How many probes the grid holds.
+    pub fn probeCount(self: GiVolume) u32 {
         return self.counts[0] * self.counts[1] * self.counts[2];
     }
 
-    fn deinit(self: GiVolume, device: *rhi.Device) void {
+    pub fn deinit(self: GiVolume, device: *rhi.Device) void {
         device.destroyTexture(self.irradiance);
         device.destroyTexture(self.irradiance_fast);
         device.destroyTexture(self.visibility);
@@ -2967,14 +3008,17 @@ const GiVolume = struct {
     }
 };
 
-const gi_irradiance_texels = 8;
-const gi_visibility_texels = 16;
+/// Texels along each side of one probe's square of irradiance.
+pub const gi_irradiance_texels = 8;
+/// Texels along each side of one probe's square of visibility.
+pub const gi_visibility_texels = 16;
 /// Upper bound on `Options.gi_max_probes`: the scroll offset has 10 bits.
-const gi_probe_limit = 256;
+pub const gi_probe_limit = 256;
 
 const TonemapPipeline = struct { format: rhi.Format, pipeline: rhi.Pipeline };
 const PickRequest = struct { view: View, pixel: [2]u32 };
-const ReflectionTargets = struct {
+/// A view's targets for screen-space reflections.
+pub const ReflectionTargets = struct {
     /// Mirror weight (rgb) and roughness (a) of every surface.
     weight: rhi.Texture,
     /// Shading normal (octahedral, rg) and sky visibility (b).
@@ -2986,8 +3030,10 @@ const ReflectionTargets = struct {
     history_valid: bool = false,
 };
 const CloudTargets = struct { current: rhi.Texture, history: rhi.Texture, history_valid: bool = false };
-const cloud_noise_size = [3]i32{ 128, 128, 64 };
-const cloud_noise_tiles = 8;
+/// Size of the noise volume that clouds are shaped by.
+pub const cloud_noise_size = [3]i32{ 128, 128, 64 };
+/// The volume is kept as a sheet of slices, this many to a row.
+pub const cloud_noise_tiles = 8;
 const MaterialPipelines = struct { plain: rhi.Pipeline, reflective: rhi.Pipeline };
 /// The 2x2 matrix (by rows) of a coordinate transform: scale, then rotate.
 fn uvMatrix(scale: [2]f32, rotation: f32) [4]f32 {
@@ -3012,13 +3058,15 @@ fn uvSetBit(reference: ?gltf.TextureRef, bit: u5) u32 {
     return if (reference) |ref| @as(u32, ref.uv_set & 1) << bit else 0;
 }
 
-fn packTint(color: [3]f32) u32 {
+/// A color as the instance records hold it: 8 bits a channel, opaque.
+pub fn packTint(color: [3]f32) u32 {
     var packed_color: u32 = 0xff000000;
     inline for (0..3) |channel| packed_color |= @as(u32, @intFromFloat(std.math.clamp(color[channel], 0, 1) * 255 + 0.5)) << (channel * 8);
     return packed_color;
 }
 
-const max_fluids = 8;
+/// Most fluids a view marches at once.
+pub const max_fluids = 8;
 const max_pose_threads = 8;
 /// Animated entities per thread below which splitting the work does not pay.
 const pose_batch = 48;
@@ -3026,7 +3074,7 @@ const max_liquids = 4;
 /// Particles a grid cell can list. A cell at rest holds eight; one that
 /// cannot list all it holds would hide how crowded it is, and the liquid
 /// would let itself be squashed flat there.
-const liquid_cell_slots = 48;
+pub const liquid_cell_slots = 48;
 
 const LiquidTargets = struct {
     depth: rhi.Texture,
@@ -3081,7 +3129,8 @@ const LiquidState = struct {
 };
 
 const max_waters = 8;
-const water_quads = 160;
+/// Quads along each side of the grid a water surface is drawn with.
+pub const water_quads = 160;
 const WaterState = struct {
     scene: Scene,
     desc: WaterDesc,
@@ -3171,7 +3220,7 @@ const FluidState = struct {
     }
 
     /// Order matters: 4 to 6 hold one number per cell, 8 is the mask.
-    fn textures(self: *FluidState) [11]*rhi.Texture {
+    pub fn textures(self: *FluidState) [11]*rhi.Texture {
         return .{ &self.velocity[0], &self.velocity[1], &self.scalars[0], &self.scalars[1], &self.pressure[0], &self.pressure[1], &self.divergence, &self.curl, &self.solid, &self.carried, &self.carried_velocity };
     }
 };
@@ -3200,7 +3249,9 @@ const InstanceSlot = struct {
     static_version: u64 = std.math.maxInt(u64),
     entity_count: usize = 0,
 };
-const EmitterData = struct {
+
+/// One particle emitter of a scene and its particles on the GPU.
+pub const EmitterData = struct {
     scene: Scene,
     desc: EmitterDesc,
     buffer: rhi.Buffer,
@@ -4319,7 +4370,7 @@ pub const Renderer = struct {
             // it is built once their geometry upload has been recorded.
             for (entry.meshes) |*mesh| {
                 if (mesh.skin_offset != null) continue;
-                mesh.blas = try device.createBlas(self.blasDesc(mesh.*));
+                mesh.blas = try device.createBlas(geometry_passes.blasDesc(self, mesh.*));
             }
             entry.blas_pending = true;
             self.blas_pending += 1;
@@ -4647,7 +4698,7 @@ pub const Renderer = struct {
         if (device.ray_tracing) {
             for (entry.meshes) |*mesh| {
                 if (mesh.skin_offset != null) continue;
-                mesh.blas = try device.createBlas(self.blasDesc(mesh.*));
+                mesh.blas = try device.createBlas(geometry_passes.blasDesc(self, mesh.*));
             }
             entry.blas_pending = true;
             self.blas_pending += 1;
@@ -6093,7 +6144,7 @@ pub const Renderer = struct {
         const data = self.scenes.get(scene) orelse return error.InvalidScene;
         if (data.waters.items.len == max_waters) return error.TooManyWaters;
         var state = WaterState{ .scene = scene, .desc = desc };
-        if (desc.splashes > 0) state.splash = try self.createEmitterLocked(scene, splashDesc(desc));
+        if (desc.splashes > 0) state.splash = try self.createEmitterLocked(scene, simulation_passes.splashDesc(desc));
         errdefer if (state.splash) |emitter| self.destroyEmitterLocked(emitter);
         try self.createWaterTextures(&state);
         errdefer for (state.state) |texture| self.device.destroyTexture(texture);
@@ -6110,7 +6161,7 @@ pub const Renderer = struct {
         defer self.mutex.unlock(self.io);
         const state = self.waters.get(water) orelse return error.InvalidWater;
         const resized = !std.mem.eql(u32, &desc.resolution, &state.desc.resolution);
-        if (desc.splashes > 0 and state.splash == null) state.splash = try self.createEmitterLocked(state.scene, splashDesc(desc));
+        if (desc.splashes > 0 and state.splash == null) state.splash = try self.createEmitterLocked(state.scene, simulation_passes.splashDesc(desc));
         if (desc.splashes <= 0) if (state.splash) |emitter| {
             self.destroyEmitterLocked(emitter);
             state.splash = null;
@@ -6167,23 +6218,6 @@ pub const Renderer = struct {
 
     // ------------------------------------------------------------- liquid
 
-    /// The box a liquid is held in: its axes (unit length), its size
-    /// along each, and its low corner.
-    const LiquidBox = struct { axes: [3]Vec3, extent: Vec3, corner: Vec3 };
-
-    fn liquidBox(transform: Mat4) LiquidBox {
-        var box: LiquidBox = undefined;
-        const center = Vec3{ transform[12], transform[13], transform[14] };
-        box.corner = center;
-        inline for (0..3) |axis| {
-            const column = Vec3{ transform[axis * 4], transform[axis * 4 + 1], transform[axis * 4 + 2] };
-            box.extent[axis] = @max(math.length(column), 1e-4);
-            box.axes[axis] = math.scale(column, 1 / box.extent[axis]);
-            box.corner = math.sub(box.corner, math.scale(column, 0.5));
-        }
-        return box;
-    }
-
     /// Adds a volume of liquid to a scene.
     pub fn createLiquid(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
         const liquid = try self.createLiquidAlone(scene, desc);
@@ -6228,7 +6262,7 @@ pub const Renderer = struct {
         const device = self.device;
         const radius = std.math.clamp(desc.particle_radius, 0.002, 10);
         const reach = radius * 4;
-        const box = liquidBox(desc.transform);
+        const box = simulation_passes.liquidBox(desc.transform);
         var grid: [3]i32 = undefined;
         var cell_count: u64 = 1;
         inline for (0..3) |axis| {
@@ -6308,226 +6342,6 @@ pub const Renderer = struct {
         };
     }
 
-    /// Density, in the solver's own units, of particles at rest: a
-    /// lattice half a reach apart.
-    fn liquidRestDensity() f32 {
-        var sum: f32 = 0;
-        var x: i32 = -2;
-        while (x <= 2) : (x += 1) {
-            var y: i32 = -2;
-            while (y <= 2) : (y += 1) {
-                var z: i32 = -2;
-                while (z <= 2) : (z += 1) {
-                    const q2 = @as(f32, @floatFromInt(x * x + y * y + z * z)) * 0.25;
-                    if (q2 >= 1) continue;
-                    const w = 1 - q2;
-                    sum += 315.0 / (64.0 * std.math.pi) * w * w * w;
-                }
-            }
-        }
-        return sum;
-    }
-
-    /// Steps every liquid of a scene: once per scene per frame.
-    fn simulateLiquids(self: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, arena: *FrameArena, delta_time: f32) !void {
-        if (scene.liquids.items.len == 0) return;
-        const device = self.device;
-        cmd.beginScope("liquid simulation");
-        defer cmd.endScope();
-        const Push = extern struct { liquid: u64, particles: u64, counts: u64, cells: u64, mode: u32, flip: u32 };
-        for (scene.liquids.items) |item| {
-            const state = self.liquids.get(item) orelse continue;
-            const desc = state.desc;
-            const box = liquidBox(desc.transform);
-            const radius = desc.particle_radius;
-            const spacing = radius * 2;
-            const frame_dt = steadyStep(&state.time_owed, delta_time * desc.time_scale);
-            const substeps = std.math.clamp(desc.substeps, 1, 8);
-            const dt = frame_dt / @as(f32, @floatFromInt(substeps));
-            var record = gpu.Liquid{
-                .from_box = .{
-                    box.axes[0][0], box.axes[0][1], box.axes[0][2], 0,
-                    box.axes[1][0], box.axes[1][1], box.axes[1][2], 0,
-                    box.axes[2][0], box.axes[2][1], box.axes[2][2], 0,
-                    box.corner[0],  box.corner[1],  box.corner[2],  1,
-                },
-                .extent = box.extent,
-                .h = radius * 4,
-                .cells = state.grid,
-                .slots = liquid_cell_slots,
-                .live_before = state.live,
-                .live = state.live,
-                .block_count = @min(state.block[0] * state.block[1] * state.block[2], state.capacity),
-                .block_nx = @max(state.block[0], 1),
-                .block_nz = @max(state.block[2], 1),
-                .spacing = spacing,
-                .dt = dt,
-                .rest_density = liquidRestDensity(),
-                .gravity = .{ math.dot(desc.gravity, box.axes[0]), math.dot(desc.gravity, box.axes[1]), math.dot(desc.gravity, box.axes[2]) },
-                .radius = radius,
-                .block_origin = .{ radius, radius, radius },
-                .seed = @truncate(self.frame_index *% 2654435761),
-                .color = desc.color,
-                .murk = @max(desc.murk, 0),
-                .source_count = state.source_count,
-                .sphere_count = 0,
-                .refraction = @max(desc.refraction, 0),
-                .keep = @exp(-@max(desc.damping, 0) * dt),
-                .viscosity = std.math.clamp(desc.viscosity, 0, 1),
-                .detail = std.math.clamp(desc.ripple_detail, 0, 2),
-            };
-            for (state.sources[0..state.source_count], record.sources[0..state.source_count]) |source, *out| {
-                const from_corner = math.sub(source.position, box.corner);
-                out.* = .{
-                    .position = .{ math.dot(from_corner, box.axes[0]), math.dot(from_corner, box.axes[1]), math.dot(from_corner, box.axes[2]) },
-                    .radius = @max(source.radius, radius),
-                    .velocity = .{ math.dot(source.velocity, box.axes[0]), math.dot(source.velocity, box.axes[1]), math.dot(source.velocity, box.axes[2]) },
-                };
-            }
-            // Entities in the liquid's way, as the spheres around them.
-            if (desc.obstacles) for (scene.entities.items) |entity_handle| {
-                if (record.sphere_count == record.spheres.len) break;
-                const entity = self.entities.get(entity_handle) orelse continue;
-                if (!entity.visible) continue;
-                const model = self.models.get(entity.model) orelse continue;
-                if (model.state != .ready) continue;
-                const center = math.sub(math.transformPoint(entity.transform, model.info.bounds_center), box.corner);
-                const reach = model.info.bounds_radius * math.maxScale(entity.transform);
-                const local = Vec3{ math.dot(center, box.axes[0]), math.dot(center, box.axes[1]), math.dot(center, box.axes[2]) };
-                var inside = true;
-                inline for (0..3) |axis| {
-                    if (local[axis] < -reach or local[axis] > box.extent[axis] + reach) inside = false;
-                }
-                // The box itself and whatever is larger than it are not
-                // things in the liquid.
-                if (!inside or reach > @min(box.extent[0], @min(box.extent[1], box.extent[2])) * 0.45) continue;
-                record.spheres[record.sphere_count] = .{ local[0], local[1], local[2], reach };
-                record.sphere_count += 1;
-            };
-
-            cmd.bindPipeline(self.pipelines.liquid_sim);
-            var push = Push{
-                .liquid = 0,
-                .particles = device.bufferAddress(state.particles),
-                .counts = device.bufferAddress(state.counts),
-                .cells = device.bufferAddress(state.cells),
-                .mode = 0,
-                .flip = 0,
-            };
-            const steps: u32 = if (frame_dt > 0) substeps else 0;
-            // One record a step, worked out first and copied into GPU
-            // memory in one go: the shader reads it for every particle
-            // and every neighbour, far too often for memory the CPU can
-            // see. Standing still, one record to draw by.
-            const records = try arena.alloc(device, gpu.Liquid, @max(steps, 1));
-            records.items[0] = record;
-            for (0..steps) |step| {
-                record.live_before = state.live;
-                // Births: the starting block, once, then what the jets owe.
-                if (!state.started) {
-                    state.started = true;
-                    state.live = record.block_count;
-                }
-                for (state.sources[0..state.source_count], 0..) |source, index| {
-                    const speed = math.length(source.velocity);
-                    // A jet comes out a layer at a time: at its own speed
-                    // a layer for every particle's width it travels.
-                    const mouth = @max(source.radius, radius);
-                    const per_layer = @max(@round(std.math.pi * mouth * mouth / (spacing * spacing)), 1);
-                    const layers_a_second = if (source.rate > 0) source.rate / per_layer else speed / spacing;
-                    state.owed[index] += layers_a_second * dt;
-                    const room: u32 = (state.capacity - state.live) / @as(u32, @intFromFloat(per_layer));
-                    const layers: u32 = @min(@as(u32, @intFromFloat(@floor(state.owed[index]))), room);
-                    state.owed[index] -= @floor(state.owed[index]);
-                    const born: u32 = layers * @as(u32, @intFromFloat(per_layer));
-                    record.sources[index].layer = per_layer;
-                    record.source_lead[index] = state.owed[index] * spacing;
-                    record.source_start[index] = state.live;
-                    state.live += born;
-                    record.source_end[index] = state.live;
-                }
-                record.live = state.live;
-                record.seed +%= 0x9e3779b9;
-                records.items[step] = record;
-            }
-            const stride = @sizeOf(gpu.Liquid);
-            cmd.sync(.all_to_transfer);
-            cmd.copyBuffer(records.buffer, state.params_buffer, records.offset, 0, records.items.len * stride);
-            cmd.sync(.transfer_to_all);
-            const params_address = device.bufferAddress(state.params_buffer);
-            for (0..steps) |step| {
-                const live = records.items[step].live;
-                if (live == 0) continue;
-                push.liquid = params_address + step * stride;
-                const groups = (live + 63) / 64;
-                push.mode = 0;
-                push.flip = 0;
-                cmd.pushConstants(push);
-                cmd.dispatch(groups, 1, 1);
-                cmd.sync(.all_to_transfer);
-                cmd.fillBuffer(state.counts, 0, @as(u64, state.cell_count) * @sizeOf(u32), 0);
-                cmd.sync(.transfer_to_all);
-                push.mode = 1;
-                cmd.pushConstants(push);
-                cmd.dispatch(groups, 1, 1);
-                cmd.sync(.compute_to_all);
-                var flip: u32 = 0;
-                for (0..std.math.clamp(desc.iterations, 1, 8)) |_| {
-                    push.flip = flip;
-                    push.mode = 2;
-                    cmd.pushConstants(push);
-                    cmd.dispatch(groups, 1, 1);
-                    cmd.sync(.compute_to_all);
-                    push.mode = 3;
-                    cmd.pushConstants(push);
-                    cmd.dispatch(groups, 1, 1);
-                    cmd.sync(.compute_to_all);
-                    flip ^= 1;
-                }
-                push.flip = flip;
-                push.mode = 4;
-                cmd.pushConstants(push);
-                cmd.dispatch(groups, 1, 1);
-                cmd.sync(.compute_to_all);
-                push.mode = 5;
-                cmd.pushConstants(push);
-                cmd.dispatch(groups, 1, 1);
-                cmd.sync(.compute_to_all);
-            }
-            state.params = params_address + (records.items.len - 1) * stride;
-            state.params_frame = self.frame_index;
-            // The stand-in for rays: the tank's footprint, as high as the
-            // liquid would stand if it lay still.
-            if (state.proxy) |stand_in| if (self.entities.get(stand_in)) |proxy| {
-                const volume = @as(f32, @floatFromInt(state.live)) * spacing * spacing * spacing;
-                const filled = std.math.clamp(volume / (box.extent[0] * box.extent[1] * box.extent[2]), 0.002, 1);
-                proxy.transform = math.mul(desc.transform, math.mul(math.translation(.{ 0, -0.5 + filled * 0.5, 0 }), math.scaling(.{ 1, filled, 1 })));
-                proxy.tint = packTint(desc.color);
-            };
-        }
-    }
-
-    /// The spray of a water surface: drops thrown up and out, falling
-    /// back, of the water's own color. Emits nothing until something
-    /// hits the surface.
-    fn splashDesc(desc: WaterDesc) EmitterDesc {
-        const t = desc.transform;
-        const tint = [3]f32{ 0.55 + desc.color[0] * 0.45, 0.6 + desc.color[1] * 0.4, 0.65 + desc.color[2] * 0.35 };
-        return .{
-            .capacity = 4096,
-            .rate = 0,
-            .lifetime = .{ 0.35, 0.9 },
-            .direction = math.normalize(.{ t[4], t[5], t[6] }),
-            .spread = 0.9,
-            .gravity = .{ 0, -9.8, 0 },
-            .drag = 0.6,
-            .size = .{ 0.03, 0.07 },
-            .color_start = .{ tint[0], tint[1], tint[2], 0.75 },
-            .color_end = .{ tint[0], tint[1], tint[2], 0 },
-            .softness = 0.05,
-        };
-    }
-
     fn createWaterTextures(self: *Renderer, state: *WaterState) !void {
         inline for (0..2) |axis| state.size[axis] = std.math.clamp(state.desc.resolution[axis], 16, 1024);
         var made: usize = 0;
@@ -6544,148 +6358,6 @@ pub const Renderer = struct {
         }
         state.cleared = false;
         state.current = 0;
-    }
-
-    /// Steps every water surface of a scene by one frame.
-    /// The time a simulation steps by this frame. Frames arrive at any
-    /// length: a few millionths of a second when two follow hard on each
-    /// other, a tenth when the window is in the background. A solver fed
-    /// those as they come divides by nearly nothing or leaps too far,
-    /// and its surface flies apart. So time is saved up in `owed` until
-    /// there is at least a two-hundredth of a second of it, and never
-    /// more than a thirtieth is stepped at once (the rest is dropped:
-    /// the simulation slows rather than breaks). 0 means do not step.
-    fn steadyStep(owed: *f32, elapsed: f32) f32 {
-        if (!(elapsed > 0)) return 0;
-        owed.* = @min(owed.* + elapsed, 1.0 / 30.0);
-        if (owed.* < 1.0 / 200.0) return 0;
-        const step = owed.*;
-        owed.* = 0;
-        return step;
-    }
-
-    fn simulateWater(self: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, arena: *FrameArena, delta_time: f32) !void {
-        if (scene.waters.items.len == 0) return;
-        const device = self.device;
-        cmd.beginScope("water simulation");
-        defer cmd.endScope();
-        for (scene.waters.items) |item| {
-            const state = self.waters.get(item) orelse continue;
-            const desc = state.desc;
-            if (!state.cleared) {
-                for (state.state) |texture| {
-                    try cmd.beginRendering(.{ .color = &.{.{ .texture = texture, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
-                    cmd.endRendering();
-                    cmd.transition(texture, .shader_read);
-                }
-                state.cleared = true;
-            }
-            const dt = steadyStep(&state.time_owed, delta_time * desc.time_scale);
-            const t = desc.transform;
-            const width = @max(math.length(.{ t[0], t[1], t[2] }), 1e-6);
-            const up = @max(math.length(.{ t[4], t[5], t[6] }), 1e-6);
-            // Rain: drops at random places, a share of a drop carried over.
-            state.rain_pending += @max(desc.rain, 0) * dt;
-            var random = std.Random.DefaultPrng.init(self.frame_index *% 0x9e3779b97f4a7c15 +% 7);
-            const rng = random.random();
-            while (state.rain_pending >= 1 and state.ripple_count < state.ripples.len) : (state.rain_pending -= 1) {
-                state.ripples[state.ripple_count] = .{
-                    .position = .{ rng.float(f32), rng.float(f32) },
-                    .radius = 0.12 / width,
-                    .depth = 0.035 / up,
-                };
-                state.ripple_count += 1;
-            }
-            state.rain_pending = @min(state.rain_pending, 1);
-            // Whatever moves through the surface leaves a dent where it is.
-            // The hardest hit on the surface this frame, for the spray.
-            var splash_strength: f32 = state.hit_strength;
-            var splash_at: Vec3 = state.hit_at;
-            var splash_radius: f32 = state.hit_radius;
-            var splash_speed: f32 = if (state.hit_strength > 0) 4 else 0;
-            state.hit_strength = 0;
-            if (desc.object_ripples > 0) {
-                const to_sheet = math.inverse(t);
-                for (scene.entities.items) |entity_handle| {
-                    if (state.ripple_count == state.ripples.len) break;
-                    const entity = self.entities.get(entity_handle) orelse continue;
-                    if (!entity.visible or entity.travelled < 1e-4) continue;
-                    const model = self.models.get(entity.model) orelse continue;
-                    if (model.state != .ready) continue;
-                    const center = math.transformPoint(entity.transform, model.info.bounds_center);
-                    const radius = model.info.bounds_radius * math.maxScale(entity.transform);
-                    const local = math.transformPoint(to_sheet, center);
-                    // Height above the sheet in world units, and whether the
-                    // sphere cuts it inside the sheet's edges.
-                    const above = local[1] * up;
-                    if (@abs(above) >= radius or @abs(local[0]) > 0.5 or @abs(local[2]) > 0.5) continue;
-                    const cut = @sqrt(radius * radius - above * above);
-                    const speed = entity.travelled / @max(delta_time, 1e-4);
-                    if (speed * cut > splash_strength) {
-                        splash_strength = speed * cut;
-                        splash_at = math.transformPoint(t, .{ local[0], 0, local[2] });
-                        splash_radius = cut;
-                        splash_speed = speed;
-                    }
-                    state.ripples[state.ripple_count] = .{
-                        .position = .{ local[0] + 0.5, local[2] + 0.5 },
-                        .radius = @min(cut, radius) / width,
-                        .depth = @min(entity.travelled * 0.35 * desc.object_ripples, radius * 0.5) / up,
-                    };
-                    state.ripple_count += 1;
-                }
-            }
-            if (state.splash) |spraying| if (self.emitters.get(spraying)) |emitter| {
-                var spray = splashDesc(desc);
-                // Still water throws nothing; a slow wade little.
-                if (splash_strength > 0.15) {
-                    spray.position = splash_at;
-                    spray.radius = splash_radius * 0.7;
-                    spray.rate = @min(desc.splashes * splash_strength * 600, 6000);
-                    spray.speed = .{ 0.4 + splash_speed * 0.25, 1.2 + splash_speed * 0.6 };
-                }
-                emitter.desc = spray;
-            };
-            // Two copies: the step reads the surface as it was, the views
-            // read it as it is afterwards.
-            var record = gpu.Water{
-                .transform = t,
-                .size = .{ @intCast(state.size[0]), @intCast(state.size[1]) },
-                .state = device.textureIndex(state.state[state.current]),
-                .sampler_linear = device.samplerIndex(self.sampler_linear_clamp),
-                .dt = dt,
-                .speed = @max(desc.wave_speed, 0) * @as(f32, @floatFromInt(state.size[0])) / width,
-                .keep = @exp(-@max(desc.damping, 0) * dt),
-                .ripple_count = state.ripple_count,
-                .color = desc.color,
-                .murk = @max(desc.murk, 0),
-                .roughness = std.math.clamp(desc.roughness, 0, 1),
-                .refraction = @max(desc.refraction, 0),
-                .swell = @max(desc.swell, 0),
-                .swell_length = @max(desc.swell_length, 0.01),
-                .foam = std.math.clamp(desc.foam, 0, 1),
-                .caustics = std.math.clamp(desc.caustics, 0, 1),
-                .detail = std.math.clamp(desc.ripple_detail, 0, 2),
-                .ripples = state.ripples,
-            };
-            state.ripple_count = 0;
-            const params = try arena.alloc(device, gpu.Water, 2);
-            params.items[0] = record;
-            if (dt > 0) {
-                const new = 1 - state.current;
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = state.state[new], .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.water_sim);
-                cmd.pushConstants(extern struct { water: u64 }{ .water = params.address });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(state.state[new], .shader_read);
-                state.current = new;
-                record.state = device.textureIndex(state.state[new]);
-            }
-            params.items[1] = record;
-            state.params = params.address + @sizeOf(gpu.Water);
-            state.params_frame = self.frame_index;
-        }
     }
 
     // --------------------------------------------------------------- fluids
@@ -6890,218 +6562,6 @@ pub const Renderer = struct {
         if (state.flipbook) |texture| self.device.destroyTexture(texture);
         state.flipbook = null;
         state.picture = null;
-    }
-
-    /// Steps every fluid of a scene by one frame and leaves each one's
-    /// description on the GPU for the views to draw from.
-    fn simulateFluids(self: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, arena: *FrameArena, delta_time: f32) !void {
-        if (scene.fluids.items.len == 0) return;
-        const device = self.device;
-        cmd.beginScope("fluid simulation");
-        defer cmd.endScope();
-        for (scene.fluids.items) |item| {
-            const state = self.fluids.get(item) orelse continue;
-            const desc = state.desc;
-            if (!state.cleared) {
-                for (state.textures()) |texture| {
-                    try cmd.beginRendering(.{ .color = &.{.{ .texture = texture.*, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
-                    cmd.endRendering();
-                    cmd.transition(texture.*, .shader_read);
-                }
-                state.cleared = true;
-                state.mask_key = 0;
-            }
-            // A long frame is simulated as a short one: the solver is
-            // stable at any step, but big steps smear the flow.
-            const dt = steadyStep(&state.time_owed, delta_time * desc.time_scale);
-            const cells: f32 = @floatFromInt(state.size[1]);
-            const box_to_world = math.mul(desc.transform, math.translation(.{ -0.5, -0.5, -0.5 }));
-            const params = try arena.alloc(device, gpu.Fluid, 1);
-            params.items[0] = .{
-                .world_to_box = math.inverse(box_to_world),
-                .box_to_world = box_to_world,
-                .size = .{ @intCast(state.size[0]), @intCast(state.size[1]), @intCast(state.size[2]) },
-                .tiles_x = @intCast(state.tiles_x),
-                .dt = dt,
-                .buoyancy = desc.buoyancy,
-                .weight = desc.weight,
-                .vorticity = @max(desc.vorticity, 0),
-                .velocity_keep = @exp(-@max(desc.velocity_loss, 0) * dt),
-                .smoke_keep = @exp(-@max(desc.smoke_loss, 0) * dt),
-                .heat_keep = @exp(-@max(desc.cooling, 0) * dt),
-                .fuel_keep = @exp(-@max(desc.burn_rate, 0) * dt),
-                .heat = desc.heat,
-                .soot = desc.soot,
-                .walls = @intFromEnum(desc.walls),
-                .source_count = state.source_count,
-                .wind = desc.wind,
-                .absorption = @max(desc.absorption, 0),
-                .smoke_color = desc.smoke_color,
-                .fire_intensity = @max(desc.fire_intensity, 0),
-                .fire_color = desc.fire_color,
-                .shadow = std.math.clamp(desc.shadow, 0, 1),
-                .sampler_linear = device.samplerIndex(self.sampler_linear_clamp),
-                .sampler_nearest = device.samplerIndex(self.sampler_nearest_clamp),
-                .scalars = 0,
-                .anisotropy = std.math.clamp(desc.anisotropy, 0, 0.95),
-                .ambient = @max(desc.ambient, 0),
-                .sources = undefined,
-                .obstacles = @splat(.{}),
-                .obstacle_count = state.obstacle_count,
-                .solid_mask = 0,
-            };
-            for (&params.items[0].sources, state.sources) |*out, source| out.* = .{
-                .position = source.position,
-                .radius = source.radius,
-                .velocity = math.scale(source.velocity, cells),
-                .smoke = source.smoke,
-                .fuel = source.fuel,
-                .temperature = source.temperature,
-            };
-            const grid = Vec3{ @floatFromInt(state.size[0]), cells, @floatFromInt(state.size[2]) };
-            for (state.obstacles[0..state.obstacle_count], params.items[0].obstacles[0..state.obstacle_count]) |obstacle, *out| out.* = switch (obstacle) {
-                .sphere => |sphere| .{ .a = Vec3{ sphere.center[0] * grid[0], sphere.center[1] * grid[1], sphere.center[2] * grid[2] }, .radius = @max(sphere.radius, 0) * cells },
-                .box => |box| .{ .a = Vec3{ box.min[0] * grid[0], box.min[1] * grid[1], box.min[2] * grid[2] }, .b = Vec3{ box.max[0] * grid[0], box.max[1] * grid[1], box.max[2] * grid[2] }, .radius = -1 },
-            };
-            const address = params.address;
-            state.params = address;
-            state.params_frame = self.frame_index;
-            const Push = extern struct { fluid: u64, a: u32 = 0, b: u32 = 0, c: u32 = 0, pad: u32 = 0 };
-            params.items[0].solid = device.textureIndex(state.solid);
-            // The scene's own geometry as obstacles needs its acceleration
-            // structure, which exists once global illumination has run.
-            const scene_tlas: u64 = if (desc.scene_obstacles and device.ray_tracing and scene.tlas_hash != 0)
-                (if (scene.tlas) |tlas| device.accelerationAddress(tlas) else 0)
-            else
-                0;
-            if (state.obstacle_count != 0 or scene_tlas != 0) {
-                params.items[0].solid_mask = 1;
-                // Redrawn only when the obstacles, the box or the scene's
-                // geometry changed since the mask was last made.
-                var hasher = std.hash.Wyhash.init(0);
-                hasher.update(std.mem.asBytes(&desc.transform));
-                hasher.update(std.mem.asBytes(&state.size));
-                hasher.update(std.mem.asBytes(&state.obstacle_count));
-                for (state.obstacles[0..state.obstacle_count]) |obstacle| switch (obstacle) {
-                    .sphere => |sphere| {
-                        hasher.update(std.mem.asBytes(&sphere.center));
-                        hasher.update(std.mem.asBytes(&sphere.radius));
-                    },
-                    .box => |box| {
-                        hasher.update(std.mem.asBytes(&box.min));
-                        hasher.update(std.mem.asBytes(&box.max));
-                    },
-                };
-                hasher.update(std.mem.asBytes(&scene_tlas));
-                if (scene_tlas != 0) hasher.update(std.mem.asBytes(&scene.tlas_hash));
-                const mask_key = hasher.final() | 1;
-                if (state.mask_key != mask_key) {
-                    state.mask_key = mask_key;
-                    try cmd.beginRendering(.{ .color = &.{.{ .texture = state.solid, .load = .discard }} });
-                    cmd.bindPipeline(if (scene_tlas != 0) self.pipelines.fluid_solid_traced else self.pipelines.fluid_solid);
-                    cmd.pushConstants(extern struct { fluid: u64, tlas: u64 }{ .fluid = address, .tlas = scene_tlas });
-                    cmd.drawFullscreen();
-                    cmd.endRendering();
-                    cmd.transition(state.solid, .shader_read);
-                }
-            }
-            if (dt > 0) {
-                const old = state.current;
-                const new = 1 - old;
-                if (desc.sharp_advection) {
-                    try cmd.beginRendering(.{ .color = &.{ .{ .texture = state.carried, .load = .discard }, .{ .texture = state.carried_velocity, .load = .discard } } });
-                    cmd.bindPipeline(self.pipelines.fluid_carry);
-                    cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[old]), .b = device.textureIndex(state.scalars[old]) });
-                    cmd.drawFullscreen();
-                    cmd.endRendering();
-                    cmd.transition(state.carried, .shader_read);
-                    cmd.transition(state.carried_velocity, .shader_read);
-                }
-                // Carry everything along the flow; burn, fade, emit.
-                try cmd.beginRendering(.{ .color = &.{
-                    .{ .texture = state.velocity[new], .load = .discard },
-                    .{ .texture = state.scalars[new], .load = .discard },
-                } });
-                cmd.bindPipeline(self.pipelines.fluid_advect);
-                cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[old]), .b = device.textureIndex(state.scalars[old]), .c = if (desc.sharp_advection) device.textureIndex(state.carried) else gpu.invalid_id, .pad = if (desc.sharp_advection and desc.sharp_velocity) device.textureIndex(state.carried_velocity) else gpu.invalid_id });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(state.velocity[new], .shader_read);
-                cmd.transition(state.scalars[new], .shader_read);
-
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = state.curl, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.fluid_curl);
-                cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[new]) });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(state.curl, .shader_read);
-
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = state.velocity[old], .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.fluid_force);
-                cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[new]), .b = device.textureIndex(state.scalars[new]), .c = device.textureIndex(state.curl) });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(state.velocity[old], .shader_read);
-
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = state.divergence, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.fluid_divergence);
-                cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[old]) });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(state.divergence, .shader_read);
-
-                // The pressure of the last step is a good first guess.
-                cmd.bindPipeline(self.pipelines.fluid_pressure);
-                for (0..std.math.clamp(desc.pressure_iterations, 1, 200)) |_| {
-                    const from = state.pressure_current;
-                    const to = 1 - from;
-                    try cmd.beginRendering(.{ .color = &.{.{ .texture = state.pressure[to], .load = .discard }} });
-                    cmd.bindPipeline(self.pipelines.fluid_pressure);
-                    cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.pressure[from]), .b = device.textureIndex(state.divergence) });
-                    cmd.drawFullscreen();
-                    cmd.endRendering();
-                    cmd.transition(state.pressure[to], .shader_read);
-                    state.pressure_current = to;
-                }
-
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = state.velocity[new], .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.fluid_project);
-                cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[old]), .b = device.textureIndex(state.pressure[state.pressure_current]) });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(state.velocity[new], .shader_read);
-                state.current = new;
-            }
-            params.items[0].scalars = device.textureIndex(state.scalars[state.current]);
-            params.items[0].velocity = device.textureIndex(state.velocity[state.current]);
-            if (state.picture) |picture| {
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = picture, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.fluid_present);
-                cmd.pushConstants(Push{ .fluid = address });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(picture, .shader_read);
-            }
-            if (state.flipbook) |sheet| {
-                const book = state.flipbook_desc;
-                const fresh = state.flipbook_recorded == 0 and state.flipbook_wait == 0;
-                const due = state.flipbook_recorded < book.columns * book.rows and dt > 0 and state.flipbook_wait == 0;
-                if (fresh or due) {
-                    try cmd.beginRendering(.{ .color = &.{.{ .texture = sheet, .load = if (fresh) .clear else .load, .clear = .{ 0, 0, 0, 0 } }} });
-                    if (due) {
-                        const frame = state.flipbook_frame;
-                        cmd.setViewport((state.flipbook_recorded % book.columns) * frame[0], (state.flipbook_recorded / book.columns) * frame[1], frame[0], frame[1]);
-                        cmd.bindPipeline(self.pipelines.fluid_present);
-                        cmd.pushConstants(Push{ .fluid = address });
-                        cmd.drawFullscreen();
-                        state.flipbook_recorded += 1;
-                    }
-                    cmd.endRendering();
-                    cmd.transition(sheet, .shader_read);
-                }
-                if (dt > 0) state.flipbook_wait = (state.flipbook_wait + 1) % @max(book.interval, 1);
-            }
-        }
     }
 
     // ------------------------------------------------------------ particles
@@ -7352,140 +6812,6 @@ pub const Renderer = struct {
         };
     }
 
-    /// Steps every emitter of a scene by one frame.
-    fn simulateParticles(self: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, arena: *FrameArena, frame_address: u64, delta_time: f32, collision_depth: ?u32) !void {
-        if (scene.emitters.items.len == 0) return;
-        const device = self.device;
-        cmd.beginScope("particle simulation");
-        defer cmd.endScope();
-        cmd.bindPipeline(self.pipelines.particle_sim);
-        for (scene.emitters.items) |handle_value| {
-            const emitter = self.emitters.get(handle_value) orelse continue;
-            const desc = emitter.desc;
-            // A new emitter with `prewarm` is stepped as many frames as that
-            // takes before it is first seen.
-            const steps: u32 = if (emitter.warmed or desc.prewarm <= 0 or delta_time <= 0) 1 else @min(@as(u32, @intFromFloat(desc.prewarm / delta_time)) + 1, 600);
-            emitter.warmed = true;
-            var step: u32 = 0;
-            while (step < steps) : (step += 1) {
-                emitter.pending += @max(desc.rate, 0) * delta_time;
-                const births: u32 = @min(@as(u32, @intFromFloat(@min(emitter.pending, 1e9))), emitter.capacity);
-                emitter.pending -= @floatFromInt(births);
-                // The fluid's description for this frame; fluids are stepped first.
-                const carrier: u64 = if (desc.fluid) |fluid| (if (self.fluids.get(fluid)) |state| (if (state.params_frame == self.frame_index) state.params else 0) else 0) else 0;
-                // Time to remember another trail point?
-                var trail_record = false;
-                const trail_interval = @max(desc.trail_seconds, 1e-3) / @as(f32, @floatFromInt(@max(emitter.trail_points, 1)));
-                if (emitter.trail_points != 0) {
-                    emitter.trail_clock += delta_time;
-                    if (emitter.trail_clock >= trail_interval) {
-                        emitter.trail_clock = @mod(emitter.trail_clock, trail_interval);
-                        emitter.trail_head = (emitter.trail_head + 1) % emitter.trail_points;
-                        trail_record = true;
-                    }
-                }
-                const params = try arena.alloc(device, gpu.Emitter, 1);
-                params.items[0] = .{
-                    .position = desc.position,
-                    .radius = desc.radius,
-                    .direction = desc.direction,
-                    .spread = std.math.clamp(desc.spread, 0, std.math.pi),
-                    .gravity = desc.gravity,
-                    .drag = desc.drag,
-                    .color_start = desc.color_start,
-                    .color_end = desc.color_end,
-                    .lifetime = .{ @max(desc.lifetime[0], 1e-3), @max(desc.lifetime[1], 1e-3) },
-                    .speed = desc.speed,
-                    .size = desc.size,
-                    .spawn_start = emitter.cursor,
-                    .spawn_count = births,
-                    .capacity = emitter.capacity,
-                    .flags = (if (desc.blend == .additive) gpu.emitter_additive else 0) | (if (desc.lit) gpu.emitter_lit else 0) |
-                        (if (carrier != 0) gpu.emitter_fluid else 0) | (if (desc.collide and collision_depth != null) gpu.emitter_collide else 0) | (if (emitter.order != null) gpu.emitter_sorted else 0),
-                    .image = if (desc.image) |image| image.index else gpu.invalid_id,
-                    .softness = desc.softness,
-                    .seed = @truncate(self.frame_index *% 0x9e3779b97f4a7c15 >> 16),
-                    .shift = emitter.shift,
-                    .follow = @max(desc.fluid_follow, 0),
-                    .bounce = std.math.clamp(desc.bounce, 0, 1),
-                    .collision_depth = collision_depth orelse gpu.invalid_id,
-                    .stretch = @max(desc.stretch, 0),
-                    .sheet = .{ @max(desc.sheet[0], 1), @max(desc.sheet[1], 1) },
-                    .fluid = carrier,
-                    .color_mid = desc.color_mid orelse .{ 0, 0, 0, 0 },
-                    .size_mid = desc.size_mid orelse 0,
-                    .mid = std.math.clamp(desc.mid, 0.01, 0.99),
-                    .keys = (if (desc.color_mid != null) @as(u32, 1) else 0) | (if (desc.size_mid != null) @as(u32, 2) else 0),
-                    .curve_colors = desc.color_curve.keys,
-                    .curve_sizes = desc.size_curve.keys,
-                    .curve_counts = .{ @min(desc.color_curve.count, max_curve_keys), @min(desc.size_curve.count, max_curve_keys) },
-                    .trail_count = emitter.trail_points,
-                    .trail_head = emitter.trail_head,
-                    .trail_record = @intFromBool(trail_record),
-                    .trail_fraction = if (emitter.trail_points != 0) std.math.clamp(emitter.trail_clock / trail_interval, 0, 1) else 0,
-                };
-                emitter.shift = .{ 0, 0, 0 };
-                emitter.cursor = (emitter.cursor + births) % emitter.capacity;
-                emitter.frame_params = params.address;
-                cmd.pushConstants(extern struct { frame: u64, emitter: u64, particles: u64, trail: u64 }{
-                    .trail = if (emitter.trail) |trail| device.bufferAddress(trail) else 0,
-                    .frame = frame_address,
-                    .emitter = params.address,
-                    .particles = device.bufferAddress(emitter.buffer),
-                });
-                cmd.dispatch((emitter.capacity + 63) / 64, 1, 1);
-                if (step + 1 < steps) cmd.sync(.compute_to_all);
-            }
-        }
-        cmd.sync(.compute_to_all);
-    }
-
-    /// The shading pipeline for a view: the build with exactly the
-    /// features it needs if that exists, otherwise one with more that is
-    /// ready, while the exact one is compiled on a worker thread.
-    fn shadePipeline(self: *Renderer, reflective: bool, needed: u32) !rhi.Pipeline {
-        const full = if (reflective) self.pipelines.shade_reflective else self.pipelines.shade;
-        if (!self.options.shader_variants) return full orelse try self.plainShadePipeline();
-        var requested = false;
-        var stand_in: ?rhi.Pipeline = null;
-        for (self.shade_variants.items) |*variant| {
-            if (variant.reflective != reflective) continue;
-            if (variant.job) |job| if (job.done.load(.acquire)) {
-                // Compiled, or failed: either way the job is over.
-                job.group.cancel(job.io);
-                if (job.compiled) |compiled| {
-                    variant.pipeline = self.device.adoptPipeline(compiled, "shading (variant)") catch null;
-                } else if (job.failure) |err| std.log.warn("shading variant did not compile: {}", .{err});
-                self.gpa.destroy(job);
-                variant.job = null;
-            };
-            if (variant.features == needed) {
-                requested = true;
-                if (variant.pipeline) |ready| return ready;
-            } else if (variant.features & needed == needed) {
-                if (variant.pipeline) |ready| stand_in = stand_in orelse ready;
-            }
-        }
-        if (!requested) {
-            // Nothing can stand in (the full pass is itself built on first
-            // use when a view has no reflection targets): compile this one
-            // now.
-            if (full == null and stand_in == null) {
-                const constants = [1]u32{needed};
-                const made = try self.device.createGraphicsPipeline(shadeVariantDesc(self.device, reflective, &constants));
-                errdefer self.device.destroyPipeline(made);
-                try self.shade_variants.append(self.gpa, .{ .reflective = reflective, .features = needed, .pipeline = made });
-                return made;
-            }
-            const job = try self.gpa.create(ShadeVariantJob);
-            errdefer self.gpa.destroy(job);
-            job.* = .{ .device = self.device, .io = self.io, .reflective = reflective, .constants = .{needed} };
-            try self.shade_variants.append(self.gpa, .{ .reflective = reflective, .features = needed, .job = job });
-            job.group.concurrent(self.io, runShadeVariantJob, .{job}) catch job.group.async(self.io, runShadeVariantJob, .{job});
-        }
-        return stand_in orelse full orelse try self.plainShadePipeline();
-    }
-
     /// Waits for every shading variant being compiled and frees them all.
     /// Called before the shader code they are built from goes away.
     fn dropShadeVariants(self: *Renderer) void {
@@ -7534,6 +6860,8 @@ pub const Renderer = struct {
     /// Works out the node matrices of every animated entity of a scene for
     /// this frame, on several threads when there are enough of them.
     fn evaluatePoses(self: *Renderer, scene: *SceneData) !void {
+        const zone = Zone.start(self.options.profiler, "poses");
+        defer zone.stop();
         self.posed.clearRetainingCapacity();
         var most_nodes: usize = 0;
         for (scene.layout.items) |entry| {
@@ -7576,186 +6904,6 @@ pub const Renderer = struct {
             animation.evaluate(&model.source.?, model.pose_order, entity.pose, scratch, entity.node_world);
             if (entity.history_frames == 0) @memcpy(entity.previous_node_world, entity.node_world);
         }
-    }
-
-    fn plainShadePipeline(self: *Renderer) !rhi.Pipeline {
-        if (self.pipelines.shade) |made| return made;
-        const made = try self.device.createGraphicsPipeline(.{
-            .name = "shading",
-            .vertex = shaderCode("fullscreen.vert.spv"),
-            .fragment = if (self.device.ray_tracing) shaderCode("shade_rt.frag.spv") else shaderCode("shade.frag.spv"),
-            .color_targets = &.{ .{ .format = hdr_format }, .{ .format = .rg16_float } },
-            .cull = .none,
-        });
-        self.pipelines.shade = made;
-        return made;
-    }
-
-    fn forwardWeightedPipeline(self: *Renderer) !rhi.Pipeline {
-        if (self.pipelines.forward_weighted) |made| return made;
-        const made = try self.device.createGraphicsPipeline(.{
-            .name = "forward transparent (weighted)",
-            .vertex = shaderCode("forward.vert.spv"),
-            .fragment = shaderCode("forward.frag.spv"),
-            .color_targets = &.{ .{ .format = hdr_format, .blend = .additive }, .{ .format = .rg16_float, .blend = .alpha }, .{ .format = .r8_unorm, .blend = .revealage } },
-            .depth = .{ .write = false, .compare = .greater_or_equal },
-            .cull = .none,
-        });
-        self.pipelines.forward_weighted = made;
-        return made;
-    }
-
-    fn forwardPeelPipeline(self: *Renderer) !rhi.Pipeline {
-        if (self.pipelines.forward_peel) |made| return made;
-        const made = try self.device.createGraphicsPipeline(.{
-            .name = "forward transparent (peel)",
-            .vertex = shaderCode("forward.vert.spv"),
-            .fragment = shaderCode("forward.frag.spv"),
-            .color_targets = &.{.{ .format = hdr_format }},
-            .depth = .{ .write = true, .compare = .greater },
-            .cull = .none,
-        });
-        self.pipelines.forward_peel = made;
-        return made;
-    }
-
-    /// The mesh an emitter's particles are drawn as, once its model is
-    /// ready; null for sprites.
-    fn emitterMesh(self: *Renderer, emitter: *const EmitterData) ?ModelMesh {
-        const model = emitter.desc.mesh orelse return null;
-        const entry = self.models.get(model) orelse return null;
-        if (entry.state != .ready or entry.meshes.len == 0) return null;
-        entry.geometry_pinned = true;
-        if (!entry.geometry_resident) return null;
-        const mesh = entry.meshes[0];
-        // Skinned and morphed meshes have no fixed shape to copy.
-        if (mesh.skin_offset != null or mesh.lod0_index_count == 0) return null;
-        return mesh;
-    }
-
-    fn drawParticles(self: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, view: *ViewState, frame_address: u64, camera_position: Vec3) !void {
-        if (scene.emitters.items.len == 0) return;
-        const device = self.device;
-        cmd.beginScope("particles");
-        defer cmd.endScope();
-        // Emitters that asked for it are sorted for this camera first:
-        // alpha-blended particles only look right drawn farthest first.
-        for (scene.emitters.items) |handle_value| {
-            const emitter = self.emitters.get(handle_value) orelse continue;
-            const order = emitter.order orelse continue;
-            if (emitter.frame_params == 0) continue;
-            const count = emitter.order_count;
-            const order_address = device.bufferAddress(order);
-            cmd.bindPipeline(self.pipelines.particle_sort_keys);
-            cmd.pushConstants(extern struct { frame: u64, particles: u64, order: u64, capacity: u32, count: u32 }{
-                .frame = frame_address,
-                .particles = device.bufferAddress(emitter.buffer),
-                .order = order_address,
-                .capacity = emitter.capacity,
-                .count = count,
-            });
-            cmd.dispatch((count + 63) / 64, 1, 1);
-            cmd.sync(.compute_to_all);
-            // A bitonic sort: log2(n) * (log2(n) + 1) / 2 rounds.
-            cmd.bindPipeline(self.pipelines.particle_sort);
-            var run: u32 = 2;
-            while (run <= count) : (run *= 2) {
-                var stride = run / 2;
-                while (stride > 0) : (stride /= 2) {
-                    cmd.pushConstants(extern struct { order: u64, count: u32, run: u32, stride: u32, pad: u32 = 0 }{ .order = order_address, .count = count, .run = run, .stride = stride });
-                    cmd.dispatch((count + 63) / 64, 1, 1);
-                    cmd.sync(.compute_to_all);
-                }
-            }
-        }
-        // Whole emitters are drawn farthest first too, by where they sit,
-        // so that one effect in front of another blends over it.
-        // A scene's worth of emitters fits on the stack; more spill over.
-        var fallback = std.heap.stackFallback(64 * @sizeOf(Emitter), self.gpa);
-        const ordering = fallback.get();
-        const ordered = try ordering.alloc(Emitter, scene.emitters.items.len);
-        defer ordering.free(ordered);
-        @memcpy(ordered, scene.emitters.items);
-        const Farther = struct {
-            renderer: *Renderer,
-            camera: Vec3,
-
-            fn distance(context: @This(), handle_value: Emitter) f32 {
-                const emitter = context.renderer.emitters.get(handle_value) orelse return 0;
-                const delta = math.sub(emitter.desc.position, context.camera);
-                return math.dot(delta, delta);
-            }
-
-            fn lessThan(context: @This(), a: Emitter, b: Emitter) bool {
-                return context.distance(a) > context.distance(b);
-            }
-        };
-        std.mem.sort(Emitter, ordered, Farther{ .renderer = self, .camera = camera_position }, Farther.lessThan);
-        var mesh_total: u32 = 0;
-        // Mesh particles first: they are solid, so they go through the
-        // depth buffer, and the sprites after them are hidden by them.
-        var mesh_pass = false;
-        for (scene.emitters.items) |handle_value| {
-            const emitter = self.emitters.get(handle_value) orelse continue;
-            if (emitter.frame_params == 0) continue;
-            const mesh = self.emitterMesh(emitter) orelse continue;
-            if (!mesh_pass) {
-                try cmd.beginRendering(.{
-                    .color = &.{ .{ .texture = view.hdr, .load = .load }, .{ .texture = view.motion, .load = .load } },
-                    .depth = .{ .texture = view.depth, .load = .load },
-                });
-                cmd.bindPipeline(self.pipelines.particle_mesh);
-                cmd.bindIndexBuffer(self.indices.buffer, 0, .uint32);
-                mesh_pass = true;
-            }
-            cmd.pushConstants(extern struct { frame: u64, emitter: u64, particles: u64, vertex_offset: u32, spin: f32 }{
-                .frame = frame_address,
-                .emitter = emitter.frame_params,
-                .particles = device.bufferAddress(emitter.buffer),
-                .vertex_offset = mesh.vertex_offset,
-                .spin = emitter.desc.spin,
-            });
-            cmd.drawIndexed(mesh.lod0_index_count, emitter.capacity, mesh.index_offset, 0, 0);
-            mesh_total += emitter.capacity;
-        }
-        if (mesh_pass) {
-            cmd.endRendering();
-            cmd.transition(view.depth, .shader_read);
-        }
-        try cmd.beginRendering(.{ .color = &.{ .{ .texture = view.hdr, .load = .load }, .{ .texture = view.motion, .load = .load } } });
-        cmd.bindPipeline(self.pipelines.particles);
-        var total: u32 = 0;
-        for (ordered) |handle_value| {
-            const emitter = self.emitters.get(handle_value) orelse continue;
-            if (emitter.frame_params == 0) continue;
-            if (emitter.trail) |trail| {
-                // The ribbons first, then the particles at their heads.
-                cmd.bindPipeline(self.pipelines.particle_trails);
-                cmd.pushConstants(extern struct { frame: u64, emitter: u64, particles: u64, depth: u32, pad: u32 = 0, order: u64 = 0, trail: u64 }{
-                    .frame = frame_address,
-                    .emitter = emitter.frame_params,
-                    .particles = device.bufferAddress(emitter.buffer),
-                    .depth = device.textureIndex(view.depth),
-                    .trail = device.bufferAddress(trail),
-                });
-                cmd.draw(emitter.capacity * emitter.trail_points * 6, 1, 0, 0);
-                cmd.bindPipeline(self.pipelines.particles);
-            }
-            if (self.emitterMesh(emitter) != null) continue;
-            cmd.pushConstants(extern struct { frame: u64, emitter: u64, particles: u64, depth: u32, pad: u32 = 0, order: u64 }{
-                .frame = frame_address,
-                .emitter = emitter.frame_params,
-                .particles = device.bufferAddress(emitter.buffer),
-                .depth = device.textureIndex(view.depth),
-                .order = if (emitter.order) |order| device.bufferAddress(order) else 0,
-            });
-            cmd.draw(emitter.capacity * 6, 1, 0, 0);
-            total += emitter.capacity;
-        }
-        cmd.endRendering();
-        cmd.transition(view.hdr, .shader_read);
-        cmd.transition(view.motion, .shader_read);
-        self.stats.particles = total + mesh_total;
     }
 
     // -------------------------------------------------------------- picking
@@ -8185,27 +7333,6 @@ pub const Renderer = struct {
     /// by chance only, as all were before.
     const max_glowing = 1024;
 
-    const SceneFrame = struct {
-        instances: u64,
-        /// Where this frame's entity records wait in the frame arena to be
-        /// copied into the instance buffer.
-        staged_buffer: rhi.Buffer,
-        staged_instances: u64,
-        staged_size: u64,
-        joints: u64,
-        skinned_vertices: u32,
-        any_moving: bool,
-        /// Ray-tracing instances for the static geometry, and its bounds.
-        tlas_instances: u64,
-        tlas_count: u32,
-        tlas_hash: u64,
-        /// The instances that glow evenly, for path tracing to aim at
-        /// (`Glowing` records in the frame arena), and how many.
-        glowing: u64,
-        glowing_count: u32,
-        bounds: [2]Vec3,
-    };
-
     /// Writes this frame's instance records and joint matrices and queues
     /// the skinning jobs.
     fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena, slot: usize) !SceneFrame {
@@ -8431,7 +7558,7 @@ pub const Renderer = struct {
             if (self.options.gi_dynamic_geometry and device.ray_tracing and !mesh.blend) {
                 // The deformed vertices are in world space up to the
                 // entity's transform, like the instance record says.
-                var dynamic_desc = self.blasDesc(mesh);
+                var dynamic_desc = geometry_passes.blasDesc(self, mesh);
                 dynamic_desc.vertex_offset = @as(u64, current) * @sizeOf(gpu.Vertex);
                 dynamic_desc.dynamic = true;
                 const slot_blas = &entity.skin_blas[entry.model_instance];
@@ -8728,16 +7855,6 @@ pub const Renderer = struct {
         return self.device.hdr_active;
     }
 
-    /// 0: the target's format encodes by itself. 1: sRGB by hand. 2: HDR10.
-    fn outputEncoding(self: *const Renderer, desc: ViewDesc, format: rhi.Format) u32 {
-        const plain: u32 = @intFromBool(!format.isSrgb());
-        return switch (desc.settings.output_encoding) {
-            .auto => if (desc.target == .backbuffer and self.device.hdr_active) 2 else plain,
-            .srgb => plain,
-            .hdr10 => 2,
-        };
-    }
-
     fn targetWritten(self: *const Renderer, target: rhi.Texture) bool {
         for (self.frame_targets[0..self.frame_target_count]) |written| if (std.meta.eql(written, target)) return true;
         return false;
@@ -8813,8 +7930,8 @@ pub const Renderer = struct {
                 cmd.transition(color, .shader_read);
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = target, .load = load, .clear = desc.clear_color }} });
                 cmd.setViewport(region.x, region.y, region.width, region.height);
-                cmd.bindPipeline(try self.tonemapPipeline(info.format));
-                cmd.pushConstants(TonemapPush{
+                cmd.bindPipeline(try post_passes.tonemapPipeline(self, info.format));
+                cmd.pushConstants(post_passes.TonemapPush{
                     .frame = frame_address,
                     .color = device.textureIndex(color),
                     .bloom = gpu.invalid_id,
@@ -8841,31 +7958,6 @@ pub const Renderer = struct {
         }
         if (desc.target == .texture) cmd.transition(target, .shader_read);
     }
-
-    const TonemapPush = extern struct {
-        frame: u64,
-        color: u32,
-        bloom: u32,
-        bloom_strength: f32,
-        encode_srgb: u32,
-        sharpen: f32,
-        bloom_scale: f32,
-        passthrough: u32,
-        /// Top-left corner of the area being written, in target pixels.
-        origin: [2]i32 = .{ 0, 0 },
-        vignette: f32 = 0,
-        grain: f32 = 0,
-        saturation: f32 = 1,
-        contrast: f32 = 1,
-        color_filter: [3]f32 = .{ 1, 1, 1 },
-        aberration: f32 = 0,
-        hdr_paper_white: f32 = 200,
-        hdr_peak: f32 = 1000,
-        lut: u32 = gpu.invalid_id,
-        lut_strength: f32 = 1,
-        flare: f32 = 0,
-        flare_pad: u32 = 0,
-    };
 
     /// Draws the 2D/3D draw lists over the finished scene (or over a cleared
     /// target when there is no scene).
@@ -8920,7 +8012,7 @@ pub const Renderer = struct {
             .indices = 0,
             .transform = math.identity,
             .camera_right = .{ 1, 0, 0 },
-            .encode_srgb = self.outputEncoding(desc, output.format),
+            .encode_srgb = post_passes.outputEncoding(self, desc, output.format),
             .camera_up = .{ 0, 1, 0 },
             .sdf_spread = font_module.sdf_spread,
             .viewport = .{ width, height },
@@ -9084,7 +8176,23 @@ pub const Renderer = struct {
         try self.buildPendingBlas(cmd);
         cmd.endScope();
 
-        const scales = EffectScales{ .ao = settings.ao_resolution, .fog = settings.fog_resolution, .gi = settings.gi_resolution, .reflections = if (settings.screen_space_reflections) settings.reflection_resolution else null, .clouds = if (scene.clouds != null and settings.clouds) settings.cloud_resolution else null, .fluid = if (scene.fluids.items.len != 0 and settings.fluids) settings.fluid_resolution else null, .lens = settings.dof_aperture > 0 or settings.motion_blur > 0, .dof = if (settings.dof_aperture > 0 and settings.dof_resolution != .full) settings.dof_resolution else null, .oit = settings.transparency == .weighted, .peel = settings.transparency == .peeled, .refraction = scene.transmissive or scene.waters.items.len != 0 or scene.liquids.items.len != 0, .liquid = scene.liquids.items.len != 0, .output_width = output_width, .output_height = output_height, .temporal_upscale = settings.upscaling == .temporal and settings.temporal_antialiasing and settings.debug_view == .none and (output_width > width or output_height > height) };
+        const scales = EffectScales{
+            .ao = settings.ao_resolution,
+            .fog = settings.fog_resolution,
+            .gi = settings.gi_resolution,
+            .reflections = if (settings.screen_space_reflections) settings.reflection_resolution else null,
+            .clouds = if (scene.clouds != null and settings.clouds) settings.cloud_resolution else null,
+            .fluid = if (scene.fluids.items.len != 0 and settings.fluids) settings.fluid_resolution else null,
+            .lens = settings.dof_aperture > 0 or settings.motion_blur > 0,
+            .dof = if (settings.dof_aperture > 0 and settings.dof_resolution != .full) settings.dof_resolution else null,
+            .oit = settings.transparency == .weighted,
+            .peel = settings.transparency == .peeled,
+            .refraction = scene.transmissive or scene.waters.items.len != 0 or scene.liquids.items.len != 0,
+            .liquid = scene.liquids.items.len != 0,
+            .output_width = output_width,
+            .output_height = output_height,
+            .temporal_upscale = settings.upscaling == .temporal and settings.temporal_antialiasing and settings.debug_view == .none and (output_width > width or output_height > height),
+        };
         if (view_data.state == null or view_data.state.?.width != width or view_data.state.?.height != height or
             !std.meta.eql(view_data.state.?.scales, scales))
         {
@@ -9138,6 +8246,48 @@ pub const Renderer = struct {
         const sun_travel = math.normalize(scene.sun.direction);
         const sun_enabled = scene.sun.intensity > 0 and math.dot(sun_travel, sun_travel) > 0.5;
         const shadows_enabled = settings.shadows and sun_enabled and scene.ref_count != 0;
+        const has_geometry = scene.ref_count != 0;
+        // Which instances the cameras draw, for texture streaming that
+        // skips what is hidden.
+        const instance_total: u32 = @as(u32, @intCast(scene.layout.items.len)) + scene.static_count;
+        const mark_seen = has_geometry and instance_total != 0 and
+            (if (self.options.texture_streaming) |streaming| streaming.skip_occluded else false);
+        // How levels of detail are chosen in the camera's own pass, and
+        // the band over which two of them cross-fade.
+        const lod_scale: f32 = if (settings.lod_error_pixels > 0)
+            @abs(proj_unjittered[5]) * @as(f32, @floatFromInt(height)) * 0.5 / settings.lod_error_pixels
+        else
+            0;
+        var pass = ScenePass{
+            .frame = frame,
+            .cmd = cmd,
+            .arena = arena,
+            .desc = desc,
+            .settings = settings,
+            .scene_handle = scene_handle,
+            .scene = scene,
+            .scene_frame = scene_frame,
+            .fresh_scene = fresh_scene,
+            .view_data = view_data,
+            .view = view,
+            .width = width,
+            .height = height,
+            .output_width = output_width,
+            .output_height = output_height,
+            .delta_time = delta_time,
+            .debugging = debugging,
+            .aspect = aspect,
+            .view_matrix = view_matrix,
+            .proj_unjittered = proj_unjittered,
+            .view_proj = view_proj,
+            .view_proj_unjittered = view_proj_unjittered,
+            .sun_travel = sun_travel,
+            .has_geometry = has_geometry,
+            .occlusion = settings.occlusion_culling and has_geometry,
+            .mark_seen = mark_seen,
+            .lod = .{ desc.camera.position[0], desc.camera.position[1], desc.camera.position[2], lod_scale },
+            .lod_band = if (lod_scale > 0) 1 + std.math.clamp(settings.lod_cross_fade, 0, 1) else 1,
+        };
         const colored_shadows = shadows_enabled and settings.colored_shadows and settings.transparent_shadows;
         if (colored_shadows and view_data.shadow_color == null) {
             view_data.shadow_color = try device.createTexture(.{
@@ -9155,39 +8305,7 @@ pub const Renderer = struct {
             view_data.shadows_colored = colored_shadows;
             view_data.cascade_cache.valid = false;
         }
-        // Far cascades change slowly, so they are re-rendered every 2nd, 4th
-        // and 8th frame and reused in between. A cascade is refreshed early
-        // if the camera has moved outside what its cached map covers.
-        const cascade_total = std.math.clamp(settings.shadow_cascades, 1, gpu.cascade_count);
-        const ideal = computeCascades(desc.camera, view_matrix, aspect, sun_travel, settings.shadow_distance, self.options.shadow_resolution, cascade_total);
-        var cascade_update: [gpu.cascade_count]bool = @splat(false);
-        {
-            const cache = &view_data.cascade_cache;
-            const stale = !cache.valid or cache.count != cascade_total or !std.meta.eql(cache.scene, scene_handle) or cache.shadow_distance != settings.shadow_distance or cache.near != desc.camera.near or
-                math.length(math.sub(cache.sun, sun_travel)) > 1e-6;
-            for (0..gpu.cascade_count) |cascade| {
-                if (cascade >= cascade_total) continue;
-                const interval = @as(u64, 1) << @intCast(cascade);
-                const due = !settings.shadow_cascade_stagger or view_data.frames % interval == interval / 2;
-                const uncovered = math.length(math.sub(ideal.centers[cascade], cache.cascades.centers[cascade])) + ideal.tight_radii[cascade] >
-                    cache.cascades.radii[cascade];
-                if (!shadows_enabled or !(stale or due or uncovered)) continue;
-                cascade_update[cascade] = true;
-                cache.cascades.view_proj[cascade] = ideal.view_proj[cascade];
-                cache.cascades.texel_size[cascade] = ideal.texel_size[cascade];
-                cache.cascades.centers[cascade] = ideal.centers[cascade];
-                cache.cascades.radii[cascade] = ideal.radii[cascade];
-            }
-            if (shadows_enabled) {
-                cache.valid = true;
-                cache.scene = scene_handle;
-                cache.count = cascade_total;
-                cache.sun = sun_travel;
-                cache.shadow_distance = settings.shadow_distance;
-                cache.near = desc.camera.near;
-                cache.cascades.splits = ideal.splits;
-            }
-        }
+        const cascade_plan = shadow_passes.updateCascades(self, &pass, shadows_enabled);
         const cascades = view_data.cascade_cache.cascades;
         // Each view keeps its own cascades: they follow its camera and are
         // reused between its frames.
@@ -9203,179 +8321,31 @@ pub const Renderer = struct {
             });
         }
         const shadow_map = if (shadows_enabled) view_data.shadow_map.? else self.shadow_map;
+        const sun_shadows = SunShadows{
+            .enabled = shadows_enabled,
+            .colored = colored_shadows,
+            .map = shadow_map,
+            .cascades = cascades,
+            .count = cascade_plan.count,
+            .update = cascade_plan.update,
+        };
 
         const environment: ?*EnvironmentEntry = blk: {
             const entry = self.environments.get(scene.environment orelse break :blk null) orelse break :blk null;
             break :blk if (entry.state == .ready) entry else null;
         };
 
-        const gi = try self.prepareGi(scene, scene_frame, settings, desc.camera.position);
+        const gi = try gi_passes.prepareGi(self, scene, scene_frame, settings, desc.camera.position);
         const gi_coarse: ?*const GiVolume = if (gi != null) (if (scene.gi_coarse) |*volume| volume else null) else null;
         const gi_middle: ?*const GiVolume = if (gi_coarse != null) (if (scene.gi_middle) |*volume| volume else null) else null;
         // Lights with a length cast shadows a point's shadow map cannot
         // show; where rays are to be had they are shadowed by rays instead.
         const traced_shadows = settings.ray_traced_light_shadows and gi != null and device.ray_tracing and scene.tlas != null;
         const lighting = try self.prepareLights(scene, arena, settings.shadows, desc.camera.position, traced_shadows);
-        // The atlas is shared; it is redrawn only when it holds another
-        // scene's lights or last frame's.
-        const local_shadows_current = self.local_shadow_frame == self.frame_index and
-            self.local_shadow_scene != null and std.meta.eql(self.local_shadow_scene.?, scene_handle);
-        // Nothing moved and the same lights hold the same tiles as when the
-        // atlas was last drawn for this scene: it is still right.
-        var shadow_key_hasher = std.hash.Wyhash.init(lighting.tiles_key);
-        shadow_key_hasher.update(std.mem.asBytes(&scene.lights_version));
-        shadow_key_hasher.update(std.mem.asBytes(&scene.layout_version));
-        shadow_key_hasher.update(std.mem.asBytes(&scene.static_version));
-        const shadow_key = shadow_key_hasher.final() | 1;
-        const same_atlas = self.local_shadow_key == shadow_key and
-            self.local_shadow_scene != null and std.meta.eql(self.local_shadow_scene.?, scene_handle);
-        // With the same lights in the same tiles, a tile is redrawn only if
-        // something that moved can be seen from its light, or could when it
-        // was last drawn (its shadow is still in the tile).
-        var tile_dirty: [max_local_shadow_views]bool = @splat(true);
-        var any_tile_dirty = lighting.tile_count != 0;
-        if (same_atlas and !local_shadows_current) {
-            any_tile_dirty = false;
-            for (0..lighting.tile_count) |tile| {
-                var reached = scene.movers_overflow;
-                if (!reached) for (scene.movers.items) |mover| {
-                    const cull = lighting.tile_views[tile];
-                    var inside = true;
-                    for (cull.planes[0..cull.plane_count]) |plane| {
-                        if (plane[0] * mover[0] + plane[1] * mover[1] + plane[2] * mover[2] + plane[3] < -mover[3]) {
-                            inside = false;
-                            break;
-                        }
-                    }
-                    if (inside) {
-                        reached = true;
-                        break;
-                    }
-                };
-                tile_dirty[tile] = reached or self.local_tile_had_mover[tile];
-                self.local_tile_had_mover[tile] = reached;
-                any_tile_dirty = any_tile_dirty or tile_dirty[tile];
-            }
-        } else if (!local_shadows_current) {
-            for (0..lighting.tile_count) |tile| self.local_tile_had_mover[tile] = scene_frame.any_moving;
-        }
-        const draw_local_shadows = any_tile_dirty and scene.ref_count != 0 and !local_shadows_current;
+        const local_shadows = shadow_passes.planLocalShadows(self, &pass, &lighting);
         // The cloud layer is described before the frame constants are
         // written, because shading needs it for the shadows it casts.
-        var cloud_address: u64 = 0;
-        if (view.clouds) |*targets| clouds: {
-            const layer = scene.clouds orelse break :clouds;
-            if (self.cloud_noise == null) {
-                // The noise volume, as a sheet of slices; made once.
-                const noise = try device.createTexture(.{
-                    .name = "cloud noise",
-                    .width = cloud_noise_size[0] * cloud_noise_tiles,
-                    .height = cloud_noise_size[1] * (cloud_noise_size[2] / cloud_noise_tiles),
-                    .format = .rgba8_unorm,
-                    .usage = .{ .sampled = true, .color_attachment = true },
-                });
-                self.cloud_noise = noise;
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = noise, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.cloud_noise);
-                cmd.pushConstants(extern struct { size: [3]i32, tiles_x: i32 }{ .size = cloud_noise_size, .tiles_x = cloud_noise_tiles });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(noise, .shader_read);
-            }
-            // The noise drifts with the wind, and stays put in the world
-            // when the scene is shifted.
-            const period = 9000 * @max(layer.scale, 0.01);
-            if (scene.cloud_time != self.time) {
-                const elapsed = self.time - scene.cloud_time;
-                inline for (0..3) |axis| scene.cloud_drift[axis] = @mod(scene.cloud_drift[axis] + @as(f64, layer.wind[axis]) * elapsed, period * 64);
-                scene.cloud_time = self.time;
-            }
-            var offset: Vec3 = undefined;
-            inline for (0..3) |axis| offset[axis] = @floatCast(@mod(scene.origin[axis] - scene.cloud_drift[axis], period * 64));
-            std.mem.swap(rhi.Texture, &targets.current, &targets.history);
-            const bottom = @max(layer.bottom, 0);
-            const bottom_altitude: f64 = bottom;
-            // Lightning: now and then a flash starts somewhere in the
-            // layer; it is a few quick strokes that die away.
-            if (layer.lightning > 0 and self.time - scene.flash_start > 0.6 and self.time != scene.flash_checked) {
-                var random = std.Random.DefaultPrng.init(self.frame_index *% 0x9e3779b97f4a7c15 +% 0x51ed);
-                const draw = random.random();
-                if (draw.float(f32) < layer.lightning / 60.0 * delta_time) {
-                    scene.flash_start = self.time;
-                    scene.flash_position = .{
-                        scene.origin[0] + desc.camera.position[0] + (draw.float(f32) - 0.5) * 8000,
-                        bottom_altitude + @max(layer.thickness, 1) * (0.3 + 0.4 * draw.float(f32)),
-                        scene.origin[2] + desc.camera.position[2] + (draw.float(f32) - 0.5) * 8000,
-                    };
-                }
-            }
-            scene.flash_checked = self.time;
-            scene.flash_brightness = 0;
-            const flash_age = self.time - scene.flash_start;
-            if (layer.lightning > 0 and flash_age >= 0 and flash_age < 0.6) {
-                for ([_]f32{ 0, 0.11, 0.19 }) |stroke| {
-                    if (flash_age >= stroke) scene.flash_brightness += @exp(-(flash_age - stroke) * 22);
-                }
-                scene.flash_brightness *= @max(layer.lightning_brightness, 0);
-            }
-            const flash = [4]f32{
-                @floatCast(scene.flash_position[0] - scene.origin[0]),
-                @floatCast(scene.flash_position[1] - scene.origin[1]),
-                @floatCast(scene.flash_position[2] - scene.origin[2]),
-                scene.flash_brightness,
-            };
-            const params = try arena.alloc(device, gpu.Clouds, 1);
-            params.items[0] = .{
-                .offset = offset,
-                .period = period,
-                .albedo = layer.color,
-                .density = @max(layer.density, 0),
-                .bottom = bottom,
-                .top = bottom + @max(layer.thickness, 1),
-                .coverage = std.math.clamp(layer.coverage, 0, 1),
-                .detail = std.math.clamp(layer.detail, 0, 1),
-                .planet_radius = @max(layer.planet_radius, 1000),
-                .max_distance = @max(settings.cloud_distance, 100),
-                .variation = std.math.clamp(layer.variation, 0, 2),
-                .ambient = @max(layer.ambient, 0),
-                .noise = device.textureIndex(self.cloud_noise.?),
-                .steps = @intCast(std.math.clamp(settings.cloud_steps, 8, 256)),
-                .light_steps = @intCast(std.math.clamp(settings.cloud_light_steps, 1, 16)),
-                .history = if (targets.history_valid and settings.cloud_temporal_filter) device.textureIndex(targets.history) else gpu.invalid_id,
-                .history_blend = 0.1,
-                .anisotropy = std.math.clamp(layer.anisotropy, 0, 0.95),
-                .depth = device.textureIndex(view.depth),
-                .shadow_strength = std.math.clamp(layer.shadow, 0, 1),
-                .cirrus = std.math.clamp(layer.cirrus, 0, 1),
-                .anvil = std.math.clamp(layer.anvil, 0, 1),
-                .flash = flash,
-            };
-            cloud_address = params.address;
-            // Every so often the layer is also baked into the sky's
-            // lighting, so ambient light and sky reflections follow it.
-            if (scene.environment) |handle_value| if (self.environments.get(handle_value)) |sky_entry| {
-                if ((sky_entry.sky_desc != null or sky_entry.state == .ready) and layer.environment_interval > 0 and
-                    (sky_entry.clouds == null or self.time - sky_entry.cloud_bake_time >= layer.environment_interval))
-                {
-                    sky_entry.clouds = params.items[0];
-                    sky_entry.cloud_bake_time = self.time;
-                    // A loaded environment has no sun of its own: its
-                    // clouds are lit by the scene's.
-                    sky_entry.cloud_to_sun = math.scale(math.normalize(scene.sun.direction), -1);
-                    sky_entry.cloud_sunlight = math.scale(scene.sun.color, scene.sun.intensity);
-                    sky_entry.sky_dirty = true;
-                    self.skies_dirty = true;
-                }
-            };
-        }
-        // A layer that was taken away leaves the sky's lighting too.
-        if (scene.clouds == null) if (scene.environment) |handle_value| if (self.environments.get(handle_value)) |sky_entry| {
-            if (sky_entry.clouds != null) {
-                sky_entry.clouds = null;
-                sky_entry.sky_dirty = true;
-                self.skies_dirty = true;
-            }
-        };
+        const cloud_address = try volume_passes.prepareClouds(self, &pass);
         var flags: u32 = 0;
         if (shadows_enabled) flags |= gpu.frame_shadows;
         if (settings.ambient_occlusion) flags |= gpu.frame_ambient_occlusion;
@@ -9389,27 +8359,7 @@ pub const Renderer = struct {
         flags |= std.math.clamp(settings.light_shadow_rays, 1, 15) << 16;
         // How many local lights bounce, in ten more.
         flags |= std.math.clamp(settings.gi_bounce_lights, 1, 1023) << 20;
-        // The scene's reflection probes that have their pictures; one
-        // whose pictures are being taken now is left out of them.
-        var probe_list: u64 = 0;
-        var probe_count: u32 = 0;
-        if (scene.probes.items.len != 0) {
-            const list = try arena.alloc(device, gpu.ReflectionProbe, scene.probes.items.len);
-            for (scene.probes.items) |probe_handle| {
-                const probe = self.probes.get(probe_handle) orelse continue;
-                if (!probe.captured or probe.capturing) continue;
-                list.items[probe_count] = .{
-                    .center = probe.desc.position,
-                    .specular = device.textureIndex(probe.cubes.specular.?),
-                    .extent = .{ @max(probe.desc.extent[0], 1e-3), @max(probe.desc.extent[1], 1e-3), @max(probe.desc.extent[2], 1e-3) },
-                    .fade = std.math.clamp(probe.desc.fade, 1e-3, 1),
-                    .intensity = @max(probe.desc.intensity, 0),
-                    .irradiance = device.textureIndex(probe.cubes.irradiance.?),
-                };
-                probe_count += 1;
-            }
-            probe_list = list.address;
-        }
+        const probes = try shading_passes.reflectionProbeList(self, &pass);
         // Filled in once the fluids have been stepped, further down.
         const fluid_list = try arena.alloc(device, gpu.FluidList, 1);
         fluid_list.items[0] = .{};
@@ -9419,23 +8369,9 @@ pub const Renderer = struct {
         if (settings.fluid_rays and scene.fluids.items.len != 0) flags |= gpu.frame_fluid_rays;
         if (cloud_address != 0 and scene.clouds.?.shadow > 0) flags |= gpu.frame_cloud_shadows;
 
-        const decals = try arena.alloc(device, gpu.Decal, scene.decals.items.len);
-        for (scene.decals.items, decals.items) |decal, *out| out.* = .{
-            .world_to_decal = math.inverse(decal.transform),
-            .color = decal.color,
-            .image = if (decal.image) |image| image.index else gpu.invalid_id,
-            .angle_fade = decal.angle_fade,
-            .emissive = decal.emissive,
-            .roughness = decal.roughness orelse -1,
-            .normal_image = if (decal.normal_image) |image| image.index else gpu.invalid_id,
-            .normal_strength = decal.normal_strength,
-            .bounds = .{ decal.transform[12], decal.transform[13], decal.transform[14], 0.5 * @sqrt(math.dot(decal.transform[0..3].*, decal.transform[0..3].*) + math.dot(decal.transform[4..7].*, decal.transform[4..7].*) + math.dot(decal.transform[8..11].*, decal.transform[8..11].*)) },
-        };
+        const decals_address = try shading_passes.writeDecals(self, &pass);
         const constants = try arena.alloc(device, gpu.FrameConstants, 1);
-        const shadow_tlas: u64 = if (settings.ray_traced_light_shadows and gi != null and device.ray_tracing)
-            (if (scene.tlas) |tlas| device.accelerationAddress(tlas) else 0)
-        else
-            0;
+        const shadow_tlas: u64 = if (traced_shadows) device.accelerationAddress(scene.tlas.?) else 0;
         constants.items[0] = .{
             .view = view_matrix,
             .proj = proj,
@@ -9520,14 +8456,15 @@ pub const Renderer = struct {
             .clusters = device.bufferAddress(self.clusters),
             .shadow_tiles = lighting.tiles,
             .decal_count = @intCast(scene.decals.items.len),
-            .decals = decals.address,
+            .decals = decals_address,
             .clouds = cloud_address,
             .fluids = fluid_list.address,
-            .probes = probe_list,
-            .probe_count = probe_count,
+            .probes = probes.address,
+            .probe_count = probes.count,
             .exposure = device.bufferAddress(view_data.exposure),
         };
         const frame_address = constants.address;
+        pass.frame_address = frame_address;
 
         // ----------------------------------------------- skinning and culling
         // Draw counts from two frames ago, for statistics.
@@ -9539,383 +8476,28 @@ pub const Renderer = struct {
             for (1..1 + gpu.cascade_count) |index| self.stats.shadow_meshlets_drawn += counted[index * 2] + counted[index * 2 + 1];
         }
 
-        // Which instances the cameras draw, for texture streaming that
-        // skips what is hidden.
-        const instance_total: u32 = @as(u32, @intCast(scene.layout.items.len)) + scene.static_count;
-        const mark_seen = scene.ref_count != 0 and instance_total != 0 and
-            (if (self.options.texture_streaming) |streaming| streaming.skip_occluded else false);
-        if (mark_seen and instance_total > scene.seen_capacity) {
-            if (scene.seen) |buffer| device.destroyBuffer(buffer);
-            scene.seen = null;
-            for (&scene.seen_readback) |*readback| {
-                if (readback.*) |buffer| device.destroyBuffer(buffer);
-                readback.* = null;
-            }
-            scene.seen_tags = @splat(.{});
-            scene.seen_capacity = @max(instance_total + instance_total / 2, 1024);
-            const size = @as(u64, scene.seen_capacity) * @sizeOf(u32);
-            scene.seen = try device.createBuffer(.{ .name = "instances seen", .size = size, .usage = .{ .storage = true, .copy_src = true } });
-            for (&scene.seen_readback) |*readback|
-                readback.* = try device.createBuffer(.{ .name = "instances seen readback", .size = size, .usage = .{}, .memory = .gpu_to_cpu });
-        }
-
-        // Which meshlets this view saw last frame, for occlusion culling.
-        var visibility_reset = false;
-        if (scene.refs_capacity != 0 and view_data.visibility_capacity < scene.refs_capacity) {
-            if (view_data.visibility) |buffer| device.destroyBuffer(buffer);
-            view_data.visibility = null;
-            view_data.visibility = try device.createBuffer(.{
-                .name = "meshlet visibility",
-                .size = @as(u64, scene.refs_capacity) * @sizeOf(u32),
-                .usage = .{ .storage = true },
-            });
-            view_data.visibility_capacity = scene.refs_capacity;
-            visibility_reset = true;
-        }
-        if (view_data.visibility_scene == null or !std.meta.eql(view_data.visibility_scene.?, scene_handle) or
-            view_data.visibility_layout != scene.layout_version) visibility_reset = true;
-        view_data.visibility_scene = scene_handle;
-        view_data.visibility_layout = scene.layout_version;
-
-        // Last frame's draws and shaders must finish reading these buffers
-        // before this frame's fills and compute passes overwrite them.
-        cmd.sync(.all_to_transfer);
-        cmd.fillBuffer(self.cull_counts, 0, view_count * 2 * @sizeOf(u32), 0);
-        if (mark_seen and fresh_scene) cmd.fillBuffer(scene.seen.?, 0, @as(u64, instance_total) * @sizeOf(u32), 0);
-        if (fresh_scene and scene_frame.staged_size != 0)
-            cmd.copyBuffer(scene_frame.staged_buffer, scene.instance_slots[0].buffer.?, scene_frame.staged_instances, 0, scene_frame.staged_size);
-        if (visibility_reset) {
-            // Meshlet references were renumbered, or this view has not seen
-            // this scene before; start from "everything was visible" so
-            // the first frame draws in a single phase.
-            if (view_data.visibility) |buffer| cmd.fillBuffer(buffer, 0, @as(u64, view_data.visibility_capacity) * @sizeOf(u32), 1);
-        }
-        cmd.sync(.transfer_to_all);
-        if (fresh_scene) try self.simulateFluids(cmd, scene, arena, delta_time);
-        if (fresh_scene) try self.simulateWater(cmd, scene, arena, delta_time);
-        if (fresh_scene) try self.simulateLiquids(cmd, scene, arena, delta_time);
-        {
-            // Built here and stored once: the arena must not be read back.
-            var list = gpu.FluidList{};
-            for (scene.fluids.items) |item| {
-                const state = self.fluids.get(item) orelse continue;
-                if (state.params_frame != self.frame_index or state.desc.shadow <= 0) continue;
-                list.fluids[list.count] = state.params;
-                list.count += 1;
-            }
-            // As for the march: no slot is left null.
-            if (list.count != 0) {
-                for (list.fluids[list.count..]) |*slot| slot.* = list.fluids[0];
-            }
-            fluid_list.items[0] = list;
-        }
+        try geometry_passes.resetCullBuffers(self, &pass, instance_total);
+        if (fresh_scene) try simulation_passes.simulateFluids(self, cmd, scene, arena, delta_time);
+        if (fresh_scene) try simulation_passes.simulateWater(self, cmd, scene, arena, delta_time);
+        if (fresh_scene) try simulation_passes.simulateLiquids(self, cmd, scene, arena, delta_time);
+        // Built here and stored once: the arena must not be read back.
+        fluid_list.items[0] = volume_passes.shadowingFluids(self, &pass);
         // Each view has its own light records, so the fires' light is
         // worked out per view, after the fluids have been stepped.
-        if (scene.fluids.items.len != 0) {
-            var fluid_slot: u32 = @intCast(scene.lights.items.len);
-            var bound = false;
-            for (scene.fluids.items) |item| {
-                const state = self.fluids.get(item) orelse continue;
-                if (state.desc.light <= 0) continue;
-                defer fluid_slot += 1;
-                if (state.params_frame != self.frame_index) continue;
-                if (!bound) cmd.bindPipeline(self.pipelines.fluid_light);
-                bound = true;
-                cmd.pushConstants(extern struct { fluid: u64, lights: u64, index: u32, scale: f32, tall: f32, pad: u32 = 0 }{ .fluid = state.params, .lights = lighting.lights, .index = fluid_slot, .scale = state.desc.light * 8, .tall = std.math.clamp(state.desc.light_tall, 0, 1) });
-                cmd.dispatch(1, 1, 1);
-            }
-            if (bound) cmd.sync(.compute_to_all);
-        }
+        volume_passes.lightFluids(self, &pass, &lighting);
         // Particles may be carried by a fluid, so they come second. They
         // collide with the depth this view drew last frame.
-        if (fresh_scene) try self.simulateParticles(cmd, scene, arena, frame_address, delta_time, if (view.history_valid) device.textureIndex(view.depth) else null);
-        const has_geometry = scene.ref_count != 0;
-        const occlusion = settings.occlusion_culling and has_geometry;
-        const DrawPush = extern struct {
-            frame: u64,
-            pad0: u32 = 0,
-            pad1: u32 = 0,
-            view_proj: Mat4,
-            /// For cross-fading levels of detail in the camera's own
-            /// pass: the camera and scale they are chosen by, the width
-            /// of the band, and the near plane.
-            lod: [4]f32 = .{ 0, 0, 0, 0 },
-            lod_band: f32 = 1,
-            lod_near: f32 = 0,
-            pad2: [2]u32 = .{ 0, 0 },
-        };
-        // How levels of detail are chosen in the camera's own pass, and
-        // the band over which two of them cross-fade.
-        const visibility_lod_scale: f32 = if (settings.lod_error_pixels > 0)
-            @abs(proj_unjittered[5]) * @as(f32, @floatFromInt(height)) * 0.5 / settings.lod_error_pixels
-        else
-            0;
-        const visibility_lod = [4]f32{ desc.camera.position[0], desc.camera.position[1], desc.camera.position[2], visibility_lod_scale };
-        const lod_band: f32 = if (visibility_lod_scale > 0) 1 + std.math.clamp(settings.lod_cross_fade, 0, 1) else 1;
-        const CullPush = extern struct {
-            frame: u64,
-            view: u64,
-            commands: u64,
-            counts: u64,
-            visibility: u64,
-            ref_count: u32,
-            bucket_capacity: u32,
-            phase: u32,
-            hiz_texture: u32,
-            hiz_size: [2]f32,
-            skin_bounds: u64,
-            seen: u64,
-            mark_seen: u32 = 0,
-            pad: u32 = 0,
-        };
-        var cull_push: CullPush = undefined;
-        var cull_views_address: u64 = 0;
-        // Cascades that leave out casters whose shadows the camera cannot see.
-        var receiver_culled: [gpu.cascade_count]bool = @splat(false);
-
+        if (fresh_scene) try particle_passes.simulateParticles(self, cmd, scene, arena, frame_address, delta_time, if (view.history_valid) device.textureIndex(view.depth) else null);
         if (has_geometry) {
-            if (scene.ref_count > self.cull_capacity) {
-                if (self.cull_commands) |buffer| device.destroyBuffer(buffer);
-                self.cull_capacity = scene.ref_count + scene.ref_count / 2;
-                self.cull_commands = try device.createBuffer(.{
-                    .name = "cull commands",
-                    .size = @as(u64, self.cull_capacity) * view_count * 2 * @sizeOf(gpu.DrawCommand),
-                    .usage = .{ .storage = true, .indirect = true },
-                });
-            }
-
-            cmd.beginScope("skinning");
-            if (fresh_scene and self.skin_jobs.items.len != 0) {
-                // Every mesh in one dispatch: the jobs go to the GPU as a
-                // table, with a second one saying which job each work
-                // group of 64 vertices belongs to.
-                var group_count: u32 = 0;
-                for (self.skin_jobs.items) |*job| {
-                    job.first_group = group_count;
-                    group_count += (job.vertex_count + 63) / 64;
-                }
-                const jobs = try arena.alloc(device, SkinJob, self.skin_jobs.items.len);
-                @memcpy(jobs.items, self.skin_jobs.items);
-                const group_jobs = try arena.alloc(device, u32, group_count);
-                for (self.skin_jobs.items, 0..) |job, index| {
-                    @memset(group_jobs.items[job.first_group..][0 .. (job.vertex_count + 63) / 64], @intCast(index));
-                }
-                cmd.bindPipeline(self.pipelines.skin);
-                // Never empty, so the shader always has a list to index.
-                const weights = try arena.alloc(device, f32, @max(self.skin_weights.items.len, 1));
-                weights.items[0] = 0;
-                @memcpy(weights.items[0..self.skin_weights.items.len], self.skin_weights.items);
-                cmd.pushConstants(extern struct { vertices: u64, skin: u64, joints: u64, morph: u64, jobs: u64, group_jobs: u64, weights: u64, group_count: u32, pad: u32 = 0 }{
-                    .weights = weights.address,
-                    .vertices = device.bufferAddress(self.vertices.buffer),
-                    .skin = device.bufferAddress(self.skin_vertices.buffer),
-                    .joints = scene_frame.joints,
-                    .morph = device.bufferAddress(self.morph_deltas.buffer),
-                    .jobs = jobs.address,
-                    .group_jobs = group_jobs.address,
-                    .group_count = group_count,
-                });
-                // Rows of 1024 groups, as skin.comp expects.
-                cmd.dispatch(@min(group_count, 1024), (group_count + 1023) / 1024, 1);
-            }
-            if (fresh_scene and self.bounds_jobs.items.len != 0) {
-                // The deformed meshes' meshlet bounds, from the vertices
-                // just written; the culling below reads them.
-                cmd.sync(.compute_to_all);
-                var group_count: u32 = 0;
-                for (self.bounds_jobs.items) |*job| {
-                    job.first_group = group_count;
-                    group_count += (job.meshlet_count + 63) / 64;
-                }
-                const jobs = try arena.alloc(device, BoundsJob, self.bounds_jobs.items.len);
-                @memcpy(jobs.items, self.bounds_jobs.items);
-                const group_jobs = try arena.alloc(device, u32, group_count);
-                for (self.bounds_jobs.items, 0..) |job, index| {
-                    @memset(group_jobs.items[job.first_group..][0 .. (job.meshlet_count + 63) / 64], @intCast(index));
-                }
-                cmd.bindPipeline(self.pipelines.skin_bounds);
-                cmd.pushConstants(extern struct { vertices: u64, indices: u64, meshlets: u64, bounds: u64, jobs: u64, group_jobs: u64, group_count: u32, pad: u32 = 0 }{
-                    .vertices = device.bufferAddress(self.vertices.buffer),
-                    .indices = device.bufferAddress(self.indices.buffer),
-                    .meshlets = device.bufferAddress(self.meshlets.buffer),
-                    .bounds = device.bufferAddress(scene.skin_bounds.?),
-                    .jobs = jobs.address,
-                    .group_jobs = group_jobs.address,
-                    .group_count = group_count,
-                });
-                cmd.dispatch(@min(group_count, 1024), (group_count + 1023) / 1024, 1);
-            }
-            if (fresh_scene and self.blas_jobs.items.len != 0 and scene.tlas != null) {
-                // Deformed meshes: rebuild each one's acceleration structure
-                // from the vertices just written.
-                cmd.sync(.compute_to_all);
-                // With a limit, the structures take turns from where the
-                // round stopped last frame.
-                const jobs = self.blas_jobs.items;
-                const budget: usize = if (self.options.gi_dynamic_refits == 0) jobs.len else @min(self.options.gi_dynamic_refits, jobs.len);
-                const first = self.refit_cursor % jobs.len;
-                self.refit_cursor = (first + budget) % jobs.len;
-                for (jobs, 0..) |job, index| {
-                    const turn = (index + jobs.len - first) % jobs.len < budget;
-                    if (!turn and device.accelerationBuilt(job.blas)) continue;
-                    var job_desc = self.blasDesc(job.mesh);
-                    job_desc.vertex_offset = @as(u64, job.vertex_offset) * @sizeOf(gpu.Vertex);
-                    job_desc.dynamic = true;
-                    try cmd.buildBlas(job.blas, job_desc);
-                }
-            }
-            cmd.endScope();
-
-            cmd.beginScope("culling");
-            const cull_views = try arena.alloc(device, gpu.CullView, view_count);
-            cull_views.items[0] = cullView(view_proj_unjittered, desc.camera.position, .perspective);
-            cull_views.items[0].p00 = proj_unjittered[0];
-            cull_views.items[0].p11 = proj_unjittered[5];
-            cull_views.items[0].near = desc.camera.near;
-            cull_views.items[0].view = view_matrix;
-            for (0..gpu.cascade_count) |cascade|
-                cull_views.items[1 + cascade] = cullView(cascades.view_proj[cascade], desc.camera.position, .shadow);
-            cull_views.items[main_late_view] = cull_views.items[0];
-            for (0..lighting.tile_count) |tile| cull_views.items[local_view_base + tile] = lighting.tile_views[tile];
-            // Every view picks levels of detail by the main camera, so a
-            // shadow is cast by the same geometry the camera sees.
-            const lod_scale: f32 = if (settings.lod_error_pixels > 0)
-                @abs(proj_unjittered[5]) * @as(f32, @floatFromInt(height)) * 0.5 / settings.lod_error_pixels
-            else
-                0;
-            for (cull_views.items) |*cull| {
-                cull.lod_camera = desc.camera.position;
-                cull.lod_scale = lod_scale;
-                cull.blended_casters = 0;
-                cull.lod_band = 1;
-                cull.min_radius = 0;
-            }
-            if (settings.shadow_lod == .light and settings.lod_error_pixels > 0) {
-                // A local light's shadow tiles pick detail by how large
-                // things are in the tile, seen from the light.
-                const tile_pixels: f32 = @floatFromInt(self.options.local_shadow_resolution / std.math.clamp(self.options.local_shadow_tiles_per_side, 1, local_shadow_tiles_per_side));
-                for (cull_views.items[local_view_base..][0..lighting.tile_count]) |*cull| {
-                    cull.lod_camera = cull.camera_position;
-                    cull.lod_scale = tile_pixels * 0.5 / settings.lod_error_pixels;
-                }
-            }
-            // Sun shadows can leave out what is smaller than a few texels
-            // of the cascade it would be drawn into.
-            if (settings.shadow_small_feature_texels > 0) for (0..gpu.cascade_count) |cascade| {
-                cull_views.items[1 + cascade].min_radius = cascades.texel_size[cascade] * settings.shadow_small_feature_texels * 0.5;
-            };
-            // A cascade drawn afresh every frame can leave out casters
-            // whose shadows fall on nothing the camera sees. With a depth
-            // pyramid to test against, those cascades are culled once it
-            // has been built.
-            if (settings.shadow_receiver_culling) for (0..cascade_total) |cascade| {
-                if (settings.shadow_cascade_stagger and cascade != 0) continue;
-                receiver_culled[cascade] = true;
-                const cull = &cull_views.items[1 + cascade];
-                cull.receiver_culling = if (occlusion) 2 else 1;
-                cull.receiver_view = view_matrix;
-                cull.receiver_p00 = proj_unjittered[0];
-                cull.receiver_p11 = proj_unjittered[5];
-                cull.receiver_near = desc.camera.near;
-                cull.light_travel = sun_travel;
-                // The filter reads this far to the side of a point, and
-                // the point itself is moved a few texels off its surface.
-                cull.receiver_margin = settings.shadow_softness + cascades.texel_size[cascade] * 6;
-                @memcpy(cull.receiver_planes[0..4], cull_views.items[0].planes[0..4]);
-                // The cascade shadows the view from where the one before
-                // starts handing over to it up to its own far end.
-                const starts = if (cascade == 0) desc.camera.near else cascades.splits[cascade - 1] * 0.9;
-                cull.receiver_planes[4] = .{ -view_matrix[2], -view_matrix[6], -view_matrix[10], -view_matrix[14] - starts };
-                cull.receiver_planes[5] = .{ view_matrix[2], view_matrix[6], view_matrix[10], view_matrix[14] + cascades.splits[cascade] };
-            };
-            // Only the camera's own passes cross-fade; shadows are cast by
-            // both levels while they trade places.
-            cull_views.items[0].lod_band = lod_band;
-            cull_views.items[main_late_view].lod_band = lod_band;
-            // Every view but the camera's two is a shadow view.
-            if (settings.transparent_shadows) for (cull_views.items, 0..) |*cull, index| {
-                if (index != 0 and index != main_late_view) cull.blended_casters = 1;
-            };
-            cull_views_address = cull_views.address;
-            cull_push = .{
-                .frame = frame_address,
-                .view = 0,
-                .commands = 0,
-                .counts = 0,
-                .visibility = if (view_data.visibility) |buffer| device.bufferAddress(buffer) else 0,
-                .ref_count = scene.ref_count,
-                .bucket_capacity = self.cull_capacity,
-                .phase = 0,
-                .hiz_texture = device.textureIndex(view.hiz),
-                .hiz_size = .{ @floatFromInt(view.hiz_width), @floatFromInt(view.hiz_height) },
-                // Any readable buffer will do when nothing has bounds.
-                .skin_bounds = device.bufferAddress(scene.skin_bounds orelse self.cull_counts),
-                .seen = device.bufferAddress(scene.seen orelse self.cull_counts),
-            };
-            cmd.bindPipeline(self.pipelines.cull);
-            // The main view (early phase when occlusion culling) and the
-            // shadow cascades.
-            for (0..view_count) |index| {
-                const is_cascade = index >= 1 and index <= gpu.cascade_count;
-                const is_local = draw_local_shadows and index >= local_view_base and index < local_view_base + lighting.tile_count;
-                if (index != 0 and !(is_cascade and cascade_update[(index -| 1) % gpu.cascade_count]) and !is_local) continue;
-                // Left for after the depth pyramid.
-                if (is_cascade and occlusion and receiver_culled[index - 1]) continue;
-                cull_push.view = cull_views_address + index * @sizeOf(gpu.CullView);
-                cull_push.commands = device.bufferAddress(self.cull_commands.?) + self.commandOffset(index, 0);
-                cull_push.counts = device.bufferAddress(self.cull_counts) + index * 2 * @sizeOf(u32);
-                cull_push.phase = if (index == 0 and occlusion) 1 else 0;
-                cull_push.mark_seen = @intFromBool(mark_seen and index == 0);
-                cmd.pushConstants(cull_push);
-                cmd.dispatch((scene.ref_count + 63) / 64, 1, 1);
-            }
-            cmd.sync(.compute_to_all);
-            cmd.endScope();
+            // Mostly the ray tracing structures of deformed meshes: one
+            // refit each, which the driver takes its time over.
+            const zone = Zone.start(self.options.profiler, "deformed geometry");
+            defer zone.stop();
+            try geometry_passes.skinScene(self, &pass);
         }
+        const culling = try geometry_passes.cullScene(self, &pass, &sun_shadows, &lighting, local_shadows.draw);
 
-        // ----------------------------------------------------- visibility
-        cmd.beginScope("visibility");
-        try cmd.beginRendering(.{
-            .color = &.{.{ .texture = view.visibility, .clear_uint = .{ gpu.invalid_id, 0, 0, 0 } }},
-            .depth = .{ .texture = view.depth, .clear = 0 },
-        });
-        if (has_geometry) self.drawVisibility(cmd, DrawPush{ .frame = frame_address, .view_proj = view_proj, .lod = visibility_lod, .lod_band = lod_band, .lod_near = desc.camera.near }, 0, scene.ref_count);
-        cmd.endRendering();
-        cmd.endScope();
-
-        if (occlusion) {
-            // Late phase: whatever the early pass left visible through the
-            // depth pyramid gets drawn now.
-            cmd.beginScope("occlusion culling");
-            try self.buildDepthPyramid(cmd, view);
-            cmd.bindPipeline(self.pipelines.cull);
-            cull_push.view = cull_views_address + main_late_view * @sizeOf(gpu.CullView);
-            cull_push.commands = device.bufferAddress(self.cull_commands.?) + self.commandOffset(main_late_view, 0);
-            cull_push.counts = device.bufferAddress(self.cull_counts) + main_late_view * 2 * @sizeOf(u32);
-            cull_push.phase = 2;
-            cull_push.mark_seen = @intFromBool(mark_seen);
-            cmd.pushConstants(cull_push);
-            cmd.dispatch((scene.ref_count + 63) / 64, 1, 1);
-            // The cascades that test casters against what the camera sees.
-            for (0..gpu.cascade_count) |cascade| {
-                if (!receiver_culled[cascade] or !cascade_update[cascade]) continue;
-                cull_push.view = cull_views_address + (1 + cascade) * @sizeOf(gpu.CullView);
-                cull_push.commands = device.bufferAddress(self.cull_commands.?) + self.commandOffset(1 + cascade, 0);
-                cull_push.counts = device.bufferAddress(self.cull_counts) + (1 + cascade) * 2 * @sizeOf(u32);
-                cull_push.phase = 0;
-                cull_push.mark_seen = 0;
-                cmd.pushConstants(cull_push);
-                cmd.dispatch((scene.ref_count + 63) / 64, 1, 1);
-            }
-            cmd.sync(.compute_to_all);
-            try cmd.beginRendering(.{
-                .color = &.{.{ .texture = view.visibility, .load = .load }},
-                .depth = .{ .texture = view.depth, .load = .load },
-            });
-            self.drawVisibility(cmd, DrawPush{ .frame = frame_address, .view_proj = view_proj, .lod = visibility_lod, .lod_band = lod_band, .lod_near = desc.camera.near }, main_late_view, scene.ref_count);
-            cmd.endRendering();
-            cmd.endScope();
-        }
+        try geometry_passes.drawSceneVisibility(self, &pass, &sun_shadows, &culling);
         if (first_view) cmd.copyBuffer(self.cull_counts, count_readback, 0, 0, view_count * 2 * @sizeOf(u32));
         if (mark_seen) {
             // Every view of the scene adds to it; the last copy has all.
@@ -9924,54 +8506,7 @@ pub const Renderer = struct {
             scene.seen_tags[slot] = .{ .layout_version = scene.layout_version, .count = instance_total, .valid = true };
         }
 
-        // -------------------------------------------------------- shadows
-        if (shadows_enabled) {
-            cmd.beginScope("shadows");
-            for (0..gpu.cascade_count) |cascade| {
-                if (!cascade_update[cascade]) continue;
-                try cmd.beginRendering(.{ .depth = .{ .texture = shadow_map, .layer = @intCast(cascade), .clear = 1 } });
-                cmd.bindIndexBuffer(self.indices.buffer, 0, .uint32);
-                cmd.pushConstants(DrawPush{ .frame = frame_address, .pad0 = @intFromBool(colored_shadows), .view_proj = cascades.view_proj[cascade] });
-                const counts_offset = (1 + cascade) * 2 * @sizeOf(u32);
-                cmd.bindPipeline(self.pipelines.shadow);
-                cmd.drawIndexedIndirectCount(self.cull_commands.?, self.commandOffset(1 + cascade, 0), self.cull_counts, counts_offset, scene.ref_count);
-                cmd.bindPipeline(self.pipelines.shadow_masked);
-                cmd.drawIndexedIndirectCount(self.cull_commands.?, self.commandOffset(1 + cascade, 1), self.cull_counts, counts_offset + @sizeOf(u32), scene.ref_count);
-                // Liquids: their particles, as discs facing the sun.
-                for (scene.liquids.items) |item| {
-                    const state = self.liquids.get(item) orelse continue;
-                    if (state.params_frame != self.frame_index or state.live == 0 or state.desc.shadow <= 0) continue;
-                    cmd.bindPipeline(self.pipelines.liquid_shadow);
-                    cmd.pushConstants(extern struct { frame: u64, liquid: u64, particles: u64, view_proj: Mat4, swell: f32, strength: f32 }{
-                        .frame = frame_address,
-                        .liquid = state.params,
-                        .particles = device.bufferAddress(state.particles),
-                        .view_proj = cascades.view_proj[cascade],
-                        .swell = 1.4,
-                        .strength = std.math.clamp(state.desc.shadow, 0, 1),
-                    });
-                    cmd.draw(state.live * 6, 1, 0, 0);
-                }
-                cmd.endRendering();
-            }
-            cmd.transition(shadow_map, .shader_read);
-            if (colored_shadows) {
-                // The see-through casters again, into each redrawn
-                // cascade's tint.
-                const tint = view_data.shadow_color.?;
-                for (0..gpu.cascade_count) |cascade| {
-                    if (!cascade_update[cascade]) continue;
-                    try cmd.beginRendering(.{ .color = &.{.{ .texture = tint, .layer = @intCast(cascade), .load = .clear, .clear = .{ 1, 1, 1, 1 } }} });
-                    cmd.bindIndexBuffer(self.indices.buffer, 0, .uint32);
-                    cmd.bindPipeline(self.pipelines.shadow_color);
-                    cmd.pushConstants(DrawPush{ .frame = frame_address, .view_proj = cascades.view_proj[cascade] });
-                    cmd.drawIndexedIndirectCount(self.cull_commands.?, self.commandOffset(1 + cascade, 1), self.cull_counts, (1 + cascade) * 2 * @sizeOf(u32) + @sizeOf(u32), scene.ref_count);
-                    cmd.endRendering();
-                }
-                cmd.transition(tint, .shader_read);
-            }
-            cmd.endScope();
-        }
+        if (shadows_enabled) try shadow_passes.drawSunShadows(self, &pass, &sun_shadows);
 
         if (lighting.light_count != 0 or scene.decals.items.len != 0) {
             cmd.beginScope("light clusters");
@@ -9985,164 +8520,23 @@ pub const Renderer = struct {
             cmd.sync(.compute_to_all);
             cmd.endScope();
         }
-        if (draw_local_shadows) {
-            self.local_shadow_scene = scene_handle;
-            self.local_shadow_frame = self.frame_index;
-            self.local_shadow_key = shadow_key;
-            cmd.beginScope("local shadows");
-            try cmd.beginRendering(.{ .depth = .{ .texture = self.local_shadow_map, .load = if (same_atlas) .load else .clear, .clear = 0 } });
-            cmd.bindIndexBuffer(self.indices.buffer, 0, .uint32);
-            const tiles_per_side = std.math.clamp(self.options.local_shadow_tiles_per_side, 1, local_shadow_tiles_per_side);
-            const tile_size = self.options.local_shadow_resolution / tiles_per_side;
-            for (0..lighting.tile_count) |tile| {
-                if (!tile_dirty[tile]) continue;
-                const view_index = local_view_base + tile;
-                cmd.setViewport(
-                    @intCast(tile % tiles_per_side * tile_size),
-                    @intCast(tile / tiles_per_side * tile_size),
-                    tile_size,
-                    tile_size,
-                );
-                // The rest of the atlas is kept, so only this tile is emptied.
-                if (same_atlas) cmd.clearDepthRect(@intCast(tile % tiles_per_side * tile_size), @intCast(tile / tiles_per_side * tile_size), tile_size, tile_size, 0);
-                cmd.pushConstants(DrawPush{ .frame = frame_address, .view_proj = lighting.tile_view_proj[tile] });
-                const counts_offset = view_index * 2 * @sizeOf(u32);
-                cmd.bindPipeline(self.pipelines.local_shadow);
-                cmd.drawIndexedIndirectCount(self.cull_commands.?, self.commandOffset(view_index, 0), self.cull_counts, counts_offset, scene.ref_count);
-                cmd.bindPipeline(self.pipelines.local_shadow_masked);
-                cmd.drawIndexedIndirectCount(self.cull_commands.?, self.commandOffset(view_index, 1), self.cull_counts, counts_offset + @sizeOf(u32), scene.ref_count);
-            }
-            cmd.endRendering();
-            cmd.transition(self.local_shadow_map, .shader_read);
-            cmd.endScope();
-        }
+        if (local_shadows.draw) try shadow_passes.drawLocalShadows(self, &pass, &lighting, &local_shadows);
 
         // The passes below sample depth and the visibility buffer.
         cmd.transition(view.visibility, .shader_read);
         cmd.transition(view.depth, .shader_read);
 
-        if (self.pick_request) |request| if (std.meta.eql(request.view, desc.view orelse self.main_view)) {
-            self.pick_request = null;
-            const slot: usize = @intCast(frame.index % rhi.frames_in_flight);
-            if (request.pixel[0] < output_width and request.pixel[1] < output_height) {
-                cmd.beginScope("pick");
-                // The previous copy out of the buffer must finish first.
-                cmd.sync(.transfer_to_all);
-                cmd.bindPipeline(self.pipelines.pick);
-                cmd.pushConstants(extern struct { frame: u64, result: u64, visibility: u32, depth: u32, pixel: [2]i32 }{
-                    .frame = frame_address,
-                    .result = device.bufferAddress(self.pick_buffer),
-                    .visibility = device.textureIndex(view.visibility),
-                    .depth = device.textureIndex(view.depth),
-                    // Asked in output pixels; the visibility buffer may be at another size.
-                    .pixel = .{
-                        @intCast(@min(@as(u64, request.pixel[0]) * width / output_width, width - 1)),
-                        @intCast(@min(@as(u64, request.pixel[1]) * height / output_height, height - 1)),
-                    },
-                });
-                cmd.dispatch(1, 1, 1);
-                cmd.sync(.compute_to_all);
-                cmd.copyBuffer(self.pick_buffer, self.pick_readback[slot], 0, 0, @sizeOf(gpu.Pick));
-                cmd.endScope();
-                self.pick_pending[slot] = .{
-                    .pixel = request.pixel,
-                    .scene = scene_handle,
-                    .layout_version = scene.layout_version,
-                    .near = desc.camera.near,
-                };
-            } else {
-                self.pick_result = .{ .pixel = request.pixel, .hit = null };
-            }
-        };
-
-        // -------------------------------------------------------------- AO
-        if (settings.ambient_occlusion) {
-            cmd.beginScope("ambient occlusion");
-            {
-                // Linear depth pyramid for the horizon search.
-                const info = device.textureInfo(view.ao_depth);
-                const sampler = device.samplerIndex(self.sampler_nearest_clamp);
-                for (0..info.mip_levels) |mip| {
-                    if (mip != 0) cmd.transitionMip(view.ao_depth, @intCast(mip - 1), .shader_read);
-                    try cmd.beginRendering(.{ .color = &.{.{ .texture = view.ao_depth, .mip = @intCast(mip), .load = .discard }} });
-                    cmd.bindPipeline(self.pipelines.ao_depth);
-                    cmd.pushConstants(extern struct { source: u32, sampler: u32, first: u32, source_lod: i32, near: f32 }{
-                        .source = device.textureIndex(if (mip == 0) view.depth else view.ao_depth),
-                        .sampler = sampler,
-                        .first = @intFromBool(mip == 0),
-                        .source_lod = if (mip == 0) 0 else @intCast(mip - 1),
-                        .near = desc.camera.near,
-                    });
-                    cmd.drawFullscreen();
-                    cmd.endRendering();
-                }
-                cmd.transition(view.ao_depth, .shader_read);
-            }
-            // Light gathered along with the occlusion comes from last
-            // frame's picture, which is there once antialiasing has
-            // resolved one.
-            const bounce_source: ?rhi.Texture = if (settings.ao_bounce > 0 and settings.temporal_antialiasing and view.history_valid and !debugging) view.history[@intCast((view_data.frames + 1) & 1)] else null;
-            try cmd.beginRendering(.{ .color = &.{ .{ .texture = view.ao_raw, .load = .discard }, .{ .texture = view.bounce_raw, .load = .discard } } });
-            cmd.bindPipeline(self.pipelines.gtao);
-            cmd.pushConstants(extern struct { frame: u64, depth: u32, color: u32, radius: f32, intensity: f32, slice_count: i32, step_count: i32 }{
-                .frame = frame_address,
-                .depth = device.textureIndex(view.ao_depth),
-                .color = if (bounce_source) |texture| device.textureIndex(texture) else gpu.invalid_id,
-                .radius = settings.ao_radius,
-                .intensity = settings.ao_intensity,
-                .slice_count = @intCast(std.math.clamp(settings.ao_slices, 1, 8)),
-                .step_count = @intCast(std.math.clamp(settings.ao_steps, 1, 32)),
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(view.ao_raw, .shader_read);
-            cmd.transition(view.bounce_raw, .shader_read);
-            // Write into the older of the two; the other is last frame's.
-            std.mem.swap(rhi.Texture, &view.ao, &view.ao_history);
-            const ao_temporal = settings.ao_temporal_filter and view.ao_history_valid;
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = view.ao, .load = .discard }} });
-            cmd.bindPipeline(self.pipelines.gtao_denoise);
-            cmd.pushConstants(extern struct { frame: u64, ao: u32, depth: u32, history: u32, blend: f32, bounce: u32 = 0, pad: u32 = 0 }{
-                .frame = frame_address,
-                .ao = device.textureIndex(view.ao_raw),
-                .depth = device.textureIndex(view.depth),
-                .history = if (ao_temporal) device.textureIndex(view.ao_history) else gpu.invalid_id,
-                .blend = 0.1,
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(view.ao, .shader_read);
-            view.ao_history_valid = true;
-            if (bounce_source != null) {
-                std.mem.swap(rhi.Texture, &view.bounce, &view.bounce_history);
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = view.bounce, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.gtao_bounce_denoise);
-                cmd.pushConstants(extern struct { frame: u64, ao: u32, depth: u32, history: u32, blend: f32, bounce: u32, pad: u32 = 0 }{
-                    .frame = frame_address,
-                    .ao = device.textureIndex(view.ao_raw),
-                    .depth = device.textureIndex(view.depth),
-                    .history = if (view.bounce_history_valid) device.textureIndex(view.bounce_history) else gpu.invalid_id,
-                    .blend = 0.1,
-                    .bounce = device.textureIndex(view.bounce_raw),
-                });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(view.bounce, .shader_read);
-                view.bounce_history_valid = true;
-            } else view.bounce_history_valid = false;
-            cmd.endScope();
-        } else {
-            view.ao_history_valid = false;
-        }
+        geometry_passes.recordPick(self, &pass);
+        try shading_passes.ambientOcclusion(self, &pass);
 
         if (gi) |volume| if (scene.gi_updated_frame != self.frame_index) {
-            try self.updateGi(cmd, scene, volume, scene_frame, frame_address, settings, 0);
+            try gi_passes.updateGi(self, cmd, scene, volume, scene_frame, frame_address, settings, 0);
             // The coarse grid can be refreshed less often than the fine one.
             if (scene.gi_coarse) |*coarse| {
                 if (coarse.frames < 64 or self.frame_index % @max(settings.gi_coarse_interval, 1) == 0)
-                    try self.updateGi(cmd, scene, coarse, scene_frame, frame_address, settings, 1);
+                    try gi_passes.updateGi(self, cmd, scene, coarse, scene_frame, frame_address, settings, 1);
             }
-            if (scene.gi_middle) |*middle| try self.updateGi(cmd, scene, middle, scene_frame, frame_address, settings, 2);
+            if (scene.gi_middle) |*middle| try gi_passes.updateGi(self, cmd, scene, middle, scene_frame, frame_address, settings, 2);
             scene.gi_updated_frame = self.frame_index;
         };
 
@@ -10163,960 +8557,35 @@ pub const Renderer = struct {
             gathered_gi = texture;
         };
 
-        // --------------------------------------------------------- shading
-        // Material evaluation and lighting in one pass straight from the
-        // visibility buffer; nothing is written to a G-buffer in between.
-        cmd.beginScope("shading");
-        // With reflections on, the pass also writes what the reflection
-        // pass needs to know about each surface.
-        const reflections_on = settings.screen_space_reflections and !debugging;
-        if (view.reflections) |*targets| {
-            // Write into the older of the two results; the other is history.
-            if (reflections_on) std.mem.swap(rhi.Texture, &targets.traced, &targets.history) else targets.history_valid = false;
-        }
-        const reflections: ?ReflectionTargets = if (reflections_on) view.reflections else null;
-        if (reflections) |targets| {
-            try cmd.beginRendering(.{ .color = &.{
-                .{ .texture = view.hdr, .load = .discard },
-                .{ .texture = view.motion, .load = .discard },
-                .{ .texture = targets.weight, .load = .discard },
-                .{ .texture = targets.surface, .load = .discard },
-            } });
-        } else {
-            try cmd.beginRendering(.{ .color = &.{
-                .{ .texture = view.hdr, .load = .discard },
-                .{ .texture = view.motion, .load = .discard },
-            } });
-        }
-        const ShadePush = extern struct { frame: u64, visibility: u32, ao: u32, debug_view: u32, gi: u32, material_shader: u32, shadow_history: u32, bounce: u32, bounce_strength: f32 };
-        var shade_push = ShadePush{
-            .frame = frame_address,
-            .visibility = device.textureIndex(view.visibility),
-            .ao = device.textureIndex(view.ao),
-            .bounce = if (settings.ambient_occlusion and view.bounce_history_valid) device.textureIndex(view.bounce) else gpu.invalid_id,
-            .bounce_strength = @max(settings.ao_bounce, 0),
-            .debug_view = @intFromEnum(settings.debug_view),
-            .gi = if (gathered_gi) |texture| device.textureIndex(texture) else gpu.invalid_id,
-            .material_shader = 0,
-            // What temporal antialiasing resolved last frame.
-            .shadow_history = if (settings.light_shadow_filter and settings.temporal_antialiasing and view.history_valid and !debugging)
-                device.textureIndex(view.history[@intCast((view_data.frames + 1) & 1)])
-            else
-                gpu.invalid_id,
-        };
-        // Custom material shaders that some loaded material uses each get
-        // a pass over their own pixels; the standard pass skips those.
-        for (self.material_shaders, self.material_shader_users, 0..) |shader, users, slot| {
-            if (shader != null and users != 0) shade_push.material_shader |= @as(u32, 1) << @intCast(slot);
-        }
-        const custom_shaders = shade_push.material_shader;
-        // The optional shading code this view can reach; the pass is built
-        // without the rest.
-        var shade_features: u32 = 0;
-        if (lighting.light_count != 0) {
-            shade_features |= gpu.feature_local_lights;
-            if (shadow_tlas != 0) shade_features |= gpu.feature_traced_light_shadows;
-            for (scene.lights.items) |light| if (light.source_radius > 0) {
-                shade_features |= gpu.feature_sized_lights;
-                break;
-            };
-        }
-        if (flags & gpu.frame_fluid_shadows != 0) shade_features |= gpu.feature_fluid_shadows;
-        if (flags & gpu.frame_cloud_shadows != 0) shade_features |= gpu.feature_cloud_shadows;
-        if (scene.decals.items.len != 0) shade_features |= gpu.feature_decals;
-        if (self.texture_transform_users != 0) shade_features |= gpu.feature_texture_transforms;
-        if (colored_shadows) shade_features |= gpu.feature_colored_shadows;
-        if (settings.gi_probe_relocation) shade_features |= gpu.feature_gi_relocation;
-        if (settings.aerial_perspective > 0) shade_features |= gpu.feature_aerial;
-        cmd.bindPipeline(try self.shadePipeline(reflections != null, shade_features));
-        cmd.pushConstants(shade_push);
-        cmd.drawFullscreen();
-        for (self.material_shaders, 0..) |shader, slot| {
-            if ((custom_shaders >> @intCast(slot)) & 1 == 0) continue;
-            shade_push.material_shader = @intCast(slot);
-            cmd.bindPipeline(if (reflections != null) shader.?.reflective else shader.?.plain);
-            cmd.pushConstants(shade_push);
-            cmd.drawFullscreen();
-        }
-        cmd.endRendering();
-        cmd.transition(view.hdr, .shader_read);
-        cmd.transition(view.motion, .shader_read);
-        cmd.endScope();
+        const reflections = try shading_passes.shadeScene(self, &pass, &lighting, flags, shadow_tlas, colored_shadows, gathered_gi);
+        if (cloud_address != 0 and !debugging) try volume_passes.drawClouds(self, &pass, cloud_address);
+        if (reflections) |targets| try shading_passes.drawReflections(self, &pass, targets, gi != null);
+        try self.runPasses(&pass, .after_opaque, view.hdr, hdr_format, width, height);
 
-        // ---------------------------------------------------------- clouds
-        if (cloud_address != 0 and !debugging) {
-            const targets = &view.clouds.?;
-            cmd.beginScope("clouds");
-            const CloudPush = extern struct { frame: u64, clouds: u64, texture: u32 = 0, pad: u32 = 0 };
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = targets.current, .load = .discard }} });
-            cmd.bindPipeline(self.pipelines.cloud);
-            cmd.pushConstants(CloudPush{ .frame = frame_address, .clouds = cloud_address });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(targets.current, .shader_read);
-            targets.history_valid = true;
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-            cmd.bindPipeline(self.pipelines.cloud_composite);
-            cmd.pushConstants(CloudPush{ .frame = frame_address, .clouds = cloud_address, .texture = device.textureIndex(targets.current) });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(view.hdr, .shader_read);
-            cmd.endScope();
-        }
+        // Surfaces and volumes that are seen through, over the opaque picture.
+        try transparency_passes.drawLiquids(self, &pass);
+        try transparency_passes.drawWater(self, &pass);
+        try transparency_passes.drawTransparency(self, &pass);
+        try volume_passes.drawFluids(self, &pass);
+        if (settings.fog_density > 0 and !debugging) try volume_passes.drawFog(self, &pass);
+        if (!debugging) try particle_passes.drawParticles(self, cmd, scene, view, frame_address, desc.camera.position);
+        try self.runPasses(&pass, .after_transparency, view.hdr, hdr_format, width, height);
 
-        if (reflections) |targets| {
-            // ------------------------------------------------ reflections
-            cmd.transition(targets.weight, .shader_read);
-            cmd.transition(targets.surface, .shader_read);
-            cmd.beginScope("reflections");
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = targets.traced, .load = .discard }} });
-            // With the scene's acceleration structure at hand, misses of
-            // the screen trace are answered by real rays.
-            const traced_tlas: u64 = if (settings.reflection_ray_tracing and gi != null and device.ray_tracing)
-                (if (scene.tlas) |tlas| device.accelerationAddress(tlas) else 0)
-            else
-                0;
-            cmd.bindPipeline(if (traced_tlas != 0) self.pipelines.ssr_traced else self.pipelines.ssr);
-            cmd.pushConstants(extern struct { frame: u64, depth: u32, color: u32, reflection: u32, surface: u32, max_roughness: f32, thickness: f32, max_distance: f32, step_count: i32, history: u32, history_blend: f32, tlas: u64 }{
-                .frame = frame_address,
-                .depth = device.textureIndex(view.depth),
-                .color = device.textureIndex(view.hdr),
-                .reflection = device.textureIndex(targets.weight),
-                .surface = device.textureIndex(targets.surface),
-                .max_roughness = std.math.clamp(settings.reflection_max_roughness, 0.05, 1),
-                .thickness = @max(settings.reflection_thickness, 0.01),
-                .max_distance = @max(settings.reflection_distance, 0.1),
-                .step_count = @intCast(std.math.clamp(settings.reflection_steps, 4, 256)),
-                .history = if (targets.history_valid and settings.reflection_temporal_filter) device.textureIndex(targets.history) else gpu.invalid_id,
-                .history_blend = 0.12,
-                .tlas = traced_tlas,
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(targets.traced, .shader_read);
-            view.reflections.?.history_valid = true;
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-            cmd.bindPipeline(self.pipelines.ssr_composite);
-            cmd.pushConstants(extern struct { frame: u64, depth: u32, reflection: u32, surface: u32, traced: u32, max_roughness: f32, blur_taps: i32, reduced: u32, pad: u32 = 0 }{
-                .frame = frame_address,
-                .depth = device.textureIndex(view.depth),
-                .reflection = device.textureIndex(targets.weight),
-                .surface = device.textureIndex(targets.surface),
-                .traced = device.textureIndex(targets.traced),
-                .max_roughness = std.math.clamp(settings.reflection_max_roughness, 0.05, 1),
-                .blur_taps = @intCast(@min(settings.reflection_blur_samples, 32)),
-                .reduced = @intFromBool(settings.reflection_resolution != .full),
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(view.hdr, .shader_read);
-            cmd.endScope();
-        }
-
-        try self.runPasses(desc, .after_opaque, .{
-            .cmd = cmd,
-            .device = device,
-            .stage = .after_opaque,
-            .frame = frame_address,
-            .color = view.hdr,
-            .color_format = hdr_format,
-            .depth = view.depth,
-            .motion = view.motion,
-            .width = width,
-            .height = height,
-        });
-
-        // ---------------------------------------------------------- liquid
-        if (scene.liquids.items.len != 0 and !debugging) liquid: {
-            const targets = view.liquid orelse break :liquid;
-            const copy = view.scene_copy orelse break :liquid;
-            cmd.beginScope("liquid");
-            defer cmd.endScope();
-            for (scene.liquids.items) |item| {
-                const state = self.liquids.get(item) orelse continue;
-                if (state.params_frame != self.frame_index or state.live == 0) continue;
-                const radius = state.desc.particle_radius;
-                const ParticlePush = extern struct { frame: u64, liquid: u64, particles: u64, depth: u32, swell: f32 };
-                const particle_push = ParticlePush{
-                    .frame = frame_address,
-                    .liquid = state.params,
-                    .particles = device.bufferAddress(state.particles),
-                    .depth = device.textureIndex(view.depth),
-                    .swell = 1.7,
-                };
-                // The nearest surface of the particles, as spheres.
-                try cmd.beginRendering(.{ .depth = .{ .texture = targets.depth, .clear = 0 } });
-                cmd.bindPipeline(self.pipelines.liquid_depth);
-                cmd.pushConstants(particle_push);
-                cmd.draw(state.live * 6, 1, 0, 0);
-                cmd.endRendering();
-                cmd.transition(targets.depth, .shader_read);
-                // How much liquid each pixel looks through.
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = targets.thickness, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
-                cmd.bindPipeline(self.pipelines.liquid_thickness);
-                cmd.pushConstants(particle_push);
-                cmd.draw(state.live * 6, 1, 0, 0);
-                cmd.endRendering();
-                cmd.transition(targets.thickness, .shader_read);
-                // The spheres smoothed into one surface, across and down,
-                // once each.
-                const BlurPush = extern struct { frame: u64, source: u32, raw: u32, direction: [2]f32, width: f32, edge: f32 };
-                cmd.bindPipeline(self.pipelines.liquid_blur);
-                var source = targets.depth;
-                var raw: u32 = 1;
-                for (0..2) |pass| {
-                    const smoothed = targets.smooth[pass % 2];
-                    try cmd.beginRendering(.{ .color = &.{.{ .texture = smoothed, .load = .discard }} });
-                    cmd.pushConstants(BlurPush{
-                        .frame = frame_address,
-                        .source = device.textureIndex(source),
-                        .raw = raw,
-                        .direction = if (pass % 2 == 0) .{ 1, 0 } else .{ 0, 1 },
-                        .width = radius * 5,
-                        .edge = radius * 4,
-                    });
-                    cmd.drawFullscreen();
-                    cmd.endRendering();
-                    cmd.transition(smoothed, .shader_read);
-                    source = smoothed;
-                    raw = 0;
-                }
-                // What is behind it is read from a copy of the picture so
-                // far, bent by the surface.
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = copy, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.copy);
-                cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(view.hdr) });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(copy, .shader_read);
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-                cmd.bindPipeline(self.pipelines.liquid);
-                cmd.pushConstants(extern struct { frame: u64, liquid: u64, distance: u32, thickness: u32, scene: u32, depth: u32 }{
-                    .frame = frame_address,
-                    .liquid = state.params,
-                    .distance = device.textureIndex(targets.smooth[1]),
-                    .thickness = device.textureIndex(targets.thickness),
-                    .scene = device.textureIndex(copy),
-                    .depth = device.textureIndex(view.depth),
-                });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(view.hdr, .shader_read);
-                if (state.desc.write_depth) {
-                    // Not in the same pass: the liquid reads the depth
-                    // of what is behind it while it is drawn.
-                    try cmd.beginRendering(.{ .color = &.{.{ .texture = view.motion, .load = .load }}, .depth = .{ .texture = view.depth, .load = .load } });
-                    cmd.bindPipeline(self.pipelines.liquid_surface);
-                    cmd.pushConstants(extern struct { frame: u64, distance: u32, pad: u32 = 0 }{ .frame = frame_address, .distance = device.textureIndex(targets.smooth[1]) });
-                    cmd.drawFullscreen();
-                    cmd.endRendering();
-                    cmd.transition(view.depth, .shader_read);
-                    cmd.transition(view.motion, .shader_read);
-                }
-            }
-        }
-
-        // ----------------------------------------------------------- water
-        if (scene.waters.items.len != 0 and !debugging) water: {
-            const copy = view.scene_copy orelse break :water;
-            cmd.beginScope("water");
-            // What is under the surface is read from a copy of the picture
-            // so far, bent by the waves.
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = copy, .load = .discard }} });
-            cmd.bindPipeline(self.pipelines.copy);
-            cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(view.hdr) });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(copy, .shader_read);
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-            cmd.bindPipeline(self.pipelines.water);
-            for (scene.waters.items) |item| {
-                const state = self.waters.get(item) orelse continue;
-                if (state.params_frame != self.frame_index) continue;
-                cmd.pushConstants(extern struct { frame: u64, water: u64, depth: u32, scene: u32, quads: u32, pad: u32 = 0 }{
-                    .frame = frame_address,
-                    .water = state.params,
-                    .depth = device.textureIndex(view.depth),
-                    .scene = device.textureIndex(copy),
-                    .quads = water_quads,
-                });
-                cmd.draw(water_quads * water_quads * 6, 1, 0, 0);
-            }
-            cmd.endRendering();
-            cmd.transition(view.hdr, .shader_read);
-            // Then into the depth buffer, for the passes that follow. Not
-            // in the same pass: the water reads the depth of what is under
-            // it while it is drawn.
-            var any_depth = false;
-            for (scene.waters.items) |item| {
-                const state = self.waters.get(item) orelse continue;
-                if (state.params_frame == self.frame_index and state.desc.write_depth) any_depth = true;
-            }
-            if (any_depth) {
-                try cmd.beginRendering(.{ .depth = .{ .texture = view.depth, .load = .load } });
-                cmd.bindPipeline(self.pipelines.water_depth);
-                for (scene.waters.items) |item| {
-                    const state = self.waters.get(item) orelse continue;
-                    if (state.params_frame != self.frame_index or !state.desc.write_depth) continue;
-                    cmd.pushConstants(extern struct { frame: u64, water: u64, depth: u32, scene: u32, quads: u32, pad: u32 = 0 }{
-                        .frame = frame_address,
-                        .water = state.params,
-                        .depth = gpu.invalid_id,
-                        .scene = gpu.invalid_id,
-                        .quads = water_quads,
-                    });
-                    cmd.draw(water_quads * water_quads * 6, 1, 0, 0);
-                }
-                cmd.endRendering();
-                cmd.transition(view.depth, .shader_read);
-            }
-            // From under a surface, the whole view is seen through water.
-            for (scene.waters.items) |item| {
-                const state = self.waters.get(item) orelse continue;
-                if (state.params_frame != self.frame_index or !state.desc.underwater) continue;
-                const local = math.transformPoint(math.inverse(state.desc.transform), desc.camera.position);
-                if (local[1] >= 0 or @abs(local[0]) > 0.5 or @abs(local[2]) > 0.5) continue;
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = copy, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.copy);
-                cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(view.hdr) });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(copy, .shader_read);
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.underwater);
-                cmd.pushConstants(extern struct { frame: u64, water: u64, depth: u32, scene: u32 }{
-                    .frame = frame_address,
-                    .water = state.params,
-                    .depth = device.textureIndex(view.depth),
-                    .scene = device.textureIndex(copy),
-                });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(view.hdr, .shader_read);
-                break;
-            }
-            cmd.endScope();
-        }
-
-        // ---------------------------------------------------- transparency
-        if (scene.transparent.items.len != 0 and !debugging) {
-            cmd.beginScope("transparency");
-            // Refraction looks through surfaces at the scene behind them,
-            // so that scene is set aside before anything is drawn over it.
-            var behind: u32 = gpu.invalid_id;
-            if (view.scene_copy) |copy| {
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = copy, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.copy);
-                cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(view.hdr) });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(copy, .shader_read);
-                behind = device.textureIndex(copy);
-            }
-            const ForwardPush = extern struct { frame: u64, instance: u32, mode: u32, scene: u32, opaque_depth: u32 = gpu.invalid_id, peel_depth: u32 = gpu.invalid_id, pad: u32 = 0 };
-            if (view.peel) |peel| {
-                // Exact layering: the nearest transparent surface at every
-                // pixel is drawn into a layer of its own, then the nearest
-                // behind that, and so on; each layer goes under the ones
-                // before it. Surfaces past the last layer are left out.
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = peel.accumulation, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
-                cmd.endRendering();
-                const layers = std.math.clamp(settings.transparency_layers, 1, 16);
-                for (0..layers) |layer| {
-                    const depth_now = peel.depth[layer % 2];
-                    const depth_before = peel.depth[(layer + 1) % 2];
-                    try cmd.beginRendering(.{
-                        .color = &.{.{ .texture = peel.layer, .load = .clear, .clear = .{ 0, 0, 0, 0 } }},
-                        .depth = .{ .texture = depth_now, .clear = 0 },
-                    });
-                    cmd.bindPipeline(try self.forwardPeelPipeline());
-                    cmd.bindIndexBuffer(self.indices.buffer, 0, .uint32);
-                    for (scene.transparent.items) |draw| {
-                        cmd.pushConstants(extern struct { frame: u64, instance: u32, mode: u32, scene: u32, opaque_depth: u32, peel_depth: u32, pad: u32 = 0 }{
-                            .frame = frame_address,
-                            .instance = draw.instance,
-                            .mode = 2,
-                            .scene = behind,
-                            .opaque_depth = device.textureIndex(view.depth),
-                            .peel_depth = if (layer == 0) gpu.invalid_id else device.textureIndex(depth_before),
-                        });
-                        cmd.drawIndexed(draw.index_count, 1, draw.first_index, 0, 0);
-                    }
-                    cmd.endRendering();
-                    cmd.transition(peel.layer, .shader_read);
-                    cmd.transition(depth_now, .shader_read);
-                    try cmd.beginRendering(.{ .color = &.{.{ .texture = peel.accumulation, .load = .load }} });
-                    cmd.bindPipeline(self.pipelines.peel_under);
-                    cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(peel.layer) });
-                    cmd.drawFullscreen();
-                    cmd.endRendering();
-                }
-                cmd.transition(peel.accumulation, .shader_read);
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-                cmd.bindPipeline(self.pipelines.peel_composite);
-                cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(peel.accumulation) });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-            } else if (view.oit) |oit| {
-                // Order-independent: every surface is accumulated with a
-                // weight, then the result is laid over the scene at once.
-                try cmd.beginRendering(.{
-                    .color = &.{
-                        .{ .texture = oit.accumulation, .load = .clear, .clear = .{ 0, 0, 0, 0 } },
-                        .{ .texture = view.motion, .load = .load },
-                        .{ .texture = oit.reveal, .load = .clear, .clear = .{ 1, 1, 1, 1 } },
-                    },
-                    .depth = .{ .texture = view.depth, .load = .load },
-                });
-                cmd.bindPipeline(try self.forwardWeightedPipeline());
-                cmd.bindIndexBuffer(self.indices.buffer, 0, .uint32);
-                for (scene.transparent.items) |draw| {
-                    cmd.pushConstants(ForwardPush{ .frame = frame_address, .instance = draw.instance, .mode = 1, .scene = behind });
-                    cmd.drawIndexed(draw.index_count, 1, draw.first_index, 0, 0);
-                }
-                cmd.endRendering();
-                cmd.transition(oit.accumulation, .shader_read);
-                cmd.transition(oit.reveal, .shader_read);
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-                cmd.bindPipeline(self.pipelines.oit_composite);
-                cmd.pushConstants(extern struct { frame: u64, accumulation: u32, reveal: u32 }{
-                    .frame = frame_address,
-                    .accumulation = device.textureIndex(oit.accumulation),
-                    .reveal = device.textureIndex(oit.reveal),
-                });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-            } else {
-                // Back to front along the view axis.
-                self.transparent_order.clearRetainingCapacity();
-                try self.transparent_order.appendSlice(self.gpa, scene.transparent.items);
-                for (self.transparent_order.items) |*draw| draw.depth = -math.transformPoint(view_matrix, draw.center)[2];
-                std.mem.sort(TransparentDraw, self.transparent_order.items, {}, struct {
-                    fn farther(_: void, a: TransparentDraw, b: TransparentDraw) bool {
-                        return a.depth > b.depth;
-                    }
-                }.farther);
-                const forward_target = rhi.RenderingDesc{
-                    .color = &.{ .{ .texture = view.hdr, .load = .load }, .{ .texture = view.motion, .load = .load } },
-                    .depth = .{ .texture = view.depth, .load = .load },
-                };
-                try cmd.beginRendering(forward_target);
-                cmd.bindPipeline(self.pipelines.forward);
-                cmd.bindIndexBuffer(self.indices.buffer, 0, .uint32);
-                var drawn_any = false;
-                for (self.transparent_order.items) |draw| {
-                    // A surface that bends light is given the picture as it
-                    // is now, with the see-through surfaces behind it in
-                    // it, instead of the one from before any were drawn.
-                    if (settings.layered_refraction and draw.transmissive and drawn_any) if (view.scene_copy) |copy| {
-                        cmd.endRendering();
-                        cmd.transition(view.hdr, .shader_read);
-                        try cmd.beginRendering(.{ .color = &.{.{ .texture = copy, .load = .discard }} });
-                        cmd.bindPipeline(self.pipelines.copy);
-                        cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(view.hdr) });
-                        cmd.drawFullscreen();
-                        cmd.endRendering();
-                        cmd.transition(copy, .shader_read);
-                        try cmd.beginRendering(forward_target);
-                        cmd.bindPipeline(self.pipelines.forward);
-                        cmd.bindIndexBuffer(self.indices.buffer, 0, .uint32);
-                    };
-                    cmd.pushConstants(ForwardPush{ .frame = frame_address, .instance = draw.instance, .mode = 0, .scene = behind });
-                    cmd.drawIndexed(draw.index_count, 1, draw.first_index, 0, 0);
-                    drawn_any = true;
-                }
-                cmd.endRendering();
-            }
-            cmd.transition(view.hdr, .shader_read);
-            cmd.transition(view.motion, .shader_read);
-            cmd.transition(view.depth, .shader_read);
-            cmd.endScope();
-        }
-
-        // ---------------------------------------------------------- fluids
-        if (view.fluid) |fluid_target| fluids: {
-            if (debugging) break :fluids;
-            var push = extern struct { frame: u64, depth: u32, count: u32, steps: i32, light_steps: i32, motion: u32, pad: u32 = 0, fluids: [max_fluids]u64 }{
-                .motion = @intFromBool(settings.fluid_motion_vectors),
-                .frame = frame_address,
-                .depth = device.textureIndex(view.depth),
-                .count = 0,
-                .steps = @intCast(std.math.clamp(settings.fluid_steps, 4, 256)),
-                .light_steps = @intCast(std.math.clamp(settings.fluid_light_steps, 1, 32)),
-                .fluids = @splat(0),
-            };
-            for (scene.fluids.items) |item| {
-                const state = self.fluids.get(item) orelse continue;
-                if (state.params_frame != self.frame_index) continue;
-                push.fluids[push.count] = state.params;
-                push.count += 1;
-            }
-            if (push.count == 0) break :fluids;
-            // Slots past the count still hold a real fluid: a driver may
-            // follow these pointers for pixels that are not using them.
-            for (push.fluids[push.count..]) |*slot| slot.* = push.fluids[0];
-            cmd.beginScope("fluids");
-            const fluid_motion = view.fluid_motion.?;
-            try cmd.beginRendering(.{ .color = &.{ .{ .texture = fluid_target, .load = .discard }, .{ .texture = fluid_motion, .load = .discard } } });
-            cmd.bindPipeline(self.pipelines.fluid);
-            cmd.pushConstants(push);
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(fluid_target, .shader_read);
-            cmd.transition(fluid_motion, .shader_read);
-            if (settings.fluid_motion_vectors) {
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = view.motion, .load = .load }} });
-                cmd.bindPipeline(self.pipelines.fluid_motion);
-                cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(fluid_motion) });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(view.motion, .shader_read);
-            }
-            // Laid over the scene the way fog is: a depth-aware upsample.
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-            cmd.bindPipeline(self.pipelines.fog_composite);
-            cmd.pushConstants(extern struct { frame: u64, fog: u32, depth: u32 }{
-                .frame = frame_address,
-                .fog = device.textureIndex(fluid_target),
-                .depth = device.textureIndex(view.depth),
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(view.hdr, .shader_read);
-            cmd.endScope();
-        }
-
-        // ------------------------------------------------------------- fog
-        if (settings.fog_density > 0 and !debugging) {
-            cmd.beginScope("volumetric fog");
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = view.fog, .load = .discard }} });
-            cmd.bindPipeline(self.pipelines.fog);
-            cmd.pushConstants(extern struct { frame: u64, depth: u32, density: f32, anisotropy: f32, height_falloff: f32, max_distance: f32, ambient: f32, step_count: i32, pad: u32 = 0 }{
-                .frame = frame_address,
-                .depth = device.textureIndex(view.depth),
-                .density = settings.fog_density,
-                .anisotropy = std.math.clamp(settings.fog_anisotropy, 0, 0.95),
-                .height_falloff = settings.fog_height_falloff,
-                .max_distance = @max(settings.shadow_distance, 1) * 2,
-                .ambient = 1,
-                .step_count = @intCast(std.math.clamp(settings.fog_steps, 4, 128)),
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(view.fog, .shader_read);
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-            cmd.bindPipeline(self.pipelines.fog_composite);
-            cmd.pushConstants(extern struct { frame: u64, fog: u32, depth: u32 }{
-                .frame = frame_address,
-                .fog = device.textureIndex(view.fog),
-                .depth = device.textureIndex(view.depth),
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(view.hdr, .shader_read);
-            cmd.endScope();
-        }
-
-        if (!debugging) try self.drawParticles(cmd, scene, view, frame_address, desc.camera.position);
-
-        try self.runPasses(desc, .after_transparency, .{
-            .cmd = cmd,
-            .device = device,
-            .stage = .after_transparency,
-            .frame = frame_address,
-            .color = view.hdr,
-            .color_format = hdr_format,
-            .depth = view.depth,
-            .motion = view.motion,
-            .width = width,
-            .height = height,
-        });
-
-        // ------------------------------------------------------------- TAA
-        // ---------------------------------------------------- path tracing
-        // In place of the picture drawn so far: what follows (lens
-        // effects, exposure, tone mapping, draw lists) works on it as on
-        // any other.
-        var path_traced = false;
-        if (settings.path_tracing and !debugging) trace: {
-            scene.trace_wanted = true;
-            var where: u64 = 0;
-            var instances_address: u64 = 0;
-            var content: u64 = 0;
-            if (device.ray_tracing) {
-                const tlas = scene.tlas orelse break :trace;
-                // Built this frame, by the bounce light's update.
-                if (scene.tlas_hash == 0 or scene.tlas_hash != scene_frame.tlas_hash) break :trace;
-                where = device.accelerationAddress(tlas);
-                content = scene.tlas_hash;
-            } else {
-                if (!scene.trace_ready) break :trace;
-                where = device.bufferAddress(scene.trace_nodes.?);
-                instances_address = device.bufferAddress(scene.trace_instances.?);
-                content = scene.trace_hash;
-            }
-            if (view_data.path_accum == null or view_data.path_size[0] != width or view_data.path_size[1] != height) {
-                if (view_data.path_accum) |old| device.destroyTexture(old);
-                if (view_data.path_guide) |old| device.destroyTexture(old);
-                if (view_data.path_filtered) |old| device.destroyTexture(old);
-                if (view_data.path_accum_old) |old| device.destroyTexture(old);
-                if (view_data.path_guide_old) |old| device.destroyTexture(old);
-                view_data.path_accum_old = null;
-                view_data.path_guide_old = null;
-                view_data.path_guide = null;
-                view_data.path_filtered = null;
-                view_data.path_accum = null;
-                view_data.path_accum = try device.createTexture(.{ .name = "path tracing", .width = width, .height = height, .format = .rgba32_float, .usage = .{ .sampled = true, .color_attachment = true } });
-                view_data.path_guide = try device.createTexture(.{ .name = "path tracing guide", .width = width, .height = height, .format = .rgba16_float, .usage = .{ .sampled = true, .color_attachment = true } });
-                view_data.path_filtered = try device.createTexture(.{ .name = "path tracing filtered", .width = width, .height = height, .format = .rgba16_float, .usage = .{ .sampled = true, .color_attachment = true } });
-                view_data.path_accum_old = try device.createTexture(.{ .name = "path tracing (last frame)", .width = width, .height = height, .format = .rgba32_float, .usage = .{ .sampled = true, .color_attachment = true } });
-                view_data.path_guide_old = try device.createTexture(.{ .name = "path tracing guide (last frame)", .width = width, .height = height, .format = .rgba16_float, .usage = .{ .sampled = true, .color_attachment = true } });
-                // Both pairs start empty, so that either can be read.
-                inline for (.{ .{ view_data.path_accum.?, view_data.path_guide.? }, .{ view_data.path_accum_old.?, view_data.path_guide_old.? } }) |pair| {
-                    try cmd.beginRendering(.{ .color = &.{ .{ .texture = pair[0], .load = .clear }, .{ .texture = pair[1], .load = .clear } } });
-                    cmd.endRendering();
-                    cmd.transition(pair[0], .shader_read);
-                    cmd.transition(pair[1], .shader_read);
-                }
-                view_data.path_size = .{ width, height };
-                view_data.path_gathered = 0;
-            }
-            // Anything the picture depends on changing starts it over. The
-            // camera is not among them: a picture is carried along as it
-            // moves (see pathtrace.frag).
-            var key = std.hash.Wyhash.init(content);
-            key.update(std.mem.asBytes(&scene.sun.direction));
-            key.update(std.mem.asBytes(&scene.sun.color));
-            key.update(std.mem.asBytes(&scene.sun.intensity));
-            key.update(std.mem.asBytes(&scene.environment_intensity));
-            // The lights by what they are, not by when they were last
-            // set: an application that hands over the same lamps every
-            // frame has not moved them.
-            for (scene.lights.items) |light| {
-                key.update(std.mem.asBytes(&light.position));
-                key.update(std.mem.asBytes(&light.direction));
-                key.update(std.mem.asBytes(&light.color));
-                key.update(std.mem.asBytes(&light.intensity));
-                key.update(std.mem.asBytes(&light.range));
-                key.update(std.mem.asBytes(&light.inner_angle));
-                key.update(std.mem.asBytes(&light.outer_angle));
-                key.update(std.mem.asBytes(&light.source_radius));
-                key.update(&.{@intFromEnum(light.kind)});
-            }
-            key.update(std.mem.asBytes(&settings.path_tracing_bounces));
-            key.update(std.mem.asBytes(&settings.path_tracing_clamp));
-            const path_key = key.final();
-            if (path_key != view_data.path_key) {
-                view_data.path_key = path_key;
-                view_data.path_gathered = 0;
-            }
-            const camera_moved = !std.meta.eql(view_data.path_camera, desc.camera);
-            const previous_eye = view_data.path_camera.position;
-            view_data.path_camera = desc.camera;
-            // This frame is written beside the last, which it reads.
-            std.mem.swap(?rhi.Texture, &view_data.path_accum, &view_data.path_accum_old);
-            std.mem.swap(?rhi.Texture, &view_data.path_guide, &view_data.path_guide_old);
-            const accum = view_data.path_accum.?;
-            cmd.beginScope("path tracing");
-            const guide = view_data.path_guide.?;
-            try cmd.beginRendering(.{ .color = &.{ .{ .texture = accum, .load = .discard }, .{ .texture = guide, .load = .discard } } });
-            cmd.bindPipeline(self.pipelines.path_trace);
-            cmd.pushConstants(extern struct { frame: u64, scene: u64, scene_instances: u64, mesh_nodes: u64, mesh_items: u64, gathered: u32, bounces: u32, samples: u32, clamp_radiance: f32, sun_radius: f32, light_count: u32, glowing: u64, glowing_count: u32, history_color: u32, history_guide: u32, moved: u32, previous_camera: [3]f32, reset: u32 }{
-                .frame = frame_address,
-                .scene = where,
-                .scene_instances = instances_address,
-                .mesh_nodes = device.bufferAddress(self.bvh_nodes.buffer),
-                .mesh_items = device.bufferAddress(self.bvh_items.buffer),
-                .gathered = view_data.path_gathered,
-                .bounces = std.math.clamp(settings.path_tracing_bounces, 1, 16),
-                .samples = std.math.clamp(settings.path_tracing_samples, 1, 64),
-                .clamp_radiance = @max(settings.path_tracing_clamp, 0.01),
-                // The sun as seen from the ground, about half a degree across.
-                .sun_radius = 0.0047,
-                .light_count = 256,
-                .glowing = scene_frame.glowing,
-                .glowing_count = scene_frame.glowing_count,
-                .history_color = device.textureIndex(view_data.path_accum_old.?),
-                .history_guide = device.textureIndex(view_data.path_guide_old.?),
-                .moved = @intFromBool(camera_moved),
-                .previous_camera = previous_eye,
-                .reset = @intFromBool(view_data.path_gathered == 0),
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(accum, .shader_read);
-            cmd.transition(guide, .shader_read);
-            if (settings.path_tracing_denoise) {
-                // The grain cleared in two runs, the second reaching
-                // further; see pathtrace_denoise.frag.
-                const filtered = view_data.path_filtered.?;
-                const DenoisePush = extern struct { frame: u64, color: u32, guide: u32, depth: u32, step_size: i32, gathered: u32, last: u32 };
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = filtered, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.path_denoise);
-                cmd.pushConstants(DenoisePush{ .frame = frame_address, .color = device.textureIndex(accum), .guide = device.textureIndex(guide), .depth = device.textureIndex(view.depth), .step_size = 1, .gathered = view_data.path_gathered, .last = 0 });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(filtered, .shader_read);
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.path_denoise_final);
-                cmd.pushConstants(DenoisePush{ .frame = frame_address, .color = device.textureIndex(filtered), .guide = device.textureIndex(guide), .depth = device.textureIndex(view.depth), .step_size = 3, .gathered = view_data.path_gathered, .last = 1 });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-            } else {
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .discard }} });
-                // No smoothing, but the surfaces' color is still to be put
-                // back on the light that was gathered without it.
-                cmd.bindPipeline(self.pipelines.path_denoise_final);
-                cmd.pushConstants(extern struct { frame: u64, color: u32, guide: u32, depth: u32, step_size: i32, gathered: u32, last: u32 }{ .frame = frame_address, .color = device.textureIndex(accum), .guide = device.textureIndex(guide), .depth = device.textureIndex(view.depth), .step_size = 1, .gathered = view_data.path_gathered, .last = 2 });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-            }
-            cmd.transition(view.hdr, .shader_read);
-            cmd.endScope();
-            // Past a few thousand frames another changes nothing that
-            // the picture's numbers can hold.
-            view_data.path_gathered = @min(view_data.path_gathered + 1, 8192);
-            self.stats.path_traced_frames = view_data.path_gathered;
-            self.stats.path_tracing_hardware = device.ray_tracing;
-            path_traced = true;
-        }
-
-        var resolved = view.hdr;
-        // A path-traced picture is already an average over frames.
-        if (settings.temporal_antialiasing and !debugging and !path_traced) {
-            cmd.beginScope("temporal antialiasing");
-            const current = view.history[@intCast(view_data.frames & 1)];
-            const previous = view.history[@intCast((view_data.frames + 1) & 1)];
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = current, .load = .discard }} });
-            cmd.bindPipeline(self.pipelines.taa);
-            cmd.pushConstants(extern struct { frame: u64, color: u32, history: u32, motion: u32, depth: u32, history_valid: u32, pad: u32 = 0 }{
-                .frame = frame_address,
-                .color = device.textureIndex(view.hdr),
-                .history = device.textureIndex(previous),
-                .motion = device.textureIndex(view.motion),
-                .depth = device.textureIndex(view.depth),
-                .history_valid = @intFromBool(view.history_valid),
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(current, .shader_read);
-            cmd.endScope();
-            resolved = current;
-            view.history_valid = true;
-        } else {
-            view.history_valid = false;
-        }
-
-        // ------------------------------------------------------------ lens
-        // Depth of field, then motion blur, each into its own target. They
-        // come after antialiasing so the history stays sharp.
-        if (view.lens) |lens| if (!debugging) {
-            const scale = @as(f32, @floatFromInt(height)) / 1080.0;
-            if (settings.dof_aperture > 0) {
-                cmd.beginScope("depth of field");
-                const focus: f32 = if (settings.dof_autofocus) -1 else @max(settings.dof_focus_distance, desc.camera.near);
-                const strength = settings.dof_aperture * 24 * scale;
-                const max_radius = @max(settings.dof_max_blur, 1) * scale;
-                // Gathered straight into the full-size target, or into a
-                // smaller one that is then joined with the sharp picture.
-                const gather_target = view.dof_reduced orelse lens[0];
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = gather_target, .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.dof);
-                cmd.pushConstants(extern struct { frame: u64, color: u32, depth: u32, focus: f32, strength: f32, max_radius: f32, taps: i32, blades: u32, pad: u32 = 0 }{
-                    .frame = frame_address,
-                    .color = device.textureIndex(resolved),
-                    .depth = device.textureIndex(view.depth),
-                    .focus = focus,
-                    .strength = strength,
-                    .max_radius = max_radius,
-                    .taps = @intCast(std.math.clamp(settings.dof_samples, 4, 128)),
-                    .blades = @min(settings.dof_blades, 16),
-                });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(gather_target, .shader_read);
-                if (view.dof_reduced) |reduced| {
-                    try cmd.beginRendering(.{ .color = &.{.{ .texture = lens[0], .load = .discard }} });
-                    cmd.bindPipeline(self.pipelines.dof_composite);
-                    cmd.pushConstants(extern struct { frame: u64, color: u32, blurred: u32, depth: u32, focus: f32, strength: f32, max_radius: f32 }{
-                        .frame = frame_address,
-                        .color = device.textureIndex(resolved),
-                        .blurred = device.textureIndex(reduced),
-                        .depth = device.textureIndex(view.depth),
-                        .focus = focus,
-                        .strength = strength,
-                        .max_radius = max_radius,
-                    });
-                    cmd.drawFullscreen();
-                    cmd.endRendering();
-                    cmd.transition(lens[0], .shader_read);
-                }
-                cmd.endScope();
-                resolved = lens[0];
-            }
-            if (settings.motion_blur > 0) {
-                cmd.beginScope("motion blur");
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = lens[1], .load = .discard }} });
-                cmd.bindPipeline(self.pipelines.motion_blur);
-                cmd.pushConstants(extern struct { frame: u64, color: u32, motion: u32, shutter: f32, max_length: f32, taps: i32, spread: u32 }{
-                    .frame = frame_address,
-                    .color = device.textureIndex(resolved),
-                    .motion = device.textureIndex(view.motion),
-                    .shutter = std.math.clamp(settings.motion_blur, 0, 2),
-                    .max_length = 0.06,
-                    .taps = @intCast(std.math.clamp(settings.motion_blur_samples, 2, 64)),
-                    .spread = @intFromBool(settings.motion_blur_spread),
-                });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(lens[1], .shader_read);
-                cmd.endScope();
-                resolved = lens[1];
-            }
-        };
-
-        // ----------------------------------------------------------- bloom
-        cmd.beginScope("bloom");
-        const BloomPush = extern struct { frame: u64, source: u32, first_level: u32, source_texel: [2]f32 };
-        var source = resolved;
-        const bloom_count: usize = std.math.clamp(settings.bloom_levels, 1, bloom_levels);
-        for (view.bloom[0..bloom_count], 0..) |level, index| {
-            const source_info = device.textureInfo(source);
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = level, .load = .discard }} });
-            cmd.bindPipeline(self.pipelines.bloom_down);
-            cmd.pushConstants(BloomPush{
-                .frame = frame_address,
-                .source = device.textureIndex(source),
-                .first_level = @intFromBool(index == 0),
-                .source_texel = .{ 1.0 / @as(f32, @floatFromInt(source_info.width)), 1.0 / @as(f32, @floatFromInt(source_info.height)) },
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(level, .shader_read);
-            source = level;
-        }
-        cmd.endScope();
-
-        // The smallest level doubles as the luminance meter. It is read
-        // before the upsample chain, which never writes to it.
-        cmd.beginScope("exposure");
-        cmd.bindPipeline(self.pipelines.exposure);
-        cmd.pushConstants(extern struct {
-            frame: u64,
-            source: u32,
-            automatic: u32,
-            compensation: f32,
-            min_luminance: f32,
-            max_luminance: f32,
-            speed: f32,
-            reset: u32,
-            depth: u32,
-            focus_speed: f32,
-            pad: u32 = 0,
-        }{
-            .frame = frame_address,
-            .source = device.textureIndex(view.bloom[bloom_count - 1]),
-            .automatic = @intFromBool(settings.automatic_exposure),
-            .compensation = std.math.pow(f32, 2, settings.exposure_compensation),
-            .min_luminance = 0.002,
-            .max_luminance = 64,
-            .speed = 1.6,
-            .reset = @intFromBool(view_data.exposure_reset),
-            .depth = device.textureIndex(view.depth),
-            .focus_speed = @max(settings.dof_autofocus_speed, 0.01),
-        });
-        cmd.dispatch(1, 1, 1);
-        cmd.sync(.compute_to_all);
-        view_data.exposure_reset = false;
-        cmd.endScope();
-
-        if (settings.bloom > 0) {
-            cmd.beginScope("bloom upsample");
-            var level: usize = bloom_count - 1;
-            while (level > 0) : (level -= 1) {
-                const source_info = device.textureInfo(view.bloom[level]);
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = view.bloom[level - 1], .load = .load }} });
-                cmd.bindPipeline(self.pipelines.bloom_up);
-                cmd.pushConstants(BloomPush{
-                    .frame = frame_address,
-                    .source = device.textureIndex(view.bloom[level]),
-                    .first_level = 0,
-                    .source_texel = .{ 1.0 / @as(f32, @floatFromInt(source_info.width)), 1.0 / @as(f32, @floatFromInt(source_info.height)) },
-                });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(view.bloom[level - 1], .shader_read);
-            }
-            cmd.endScope();
-        }
-
-        // --------------------------------------------------------- tonemap
-        cmd.beginScope("tonemap");
-        if (view.upscaled) |upscaled| {
-            // The scene was rendered at another resolution than the output.
-            cmd.endScope();
-            cmd.beginScope("upscale");
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = upscaled, .load = .discard }} });
-            cmd.bindPipeline(self.pipelines.upscale);
-            cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(resolved) });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(upscaled, .shader_read);
-            cmd.endScope();
-            cmd.beginScope("tonemap");
-            resolved = upscaled;
-        }
-        try cmd.beginRendering(.{ .color = &.{.{ .texture = target, .load = .discard }} });
-        cmd.bindPipeline(try self.tonemapPipeline(target_format));
-        cmd.pushConstants(TonemapPush{
-            .frame = frame_address,
-            .color = device.textureIndex(resolved),
-            .bloom = device.textureIndex(view.bloom[0]),
-            .bloom_strength = settings.bloom,
-            .encode_srgb = self.outputEncoding(desc, target_format),
-            .hdr_paper_white = @max(settings.hdr_paper_white, 1),
-            .hdr_peak = @max(settings.hdr_peak, settings.hdr_paper_white),
-            .sharpen = if (settings.temporal_antialiasing and !debugging) settings.sharpen else 0,
-            .bloom_scale = 1.0 / @as(f32, @floatFromInt(bloom_count)),
-            .passthrough = @intFromBool(debugging),
-            .vignette = if (debugging) 0 else std.math.clamp(settings.vignette, 0, 1),
-            .grain = if (debugging) 0 else @max(settings.film_grain, 0),
-            .saturation = if (debugging) 1 else @max(settings.saturation, 0),
-            .contrast = if (debugging) 1 else std.math.clamp(settings.contrast, 0.25, 4),
-            // Temperature shifts the balance between red and blue.
-            .color_filter = .{
-                settings.color_filter[0] * (1 + 0.25 * std.math.clamp(settings.temperature, -1, 1)),
-                settings.color_filter[1],
-                settings.color_filter[2] * (1 - 0.25 * std.math.clamp(settings.temperature, -1, 1)),
-            },
-            .aberration = if (debugging) 0 else std.math.clamp(settings.chromatic_aberration, 0, 1),
-            .lut = if (debugging) gpu.invalid_id else if (settings.color_lut) |image| image.index else gpu.invalid_id,
-            .lut_strength = std.math.clamp(settings.color_lut_strength, 0, 1),
-            .flare = if (debugging) 0 else @max(settings.lens_flare, 0),
-        });
-        cmd.drawFullscreen();
-        cmd.endRendering();
-        cmd.endScope();
-
-        try self.runPasses(desc, .after_tonemap, .{
-            .cmd = cmd,
-            .device = device,
-            .stage = .after_tonemap,
-            .frame = frame_address,
-            .color = target,
-            .color_format = target_format,
-            .depth = view.depth,
-            .motion = view.motion,
-            .width = output_width,
-            .height = output_height,
-        });
+        // The last steps work on the whole picture; each hands the next
+        // the texture it left its result in.
+        const path_traced = try path_tracing_pass.pathTrace(self, &pass);
+        var resolved = try post_passes.resolveTemporal(self, &pass, path_traced);
+        resolved = try post_passes.lensEffects(self, &pass, resolved);
+        const bloom_count = try post_passes.bloomAndExposure(self, &pass, resolved);
+        try post_passes.tonemapScene(self, &pass, resolved, bloom_count, target, target_format);
+        try self.runPasses(&pass, .after_tonemap, target, target_format, output_width, output_height);
 
         view_data.previous_view_proj = view_proj_unjittered;
         view_data.previous_jitter = jitter;
         view_data.frames += 1;
         view_data.last_frame = self.frame_index;
         if (first_view) {
-            self.stats.instances = @as(u32, @intCast(scene.layout.items.len)) + scene.static_count;
+            self.stats.instances = instance_total;
             self.stats.meshlets = scene.ref_count;
             self.stats.triangles = scene.triangle_count;
             self.stats.skinned_vertices = scene_frame.skinned_vertices;
@@ -11124,33 +8593,34 @@ pub const Renderer = struct {
         return frame_address;
     }
 
-    fn runPasses(self: *Renderer, desc: ViewDesc, stage: PassStage, context: PassContext) !void {
-        _ = self;
+    /// Runs the application's passes for `stage`, which draw into `color`.
+    fn runPasses(self: *Renderer, p: *const ScenePass, stage: PassStage, color: rhi.Texture, color_format: rhi.Format, width: u32, height: u32) !void {
+        const cmd = p.cmd;
         var ran = false;
-        for (desc.passes) |pass| {
+        for (p.desc.passes) |pass| {
             if (pass.stage != stage) continue;
-            context.cmd.beginScope("custom pass");
-            defer context.cmd.endScope();
-            try pass.run(pass.context, context);
+            cmd.beginScope("custom pass");
+            defer cmd.endScope();
+            try pass.run(pass.context, .{
+                .cmd = cmd,
+                .device = self.device,
+                .stage = stage,
+                .frame = p.frame_address,
+                .color = color,
+                .color_format = color_format,
+                .depth = p.view.depth,
+                .motion = p.view.motion,
+                .width = width,
+                .height = height,
+            });
             ran = true;
         }
         if (!ran) return;
         // Whatever the pass attached goes back to being readable.
-        if (stage != .after_tonemap) context.cmd.transition(context.color, .shader_read);
-        context.cmd.transition(context.depth, .shader_read);
-        context.cmd.transition(context.motion, .shader_read);
+        if (stage != .after_tonemap) cmd.transition(color, .shader_read);
+        cmd.transition(p.view.depth, .shader_read);
+        cmd.transition(p.view.motion, .shader_read);
     }
-
-    const Lighting = struct {
-        lights: u64,
-        tiles: u64,
-        light_count: u32,
-        /// Which lights were given shadow tiles, as a hash.
-        tiles_key: u64 = 0,
-        tile_count: u32,
-        tile_view_proj: [max_local_shadow_views]Mat4,
-        tile_views: [max_local_shadow_views]gpu.CullView,
-    };
 
     /// Converts the scene's lights to GPU records and assigns shadow atlas
     /// tiles to the ones that cast shadows.
@@ -11368,19 +8838,7 @@ pub const Renderer = struct {
         for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
             if (!entry.blas_pending) continue;
             entry.blas_pending = false;
-            for (entry.meshes) |mesh| if (mesh.blas) |blas| try cmd.buildBlas(blas, self.blasDesc(mesh));
-        };
-    }
-
-    fn blasDesc(self: *Renderer, mesh: ModelMesh) rhi.BlasDesc {
-        return .{
-            .vertices = self.vertices.buffer,
-            .vertex_offset = @as(u64, mesh.vertex_offset) * @sizeOf(gpu.Vertex),
-            .vertex_count = mesh.vertex_count,
-            .vertex_stride = @sizeOf(gpu.Vertex),
-            .indices = self.indices.buffer,
-            .index_offset = @as(u64, mesh.index_offset) * @sizeOf(u32),
-            .index_count = mesh.lod0_index_count,
+            for (entry.meshes) |mesh| if (mesh.blas) |blas| try cmd.buildBlas(blas, geometry_passes.blasDesc(self, mesh));
         };
     }
 
@@ -11459,409 +8917,6 @@ pub const Renderer = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.scenes.get(scene)) |data| data.gi_bounds = bounds;
-    }
-
-    /// Sizes the probe volume and the top-level acceleration structure for
-    /// this frame. Returns null when global illumination is off, unsupported
-    /// or there is nothing to trace against.
-    fn prepareGi(self: *Renderer, scene: *SceneData, scene_frame: SceneFrame, settings: Settings, camera_position: Vec3) !?*GiVolume {
-        const device = self.device;
-        const pipelines = self.gi_pipelines orelse return null;
-        _ = pipelines;
-        var gi_max_counts: [3]u32 = undefined;
-        inline for (0..3) |axis| gi_max_counts[axis] = std.math.clamp(self.options.gi_max_probes[axis], 2, gi_probe_limit);
-        if (!settings.global_illumination or scene_frame.tlas_count == 0) return null;
-        if (scene.tlas == null or scene.tlas_capacity < scene_frame.tlas_count) {
-            if (scene.tlas) |old| device.destroyAcceleration(old);
-            scene.tlas = null;
-            scene.tlas_capacity = @max(scene_frame.tlas_count * 2, 256);
-            scene.tlas = try device.createTlas(scene.tlas_capacity);
-            scene.tlas_hash = 0;
-        }
-
-        const bounds = scene.gi_bounds orelse scene_frame.bounds;
-        const extent = math.sub(bounds[1], bounds[0]);
-        const wanted = @max(settings.gi_probe_spacing, 0.25);
-        var spacing = wanted;
-        inline for (0..3) |axis| spacing = @max(spacing, extent[axis] / @as(f32, @floatFromInt(gi_max_counts[axis] - 1)));
-        // A scene too large for the probe budget at the wanted spacing
-        // either gets its probes stretched apart, or keeps the spacing and
-        // a grid that moves with the camera.
-        const stretched = spacing;
-        // Only worth a second grid when stretching would cost real detail.
-        const follow = settings.gi_follow_camera and scene.gi_bounds == null and spacing > wanted * settings.gi_follow_threshold;
-        if (follow) spacing = wanted;
-        var cell: [3]i32 = undefined;
-        var counts: [3]u32 = undefined;
-        inline for (0..3) |axis| {
-            // The grid sits on multiples of the spacing, so probes stay in
-            // place in the world when the bounds or the camera move.
-            const first: i32 = @intFromFloat(@floor((bounds[0][axis] + scene.origin[axis]) / spacing));
-            const needed: f32 = @floatCast(@ceil((bounds[1][axis] + scene.origin[axis]) / spacing) - @as(f64, @floatFromInt(first)) + 1);
-            counts[axis] = std.math.clamp(@as(u32, @intFromFloat(@max(needed, 2))), 2, gi_max_counts[axis]);
-            cell[axis] = if (follow and needed > @as(f32, @floatFromInt(gi_max_counts[axis])))
-                @as(i32, @intFromFloat(@floor((camera_position[axis] + scene.origin[axis]) / spacing))) - @as(i32, @intCast(counts[axis] / 2))
-            else
-                first;
-        }
-        const rays_per_probe = std.math.clamp(settings.gi_rays, 16, 256);
-        const main = try self.ensureGiVolume(&scene.gi, scene.origin, cell, counts, spacing, rays_per_probe);
-        if (follow) {
-            // Behind the grid that follows the camera, a coarse one over
-            // the whole scene, so nothing falls back to plain sky light.
-            var coarse_cell: [3]i32 = undefined;
-            var coarse_counts: [3]u32 = undefined;
-            inline for (0..3) |axis| {
-                const first: i32 = @intFromFloat(@floor((bounds[0][axis] + scene.origin[axis]) / stretched));
-                const needed: f32 = @floatCast(@ceil((bounds[1][axis] + scene.origin[axis]) / stretched) - @as(f64, @floatFromInt(first)) + 1);
-                coarse_counts[axis] = std.math.clamp(@as(u32, @intFromFloat(@max(needed, 2))), 2, gi_max_counts[axis]);
-                coarse_cell[axis] = first;
-            }
-            _ = try self.ensureGiVolume(&scene.gi_coarse, scene.origin, coarse_cell, coarse_counts, stretched, rays_per_probe);
-            // Very far apart from the main grid's spacing: a grid between
-            // the two, around the camera.
-            const ratio = stretched / wanted;
-            if (settings.gi_middle_ratio > 0 and ratio > settings.gi_middle_ratio) {
-                const middle_spacing = wanted * @sqrt(ratio);
-                var middle_cell: [3]i32 = undefined;
-                var middle_counts: [3]u32 = undefined;
-                inline for (0..3) |axis| {
-                    const first: i32 = @intFromFloat(@floor((bounds[0][axis] + scene.origin[axis]) / middle_spacing));
-                    const needed: f32 = @floatCast(@ceil((bounds[1][axis] + scene.origin[axis]) / middle_spacing) - @as(f64, @floatFromInt(first)) + 1);
-                    middle_counts[axis] = std.math.clamp(@as(u32, @intFromFloat(@max(needed, 2))), 2, gi_max_counts[axis]);
-                    middle_cell[axis] = if (needed > @as(f32, @floatFromInt(gi_max_counts[axis])))
-                        @as(i32, @intFromFloat(@floor((camera_position[axis] + scene.origin[axis]) / middle_spacing))) - @as(i32, @intCast(middle_counts[axis] / 2))
-                    else
-                        first;
-                }
-                _ = try self.ensureGiVolume(&scene.gi_middle, scene.origin, middle_cell, middle_counts, middle_spacing, rays_per_probe);
-            } else if (scene.gi_middle) |*middle| {
-                middle.deinit(device);
-                scene.gi_middle = null;
-            }
-        } else if (scene.gi_coarse) |*coarse| {
-            coarse.deinit(device);
-            scene.gi_coarse = null;
-            if (scene.gi_middle) |*middle| {
-                middle.deinit(device);
-                scene.gi_middle = null;
-            }
-        }
-        return main;
-    }
-
-    /// Returns the volume in `slot` moved to `cell`, or a new one if the
-    /// grid's shape, spacing or ray count changed.
-    fn ensureGiVolume(self: *Renderer, slot: *?GiVolume, scene_origin: [3]f64, cell: [3]i32, counts: [3]u32, spacing: f32, rays_per_probe: u32) !*GiVolume {
-        const device = self.device;
-        // Cells are counted from the application's world zero in 64 bits,
-        // so the grid stays put however far the scene has been shifted.
-        var origin: Vec3 = undefined;
-        inline for (0..3) |axis| origin[axis] = @floatCast(@as(f64, @floatFromInt(cell[axis])) * spacing - scene_origin[axis]);
-        if (slot.*) |*volume| {
-            const same = std.mem.eql(u32, &volume.counts, &counts) and volume.rays_per_probe == rays_per_probe and
-                @abs(volume.spacing - spacing) < 1e-4;
-            if (same) {
-                // Probes are stored by their world cell modulo the grid
-                // size, so moving the grid keeps every probe that is still
-                // inside it; only the cells that wrapped around are new.
-                inline for (0..3) |axis| volume.shift[axis] = cell[axis] - volume.cell[axis];
-                // A jump that brings in more new probes than it keeps (a
-                // teleport, a cut): the grid settles again at the quick
-                // rate a new one starts with, instead of the steady one.
-                var kept: u64 = 1;
-                var total: u64 = 1;
-                inline for (0..3) |axis| {
-                    kept *= counts[axis] -| @abs(volume.shift[axis]);
-                    total *= counts[axis];
-                }
-                if (kept * 2 < total and volume.frames != 0) volume.frames = 1;
-                volume.cell = cell;
-                volume.origin = origin;
-                return volume;
-            }
-            volume.deinit(device);
-            slot.* = null;
-        }
-        const color = rhi.TextureUsage{ .sampled = true, .color_attachment = true };
-        const tiles_x = counts[0] * counts[2];
-        const probe_count = counts[0] * counts[1] * counts[2];
-        slot.* = .{
-            .origin = origin,
-            .cell = cell,
-            .spacing = spacing,
-            .counts = counts,
-            .rays_per_probe = rays_per_probe,
-            .irradiance = try device.createTexture(.{
-                .name = "gi irradiance",
-                .width = tiles_x * gi_irradiance_texels,
-                .height = counts[1] * gi_irradiance_texels,
-                .format = hdr_format,
-                .usage = color,
-            }),
-            .irradiance_fast = try device.createTexture(.{
-                .name = "gi irradiance (fast)",
-                .width = tiles_x * gi_irradiance_texels,
-                .height = counts[1] * gi_irradiance_texels,
-                .format = hdr_format,
-                .usage = color,
-            }),
-            .visibility = try device.createTexture(.{
-                .name = "gi visibility",
-                .width = tiles_x * gi_visibility_texels,
-                .height = counts[1] * gi_visibility_texels,
-                .format = .rg16_float,
-                .usage = color,
-            }),
-            .offsets = .{
-                try device.createTexture(.{ .name = "gi probe offsets", .width = tiles_x, .height = counts[1], .format = .rgba16_float, .usage = color }),
-                try device.createTexture(.{ .name = "gi probe offsets", .width = tiles_x, .height = counts[1], .format = .rgba16_float, .usage = color }),
-            },
-            .rays = try device.createBuffer(.{
-                .name = "gi rays",
-                .size = @as(u64, probe_count) * rays_per_probe * @sizeOf([4]f32),
-                .usage = .{ .storage = true },
-            }),
-        };
-        return &slot.*.?;
-    }
-
-    /// Traces this frame's probe rays and blends them into the atlases.
-    fn updateGi(
-        self: *Renderer,
-        cmd: *rhi.CommandEncoder,
-        scene: *SceneData,
-        volume: *GiVolume,
-        scene_frame: SceneFrame,
-        frame_address: u64,
-        settings: Settings,
-        grid_index: u32,
-    ) !void {
-        const device = self.device;
-        const pipelines = self.gi_pipelines.?;
-        cmd.beginScope("global illumination");
-        defer cmd.endScope();
-        const tlas = scene.tlas.?;
-        // Static geometry rarely changes; rebuild only when the instance
-        // list (transforms, meshes) differs from the last build.
-        if (scene.tlas_hash != scene_frame.tlas_hash) {
-            cmd.buildTlas(tlas, scene_frame.tlas_instances, scene_frame.tlas_count);
-            scene.tlas_hash = scene_frame.tlas_hash;
-        }
-
-        // A new rotation every frame turns a small fixed ray set into
-        // full coverage of the sphere over time. The rotations follow a
-        // sequence that fills the space of rotations evenly rather than
-        // at random, so that what the probes average over a second
-        // or two has fewer gaps and clumps and wanders less.
-        const turn: f64 = @floatFromInt(self.frame_index + 1);
-        const first: f32 = @floatCast(@mod(turn * 0.8191725133961645, 1.0));
-        const second: f32 = @floatCast(@mod(turn * 0.6710436067037893, 1.0));
-        const third: f32 = @floatCast(@mod(turn * 0.5497004779019703, 1.0));
-        const rotation = math.fromQuat(.{
-            @sqrt(1 - first) * @sin(std.math.tau * second),
-            @sqrt(1 - first) * @cos(std.math.tau * second),
-            @sqrt(first) * @sin(std.math.tau * third),
-            @sqrt(first) * @cos(std.math.tau * third),
-        });
-        const rotation_columns = [3][4]f32{ rotation[0..4].*, rotation[4..8].*, rotation[8..12].* };
-        // Distances beyond the neighbouring probes do not matter to the
-        // visibility test; clamping keeps the moments well conditioned.
-        const max_distance = volume.spacing * 1.75 * 1.5;
-        const probe_count = volume.probeCount();
-        // Once converged, a quarter of the probes are refreshed per frame.
-        // When the grid moved, every probe is traced this frame so the ones
-        // that just came into range have data at once.
-        const moved = volume.shift[0] != 0 or volume.shift[1] != 0 or volume.shift[2] != 0;
-        const stride: u32 = if (volume.frames < 200 or moved) 1 else std.math.clamp(settings.gi_update_interval, 1, 16);
-        const phase: u32 = @intCast(self.frame_index % stride);
-
-        cmd.bindPipeline(pipelines.trace);
-        cmd.pushConstants(extern struct {
-            frame: u64,
-            rays: u64,
-            tlas: u64,
-            rotation: [3][4]f32,
-            rays_per_probe: u32,
-            probe_count: u32,
-            multibounce: u32,
-            max_distance: f32,
-            probe_stride: u32,
-            probe_phase: u32,
-            grid: u32,
-            skip_buried: u32,
-        }{
-            .frame = frame_address,
-            .rays = device.bufferAddress(volume.rays),
-            .tlas = device.accelerationAddress(tlas),
-            .rotation = rotation_columns,
-            .rays_per_probe = volume.rays_per_probe,
-            .probe_count = probe_count,
-            // Bounce light comes from the probes themselves, which is only
-            // valid once every grid in use has been written at least once.
-            .multibounce = @intFromBool(volume.frames != 0 and
-                (if (scene.gi) |other| other.frames != 0 else true) and
-                (if (scene.gi_coarse) |other| other.frames != 0 else true) and
-                (if (scene.gi_middle) |other| other.frames != 0 else true)),
-            .probe_stride = stride,
-            .probe_phase = phase,
-            .grid = grid_index,
-            .skip_buried = @intFromBool(settings.gi_skip_buried_probes),
-            .max_distance = 1000,
-        });
-        cmd.dispatch((((probe_count + stride - 1) / stride) * volume.rays_per_probe + 63) / 64, 1, 1);
-        cmd.sync(.compute_to_all);
-
-        // Converge quickly at first, then favour stability.
-        // A probe refreshed every `stride` frames blends correspondingly more
-        // per update, so the response over time stays the same.
-        // Each update counts for less as more have been gathered, twice
-        // what an even average would give it (the early ones saw probes
-        // that had not yet caught any bounced light), until the steady
-        // rate is reached.
-        const settled = std.math.pow(f32, std.math.clamp(settings.gi_hysteresis, 0, 0.999), @floatFromInt(stride));
-        const gathered: f32 = @floatFromInt(volume.frames);
-        const hysteresis: f32 = if (volume.frames == 0) 0 else @min(settled, @max(0.8, 1 - 2 / (gathered + 2)));
-        const UpdatePush = extern struct {
-            frame: u64,
-            rays: u64,
-            rotation: [3][4]f32,
-            rays_per_probe: u32,
-            hysteresis: f32,
-            max_distance: f32,
-            probe_stride: u32,
-            probe_phase: u32,
-            fast_hysteresis: f32,
-            /// Grid cells the volume moved by; probes that wrapped around
-            /// start over instead of blending with stale data.
-            shift: [3]i32,
-            grid: u32,
-        };
-        const RelocatePush = extern struct { update: UpdatePush, previous_offsets: u32, pad: [3]u32 = .{ 0, 0, 0 } };
-        const update_push = UpdatePush{
-            .frame = frame_address,
-            .rays = device.bufferAddress(volume.rays),
-            .rotation = rotation_columns,
-            .rays_per_probe = volume.rays_per_probe,
-            .hysteresis = hysteresis,
-            .max_distance = max_distance,
-            .probe_stride = stride,
-            .probe_phase = phase,
-            .fast_hysteresis = if (volume.frames == 0) 0 else 0.9,
-            .shift = volume.shift,
-            .grid = grid_index,
-        };
-        // The first update overwrites; clearing avoids blending with
-        // whatever the fresh texture happened to contain.
-        const load: rhi.LoadOp = if (volume.frames == 0) .clear else .load;
-        try cmd.beginRendering(.{ .color = &.{
-            .{ .texture = volume.irradiance, .load = load },
-            .{ .texture = volume.irradiance_fast, .load = load },
-        } });
-        cmd.bindPipeline(pipelines.irradiance);
-        cmd.pushConstants(update_push);
-        cmd.drawFullscreen();
-        cmd.endRendering();
-        cmd.transition(volume.irradiance_fast, .shader_read);
-        // The steady average may not drift further from the fast one than
-        // sampling noise explains; beyond that the light really changed
-        // and it is pulled along at once.
-        const tolerance = std.math.clamp(settings.gi_change_tolerance, 0, 4);
-        if (tolerance > 0 and volume.frames != 0) {
-            const ClampPush = extern struct { frame: u64, fast: u32, scale: f32, offset: f32, pad: u32 = 0 };
-            for ([_]rhi.Pipeline{ pipelines.clamp_upper, pipelines.clamp_lower }, [_]f32{ 1, -1 }) |pipeline, sign| {
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = volume.irradiance, .load = .load }} });
-                cmd.bindPipeline(pipeline);
-                cmd.pushConstants(ClampPush{
-                    .frame = frame_address,
-                    .fast = device.textureIndex(volume.irradiance_fast),
-                    .scale = @max(1 + sign * tolerance, 0),
-                    .offset = sign * 0.002,
-                });
-                cmd.drawFullscreen();
-                cmd.endRendering();
-            }
-        }
-        cmd.transition(volume.irradiance, .shader_read);
-        try cmd.beginRendering(.{ .color = &.{.{ .texture = volume.visibility, .load = load }} });
-        cmd.bindPipeline(pipelines.visibility);
-        cmd.pushConstants(update_push);
-        cmd.drawFullscreen();
-        cmd.endRendering();
-        cmd.transition(volume.visibility, .shader_read);
-        if (settings.gi_probe_relocation) {
-            // The rays just traced say where each probe stands; the
-            // offsets take effect from the next frame's trace on.
-            const read = volume.offsets[volume.offset_turn];
-            const write = volume.offsets[1 - volume.offset_turn];
-            if (!volume.offsets_valid) {
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = read, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
-                cmd.endRendering();
-                cmd.transition(read, .shader_read);
-            }
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = write, .load = .discard }} });
-            cmd.bindPipeline(pipelines.relocate);
-            var relocate_push = RelocatePush{ .update = update_push, .previous_offsets = device.textureIndex(read) };
-            relocate_push.update.grid = grid_index;
-            cmd.pushConstants(relocate_push);
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(write, .shader_read);
-            volume.offset_turn = 1 - volume.offset_turn;
-            volume.offsets_valid = true;
-        } else volume.offsets_valid = false;
-        volume.frames +|= 1;
-        self.stats.gi_probes = probe_count;
-    }
-
-    fn drawVisibility(self: *Renderer, cmd: *rhi.CommandEncoder, push: anytype, view_index: usize, max_draws: u32) void {
-        cmd.bindIndexBuffer(self.indices.buffer, 0, .uint32);
-        cmd.pushConstants(push);
-        const counts_offset = view_index * 2 * @sizeOf(u32);
-        cmd.bindPipeline(self.pipelines.visibility);
-        cmd.drawIndexedIndirectCount(self.cull_commands.?, self.commandOffset(view_index, 0), self.cull_counts, counts_offset, max_draws);
-        cmd.bindPipeline(self.pipelines.visibility_masked);
-        cmd.drawIndexedIndirectCount(self.cull_commands.?, self.commandOffset(view_index, 1), self.cull_counts, counts_offset + @sizeOf(u32), max_draws);
-    }
-
-    /// Reduces the depth buffer into a mip chain of farthest depths.
-    fn buildDepthPyramid(self: *Renderer, cmd: *rhi.CommandEncoder, view: *ViewState) !void {
-        const device = self.device;
-        const Push = extern struct { source: u32, sampler: u32, first: u32, source_lod: i32, texel: [2]f32 };
-        const sampler = device.samplerIndex(self.sampler_nearest_clamp);
-        cmd.transition(view.depth, .shader_read);
-        for (0..view.hiz_mips) |mip| {
-            if (mip != 0) cmd.transitionMip(view.hiz, @intCast(mip - 1), .shader_read);
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hiz, .mip = @intCast(mip), .load = .discard }} });
-            cmd.bindPipeline(self.pipelines.hiz);
-            cmd.pushConstants(Push{
-                .source = device.textureIndex(if (mip == 0) view.depth else view.hiz),
-                .sampler = sampler,
-                .first = @intFromBool(mip == 0),
-                .source_lod = if (mip == 0) 0 else @intCast(mip - 1),
-                .texel = .{ 1.0 / @as(f32, @floatFromInt(view.hiz_width)), 1.0 / @as(f32, @floatFromInt(view.hiz_height)) },
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-        }
-        cmd.transition(view.hiz, .shader_read);
-    }
-
-    fn commandOffset(self: *const Renderer, view_index: usize, bucket: usize) u64 {
-        return (@as(u64, view_index) * 2 + bucket) * self.cull_capacity * @sizeOf(gpu.DrawCommand);
-    }
-
-    fn tonemapPipeline(self: *Renderer, format: rhi.Format) !rhi.Pipeline {
-        for (self.tonemap_pipelines.items) |entry| if (entry.format == format) return entry.pipeline;
-        const pipeline = try self.device.createGraphicsPipeline(.{
-            .name = "tonemap",
-            .vertex = shaderCode("fullscreen.vert.spv"),
-            .fragment = shaderCode("tonemap.frag.spv"),
-            .color_targets = &.{.{ .format = format }},
-            .cull = .none,
-        });
-        try self.tonemap_pipelines.append(self.gpa, .{ .format = format, .pipeline = pipeline });
-        return pipeline;
     }
 };
 
@@ -11981,7 +9036,7 @@ fn createPipelines(device: *rhi.Device) !Pipelines {
             .cull = .none,
         }),
         .gtao = try Local.pass(device, "gtao", shaderCode("gtao.frag.spv"), &.{ .{ .format = .rg16_float }, .{ .format = .rgba16_float } }),
-        .gtao_bounce_denoise = try Local.pass(device, "gtao bounce denoise", shaderCode("gtao_bounce_denoise.frag.spv"), &.{.{ .format = .rgba16_float }}),
+        .gtao_bounce_denoise = try Local.pass(device, "gtao bounce denoise", shaderCode("gtao_bounce_denoise.frag.spv"), &.{ .{ .format = .r16_float }, .{ .format = .rgba16_float } }),
         .ao_depth = try Local.pass(device, "ao depth", shaderCode("ao_depth.frag.spv"), &.{.{ .format = .r16_float }}),
         .gi_gather = try Local.pass(device, "gi gather", shaderCode("gi_gather.frag.spv"), &.{.{ .format = hdr_format }}),
         .gtao_denoise = try Local.pass(device, "gtao denoise", shaderCode("gtao_denoise.frag.spv"), &.{.{ .format = .r16_float }}),
@@ -12106,7 +9161,7 @@ fn createPipelines(device: *rhi.Device) !Pipelines {
 const CullKind = enum { perspective, shadow };
 
 /// Extracts world-space culling planes (normals pointing inward).
-fn cullView(view_proj: Mat4, camera_position: Vec3, kind: CullKind) gpu.CullView {
+pub fn cullView(view_proj: Mat4, camera_position: Vec3, kind: CullKind) gpu.CullView {
     const row = struct {
         fn get(m: Mat4, index: usize) [4]f32 {
             return .{ m[index], m[4 + index], m[8 + index], m[12 + index] };
@@ -12160,7 +9215,9 @@ const CascadeCache = struct {
 /// motion between refreshes stays inside the rendered area.
 const cascade_margin = [gpu.cascade_count]f32{ 1.0, 1.05, 1.08, 1.12 };
 
-const Cascades = struct {
+/// The sun's shadow cascades: the matrix of each, where it ends along the
+/// view and the area it covers.
+pub const Cascades = struct {
     /// World-space bounding sphere each map covers (`radii` includes the
     /// reuse margin, `tight_radii` does not).
     centers: [gpu.cascade_count]Vec3,
@@ -12174,7 +9231,7 @@ const Cascades = struct {
 /// Fits each cascade to a bounding sphere of its frustum slice and snaps it
 /// to shadow-map texels, so the shadow does not shimmer as the camera moves
 /// or rotates.
-fn computeCascades(camera: Camera, view_matrix: Mat4, aspect: f32, sun_travel: Vec3, shadow_distance: f32, shadow_resolution: u32, count: u32) Cascades {
+pub fn computeCascades(camera: Camera, view_matrix: Mat4, aspect: f32, sun_travel: Vec3, shadow_distance: f32, shadow_resolution: u32, count: u32) Cascades {
     const active: usize = std.math.clamp(count, 1, gpu.cascade_count);
     var result: Cascades = undefined;
     const inv_view = math.inverse(view_matrix);
@@ -12336,11 +9393,12 @@ fn createGiPipelines(device: *rhi.Device) !GiPipelines {
     };
 }
 
-/// Shader code by name: what `reloadShaders` last compiled, or else what
-/// was built into the program.
+/// Shaders that `reloadShaders` has compiled, by name.
 var shader_overrides: std.StringHashMapUnmanaged([]u8) = .empty;
 
-fn shaderCode(comptime name: []const u8) []const u8 {
+/// Shader code by name: what `reloadShaders` last compiled, or else what
+/// was built into the program.
+pub fn shaderCode(comptime name: []const u8) []const u8 {
     if (shader_overrides.get(name)) |code| return code;
     return @embedFile(name);
 }

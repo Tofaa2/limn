@@ -46,6 +46,8 @@ const Block = struct {
     mapped: ?[*]u8,
     live_allocations: u32 = 0,
     active: bool = true,
+    /// Always has room for one more range per live allocation, so that
+    /// freeing never has to allocate.
     free_ranges: std.ArrayList(Range) = .empty,
 };
 
@@ -151,7 +153,7 @@ pub const Allocator = struct {
         };
         const memory = try self.allocateMemory(block_size, memory_type);
         errdefer self.device.freeMemory(memory, null);
-        const new_block = Block{
+        var new_block = Block{
             .memory = memory,
             .size = block_size,
             .memory_type = memory_type,
@@ -161,14 +163,17 @@ pub const Allocator = struct {
             else
                 null,
         };
+        // The first allocation sits at the start of the block; room is kept
+        // for the range that freeing it will record.
+        new_block.cursor = requirements.size;
+        new_block.live_allocations = 1;
+        try new_block.free_ranges.ensureUnusedCapacity(self.allocator, 1);
+        errdefer new_block.free_ranges.deinit(self.allocator);
         if (index == self.blocks.items.len)
             try self.blocks.append(self.allocator, new_block)
         else
             self.blocks.items[index] = new_block;
-        const block = &self.blocks.items[index];
-        const offset = (try self.allocateFromBlock(block, requirements)) orelse unreachable;
-        block.live_allocations = 1;
-        return blockAllocation(block, index, offset, requirements.size);
+        return blockAllocation(&self.blocks.items[index], index, 0, requirements.size);
     }
 
     /// Releases an allocation. The resource bound to it must already be
@@ -188,8 +193,8 @@ pub const Allocator = struct {
                 block.mapped = null;
                 return;
             }
-            block.free_ranges.append(self.allocator, .{ .offset = allocation.offset, .size = allocation.size }) catch
-                @panic("GPU allocator could not record a freed range");
+            // Room was set aside when the range was handed out.
+            block.free_ranges.appendAssumeCapacity(.{ .offset = allocation.offset, .size = allocation.size });
             coalesce(block);
             return;
         }
@@ -215,11 +220,14 @@ pub const Allocator = struct {
     }
 
     fn allocateFromBlock(self: *Allocator, block: *Block, requirements: vk.MemoryRequirements) !?u64 {
+        // Taking a range adds at most one to the list on balance, and each
+        // live allocation, this one included, adds one more when it is
+        // freed. Reserving for all of that now is what lets `free` not fail.
+        try block.free_ranges.ensureUnusedCapacity(self.allocator, block.live_allocations + 2);
         for (block.free_ranges.items, 0..) |range, index| {
             const offset = std.mem.alignForward(u64, range.offset, requirements.alignment);
             const padding = offset - range.offset;
             if (padding + requirements.size > range.size) continue;
-            try block.free_ranges.ensureUnusedCapacity(self.allocator, 2);
             _ = block.free_ranges.orderedRemove(index);
             if (padding != 0) block.free_ranges.appendAssumeCapacity(.{ .offset = range.offset, .size = padding });
             const suffix_offset = offset + requirements.size;
@@ -232,7 +240,7 @@ pub const Allocator = struct {
         // Alignment padding is recorded so it can be reused and so that
         // freeing every allocation leaves the block fully coalesced.
         if (offset != block.cursor)
-            try block.free_ranges.append(self.allocator, .{ .offset = block.cursor, .size = offset - block.cursor });
+            block.free_ranges.appendAssumeCapacity(.{ .offset = block.cursor, .size = offset - block.cursor });
         block.cursor = offset + requirements.size;
         return offset;
     }

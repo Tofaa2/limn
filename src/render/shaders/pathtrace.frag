@@ -118,7 +118,7 @@ Surface surfaceAt(FrameConstants frame, TraceHit hit, vec3 origin, vec3 directio
     mat3 normal_matrix = transpose(inverse(mat3(instance.transform)));
     surface.flat_normal = normalize(normal_matrix * cross(v1.position - v0.position, v2.position - v0.position));
     if (dot(surface.flat_normal, direction) > 0.0) surface.flat_normal = -surface.flat_normal;
-    surface.normal = normalize(normal_matrix * (v0.normal * lambda.x + v1.normal * lambda.y + v2.normal * lambda.z));
+    surface.normal = normalize(normal_matrix * (vertexNormal(v0) * lambda.x + vertexNormal(v1) * lambda.y + vertexNormal(v2) * lambda.z));
     if (dot(surface.normal, surface.flat_normal) < 0.0) surface.normal = -surface.normal;
     surface.position = origin + direction * hit.t;
 

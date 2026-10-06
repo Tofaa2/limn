@@ -215,8 +215,8 @@ void main() {
     vec3 world_position = w0 * lambda.x + w1 * lambda.y + w2 * lambda.z;
     mat3 normal_matrix = normalMatrix(instance.transform);
     vec3 geometric_normal = normalize(normal_matrix * cross(v1.position - v0.position, v2.position - v0.position));
-    vec3 normal = normalize(normal_matrix * (v0.normal * lambda.x + v1.normal * lambda.y + v2.normal * lambda.z));
-    vec4 tangent_object = v0.tangent * lambda.x + v1.tangent * lambda.y + v2.tangent * lambda.z;
+    vec3 normal = normalize(normal_matrix * (vertexNormal(v0) * lambda.x + vertexNormal(v1) * lambda.y + vertexNormal(v2) * lambda.z));
+    vec4 tangent_object = vertexTangent(v0) * lambda.x + vertexTangent(v1) * lambda.y + vertexTangent(v2) * lambda.z;
     vec3 tangent = mat3(instance.transform) * tangent_object.xyz;
 
     vec3 view_direction = normalize(frame.camera_position - world_position);

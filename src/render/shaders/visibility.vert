@@ -5,7 +5,9 @@
 // from the global buffers using the draw's meshlet reference.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
-    uint pad0;
+    // 1 in a shadow pass whose see-through casters go into the tint; the
+    // shadow fragment shaders read it.
+    uint tinted;
     uint pad1;
     mat4 view_proj;
     // Cross-fading between levels of detail: the camera the levels are

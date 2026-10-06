@@ -16,10 +16,12 @@ pub const max_meshlet_vertices = 64;
 /// See `max_meshlet_vertices`.
 pub const max_meshlet_triangles = 124;
 
-/// Vertex layout shared with the shaders (`Vertex` in common.glsl).
-pub const Vertex = extern struct {
+/// A vertex as meshes are read and worked on, every attribute a float.
+/// What reaches the GPU is the packed `Vertex` made from it.
+pub const FullVertex = extern struct {
     position: [3]f32,
     normal: [3]f32,
+    /// The tangent, and in w the side the bitangent is on (1 or -1).
     tangent: [4]f32,
     uv: [2]f32,
     /// Multiplies the material's base color: RGBA8, red in the low byte.
@@ -27,6 +29,70 @@ pub const Vertex = extern struct {
     /// A second set of texture coordinates, for textures that ask for it.
     uv1: [2]f32 = .{ 0, 0 },
 };
+
+/// Vertex layout shared with the shaders (`Vertex` in common.glsl). The
+/// normal and tangent are unit vectors, so each is kept as a point of the
+/// octahedron in two signed 16-bit fractions: a third of the space of
+/// three floats, and exact to a few thousandths of a degree.
+pub const Vertex = extern struct {
+    position: [3]f32,
+    normal: [2]i16,
+    /// The lowest bit of the second number is set when the bitangent is
+    /// on the far side (a glTF tangent with w = -1).
+    tangent: [2]i16,
+    uv: [2]f32,
+    /// Multiplies the material's base color: RGBA8, red in the low byte.
+    color: u32 = 0xffffffff,
+    /// A second set of texture coordinates, for textures that ask for it.
+    uv1: [2]f32 = .{ 0, 0 },
+
+    /// The vertex as the GPU holds it.
+    pub fn pack(full: FullVertex) Vertex {
+        var tangent = packDirection(full.tangent[0..3].*);
+        tangent[1] = (tangent[1] & ~@as(i16, 1)) | @intFromBool(full.tangent[3] < 0);
+        return .{
+            .position = full.position,
+            .normal = packDirection(full.normal),
+            .tangent = tangent,
+            .uv = full.uv,
+            .color = full.color,
+            .uv1 = full.uv1,
+        };
+    }
+
+    /// The normal as a unit vector again.
+    pub fn unpackNormal(self: Vertex) [3]f32 {
+        return unpackDirection(self.normal);
+    }
+};
+
+/// A direction as a point of the octahedron (`packDirection` in
+/// common.glsl). One of no length becomes +X.
+fn packDirection(direction: [3]f32) [2]i16 {
+    const sum = @abs(direction[0]) + @abs(direction[1]) + @abs(direction[2]);
+    if (!(sum > 1e-20)) return .{ 32767, 0 };
+    var point = [2]f32{ direction[0] / sum, direction[1] / sum };
+    if (direction[2] < 0) {
+        // The lower half is folded outward over the corners.
+        const folded = [2]f32{ 1 - @abs(point[1]), 1 - @abs(point[0]) };
+        point = .{ std.math.copysign(folded[0], point[0]), std.math.copysign(folded[1], point[1]) };
+    }
+    return .{
+        @intFromFloat(@round(std.math.clamp(point[0], -1, 1) * 32767)),
+        @intFromFloat(@round(std.math.clamp(point[1], -1, 1) * 32767)),
+    };
+}
+
+fn unpackDirection(point: [2]i16) [3]f32 {
+    var x = @max(@as(f32, @floatFromInt(point[0])) / 32767, -1);
+    var y = @max(@as(f32, @floatFromInt(point[1])) / 32767, -1);
+    const z = 1 - @abs(x) - @abs(y);
+    const fold = @max(-z, 0);
+    x += if (x >= 0) -fold else fold;
+    y += if (y >= 0) -fold else fold;
+    const length = @sqrt(x * x + y * y + z * z);
+    return .{ x / length, y / length, z / length };
+}
 
 /// Per-vertex skinning data (`SkinVertex` in common.glsl).
 pub const SkinVertex = extern struct {
@@ -63,7 +129,7 @@ pub const Meshlet = extern struct {
 };
 
 comptime {
-    std.debug.assert(@sizeOf(Vertex) == 60);
+    std.debug.assert(@sizeOf(Vertex) == 40);
     std.debug.assert(@sizeOf(SkinVertex) == 32);
     std.debug.assert(@sizeOf(Meshlet) == 80);
 }
@@ -1088,7 +1154,7 @@ fn loadNodes(arena: std.mem.Allocator, data: *gltf.Data, model: *Model) !void {
 // ------------------------------------------------------------------- meshes
 
 const FatVertex = extern struct {
-    vertex: Vertex,
+    vertex: FullVertex,
     skin: SkinVertex,
     /// Index of this vertex in the file, before reordering.
     source: u32 = 0,
@@ -1752,7 +1818,7 @@ fn finishMesh(
     var minimum: [3]f32 = @splat(std.math.inf(f32));
     var maximum: [3]f32 = @splat(-std.math.inf(f32));
     for (fat, 0..) |value, index| {
-        vertices[index] = value.vertex;
+        vertices[index] = .pack(value.vertex);
         if (skin) |influences| influences[index] = value.skin;
         inline for (0..3) |axis| {
             minimum[axis] = @min(minimum[axis], value.vertex.position[axis]);
@@ -2198,7 +2264,7 @@ test "procedural meshes become meshlets with generated normals" {
     try std.testing.expectEqual(@as(usize, 1), model.meshes.len);
     try std.testing.expectEqual(@as(usize, 6), model.meshes[0].indices.len);
     // Counter-clockwise in the XZ plane seen from above faces +Y.
-    try std.testing.expectApproxEqAbs(@as(f32, 1), model.meshes[0].vertices[0].normal[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), model.meshes[0].vertices[0].unpackNormal()[1], 1e-4);
 }
 
 test "a cluster hierarchy stays watertight at every cut" {
