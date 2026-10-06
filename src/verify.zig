@@ -366,6 +366,8 @@ pub fn main(init: std.process.Init) !void {
             settings.chromatic_aberration = 0.4;
         } else if (std.mem.eql(u8, arg, "--flare")) {
             settings.lens_flare = 1;
+        } else if (std.mem.eql(u8, arg, "--quality")) {
+            settings = gfx.Settings.preset(std.meta.stringToEnum(gfx.Quality, args.next() orelse return error.MissingArgument) orelse return error.InvalidArgument);
         } else if (std.mem.eql(u8, arg, "--lut")) {
             // "identity" must change nothing; "warm" is a visible grade.
             lut = args.next() orelse return error.MissingArgument;
@@ -652,7 +654,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("renderer started in {d} ms", .{elapsedMs(init.io, renderer_start)});
     defer renderer.deinit();
     const device = renderer.device;
-    std.log.info("device: {s}", .{device.name()});
+    std.log.info("device: {s}, recommended quality {s}", .{ device.name(), @tagName(renderer.recommendedQuality()) });
 
     const target = try device.createTexture(.{
         .name = "output",

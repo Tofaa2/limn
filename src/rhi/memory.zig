@@ -47,7 +47,9 @@ const Block = struct {
     live_allocations: u32 = 0,
     active: bool = true,
     /// Always has room for one more range per live allocation, so that
-    /// freeing never has to allocate.
+    /// freeing never has to allocate: `allocate` reserves it, for the
+    /// allocation it makes and for the range or two that cutting it out
+    /// of a free range leaves behind.
     free_ranges: std.ArrayList(Range) = .empty,
 };
 
@@ -163,8 +165,6 @@ pub const Allocator = struct {
             else
                 null,
         };
-        // The first allocation sits at the start of the block; room is kept
-        // for the range that freeing it will record.
         new_block.cursor = requirements.size;
         new_block.live_allocations = 1;
         try new_block.free_ranges.ensureUnusedCapacity(self.allocator, 1);
@@ -193,7 +193,6 @@ pub const Allocator = struct {
                 block.mapped = null;
                 return;
             }
-            // Room was set aside when the range was handed out.
             block.free_ranges.appendAssumeCapacity(.{ .offset = allocation.offset, .size = allocation.size });
             coalesce(block);
             return;
@@ -220,9 +219,6 @@ pub const Allocator = struct {
     }
 
     fn allocateFromBlock(self: *Allocator, block: *Block, requirements: vk.MemoryRequirements) !?u64 {
-        // Taking a range adds at most one to the list on balance, and each
-        // live allocation, this one included, adds one more when it is
-        // freed. Reserving for all of that now is what lets `free` not fail.
         try block.free_ranges.ensureUnusedCapacity(self.allocator, block.live_allocations + 2);
         for (block.free_ranges.items, 0..) |range, index| {
             const offset = std.mem.alignForward(u64, range.offset, requirements.alignment);
