@@ -70,7 +70,7 @@ void main() {
     float previous_angle = phase + push.spin * pace * max(particle.age - frame.delta_time, 0.0);
 
     vec3 world = particle.position + turn(vertex.position, axis, angle) * size;
-    vec3 normal = turn(vertex.normal, axis, angle);
+    vec3 normal = turn(vertexNormal(vertex), axis, angle);
 
     vec4 color = mix(emitter.color_start, emitter.color_end, t);
     if ((emitter.keys & 1u) != 0u)

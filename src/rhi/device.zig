@@ -720,6 +720,7 @@ pub const Device = struct {
     }
 
     /// Persistently mapped bytes of a `cpu_to_gpu` / `gpu_to_cpu` buffer.
+    /// Panics for a buffer that lives on the GPU only.
     pub fn mapped(self: *Device, buffer: types.Buffer) []u8 {
         const resource = self.bufferResource(buffer);
         return (resource.allocation.mapped orelse @panic("buffer is not host visible"))[0..@intCast(resource.size)];
@@ -896,6 +897,7 @@ pub const Device = struct {
     }
 
     /// Index of the texture in the global `textures[]` shader array.
+    /// Panics unless the texture was created with `.sampled` usage.
     pub fn textureIndex(self: *Device, texture: types.Texture) u32 {
         return self.textureResource(texture).bindless_index orelse @panic("texture was not created with .sampled usage");
     }
@@ -1266,6 +1268,7 @@ pub const Device = struct {
     }
 
     /// Index of the sampler in the global `samplers[]` shader array.
+    /// Panics on a stale or invalid handle.
     pub fn samplerIndex(self: *Device, sampler: types.Sampler) u32 {
         return (self.samplers.get(sampler) orelse @panic("stale or invalid sampler handle")).bindless_index;
     }

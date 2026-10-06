@@ -69,14 +69,45 @@ const uint MATERIAL_BLEND = 4u;
 
 struct Vertex {
     vec3 position;
-    vec3 normal;
-    vec4 tangent;
+    // Unit vectors, each a point of the octahedron in two signed 16-bit
+    // fractions; read them with vertexNormal and vertexTangent.
+    uint normal;
+    uint tangent;
     vec2 uv;
     // Multiplies the base color (RGBA8).
     uint color;
     // A second set of texture coordinates.
     vec2 uv1;
 };
+
+vec3 unpackDirection(uint packed) {
+    vec2 point = unpackSnorm2x16(packed);
+    vec3 direction = vec3(point, 1.0 - abs(point.x) - abs(point.y));
+    // The lower half is folded outward over the corners.
+    float fold = max(-direction.z, 0.0);
+    direction.x += direction.x >= 0.0 ? -fold : fold;
+    direction.y += direction.y >= 0.0 ? -fold : fold;
+    return normalize(direction);
+}
+
+uint packDirection(vec3 direction) {
+    vec2 point = direction.xy / max(abs(direction.x) + abs(direction.y) + abs(direction.z), 1e-20);
+    if (direction.z < 0.0) point = (1.0 - abs(point.yx)) * vec2(point.x >= 0.0 ? 1.0 : -1.0, point.y >= 0.0 ? 1.0 : -1.0);
+    return packSnorm2x16(point);
+}
+
+vec3 vertexNormal(Vertex vertex) {
+    return unpackDirection(vertex.normal);
+}
+
+// The tangent, and in w the side the bitangent is on (1 or -1).
+vec4 vertexTangent(Vertex vertex) {
+    return vec4(unpackDirection(vertex.tangent), (vertex.tangent & 0x10000u) != 0u ? -1.0 : 1.0);
+}
+
+uint packTangent(vec4 tangent) {
+    return (packDirection(tangent.xyz) & ~0x10000u) | (tangent.w < 0.0 ? 0x10000u : 0u);
+}
 
 struct SkinVertex {
     uvec4 joints;

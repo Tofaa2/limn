@@ -54,7 +54,7 @@ int rtTraceMasked(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 directi
     vec3 geometric_normal = normalize(normal_matrix * cross(v1.position - v0.position, v2.position - v0.position));
     bool back_face = dot(geometric_normal, direction) > 0.0;
     if (back_face && (material.flags & MATERIAL_DOUBLE_SIDED) == 0u) return RT_BACK;
-    vec3 normal = normalize(normal_matrix * (v0.normal * lambda.x + v1.normal * lambda.y + v2.normal * lambda.z));
+    vec3 normal = normalize(normal_matrix * (vertexNormal(v0) * lambda.x + vertexNormal(v1) * lambda.y + vertexNormal(v2) * lambda.z));
     if (dot(normal, direction) > 0.0) normal = -normal;
     vec2 uv = v0.uv * lambda.x + v1.uv * lambda.y + v2.uv * lambda.z;
     vec2 uvb = v0.uv1 * lambda.x + v1.uv1 * lambda.y + v2.uv1 * lambda.z;

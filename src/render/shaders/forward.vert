@@ -26,8 +26,9 @@ void main() {
     if (sway != 0.0) world.xyz += swayOffset(sway, instance.transform[3].xyz, world.xyz, push.frame.time);
     mat3 normal_matrix = transpose(inverse(mat3(instance.transform)));
     out_position = world.xyz;
-    out_normal = normal_matrix * vertex.normal;
-    out_tangent = vec4(mat3(instance.transform) * vertex.tangent.xyz, vertex.tangent.w);
+    out_normal = normal_matrix * vertexNormal(vertex);
+    vec4 tangent = vertexTangent(vertex);
+    out_tangent = vec4(mat3(instance.transform) * tangent.xyz, tangent.w);
     out_uv = vertex.uv;
     out_vertex_color = unpackUnorm4x8(vertex.color);
     out_uv1 = vertex.uv1;
