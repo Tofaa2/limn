@@ -78,7 +78,8 @@ fn resolveWithFidelityFx(renderer: *Renderer, p: *const ScenePass, output: rhi.T
     const render_size = [2]u32{ p.width, p.height };
     const output_info = device.textureInfo(output);
     const output_size = [2]u32{ output_info.width, output_info.height };
-    if (output_size[0] <= render_size[0] and output_size[1] <= render_size[1]) return false;
+    const generating = generation == .fsr3 and p.settings.frame_generation and p.fills_backbuffer;
+    if (!generating and output_size[0] <= render_size[0] and output_size[1] <= render_size[1]) return false;
     if (view_data.upscaler) |upscaler| {
         if (upscaler.generation != generation or !std.meta.eql(upscaler.render_size, render_size) or !std.meta.eql(upscaler.output_size, output_size)) {
             // Frames using it may still be in flight.
@@ -116,6 +117,10 @@ fn resolveWithFidelityFx(renderer: *Renderer, p: *const ScenePass, output: rhi.T
         .reset = fresh or !view.history_valid,
     });
     cmd.endScope();
+    if (generating) {
+        renderer.generating = view_data.upscaler;
+        renderer.generating_reset = fresh or !view.history_valid;
+    }
     return true;
 }
 

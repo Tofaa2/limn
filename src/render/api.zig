@@ -826,8 +826,12 @@ pub const Settings = struct {
     /// Scaling of a picture rendered below output size. `.temporal`, `.fsr2`
     /// and `.fsr3` need `temporal_antialiasing`; `.fsr2` and `.fsr3` also need
     /// storage images and `-Dfidelityfx`, else fall back to `.temporal`. `.fsr`
-    /// is FSR 1, sharpened by `sharpen`. No FSR 3 frame generation.
+    /// is FSR 1, sharpened by `sharpen`.
     upscaling: Upscaling = .temporal,
+    /// FSR 3 frame generation: shows a generated picture between every two
+    /// rendered. Needs `.fsr3` upscaling on a view that fills the backbuffer;
+    /// presentation is then vsynced. Draw lists are interpolated with the scene.
+    frame_generation: bool = false,
     /// Screen-space error in pixels at which meshes switch to a coarser LOD; 0
     /// always draws full detail.
     lod_error_pixels: f32 = 1,

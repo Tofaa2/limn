@@ -15,9 +15,10 @@
 //!   Up/Down  the share of the window's size the scene is drawn at
 //!   V        variable-rate shading: flat stretches shaded once for
 //!            every 2 by 2 pixels
+//!   G        FSR 3 frame generation (with 5, in a window)
 //!   A/D      orbit the camera
 //!
-//! `--mode N` (1 to 5), `--scale X`, `--vrs 1`. `--frames N`,
+//! `--mode N` (1 to 5), `--scale X`, `--vrs 1`, `--framegen 1`. `--frames N`,
 //! `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");
@@ -33,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
     var mode: gfx.Upscaling = .fsr3;
     var scale_index: usize = 1;
     var coarse_shading = false;
+    var frame_generation = false;
     {
         var arguments = try init.minimal.args.iterateAllocator(gpa);
         defer arguments.deinit();
@@ -51,6 +53,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
             if (std.mem.eql(u8, argument, "--vrs")) coarse_shading = true;
+            if (std.mem.eql(u8, argument, "--framegen")) frame_generation = true;
         }
     }
     var stage = try Stage.create(init, "Limn upscaling", .{});
@@ -137,6 +140,7 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_UP) and scale_index + 1 < scales.len) scale_index += 1;
         if (stage.keyPressed(glfw.GLFW_KEY_DOWN) and scale_index > 0) scale_index -= 1;
         if (stage.keyPressed(glfw.GLFW_KEY_V)) coarse_shading = !coarse_shading;
+        if (stage.keyPressed(glfw.GLFW_KEY_G)) frame_generation = !frame_generation;
         if (stage.keyDown(glfw.GLFW_KEY_A)) orbit -= tick.dt * 0.6;
         if (stage.keyDown(glfw.GLFW_KEY_D)) orbit += tick.dt * 0.6;
         orbit += tick.dt * 0.04;
@@ -153,9 +157,9 @@ pub fn main(init: std.process.Init) !void {
             .temporal => "Temporal: built from several frames",
             .fsr => "FidelityFX Super Resolution 1",
             .fsr2 => "FidelityFX Super Resolution 2",
-            .fsr3 => "FidelityFX Super Resolution 3 (upscaler)",
+            .fsr3 => if (frame_generation) "FidelityFX Super Resolution 3 with frame generation" else "FidelityFX Super Resolution 3",
         }, .{ 24, 20 }, .{ .size = 20 });
-        try list.text(font, try std.fmt.bufPrint(&text, "drawn at {d} x {d}, shown at {d} x {d}\n{d:.2} ms GPU · shading {d:.2} ms · {d:.0} fps", .{
+        try list.text(font, try std.fmt.bufPrint(&text, "drawn at {d} x {d}, shown at {d} x {d}\n{d:.2} ms GPU · shading {d:.2} ms · {d:.0} fps rendered, {d:.0} shown", .{
             @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(tick.size[0])) * scale))),
             @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(tick.size[1])) * scale))),
             tick.size[0],
@@ -163,8 +167,9 @@ pub fn main(init: std.process.Init) !void {
             stage.gpu_ms,
             shading_ms,
             stage.fps,
+            stage.shown_fps,
         }), .{ 24, 50 }, .{ .size = 15 });
-        try list.text(font, try std.fmt.bufPrint(&text, "1-5 upscaler · Up/Down size · V coarse shading {s} · A/D orbit", .{if (coarse_shading) "on" else "off"}), .{ 24, 100 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
+        try list.text(font, try std.fmt.bufPrint(&text, "1-5 upscaler · Up/Down size · V coarse shading {s} · G frame generation · A/D orbit", .{if (coarse_shading) "on" else "off"}), .{ 24, 100 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
 
         const eye = math.Vec3{ @sin(orbit) * 13, 4.2, @cos(orbit) * 13 };
         try stage.end(try renderer.render(.{
@@ -176,6 +181,7 @@ pub fn main(init: std.process.Init) !void {
                 .settings = .{
                     .render_scale = scale,
                     .upscaling = mode,
+                    .frame_generation = frame_generation,
                     .variable_rate_shading = coarse_shading,
                     .shadow_distance = 45,
                     .global_illumination = false,

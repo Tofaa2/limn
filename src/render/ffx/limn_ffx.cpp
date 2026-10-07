@@ -2,14 +2,16 @@
 #include "limn_ffx.h"
 
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
+#include <FidelityFX/host/ffx_frameinterpolation.h>
 #include <FidelityFX/host/ffx_fsr2.h>
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
+#include <FidelityFX/host/ffx_opticalflow.h>
 
 #include <cfloat>
 #include <cstdlib>
 #include <new>
 
-// Referenced by the backend; frame generation is not built in.
+// Referenced by the backend; only the SDK's own swapchain uses it.
 FfxErrorCode ffxSetFrameGenerationConfigToSwapchainVK(FfxFrameGenerationConfig const*) {
     return FFX_ERROR_BACKEND_API_ERROR;
 }
@@ -25,7 +27,25 @@ struct LimnFfx {
     bool shared_made = false;
     uint32_t output_width = 0;
     uint32_t output_height = 0;
+
+    FfxOpticalflowContext optical_flow = {};
+    FfxFrameInterpolationContext interpolation = {};
+    FfxResourceInternal flow[2] = {};
+    bool generation_made = false;
+    uint32_t shown_width = 0;
+    uint32_t shown_height = 0;
+    int32_t shown_format = 0;
+    uint64_t frame_id = 0;
+    // Of the last upscale.
+    uint32_t render_width = 0;
+    uint32_t render_height = 0;
+    float frame_milliseconds = 0;
+    float camera_near = 0;
+    float camera_fov_y = 0;
 };
+
+// One for the upscaler, one each for optical flow and interpolation.
+static const size_t max_contexts = 3;
 
 static FfxResource imageResource(const LimnFfxImage& image, const wchar_t* name, bool written) {
     VkImageCreateInfo info = {};
@@ -82,9 +102,9 @@ LimnFfx* limnFfxCreate(const LimnFfxCreate* desc) {
     device_context.vkDevice = static_cast<VkDevice>(desc->device);
     device_context.vkPhysicalDevice = static_cast<VkPhysicalDevice>(desc->physical_device);
     device_context.vkDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(desc->get_device_proc_addr);
-    const size_t scratch_size = ffxGetScratchMemorySizeVK(device_context.vkPhysicalDevice, 1);
+    const size_t scratch_size = ffxGetScratchMemorySizeVK(device_context.vkPhysicalDevice, max_contexts);
     ffx->scratch = std::calloc(1, scratch_size);
-    if (!ffx->scratch || ffxGetInterfaceVK(&ffx->backend, ffxGetDeviceVK(&device_context), ffx->scratch, scratch_size, 1) != FFX_OK) {
+    if (!ffx->scratch || ffxGetInterfaceVK(&ffx->backend, ffxGetDeviceVK(&device_context), ffx->scratch, scratch_size, max_contexts) != FFX_OK) {
         limnFfxDestroy(ffx);
         return nullptr;
     }
@@ -151,6 +171,11 @@ static int32_t dispatch(LimnFfx* ffx, const LimnFfxFrame* frame) {
         dispatch.viewSpaceToMetersFactor = 1.0f;
         return static_cast<int32_t>(ffxFsr2ContextDispatch(&ffx->fsr2, &dispatch));
     }
+    ffx->render_width = frame->render_width;
+    ffx->render_height = frame->render_height;
+    ffx->frame_milliseconds = frame->frame_milliseconds;
+    ffx->camera_near = frame->camera_near;
+    ffx->camera_fov_y = frame->camera_fov_y;
     FfxFsr3UpscalerDispatchDescription dispatch = {};
     dispatch.commandList = ffxGetCommandListVK(static_cast<VkCommandBuffer>(frame->command_buffer));
     dispatch.color = imageResource(frame->color, L"limn color", false);
@@ -176,8 +201,109 @@ static int32_t dispatch(LimnFfx* ffx, const LimnFfxFrame* frame) {
     return static_cast<int32_t>(ffxFsr3UpscalerContextDispatch(&ffx->fsr3, &dispatch));
 }
 
+static void destroyGeneration(LimnFfx* ffx) {
+    if (!ffx->generation_made) return;
+    for (int index = 0; index < 2; index++) ffx->backend.fpDestroyResource(&ffx->backend, ffx->flow[index], 0);
+    ffxFrameInterpolationContextDestroy(&ffx->interpolation);
+    ffxOpticalflowContextDestroy(&ffx->optical_flow);
+    ffx->generation_made = false;
+}
+
+static bool createGeneration(LimnFfx* ffx, const LimnFfxGenerate* frame) {
+    FfxOpticalflowContextDescription flow = {};
+    flow.backendInterface = ffx->backend;
+    flow.resolution = {frame->shown.width, frame->shown.height};
+    if (ffxOpticalflowContextCreate(&ffx->optical_flow, &flow) != FFX_OK) return false;
+
+    FfxFrameInterpolationContextDescription interpolation = {};
+    interpolation.backendInterface = ffx->backend;
+    interpolation.flags = FFX_FRAMEINTERPOLATION_ENABLE_DEPTH_INVERTED | FFX_FRAMEINTERPOLATION_ENABLE_DEPTH_INFINITE;
+    interpolation.maxRenderSize = {frame->shown.width, frame->shown.height};
+    interpolation.displaySize = {frame->shown.width, frame->shown.height};
+    interpolation.backBufferFormat = ffxGetSurfaceFormatVK(static_cast<VkFormat>(frame->shown.format));
+    interpolation.previousInterpolationSourceFormat = interpolation.backBufferFormat;
+    if (ffxFrameInterpolationContextCreate(&ffx->interpolation, &interpolation) != FFX_OK) {
+        ffxOpticalflowContextDestroy(&ffx->optical_flow);
+        return false;
+    }
+
+    FfxOpticalflowSharedResourceDescriptions shared = {};
+    bool made = ffxOpticalflowGetSharedResourceDescriptions(&ffx->optical_flow, &shared) == FFX_OK;
+    made = made && ffx->backend.fpCreateResource(&ffx->backend, &shared.opticalFlowVector, 0, &ffx->flow[0]) == FFX_OK;
+    if (made && ffx->backend.fpCreateResource(&ffx->backend, &shared.opticalFlowSCD, 0, &ffx->flow[1]) != FFX_OK) {
+        ffx->backend.fpDestroyResource(&ffx->backend, ffx->flow[0], 0);
+        made = false;
+    }
+    if (!made) {
+        ffxFrameInterpolationContextDestroy(&ffx->interpolation);
+        ffxOpticalflowContextDestroy(&ffx->optical_flow);
+        return false;
+    }
+    ffx->generation_made = true;
+    ffx->shown_width = frame->shown.width;
+    ffx->shown_height = frame->shown.height;
+    ffx->shown_format = frame->shown.format;
+    return true;
+}
+
+int32_t limnFfxGenerateFrame(LimnFfx* ffx, const LimnFfxGenerate* frame) {
+    if (ffx->generation != 3 || ffx->render_width == 0) return -1;
+    bool reset = frame->reset != 0;
+    if (ffx->generation_made && (ffx->shown_width != frame->shown.width || ffx->shown_height != frame->shown.height || ffx->shown_format != frame->shown.format)) {
+        destroyGeneration(ffx);
+    }
+    if (!ffx->generation_made) {
+        if (!createGeneration(ffx, frame)) return -1;
+        reset = true;
+    }
+    const FfxCommandList commands = ffxGetCommandListVK(static_cast<VkCommandBuffer>(frame->command_buffer));
+    const FfxResource shown = imageResource(frame->shown, L"limn shown", false);
+    const FfxResource vectors = ffx->backend.fpGetResource(&ffx->backend, ffx->flow[0]);
+    const FfxResource scene_change = ffx->backend.fpGetResource(&ffx->backend, ffx->flow[1]);
+    const FfxBackbufferTransferFunction transfer = frame->pq ? FFX_BACKBUFFER_TRANSFER_FUNCTION_PQ : FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+    const float luminance[2] = {0.0f, frame->pq ? 1000.0f : 200.0f};
+
+    FfxOpticalflowDispatchDescription flow = {};
+    flow.commandList = commands;
+    flow.color = shown;
+    flow.opticalFlowVector = vectors;
+    flow.opticalFlowSCD = scene_change;
+    flow.reset = reset;
+    flow.backbufferTransferFunction = transfer;
+    flow.minMaxLuminance = {luminance[0], luminance[1]};
+    if (ffxOpticalflowContextDispatch(&ffx->optical_flow, &flow) != FFX_OK) return -1;
+
+    FfxFrameInterpolationDispatchDescription dispatch = {};
+    dispatch.commandList = commands;
+    dispatch.displaySize = {frame->shown.width, frame->shown.height};
+    dispatch.renderSize = {ffx->render_width, ffx->render_height};
+    dispatch.currentBackBuffer = shown;
+    dispatch.output = imageResource(frame->output, L"limn generated", true);
+    dispatch.interpolationRect = {0, 0, static_cast<int32_t>(frame->shown.width), static_cast<int32_t>(frame->shown.height)};
+    dispatch.opticalFlowVector = vectors;
+    dispatch.opticalFlowSceneChangeDetection = scene_change;
+    dispatch.opticalFlowBlockSize = 8;
+    dispatch.opticalFlowScale = {1.0f / frame->shown.width, 1.0f / frame->shown.height};
+    dispatch.cameraNear = ffx->camera_near;
+    dispatch.cameraFar = FLT_MAX;
+    dispatch.cameraFovAngleVertical = ffx->camera_fov_y;
+    dispatch.viewSpaceToMetersFactor = 1.0f;
+    dispatch.frameTimeDelta = ffx->frame_milliseconds;
+    dispatch.reset = reset;
+    dispatch.backBufferTransferFunction = transfer;
+    dispatch.minMaxLuminance[0] = luminance[0];
+    dispatch.minMaxLuminance[1] = luminance[1];
+    dispatch.frameID = ffx->frame_id++;
+    dispatch.dilatedDepth = ffx->backend.fpGetResource(&ffx->backend, ffx->shared[0]);
+    dispatch.dilatedMotionVectors = ffx->backend.fpGetResource(&ffx->backend, ffx->shared[1]);
+    dispatch.reconstructedPrevDepth = ffx->backend.fpGetResource(&ffx->backend, ffx->shared[2]);
+    if (ffxFrameInterpolationDispatch(&ffx->interpolation, &dispatch) != FFX_OK) return -1;
+    return reset ? 0 : 1;
+}
+
 void limnFfxDestroy(LimnFfx* ffx) {
     if (!ffx) return;
+    destroyGeneration(ffx);
     if (ffx->shared_made) {
         for (int index = 0; index < 3; index++) ffx->backend.fpDestroyResource(&ffx->backend, ffx->shared[index], 0);
     }

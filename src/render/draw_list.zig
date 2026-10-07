@@ -469,8 +469,6 @@ pub const DrawList = struct {
         return self.screen.indices.items.len == 0 and self.world.indices.items.len == 0;
     }
 
-    // ---------------------------------------------------------- transforms
-
     /// Composes `transform` onto the current 2D transform until the matching
     /// `popTransform`. Screen-space only. Nests up to 16 deep.
     pub fn pushTransform(self: *DrawList, transform: Transform2D) void {
@@ -485,8 +483,6 @@ pub const DrawList = struct {
         self.transform_depth -= 1;
         self.transform = self.transform_stack[self.transform_depth];
     }
-
-    // ------------------------------------------------------------ clipping
 
     /// Restricts screen-space drawing to `r` (in the current transform's
     /// coordinates) until the matching `popClip`. Nested clips intersect.
@@ -527,8 +523,6 @@ pub const DrawList = struct {
             try self.screen.clips.append(self.gpa, .{ .first_index = first, .rect = clip });
         }
     }
-
-    // -------------------------------------------------------------- shapes
 
     /// Corner colors in order top-left, top-right, bottom-right, bottom-left.
     pub fn rectGradient(self: *DrawList, r: Rect, colors: [4]Color) !void {
@@ -706,8 +700,6 @@ pub const DrawList = struct {
         try self.polyline(path.points.items, thickness, color, path.closed);
     }
 
-    // ------------------------------------------------------------- sprites
-
     /// Draws an image whose border keeps its size while the middle stretches.
     /// `border` is left, top, right, bottom in image pixels; `scale` enlarges
     /// the border on screen.
@@ -728,8 +720,6 @@ pub const DrawList = struct {
             try self.image(img, .{ .x = target_x[column], .y = target_y[row], .width = width, .height = height }, piece);
         };
     }
-
-    // -------------------------------------------------------------- screen
 
     fn screenVertex(self: *const DrawList, p: [2]f32, uv: [2]f32, color: Color, texture_mode: u32) Vertex {
         const transformed = self.transform.apply(p);
@@ -1097,8 +1087,6 @@ pub const DrawList = struct {
         extent[1] = y - position[1];
         return extent;
     }
-
-    // --------------------------------------------------------------- world
 
     /// Filled quad; corners in order around the perimeter.
     pub fn quad3d(self: *DrawList, corners: [4]math.Vec3, color: Color) !void {

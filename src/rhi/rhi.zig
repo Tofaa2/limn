@@ -3,6 +3,7 @@ const types = @import("types.zig");
 const device = @import("device.zig");
 
 pub const Device = device.Device;
+pub const FrameGenerator = device.FrameGenerator;
 pub const deviceProcAddr = @import("loader.zig").deviceProcAddr;
 pub const Detached = device.Detached;
 pub const Frame = device.Frame;

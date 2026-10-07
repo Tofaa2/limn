@@ -85,8 +85,6 @@ pub const env_specular_mips = 6;
 pub const env_irradiance_size = 32;
 pub const stream_budget_bytes = 48 * 1024 * 1024;
 
-// ------------------------------------------------------------------ storage
-
 pub const Range = struct { offset: u32, count: u32 };
 
 /// First-fit range allocator over element indices with coalescing frees.
@@ -287,8 +285,6 @@ pub const FrameArena = struct {
         };
     }
 };
-
-// ------------------------------------------------------------------- assets
 
 pub const ModelJob = struct {
     gpa: std.mem.Allocator,
@@ -749,8 +745,6 @@ pub const SkinJob = extern struct {
 comptime {
     std.debug.assert(@sizeOf(SkinJob) == 48);
 }
-
-// ----------------------------------------------------------- render targets
 
 /// Tracks textures a constructor has made, for `errdefer made.destroy()`.
 pub const MadeTextures = struct {

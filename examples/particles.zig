@@ -245,7 +245,7 @@ pub fn main(init: std.process.Init) !void {
         .pipeline_cache_path = "zig-out/pipeline.cache",
         // The offscreen mode doubles as a self-check.
         .validation = offscreen,
-        .surface = if (window) |value| try value.surface(true) else null,
+        .surface = if (window) |value| try value.surface(false) else null,
     });
     defer renderer.deinit();
     const target: ?gfx.rhi.Texture = if (offscreen) try renderer.createTarget(1280, 720) else null;

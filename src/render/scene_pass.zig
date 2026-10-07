@@ -63,6 +63,8 @@ pub const ScenePass = struct {
     /// Size of the area of the target the view fills.
     output_width: u32,
     output_height: u32,
+    /// The view covers the whole backbuffer.
+    fills_backbuffer: bool = false,
     delta_time: f32,
     /// A debug view is shown: effects that would hide it are left out.
     debugging: bool,
