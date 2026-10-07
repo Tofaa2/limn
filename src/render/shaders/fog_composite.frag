@@ -1,8 +1,8 @@
 #version 460
 #include "common.glsl"
 
-// Depth-aware upsample of the half-resolution fog, blended over the lit
-// scene as `scene * transmittance + scattering`.
+// Depth-aware upsample of the half-resolution fog, blended as `scene *
+// transmittance + scattering`.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint fog_texture;
@@ -25,7 +25,6 @@ void main() {
     for (int y = 0; y < 2; y++) {
         for (int x = 0; x < 2; x++) {
             ivec2 tap = clamp(base + ivec2(x, y), ivec2(0), fog_size - 1);
-            // Depth of the full-resolution pixel the half-res sample saw.
             vec2 tap_uv = (vec2(tap) + 0.5) / vec2(fog_size);
             float depth = linearDepth(textureLod(TEX(push.depth_texture, nearest), tap_uv, 0.0).r, frame.near);
             float bilinear = (x == 0 ? 1.0 - f.x : f.x) * (y == 0 ? 1.0 - f.y : f.y);

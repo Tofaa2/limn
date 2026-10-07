@@ -3,15 +3,14 @@
 #include "shading.glsl"
 #include "particles.glsl"
 
-// Particles drawn as copies of a mesh (debris, leaves, shards): one
-// instance per particle slot, vertices pulled from the scene's buffers.
+// Particles drawn as mesh instances, one per particle slot.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     EmitterRef emitter;
     Particles particles;
-    // Where the mesh's vertices start.
+    // First vertex of the mesh.
     uint vertex_offset;
-    // Radians per second each copy tumbles about an axis of its own.
+    // Tumble rate in radians per second.
     float spin;
 } push;
 
@@ -29,7 +28,7 @@ uint hashSlot(uint value) {
     return value;
 }
 
-// Turns `v` about the unit `axis`.
+// Rotates `v` about unit `axis`.
 vec3 turn(vec3 v, vec3 axis, float angle) {
     float s = sin(angle);
     float c = cos(angle);
@@ -42,7 +41,7 @@ void main() {
     uint slot = uint(gl_InstanceIndex);
     Particle particle = push.particles.data[slot];
     if (particle.age >= particle.lifetime) {
-        // Dead: collapse the copy.
+        // Dead: degenerate.
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         out_color = vec4(0.0);
         out_uv = vec2(0.0);
@@ -61,7 +60,6 @@ void main() {
         size = mix(emitter.curve_sizes[key], emitter.curve_sizes[key + 1u], at - float(key));
     }
 
-    // Every copy tumbles about its own axis, at its own pace and phase.
     uint h = hashSlot(slot + 1u);
     vec3 axis = normalize(vec3(h & 1023u, (h >> 10) & 1023u, (h >> 20) & 1023u) / 511.5 - 1.0 + vec3(1e-3, 0.0, 0.0));
     float pace = 0.5 + float(hashSlot(h) & 1023u) / 1023.0;
@@ -82,8 +80,6 @@ void main() {
     }
     color *= unpackUnorm4x8(vertex.color);
     if ((emitter.flags & EMITTER_LIT) != 0u) {
-        // A matte surface: light from the surroundings, and from the sun
-        // where it reaches the particle and this side faces it.
         vec3 light = vec3(0.0);
         if ((frame.flags & FRAME_GI) != 0u) {
             light += giAmbient(frame, particle.position) * frame.gi_intensity;

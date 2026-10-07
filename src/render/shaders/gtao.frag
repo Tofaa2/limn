@@ -1,51 +1,47 @@
 #version 460
 #include "common.glsl"
 
-// Ground-truth ambient occlusion (Jimenez et al. 2016): horizon search in
-// screen space with a cosine-weighted analytic integral per slice.
+// Ground-truth ambient occlusion (Jimenez et al. 2016): screen-space horizon
+// search with a cosine-weighted analytic integral per slice.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint depth_texture;
-    // Last frame's lit picture, to gather the light of what occludes; or
-    // INVALID_ID to gather none.
+    // Last frame's lit color for bounce gathering, or INVALID_ID.
     uint color_texture;
     float radius;
     float intensity;
-    // Directions searched per pixel and samples along each side of one.
+    // Slices per pixel and steps per side.
     int slice_count;
     int step_count;
 } push;
 
 layout(location = 0) in vec2 in_uv;
-// r: occlusion, g: linear view depth of this sample, so the upsample pass
-// needs a single fetch per tap.
+// r: occlusion, g: linear view depth.
 layout(location = 0) out vec2 out_ao;
-// The light arriving from the surfaces that block the sky: what occlusion
-// takes away, they give back in their own color.
+// Bounce light from the occluders.
 layout(location = 1) out vec4 out_bounce;
 
 
 const float sky_depth = 50000.0;
 
-// View-space position from the prefiltered linear depth pyramid.
+// View-space position from the linear depth pyramid.
 vec3 viewPosition(FrameConstants frame, vec2 uv, float mip) {
     float z = textureLod(TEX(push.depth_texture, frame.sampler_nearest_clamp), uv, mip).r;
     vec2 ndc = uv * 2.0 - 1.0;
+    // Account for lens shift.
+    ndc += vec2(frame.proj[2][0], frame.proj[2][1]);
     return vec3(ndc.x / frame.proj[0][0], ndc.y / frame.proj[1][1], -1.0) * z;
 }
 
 void main() {
     FrameConstants frame = push.frame;
-    // Runs at the resolution of level 0 of the depth pyramid.
     vec3 position = viewPosition(frame, in_uv, 0.0);
     if (-position.z > sky_depth) {
         out_ao = vec2(1.0, -position.z);
         out_bounce = vec4(0.0);
         return;
     }
-    // Normal from depth: for each axis use the neighbour closer in depth, so
-    // the estimate does not straddle silhouettes. This is the geometric
-    // normal; normal-map detail is too fine to matter at AO scale.
+    // Normal from depth: per axis, use the neighbour closer in depth.
     vec2 texel = 1.0 / vec2(textureSize(TEX(push.depth_texture, frame.sampler_nearest_clamp), 0));
     vec3 left = viewPosition(frame, in_uv - vec2(texel.x, 0.0), 0.0);
     vec3 right = viewPosition(frame, in_uv + vec2(texel.x, 0.0), 0.0);
@@ -57,11 +53,9 @@ void main() {
     if (dot(normal, position) > 0.0) normal = -normal;
     vec3 view = normalize(-position);
 
-    // Screen-space radius in UV units for a world-space radius at this depth.
     float projected = push.radius * 0.5 * abs(frame.proj[1][1]) / -position.z;
     vec2 radius_uv = vec2(projected * frame.resolution.y / frame.resolution.x, projected);
     radius_uv = min(radius_uv, vec2(0.15));
-    // In pixels of this pass, whatever fraction of the frame it runs at.
     float pixel_radius = radius_uv.y * float(textureSize(TEX(push.depth_texture, frame.sampler_nearest_clamp), 0).y);
     if (pixel_radius < 1.5) {
         out_ao = vec2(1.0, -position.z);
@@ -94,22 +88,17 @@ void main() {
             float direction_sign = side == 0 ? 1.0 : -1.0;
             for (int tap_index = 0; tap_index < push.step_count; tap_index++) {
                 float t = (float(tap_index) + noise_offset) / float(push.step_count);
-                // Quadratic distribution concentrates samples near the pixel.
                 float reach = t * t + 0.5 / pixel_radius;
                 vec2 sample_uv = in_uv + direction_sign * omega * radius_uv * reach;
-                // Farther samples read coarser levels so neighbouring pixels
-                // share texels.
+                // Farther samples read coarser mips.
                 float mip = clamp(log2(reach * pixel_radius) - 2.5, 0.0, 4.0);
                 vec3 delta = viewPosition(frame, sample_uv, floor(mip)) - position;
                 float distance_squared = dot(delta, delta);
                 float cos_horizon = dot(delta, view) * inversesqrt(max(distance_squared, 1e-8));
-                // Fade distant occluders to avoid haloing around thin objects.
+                // Distance falloff against haloing around thin objects.
                 float falloff = clamp(distance_squared / falloff_end * 2.0 - 1.0, 0.0, 1.0);
                 float candidate = mix(cos_horizon, -1.0, falloff);
                 if (candidate > horizon_cos[side]) {
-                    // This sample hides a slice of sky nothing nearer hid:
-                    // its light arrives through that slice instead, as
-                    // strongly as it faces the surface.
                     if (gather) {
                         float facing = max(dot(normal, delta) * inversesqrt(max(distance_squared, 1e-8)), 0.0);
                         float slice_width = candidate - max(horizon_cos[side], -0.2);
@@ -128,6 +117,5 @@ void main() {
     }
     visibility /= float(push.slice_count);
     out_ao = vec2(pow(clamp(visibility, 0.0, 1.0), push.intensity), -position.z);
-    // Each side of each slice could at most fill its quarter turn.
     out_bounce = vec4(min(bounce / float(push.slice_count * 2), vec3(64.0)), 1.0);
 }

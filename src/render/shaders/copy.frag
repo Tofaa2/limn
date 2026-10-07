@@ -1,7 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// Copies one texture into another of the same size.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;

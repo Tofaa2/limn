@@ -1,6 +1,5 @@
-//! Getting a scene's geometry onto the screen: deforming what is skinned,
-//! culling, and drawing the visibility buffer that everything after reads.
-//! Internal to the renderer.
+//! Scene geometry: skinning, culling and the visibility buffer. Internal to the
+//! renderer.
 const std = @import("std");
 const rhi = @import("../../rhi/rhi.zig");
 const gpu = @import("../gpu.zig");
@@ -22,11 +21,14 @@ const SunShadows = scene_pass.SunShadows;
 const CullState = scene_pass.CullState;
 const DrawPush = scene_pass.DrawPush;
 const CullPush = scene_pass.CullPush;
+const InstanceCullPush = scene_pass.InstanceCullPush;
 const Lighting = scene_pass.Lighting;
 
-/// Makes room in the buffers the culling writes to, and empties them:
-/// the draw counts, which instances the cameras drew, and which
-/// meshlets this view saw last frame.
+/// Meshlet headroom in the draw command buffer beyond the scene's count.
+const cull_headroom = 1 << 16;
+
+/// Sizes and clears the buffers culling writes: draw counts, instance seen
+/// flags and last frame's meshlet visibility.
 pub fn resetCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total: u32) !void {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -36,7 +38,8 @@ pub fn resetCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total
     const fresh_scene = p.fresh_scene;
     const view_data = p.view_data;
     const mark_seen = p.mark_seen;
-    if (mark_seen and instance_total > scene.seen_capacity) {
+    // One extra word for the count.
+    if (instance_total + 1 > scene.seen_capacity or (mark_seen and scene.seen_readback[0] == null)) {
         if (scene.seen) |buffer| device.destroyBuffer(buffer);
         scene.seen = null;
         for (&scene.seen_readback) |*readback| {
@@ -44,14 +47,16 @@ pub fn resetCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total
             readback.* = null;
         }
         scene.seen_tags = @splat(.{});
-        scene.seen_capacity = @max(instance_total + instance_total / 2, 1024);
-        const size = @as(u64, scene.seen_capacity) * @sizeOf(u32);
+        scene.seen_capacity = 0;
+        const capacity = @max(instance_total + 1 + @min(instance_total / 2, cull_headroom), 1024);
+        const size = @as(u64, capacity) * @sizeOf(u32);
         scene.seen = try device.createBuffer(.{ .name = "instances seen", .size = size, .usage = .{ .storage = true, .copy_src = true } });
-        for (&scene.seen_readback) |*readback|
+        if (mark_seen) for (&scene.seen_readback) |*readback| {
             readback.* = try device.createBuffer(.{ .name = "instances seen readback", .size = size, .usage = .{}, .memory = .gpu_to_cpu });
+        };
+        scene.seen_capacity = capacity;
     }
 
-    // Which meshlets this view saw last frame, for occlusion culling.
     var visibility_reset = false;
     if (scene.refs_capacity != 0 and view_data.visibility_capacity < scene.refs_capacity) {
         if (view_data.visibility) |buffer| device.destroyBuffer(buffer);
@@ -64,28 +69,59 @@ pub fn resetCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total
         view_data.visibility_capacity = scene.refs_capacity;
         visibility_reset = true;
     }
+    if (scene.static_count > view_data.instance_visibility_capacity) {
+        if (view_data.instance_visibility) |buffer| device.destroyBuffer(buffer);
+        view_data.instance_visibility = null;
+        const capacity = scene.static_count + @min(scene.static_count / 2, cull_headroom);
+        view_data.instance_visibility = try device.createBuffer(.{
+            .name = "instance visibility",
+            .size = @as(u64, capacity) * @sizeOf(u32),
+            .usage = .{ .storage = true },
+        });
+        view_data.instance_visibility_capacity = capacity;
+        visibility_reset = true;
+    }
     if (view_data.visibility_scene == null or !std.meta.eql(view_data.visibility_scene.?, scene_handle) or
         view_data.visibility_layout != scene.layout_version) visibility_reset = true;
     view_data.visibility_scene = scene_handle;
     view_data.visibility_layout = scene.layout_version;
 
-    // Last frame's draws and shaders must finish reading these buffers
-    // before this frame's fills and compute passes overwrite them.
+    // Last frame's draws must finish reading these buffers first.
     cmd.sync(.all_to_transfer);
     cmd.fillBuffer(renderer.cull_counts, 0, view_count * 2 * @sizeOf(u32), 0);
-    if (mark_seen and fresh_scene) cmd.fillBuffer(scene.seen.?, 0, @as(u64, instance_total) * @sizeOf(u32), 0);
+    const dispatches = try p.arena.alloc(device, gpu.CullDispatch, view_count);
+    @memset(dispatches.items, .{ .x = (scene.entity_ref_count + 63) / 64 });
+    cmd.copyBuffer(dispatches.buffer, renderer.cull_dispatch, dispatches.offset, 0, view_count * @sizeOf(gpu.CullDispatch));
+    if (scene.impostor_count != 0) {
+        if (scene.static_count > scene.impostor_list_capacity) {
+            if (scene.impostor_list) |buffer| device.destroyBuffer(buffer);
+            scene.impostor_list = null;
+            const capacity = scene.static_count + @min(scene.static_count / 2, cull_headroom);
+            scene.impostor_list = try device.createBuffer(.{ .name = "impostor list", .size = @as(u64, capacity) * @sizeOf(u32), .usage = .{ .storage = true } });
+            scene.impostor_list_capacity = capacity;
+        }
+        const draw = try p.arena.alloc(device, gpu.DrawIndirect, 1);
+        draw.items[0] = .{ .vertex_count = 6 };
+        cmd.copyBuffer(draw.buffer, renderer.impostor_draw, draw.offset, 0, @sizeOf(gpu.DrawIndirect));
+    }
+    if (device.mesh_shaders) {
+        const draws = try p.arena.alloc(device, gpu.MeshDraw, view_count * 2);
+        @memset(draws.items, .{});
+        cmd.copyBuffer(draws.buffer, renderer.cull_mesh_draws, draws.offset, 0, view_count * 2 * @sizeOf(gpu.MeshDraw));
+    }
+    if (fresh_scene) cmd.fillBuffer(scene.seen.?, 0, (@as(u64, instance_total) + 1) * @sizeOf(u32), 0);
     if (fresh_scene and scene_frame.staged_size != 0)
         cmd.copyBuffer(scene_frame.staged_buffer, scene.instance_slots[0].buffer.?, scene_frame.staged_instances, 0, scene_frame.staged_size);
     if (visibility_reset) {
-        // Meshlet references were renumbered, or this view has not seen
-        // this scene before; start from "everything was visible" so
-        // the first frame draws in a single phase.
+        // New layout or view: start from all visible, so the first frame draws
+        // in a single phase.
         if (view_data.visibility) |buffer| cmd.fillBuffer(buffer, 0, @as(u64, view_data.visibility_capacity) * @sizeOf(u32), 1);
+        if (view_data.instance_visibility) |buffer| cmd.fillBuffer(buffer, 0, @as(u64, view_data.instance_visibility_capacity) * @sizeOf(u32), 1);
     }
     cmd.sync(.transfer_to_all);
 }
 
-/// The triangles of `mesh`, for building its ray tracing structure.
+/// Triangles of `mesh`, for building its BLAS.
 pub fn blasDesc(renderer: *Renderer, mesh: ModelMesh) rhi.BlasDesc {
     return .{
         .vertices = renderer.vertices.buffer,
@@ -98,8 +134,8 @@ pub fn blasDesc(renderer: *Renderer, mesh: ModelMesh) rhi.BlasDesc {
     };
 }
 
-/// Deforms the scene's skinned and morphed meshes, then brings their
-/// meshlet bounds and ray tracing structures up to date.
+/// Skins and morphs the scene's meshes, then updates their meshlet bounds and
+/// BLASes.
 pub fn skinScene(renderer: *Renderer, p: *const ScenePass) !void {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -109,9 +145,6 @@ pub fn skinScene(renderer: *Renderer, p: *const ScenePass) !void {
     const fresh_scene = p.fresh_scene;
     cmd.beginScope("skinning");
     if (fresh_scene and renderer.skin_jobs.items.len != 0) {
-        // Every mesh in one dispatch: the jobs go to the GPU as a
-        // table, with a second one saying which job each work
-        // group of 64 vertices belongs to.
         var group_count: u32 = 0;
         for (renderer.skin_jobs.items) |*job| {
             job.first_group = group_count;
@@ -124,7 +157,7 @@ pub fn skinScene(renderer: *Renderer, p: *const ScenePass) !void {
             @memset(group_jobs.items[job.first_group..][0 .. (job.vertex_count + 63) / 64], @intCast(index));
         }
         cmd.bindPipeline(renderer.pipelines.skin);
-        // Never empty, so the shader always has a list to index.
+        // Never empty, so the shader always has a list.
         const weights = try arena.alloc(device, f32, @max(renderer.skin_weights.items.len, 1));
         weights.items[0] = 0;
         @memcpy(weights.items[0..renderer.skin_weights.items.len], renderer.skin_weights.items);
@@ -138,12 +171,10 @@ pub fn skinScene(renderer: *Renderer, p: *const ScenePass) !void {
             .group_jobs = group_jobs.address,
             .group_count = group_count,
         });
-        // Rows of 1024 groups, as skin.comp expects.
+        // Rows of 1024 groups, as in skin.comp.
         cmd.dispatch(@min(group_count, 1024), (group_count + 1023) / 1024, 1);
     }
     if (fresh_scene and renderer.bounds_jobs.items.len != 0) {
-        // The deformed meshes' meshlet bounds, from the vertices
-        // just written; the culling below reads them.
         cmd.sync(.compute_to_all);
         var group_count: u32 = 0;
         for (renderer.bounds_jobs.items) |*job| {
@@ -169,11 +200,7 @@ pub fn skinScene(renderer: *Renderer, p: *const ScenePass) !void {
         cmd.dispatch(@min(group_count, 1024), (group_count + 1023) / 1024, 1);
     }
     if (fresh_scene and renderer.blas_jobs.items.len != 0 and scene.tlas != null) {
-        // Deformed meshes: rebuild each one's acceleration structure
-        // from the vertices just written.
         cmd.sync(.compute_to_all);
-        // With a limit, the structures take turns from where the
-        // round stopped last frame.
         const jobs = renderer.blas_jobs.items;
         const budget: usize = if (renderer.options.gi_dynamic_refits == 0) jobs.len else @min(renderer.options.gi_dynamic_refits, jobs.len);
         const first = renderer.refit_cursor % jobs.len;
@@ -190,16 +217,39 @@ pub fn skinScene(renderer: *Renderer, p: *const ScenePass) !void {
     cmd.endScope();
 }
 
-/// Where one culling view's draw commands start in the command buffer;
-/// `bucket` is 0 for opaque meshlets and 1 for alpha-tested ones.
+/// Offset of a culling view's draw commands; `bucket` is 0 for opaque and 1 for
+/// alpha-tested meshlets.
 pub fn commandOffset(renderer: *const Renderer, view_index: usize, bucket: usize) u64 {
-    return (@as(u64, view_index) * 2 + bucket) * renderer.cull_capacity * @sizeOf(gpu.DrawCommand);
+    const per_view = @as(u64, renderer.cull_capacity) + renderer.cull_masked_capacity;
+    return (view_index * per_view + bucket * renderer.cull_capacity) * commandSize(renderer);
 }
 
-/// Lists what each of the frame's views draws: the camera (its early
-/// phase, when occlusion culling is on), the shadow cascades being
-/// redrawn and the local lights' shadow tiles.
+/// Bytes culling writes per drawn meshlet: a draw command, or a bare reference
+/// with mesh shaders.
+fn commandSize(renderer: *const Renderer) u64 {
+    return if (renderer.device.mesh_shaders) @sizeOf(u32) else @sizeOf(gpu.DrawCommand);
+}
+
+/// Draws one of a view's two meshlet lists with the bound pipeline. `bucket` 0:
+/// opaque; 1: alpha-tested, two-sided or fading.
+pub fn drawMeshlets(renderer: *Renderer, cmd: *rhi.CommandEncoder, push: DrawPush, view_index: usize, bucket: usize, max_draws: u32) void {
+    const counts_offset = (view_index * 2 + bucket) * @sizeOf(u32);
+    if (renderer.device.mesh_shaders) {
+        var with_list = push;
+        with_list.list = renderer.device.bufferAddress(renderer.cull_commands.?) + commandOffset(renderer, view_index, bucket);
+        with_list.count = renderer.device.bufferAddress(renderer.cull_counts) + counts_offset;
+        cmd.pushConstants(with_list);
+        cmd.drawMeshTasksIndirect(renderer.cull_mesh_draws, (view_index * 2 + bucket) * @sizeOf(gpu.MeshDraw));
+        return;
+    }
+    cmd.pushConstants(push);
+    cmd.drawIndexedIndirectCount(renderer.cull_commands.?, commandOffset(renderer, view_index, bucket), renderer.cull_counts, counts_offset, if (bucket == 0) max_draws else @min(max_draws, renderer.cull_masked_capacity));
+}
+
+/// Culls for each of the frame's views: the camera (early phase with occlusion
+/// culling), the cascades being redrawn and local shadow tiles.
 pub fn cullScene(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadows, lighting: *const Lighting, draw_local_shadows: bool) !CullState {
+    const views_wanted: u32 = if (p.settings.virtual_shadow_maps) view_count else if (lighting.tile_count == 0) local_view_base else render.vsm_view_base;
     const device = renderer.device;
     const cmd = p.cmd;
     const arena = p.arena;
@@ -213,7 +263,6 @@ pub fn cullScene(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadow
     const view_proj_unjittered = p.view_proj_unjittered;
     const sun_travel = p.sun_travel;
     const occlusion = p.occlusion;
-    const mark_seen = p.mark_seen;
     const lod_band = p.lod_band;
     const frame_address = p.frame_address;
     const cascades = sun.cascades;
@@ -222,18 +271,39 @@ pub fn cullScene(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadow
     if (!p.has_geometry) return std.mem.zeroes(CullState);
     var cull_push: CullPush = undefined;
     var cull_views_address: u64 = 0;
-    // Cascades that leave out casters whose shadows the camera cannot see.
     var receiver_culled: [gpu.cascade_count]bool = @splat(false);
-    if (scene.ref_count > renderer.cull_capacity) {
+    // Bucket 1 holds alpha-tested materials and, with cross-fade, any meshlet.
+    const masked_wanted = if (p.lod_band > 1) scene.ref_count else scene.masked_ref_count;
+    if (renderer.cull_commands == null or scene.ref_count > renderer.cull_capacity or masked_wanted > renderer.cull_masked_capacity or views_wanted > renderer.cull_views) {
         if (renderer.cull_commands) |buffer| device.destroyBuffer(buffer);
-        renderer.cull_capacity = scene.ref_count + scene.ref_count / 2;
+        renderer.cull_commands = null;
+        const capacity = scene.ref_count + @min(scene.ref_count / 2, cull_headroom);
+        const masked_capacity = @max(@min(masked_wanted + @min(masked_wanted / 2, cull_headroom), capacity), 1);
+        const views = @max(renderer.cull_views, views_wanted);
         renderer.cull_commands = try device.createBuffer(.{
             .name = "cull commands",
-            .size = @as(u64, renderer.cull_capacity) * view_count * 2 * @sizeOf(gpu.DrawCommand),
+            .size = (@as(u64, capacity) + masked_capacity) * views * commandSize(renderer),
             .usage = .{ .storage = true, .indirect = true },
         });
+        renderer.cull_capacity = capacity;
+        renderer.cull_masked_capacity = masked_capacity;
+        renderer.cull_views = views;
     }
 
+    const static_refs = scene.ref_count - scene.entity_ref_count;
+    if (static_refs > scene.candidate_capacity or views_wanted > scene.candidate_views) {
+        if (scene.candidates) |buffer| device.destroyBuffer(buffer);
+        scene.candidates = null;
+        const capacity = static_refs + @min(static_refs / 2, cull_headroom);
+        const views = @max(scene.candidate_views, views_wanted);
+        scene.candidates = try device.createBuffer(.{
+            .name = "cull candidates",
+            .size = @as(u64, @max(capacity, 1)) * views * @sizeOf(u32),
+            .usage = .{ .storage = true },
+        });
+        scene.candidate_capacity = capacity;
+        scene.candidate_views = views;
+    }
     cmd.beginScope("culling");
     const cull_views = try arena.alloc(device, gpu.CullView, view_count);
     cull_views.items[0] = cullView(view_proj_unjittered, desc.camera.position, .perspective);
@@ -245,10 +315,9 @@ pub fn cullScene(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadow
         cull_views.items[1 + cascade] = cullView(cascades.view_proj[cascade], desc.camera.position, .shadow);
     cull_views.items[main_late_view] = cull_views.items[0];
     for (0..lighting.tile_count) |tile| cull_views.items[local_view_base + tile] = lighting.tile_views[tile];
-    // Every view picks levels of detail by the main camera, so a
-    // shadow is cast by the same geometry the camera sees.
     const lod_scale = p.lod[3];
     for (cull_views.items) |*cull| {
+        cull.lens_shift = .{ -proj_unjittered[8], -proj_unjittered[9] };
         cull.lod_camera = desc.camera.position;
         cull.lod_scale = lod_scale;
         cull.blended_casters = 0;
@@ -256,23 +325,15 @@ pub fn cullScene(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadow
         cull.min_radius = 0;
     }
     if (settings.shadow_lod == .light and settings.lod_error_pixels > 0) {
-        // A local light's shadow tiles pick detail by how large
-        // things are in the tile, seen from the light.
         const tile_pixels: f32 = @floatFromInt(renderer.options.local_shadow_resolution / std.math.clamp(renderer.options.local_shadow_tiles_per_side, 1, local_shadow_tiles_per_side));
         for (cull_views.items[local_view_base..][0..lighting.tile_count]) |*cull| {
             cull.lod_camera = cull.camera_position;
             cull.lod_scale = tile_pixels * 0.5 / settings.lod_error_pixels;
         }
     }
-    // Sun shadows can leave out what is smaller than a few texels
-    // of the cascade it would be drawn into.
     if (settings.shadow_small_feature_texels > 0) for (0..gpu.cascade_count) |cascade| {
         cull_views.items[1 + cascade].min_radius = cascades.texel_size[cascade] * settings.shadow_small_feature_texels * 0.5;
     };
-    // A cascade drawn afresh every frame can leave out casters
-    // whose shadows fall on nothing the camera sees. With a depth
-    // pyramid to test against, those cascades are culled once it
-    // has been built.
     if (settings.shadow_receiver_culling) for (0..cascade_total) |cascade| {
         if (settings.shadow_cascade_stagger and cascade != 0) continue;
         receiver_culled[cascade] = true;
@@ -283,21 +344,15 @@ pub fn cullScene(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadow
         cull.receiver_p11 = proj_unjittered[5];
         cull.receiver_near = desc.camera.near;
         cull.light_travel = sun_travel;
-        // The filter reads this far to the side of a point, and
-        // the point itself is moved a few texels off its surface.
         cull.receiver_margin = settings.shadow_softness + cascades.texel_size[cascade] * 6;
         @memcpy(cull.receiver_planes[0..4], cull_views.items[0].planes[0..4]);
-        // The cascade shadows the view from where the one before
-        // starts handing over to it up to its own far end.
         const starts = if (cascade == 0) desc.camera.near else cascades.splits[cascade - 1] * 0.9;
         cull.receiver_planes[4] = .{ -view_matrix[2], -view_matrix[6], -view_matrix[10], -view_matrix[14] - starts };
         cull.receiver_planes[5] = .{ view_matrix[2], view_matrix[6], view_matrix[10], view_matrix[14] + cascades.splits[cascade] };
     };
-    // Only the camera's own passes cross-fade; shadows are cast by
-    // both levels while they trade places.
+    // Only the camera's passes cross-fade; shadows draw both levels.
     cull_views.items[0].lod_band = lod_band;
     cull_views.items[main_late_view].lod_band = lod_band;
-    // Every view but the camera's two is a shadow view.
     if (settings.transparent_shadows) for (cull_views.items, 0..) |*cull, index| {
         if (index != 0 and index != main_late_view) cull.blended_casters = 1;
     };
@@ -310,53 +365,121 @@ pub fn cullScene(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadow
         .visibility = if (view_data.visibility) |buffer| device.bufferAddress(buffer) else 0,
         .ref_count = scene.ref_count,
         .bucket_capacity = renderer.cull_capacity,
+        .masked_capacity = renderer.cull_masked_capacity,
         .phase = 0,
         .hiz_texture = device.textureIndex(view.hiz),
         .hiz_size = .{ @floatFromInt(view.hiz_width), @floatFromInt(view.hiz_height) },
-        // Any readable buffer will do when nothing has bounds.
+        // Any readable buffer when nothing has bounds.
         .skin_bounds = device.bufferAddress(scene.skin_bounds orelse renderer.cull_counts),
         .seen = device.bufferAddress(scene.seen orelse renderer.cull_counts),
+        .entity_refs = scene.entity_ref_count,
+        .seen_total = @as(u32, @intCast(scene.layout.items.len)) + scene.static_count,
+        .instance_visibility = device.bufferAddress(view_data.instance_visibility orelse renderer.cull_counts),
+        .entity_instances = @intCast(scene.layout.items.len),
     };
-    cmd.bindPipeline(renderer.pipelines.cull);
-    // The main view (early phase when occlusion culling) and the
-    // shadow cascades.
+    var culled: [view_count]bool = @splat(false);
     for (0..view_count) |index| {
         const is_cascade = index >= 1 and index <= gpu.cascade_count;
         const is_local = draw_local_shadows and index >= local_view_base and index < local_view_base + lighting.tile_count;
         if (index != 0 and !(is_cascade and cascade_update[(index -| 1) % gpu.cascade_count]) and !is_local) continue;
-        // Left for after the depth pyramid.
         if (is_cascade and occlusion and receiver_culled[index - 1]) continue;
-        cull_push.view = cull_views_address + index * @sizeOf(gpu.CullView);
-        cull_push.commands = device.bufferAddress(renderer.cull_commands.?) + commandOffset(renderer, index, 0);
-        cull_push.counts = device.bufferAddress(renderer.cull_counts) + index * 2 * @sizeOf(u32);
-        cull_push.phase = if (index == 0 and occlusion) 1 else 0;
-        cull_push.mark_seen = @intFromBool(mark_seen and index == 0);
-        cmd.pushConstants(cull_push);
-        cmd.dispatch((scene.ref_count + 63) / 64, 1, 1);
+        culled[index] = true;
     }
-    cmd.sync(.compute_to_all);
+    var phases: [view_count]u32 = @splat(0);
+    if (occlusion) phases[0] = 1;
+    cullViews(renderer, p, &cull_push, cull_views_address, &culled, &phases);
     cmd.endScope();
     return .{ .push = cull_push, .views = cull_views_address, .receiver_culled = receiver_culled };
 }
 
-/// Draws what culling listed for `view_index`, opaque then alpha-tested,
-/// into the render pass that is open.
-pub fn drawVisibility(renderer: *Renderer, cmd: *rhi.CommandEncoder, push: anytype, view_index: usize, max_draws: u32) void {
-    cmd.bindIndexBuffer(renderer.indices.buffer, 0, .uint32);
-    cmd.pushConstants(push);
-    const counts_offset = view_index * 2 * @sizeOf(u32);
-    cmd.bindPipeline(renderer.pipelines.visibility);
-    cmd.drawIndexedIndirectCount(renderer.cull_commands.?, commandOffset(renderer, view_index, 0), renderer.cull_counts, counts_offset, max_draws);
-    cmd.bindPipeline(renderer.pipelines.visibility_masked);
-    cmd.drawIndexedIndirectCount(renderer.cull_commands.?, commandOffset(renderer, view_index, 1), renderer.cull_counts, counts_offset + @sizeOf(u32), max_draws);
+/// Culls the views marked in `views`, each in its given phase: instance groups'
+/// instances first, then meshlets.
+pub fn cullViews(renderer: *Renderer, p: *const ScenePass, push: *CullPush, views_address: u64, views: *const [view_count]bool, phases: *const [view_count]u32) void {
+    const device = renderer.device;
+    const cmd = p.cmd;
+    const scene = p.scene;
+    const candidates = if (scene.candidates) |buffer| device.bufferAddress(buffer) else 0;
+    const dispatches = device.bufferAddress(renderer.cull_dispatch);
+    if (scene.static_count != 0) if (scene.static_cull) |bounds| {
+        cmd.bindPipeline(renderer.pipelines.cull_instances);
+        for (views, 0..) |wanted, index| {
+            if (!wanted) continue;
+            cmd.pushConstants(InstanceCullPush{
+                .frame = push.frame,
+                .view = views_address + index * @sizeOf(gpu.CullView),
+                .instances = device.bufferAddress(bounds),
+                .candidates = candidates + @as(u64, index) * scene.candidate_capacity * @sizeOf(u32),
+                .dispatch = dispatches + index * @sizeOf(gpu.CullDispatch),
+                .visibility = push.instance_visibility,
+                .instance_count = scene.static_count,
+                .phase = phases[index],
+                .hiz_texture = push.hiz_texture,
+                .entity_refs = scene.entity_ref_count,
+                .hiz_size = push.hiz_size,
+                .impostors = if (scene.impostor_table) |table| device.bufferAddress(table) else 0,
+                .impostor_list = if (scene.impostor_list) |list| device.bufferAddress(list) else 0,
+                .impostor_draw = device.bufferAddress(renderer.impostor_draw),
+                .impostor_view = @intFromBool(scene.impostor_count != 0 and scene.impostor_list != null and (index == 0 or index == main_late_view)),
+            });
+            cmd.dispatch((scene.static_count + 63) / 64, 1, 1);
+        }
+        cmd.sync(.compute_to_all);
+    };
+    cmd.bindPipeline(renderer.pipelines.cull);
+    for (views, 0..) |wanted, index| {
+        if (!wanted) continue;
+        push.view = views_address + index * @sizeOf(gpu.CullView);
+        push.commands = device.bufferAddress(renderer.cull_commands.?) + commandOffset(renderer, index, 0);
+        push.counts = device.bufferAddress(renderer.cull_counts) + index * 2 * @sizeOf(u32);
+        push.phase = phases[index];
+        push.mark_seen = @intFromBool(scene.seen != null and (index == 0 or index == main_late_view));
+        push.candidates = candidates + @as(u64, index) * scene.candidate_capacity * @sizeOf(u32);
+        push.dispatch = dispatches + index * @sizeOf(gpu.CullDispatch);
+        push.mesh_lists = @intFromBool(device.mesh_shaders);
+        push.lists = push.commands;
+        push.mesh_draws = device.bufferAddress(renderer.cull_mesh_draws) + index * 2 * @sizeOf(gpu.MeshDraw);
+        cmd.pushConstants(push.*);
+        cmd.dispatchIndirect(renderer.cull_dispatch, index * @sizeOf(gpu.CullDispatch));
+    }
+    cmd.sync(.compute_to_all);
 }
 
-/// Reduces the depth buffer into a mip chain of farthest depths.
+/// Draws what culling listed for `view_index`, opaque then alpha-tested.
+pub fn drawVisibility(renderer: *Renderer, cmd: *rhi.CommandEncoder, push: DrawPush, view_index: usize, max_draws: u32) void {
+    cmd.bindIndexBuffer(renderer.indices.buffer, 0, .uint32);
+    cmd.bindPipeline(renderer.pipelines.visibility);
+    drawMeshlets(renderer, cmd, push, view_index, 0, max_draws);
+    cmd.bindPipeline(renderer.pipelines.visibility_masked);
+    drawMeshlets(renderer, cmd, push, view_index, 1, max_draws);
+}
+
+/// Builds the mip chain of farthest depths.
 pub fn buildDepthPyramid(renderer: *Renderer, cmd: *rhi.CommandEncoder, view: *ViewState) !void {
     const device = renderer.device;
     const Push = extern struct { source: u32, sampler: u32, first: u32, source_lod: i32, texel: [2]f32 };
     const sampler = device.samplerIndex(renderer.sampler_nearest_clamp);
     cmd.transition(view.depth, .shader_read);
+    if (renderer.pipelines.hiz_compute) |pipeline| {
+        cmd.bindPipeline(pipeline);
+        for (0..view.hiz_mips) |mip| {
+            const level: u32 = @intCast(mip);
+            if (mip != 0) cmd.transitionMip(view.hiz, level - 1, .shader_read);
+            cmd.transitionMip(view.hiz, level, .storage);
+            const width = @max(view.hiz_width >> @intCast(mip), 1);
+            const height = @max(view.hiz_height >> @intCast(mip), 1);
+            cmd.pushConstants(extern struct { source: u32, sampler: u32, first: u32, source_lod: i32, target: u32, pad: u32 = 0, size: [2]i32 }{
+                .source = device.textureIndex(if (mip == 0) view.depth else view.hiz),
+                .sampler = sampler,
+                .first = @intFromBool(mip == 0),
+                .source_lod = if (mip == 0) 0 else @intCast(mip - 1),
+                .target = try device.storageIndex(view.hiz, level),
+                .size = .{ @intCast(width), @intCast(height) },
+            });
+            cmd.dispatch((width + 7) / 8, (height + 7) / 8, 1);
+        }
+        cmd.transition(view.hiz, .shader_read);
+        return;
+    }
     for (0..view.hiz_mips) |mip| {
         if (mip != 0) cmd.transitionMip(view.hiz, @intCast(mip - 1), .shader_read);
         try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hiz, .mip = @intCast(mip), .load = .discard }} });
@@ -374,11 +497,9 @@ pub fn buildDepthPyramid(renderer: *Renderer, cmd: *rhi.CommandEncoder, view: *V
     cmd.transition(view.hiz, .shader_read);
 }
 
-/// Draws the visibility buffer and depth: what the culling listed, and
-/// with occlusion culling a second phase of what the depth of the
-/// first shows was not hidden after all.
+/// Draws the visibility buffer and depth; with occlusion culling, a second
+/// phase draws what the first phase's depth did not hide.
 pub fn drawSceneVisibility(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadows, culling: *const CullState) !void {
-    const device = renderer.device;
     const cmd = p.cmd;
     const desc = p.desc;
     const scene = p.scene;
@@ -386,7 +507,6 @@ pub fn drawSceneVisibility(renderer: *Renderer, p: *const ScenePass, sun: *const
     const view_proj = p.view_proj;
     const has_geometry = p.has_geometry;
     const occlusion = p.occlusion;
-    const mark_seen = p.mark_seen;
     const visibility_lod = p.lod;
     const lod_band = p.lod_band;
     const frame_address = p.frame_address;
@@ -404,30 +524,14 @@ pub fn drawSceneVisibility(renderer: *Renderer, p: *const ScenePass, sun: *const
     cmd.endScope();
 
     if (occlusion) {
-        // Late phase: whatever the early pass left visible through the
-        // depth pyramid gets drawn now.
         cmd.beginScope("occlusion culling");
         try buildDepthPyramid(renderer, cmd, view);
-        cmd.bindPipeline(renderer.pipelines.cull);
-        cull_push.view = cull_views_address + main_late_view * @sizeOf(gpu.CullView);
-        cull_push.commands = device.bufferAddress(renderer.cull_commands.?) + commandOffset(renderer, main_late_view, 0);
-        cull_push.counts = device.bufferAddress(renderer.cull_counts) + main_late_view * 2 * @sizeOf(u32);
-        cull_push.phase = 2;
-        cull_push.mark_seen = @intFromBool(mark_seen);
-        cmd.pushConstants(cull_push);
-        cmd.dispatch((scene.ref_count + 63) / 64, 1, 1);
-        // The cascades that test casters against what the camera sees.
-        for (0..gpu.cascade_count) |cascade| {
-            if (!receiver_culled[cascade] or !cascade_update[cascade]) continue;
-            cull_push.view = cull_views_address + (1 + cascade) * @sizeOf(gpu.CullView);
-            cull_push.commands = device.bufferAddress(renderer.cull_commands.?) + commandOffset(renderer, 1 + cascade, 0);
-            cull_push.counts = device.bufferAddress(renderer.cull_counts) + (1 + cascade) * 2 * @sizeOf(u32);
-            cull_push.phase = 0;
-            cull_push.mark_seen = 0;
-            cmd.pushConstants(cull_push);
-            cmd.dispatch((scene.ref_count + 63) / 64, 1, 1);
-        }
-        cmd.sync(.compute_to_all);
+        var culled: [view_count]bool = @splat(false);
+        var phases: [view_count]u32 = @splat(0);
+        culled[main_late_view] = true;
+        phases[main_late_view] = 2;
+        for (0..gpu.cascade_count) |cascade| culled[1 + cascade] = receiver_culled[cascade] and cascade_update[cascade];
+        cullViews(renderer, p, &cull_push, cull_views_address, &culled, &phases);
         try cmd.beginRendering(.{
             .color = &.{.{ .texture = view.visibility, .load = .load }},
             .depth = .{ .texture = view.depth, .load = .load },
@@ -438,7 +542,7 @@ pub fn drawSceneVisibility(renderer: *Renderer, p: *const ScenePass, sun: *const
     }
 }
 
-/// Answers a pending `pick` of this view from its visibility buffer.
+/// Answers a pending `pick` from this view's visibility buffer.
 pub fn recordPick(renderer: *Renderer, p: *const ScenePass) void {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -457,7 +561,7 @@ pub fn recordPick(renderer: *Renderer, p: *const ScenePass) void {
         const slot: usize = @intCast(frame.index % rhi.frames_in_flight);
         if (request.pixel[0] < output_width and request.pixel[1] < output_height) {
             cmd.beginScope("pick");
-            // The previous copy out of the buffer must finish first.
+            // The previous readback copy must finish first.
             cmd.sync(.transfer_to_all);
             cmd.bindPipeline(renderer.pipelines.pick);
             cmd.pushConstants(extern struct { frame: u64, result: u64, visibility: u32, depth: u32, pixel: [2]i32 }{
@@ -465,7 +569,6 @@ pub fn recordPick(renderer: *Renderer, p: *const ScenePass) void {
                 .result = device.bufferAddress(renderer.pick_buffer),
                 .visibility = device.textureIndex(view.visibility),
                 .depth = device.textureIndex(view.depth),
-                // Asked in output pixels; the visibility buffer may be at another size.
                 .pixel = .{
                     @intCast(@min(@as(u64, request.pixel[0]) * width / output_width, width - 1)),
                     @intCast(@min(@as(u64, request.pixel[1]) * height / output_height, height - 1)),

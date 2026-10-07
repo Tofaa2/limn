@@ -80,3 +80,14 @@ https://github.com/KayKit-Game-Assets/KayKit-Character-Pack-Adventures-1.0
 
 The copy here has the meshes of the weapons it carries removed; the
 skeleton and the animation clips are unchanged.
+
+`hair/` is not kept with these sources (it is in `.gitignore`). The `hair`
+example looks there for `wWavyThin.hair` and `woman.obj`, which are Cem
+Yuksel's hair model and the head it was combed on (the head courtesy of
+Murat Afshar):
+
+http://www.cemyuksel.com/research/hairmodels
+
+They may be downloaded and used freely for personal or research projects;
+anything published that was made with them is expected to link to that
+page. Without them the example makes a head of hair of its own.

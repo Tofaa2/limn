@@ -4,9 +4,8 @@
 #include "liquid.glsl"
 #include "water.glsl"
 
-// Draws a liquid as one surface over the scene: what is behind it bent
-// and tinted by how much liquid the light crossed, the sky and sun
-// mirrored on top.
+// Shades a liquid as one surface: refracted, absorbed scene behind it and sky
+// and sun reflections on top.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     LiquidRef liquid;
@@ -34,8 +33,7 @@ void main() {
     vec2 uv = gl_FragCoord.xy * frame.inv_resolution;
     float thickness = textureLod(TEX(push.thickness_texture, linear), uv, 0.0).r;
 
-    // The surface's slope from its neighbours, taking on each axis the
-    // side with the smaller step so an edge does not tilt it.
+    // Normal from depth: per axis, use the neighbour closer in depth.
     vec3 position = pointAt(pixel, here);
     float left = texelFetch(TEX(push.distance_texture, nearest), pixel + ivec2(-1, 0), 0).r;
     float right = texelFetch(TEX(push.distance_texture, nearest), pixel + ivec2(1, 0), 0).r;
@@ -48,7 +46,6 @@ void main() {
     vec3 normal = normalize(cross(along_x, along_y));
     vec3 view = normalize(frame.camera_position - position);
     if (dot(normal, view) < 0.0) normal = -normal;
-    // Fine ripples on what lies open to the sky, for the light only.
     {
         float pixel = here * 2.0 / (abs(frame.proj[1][1]) * frame.resolution.y);
         vec2 ripple = waterDetailSlope(liquid.detail, position.xz, frame.time, pixel / max(abs(dot(normal, view)), 0.08)) * max(normal.y, 0.0);
@@ -57,16 +54,14 @@ void main() {
     float n_dot_v = clamp(dot(normal, view), 0.0, 1.0);
     float fresnel = 0.02 + 0.98 * pow(1.0 - n_dot_v, 5.0);
 
-    // What is behind, shifted by the slope; never something in front.
+    // Refraction offset; never samples something in front.
     vec2 bend = (frame.view * vec4(normal, 0.0)).xy * vec2(1.0, -1.0) * liquid.refraction * min(thickness * 2.0, 1.0) / max(here, 0.5);
     vec2 behind_uv = clamp(uv - bend, vec2(0.001), vec2(0.999));
     float behind_depth = textureLod(TEX(push.depth_texture, nearest), behind_uv, 0.0).r;
     if (behind_depth > 0.0 && linearDepth(behind_depth, frame.near) < here) behind_uv = uv;
     vec3 behind = textureLod(TEX(push.scene_texture, linear), behind_uv, 0.0).rgb;
 
-    // Light crossing the liquid loses the colors the liquid is not, the
-    // more of it there is: shallow liquid is clear, deep liquid its own
-    // color and dark. A little of the light it takes is sent back.
+    // Beer-Lambert absorption plus a little in-scattering.
     vec3 clear = exp(-liquid.murk * thickness * (vec3(1.0) - liquid.color));
     vec3 ambient = vec3(0.0);
     if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
@@ -76,7 +71,6 @@ void main() {
     vec3 lit = ambient + frame.sun_radiance * sun_facing * sun_shadow;
     vec3 under = behind * clear + liquid.color * lit * 0.12 * (1.0 - exp(-liquid.murk * thickness * 0.5));
 
-    // On the surface: the sky, and the sun as a glint.
     vec3 mirror = reflect(-view, normal);
     vec3 reflected = vec3(0.0);
     if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
@@ -85,8 +79,7 @@ void main() {
     float glint = pow(clamp(dot(normal, halfway), 0.0, 1.0), 220.0) * sun_shadow;
     vec3 color = mix(under, reflected, fresnel) + frame.sun_radiance * glint * 1.5;
 
-    // A drop on its own is too thin to tint or bend anything, and would
-    // not show: it catches the light instead, as spray does.
+    // Thin drops are shaded as spray.
     float drop = 1.0 - smoothstep(liquid.radius * 0.15, liquid.radius * 0.9, thickness);
     color = mix(color, lit * 0.5 + reflected * 0.3, drop * 0.35);
     out_color = vec4(color, 1.0);

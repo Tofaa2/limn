@@ -1,9 +1,7 @@
 #version 460
 #include "common.glsl"
 
-// Joins a depth of field gathered at reduced resolution with the sharp
-// picture: each pixel takes the blurred version to the degree that it, or
-// something blurred in front that spills over it, is out of focus.
+// Blends reduced-resolution depth of field over the sharp image by blur radius.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint color_texture;
@@ -25,8 +23,6 @@ void main() {
     float radius = min(push.strength * abs(view_depth - focus_distance) / max(view_depth, 1e-3), push.max_radius);
     vec3 sharp = texelFetch(TEX(push.color_texture, frame.sampler_nearest_clamp), ivec2(gl_FragCoord.xy), 0).rgb;
     vec4 blurred = textureLod(TEX(push.blurred_texture, frame.sampler_linear_clamp), in_uv, 0.0);
-    // The coarse picture's own radius is spread by its filtering, which
-    // is what lets a blurred thing in front soften the edge behind it.
     float spilled = blurred.a * push.max_radius;
     float amount = smoothstep(0.5, 2.5, max(radius, spilled));
     out_color = vec4(mix(sharp, blurred.rgb, amount), 1.0);

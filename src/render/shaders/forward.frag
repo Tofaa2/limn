@@ -5,13 +5,12 @@
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint instance_index;
-    // 0: blend in the order drawn. 1: order-independent, weighted.
-    // 2: one layer of a depth peel.
+    // 0: ordered blend. 1: weighted order-independent. 2: depth peel layer.
     uint mode;
-    // The scene without transparent surfaces, for refraction; or INVALID_ID.
+    // Opaque scene color for refraction, or INVALID_ID.
     uint scene_texture;
-    // Peeling: the opaque scene's depth, and the depth of the layer peeled
-    // before this one (INVALID_ID for the first).
+    // Peeling: opaque depth and the previous layer's depth (INVALID_ID for the
+    // first).
     uint opaque_depth;
     uint peel_depth;
 } push;
@@ -27,18 +26,16 @@ layout(location = 7) in vec2 in_uv1;
 
 // Premultiplied alpha.
 layout(location = 0) out vec4 out_color;
-// Screen motion of the surface, blended over the background'"'"'s by how
-// much of it the surface covers, so antialiasing follows what dominates.
+// Screen motion, weighted by coverage.
 layout(location = 1) out vec4 out_motion;
-// Weighted mode only: how much of the background this surface hides.
+// Weighted mode only: revealage.
 layout(location = 2) out float out_reveal;
 
 void main() {
     FrameConstants frame = push.frame;
     if (push.mode == 2u) {
-        // Keep only what is in front of the opaque scene and strictly
-        // behind the layer already taken; the depth test then leaves the
-        // nearest of those. Depth is larger the nearer.
+        // Keep fragments in front of the opaque scene and strictly behind the
+        // previous layer (reverse-Z).
         ivec2 at = ivec2(gl_FragCoord.xy);
         if (gl_FragCoord.z < texelFetch(TEX(push.opaque_depth, frame.sampler_nearest_clamp), at, 0).r) discard;
         if (push.peel_depth != INVALID_ID && gl_FragCoord.z >= texelFetch(TEX(push.peel_depth, frame.sampler_nearest_clamp), at, 0).r) discard;
@@ -66,7 +63,6 @@ void main() {
 
     vec3 normal = normalize(in_normal);
     if (!gl_FrontFacing) normal = -normal;
-    // The coat follows the smooth surface or its own normal map.
     vec3 coat_normal = normal;
     float clearcoat = material.clearcoat;
     float clearcoat_roughness = material.clearcoat_roughness;
@@ -97,7 +93,6 @@ void main() {
         normal = normalize(t * sampled.x + b * sampled.y + normal * sampled.z);
     }
 
-    // Decals land on transparent surfaces as they do on opaque ones.
     DECAL_LOOP_BEGIN(in_position)
         Decal decal = frame.decals.data[i];
         vec3 local = (decal.world_to_decal * vec4(in_position, 1.0)).xyz;
@@ -109,7 +104,7 @@ void main() {
         if (decal.image != INVALID_ID) tint *= texture(TEX(decal.image, frame.sampler_linear_clamp), vec2(local.x + 0.5, 0.5 - local.y));
         weight *= tint.a;
         base_color.rgb = mix(base_color.rgb, tint.rgb, weight);
-        // Paint on glass is paint: it covers what the glass let through.
+        // Decals are opaque.
         base_color.a = mix(base_color.a, 1.0, weight);
         emissive += tint.rgb * (decal.emissive * weight);
         if (decal.roughness >= 0.0) roughness = mix(roughness, clamp(decal.roughness, 0.045, 1.0), weight);
@@ -140,32 +135,24 @@ void main() {
         surface.anisotropy = material.anisotropy;
     }
 
-    // Diffuse light is what the surface lets through less of as it becomes
-    // more opaque; reflections stay at full strength however clear it is.
+    // Opacity scales diffuse only; specular stays at full strength.
     Surface specular_only = surface;
     specular_only.diffuse_color = vec3(0.0);
     float noise = interleavedGradientNoise(gl_FragCoord.xy, frame.frame_index);
     vec3 specular = shadeSurface(frame, specular_only, gl_FragCoord.xy, noise, vec4(0.0));
     vec3 total = shadeSurface(frame, surface, gl_FragCoord.xy, noise, vec4(0.0));
     vec3 diffuse = max(total - specular, vec3(0.0));
-    // Light that passes through is not available to be scattered back.
     float alpha = base_color.a * (1.0 - material.transmission);
     float fresnel = max(surface.f0.r, max(surface.f0.g, surface.f0.b));
     fresnel += (1.0 - fresnel) * pow(1.0 - clamp(dot(surface.normal, surface.view), 0.0, 1.0), 5.0);
-    // Reflective glass hides what is behind it at grazing angles.
     float coverage = clamp(alpha + (1.0 - alpha) * fresnel * (1.0 - surface.roughness), 0.0, 1.0);
     vec3 color = (diffuse + emissive) * alpha + specular;
     if (material.transmission > 0.0 && push.scene_texture != INVALID_ID) {
-        // Light passing through: what lies behind, seen along the ray bent
-        // by the surface, tinted by the material. It replaces the plain
-        // see-through part of the pixel.
         vec3 bent = refract(-surface.view, surface.normal, 1.0 / max(material.ior, 1.0));
         vec4 exit = frame.view_proj * vec4(in_position + bent * material.thickness, 1.0);
         vec2 uv_behind = clamp(exit.xy / exit.w * 0.5 + 0.5, vec2(0.0), vec2(1.0));
         vec3 behind = textureLod(TEX(push.scene_texture, frame.sampler_linear_clamp), uv_behind, 0.0).rgb;
         if (surface.roughness > 0.08) {
-            // Frosted glass: what is behind is seen through a spread of
-            // directions, wider the rougher the surface.
             float spread = surface.roughness * surface.roughness * 0.06;
             float spin = noise * 6.2831853;
             for (int i = 0; i < 8; i++) {
@@ -180,8 +167,7 @@ void main() {
         coverage += through;
     }
     if (frame.aerial != 0.0 && (frame.flags & FRAME_ENVIRONMENT) != 0u) {
-        // Aerial perspective, as for opaque surfaces, on the share of the
-        // pixel this surface covers. What shows through has its own.
+        // Aerial perspective on the covered share of the pixel.
         vec3 air_through;
         vec3 air;
         aerialHaze(frame, surface.view, length(in_position - frame.camera_position), air_through, air);
@@ -189,8 +175,7 @@ void main() {
     }
     out_motion = vec4((in_clip.xy / in_clip.w - in_previous_clip.xy / in_previous_clip.w) * 0.5, 0.0, coverage);
     if (push.mode == 1u) {
-        // Weighted blended order-independent transparency (McGuire and
-        // Bavoil 2013): nearer and more opaque surfaces count for more.
+        // Weighted blended OIT (McGuire and Bavoil 2013).
         float weight = clamp(pow(min(1.0, coverage * 10.0) + 0.01, 3.0) * 1e8 * pow(gl_FragCoord.z * 0.9 + 0.1, 3.0), 1e-2, 3e3);
         out_color = vec4(color, coverage) * weight;
         out_reveal = coverage;

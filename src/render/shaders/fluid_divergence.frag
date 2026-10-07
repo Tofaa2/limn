@@ -2,9 +2,7 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// How much more flows out of each cell than into it. Air does not
-// compress, so the pressure step removes exactly this. The second channel
-// says whether the cell is solid, for the pressure passes.
+// Velocity divergence per cell. The second channel flags solid cells.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;

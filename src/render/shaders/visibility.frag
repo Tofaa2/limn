@@ -14,8 +14,7 @@ layout(location = 0) out uint out_id;
 
 void main() {
 #ifdef ALPHA_TEST
-    // A level of detail on its way in or out keeps a share of its pixels,
-    // the level it trades places with the rest.
+    // LOD cross-fade: dithered between the two levels.
     if (in_fade.x < 1.0 || in_fade.y > 0.0) {
         float noise = interleavedGradientNoise(gl_FragCoord.xy, (push.frame.flags & FRAME_TEMPORAL) != 0u ? push.frame.frame_index : 0u);
         if (noise >= in_fade.x || noise < in_fade.y) discard;

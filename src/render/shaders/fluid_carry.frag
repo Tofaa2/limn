@@ -2,9 +2,7 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// A first guess at where smoke, heat, fuel and the flow itself are carried to this step:
-// each cell takes what was upstream of it. The advection pass proper
-// measures how far off this guess is and corrects it (MacCormack).
+// Forward advection guess for the MacCormack correction in fluid_advect.frag.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;

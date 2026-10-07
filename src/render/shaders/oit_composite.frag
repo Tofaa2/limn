@@ -1,7 +1,7 @@
 #version 460
 #include "common.glsl"
 
-// Resolves weighted blended transparency over the opaque picture.
+// Resolves weighted blended OIT over the opaque image.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint accumulation_texture;
@@ -14,10 +14,7 @@ void main() {
     uint nearest = push.frame.sampler_nearest_clamp;
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     float reveal = texelFetch(TEX(push.reveal_texture, nearest), pixel, 0).r;
-    // Nothing transparent here.
     if (reveal >= 1.0) discard;
     vec4 accumulation = texelFetch(TEX(push.accumulation_texture, nearest), pixel, 0);
-    // Average premultiplied color of everything transparent, then laid
-    // over the background by how much of it is hidden in total.
     out_color = vec4(accumulation.rgb / max(accumulation.a, 1e-5), 1.0 - reveal);
 }

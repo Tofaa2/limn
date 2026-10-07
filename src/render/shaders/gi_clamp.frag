@@ -1,9 +1,8 @@
 #version 460
 #include "common.glsl"
 
-// Bounds the steady irradiance atlas by the fast one. Drawn twice, with
-// minimum and maximum blending, so the atlas ends up clamped to
-// [fast * (1 - tolerance), fast * (1 + tolerance)] without being read.
+// Clamps the steady irradiance atlas to fast * (1 +- tolerance). Drawn twice,
+// with min and max blending.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint fast_texture;

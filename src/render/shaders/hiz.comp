@@ -1,0 +1,47 @@
+#version 460
+#define STORAGE_IMAGES
+#include "common.glsl"
+
+// Compute version of hiz.frag: builds one level of the min-depth pyramid
+// (reverse-Z, so min is farthest) for occlusion culling.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant, scalar) uniform Push {
+    uint source_texture;
+    uint sampler_index;
+    // Nonzero when reading the full-resolution depth buffer (level 0).
+    uint first;
+    int source_lod;
+    // Target storage image and its size.
+    uint target;
+    uint pad;
+    ivec2 size;
+} push;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, push.size))) return;
+    float a;
+    float b;
+    float c;
+    float d;
+    if (push.first != 0u) {
+        // Level 0 is at most 2x smaller than the depth buffer, so four taps
+        // cover it.
+        vec2 texel = 1.0 / vec2(push.size);
+        vec2 uv = (vec2(pixel) + 0.5) * texel;
+        vec2 offset = texel * 0.25;
+        a = textureLod(TEX(push.source_texture, push.sampler_index), uv + vec2(-offset.x, -offset.y), 0.0).r;
+        b = textureLod(TEX(push.source_texture, push.sampler_index), uv + vec2(offset.x, -offset.y), 0.0).r;
+        c = textureLod(TEX(push.source_texture, push.sampler_index), uv + vec2(-offset.x, offset.y), 0.0).r;
+        d = textureLod(TEX(push.source_texture, push.sampler_index), uv + vec2(offset.x, offset.y), 0.0).r;
+    } else {
+        ivec2 base = pixel * 2;
+        ivec2 limit = textureSize(TEX(push.source_texture, push.sampler_index), push.source_lod) - 1;
+        a = texelFetch(TEX(push.source_texture, push.sampler_index), min(base, limit), push.source_lod).r;
+        b = texelFetch(TEX(push.source_texture, push.sampler_index), min(base + ivec2(1, 0), limit), push.source_lod).r;
+        c = texelFetch(TEX(push.source_texture, push.sampler_index), min(base + ivec2(0, 1), limit), push.source_lod).r;
+        d = texelFetch(TEX(push.source_texture, push.sampler_index), min(base + ivec2(1, 1), limit), push.source_lod).r;
+    }
+    imageStore(STORAGE(push.target), pixel, vec4(min(min(a, b), min(c, d))));
+}

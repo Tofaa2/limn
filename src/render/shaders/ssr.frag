@@ -8,10 +8,9 @@
 #include "rt.glsl"
 #endif
 
-// Screen-space reflections: follows each glossy pixel's mirror direction
-// through the depth buffer and reports the lit color it runs into, with a
-// confidence. Where it finds nothing (off screen, behind something, too
-// rough) the confidence is zero and the composite uses the sky instead.
+// Screen-space reflections: marches the reflection ray through the depth buffer
+// and outputs the hit color with a confidence; zero confidence falls back to
+// the sky.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint depth_texture;
@@ -26,8 +25,7 @@ layout(push_constant, scalar) uniform Push {
     uint history_texture;
     float history_blend;
 #ifdef RAY_TRACED
-    // The scene's acceleration structure: where the screen has no answer,
-    // a real ray is traced instead.
+    // TLAS: rays are traced where the screen has no answer.
     uint64_t tlas;
 #endif
 } push;
@@ -38,8 +36,6 @@ layout(location = 0) out vec4 out_reflection;
 void main() {
     FrameConstants frame = push.frame;
     uint nearest = frame.sampler_nearest_clamp;
-    // The trace may run at a lower resolution than the picture: each of
-    // its pixels answers for the full-resolution pixel under its centre.
     ivec2 pixel = min(ivec2(in_uv * frame.resolution), ivec2(frame.resolution) - 1);
     out_reflection = vec4(0.0);
     float depth = texelFetch(TEX(push.depth_texture, nearest), pixel, 0).r;
@@ -53,17 +49,14 @@ void main() {
     vec3 incoming = normalize(position - frame.camera_position);
     vec3 direction = reflect(incoming, normal);
     float view_depth = linearDepth(depth, frame.near);
-    // Start a little off the surface so the ray does not hit where it began.
     vec3 origin = position + normal * (0.01 + view_depth * 0.004);
     float reach = min(push.max_distance, view_depth * 6.0 + 2.0);
 
-    // The same offset every frame: a pattern that changes with time makes
-    // reflections of thin things sparkle more than antialiasing can hide.
+    // Fixed jitter: a temporal pattern makes thin reflections sparkle.
     float jitter = interleavedGradientNoise(gl_FragCoord.xy, 0u);
     float previous_t = 0.0;
     float hit_t = -1.0;
     for (int i = 0; i < push.step_count; i++) {
-        // Steps lengthen with distance: nearby contact matters most.
         float fraction = (float(i) + jitter) / float(push.step_count);
         float t = reach * fraction * fraction;
         vec4 clip = frame.view_proj * vec4(origin + direction * t, 1.0);
@@ -72,8 +65,6 @@ void main() {
         if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) break;
         float scene = linearDepth(textureLod(TEX(push.depth_texture, nearest), uv, 0.0).r, frame.near);
         float behind = clip.w - scene;
-        // Behind a surface, but not so far behind that it passed something
-        // thin in front.
         if (behind > 0.0 && behind < push.thickness + (t - previous_t)) {
             hit_t = t;
             break;
@@ -83,7 +74,7 @@ void main() {
     vec4 result = vec4(0.0);
     if (hit_t >= 0.0) {
 
-    // Narrow down the crossing between the last two samples.
+    // Binary search refinement.
     float low = previous_t;
     float high = hit_t;
     for (int i = 0; i < 5; i++) {
@@ -98,12 +89,10 @@ void main() {
     float scene = linearDepth(textureLod(TEX(push.depth_texture, nearest), hit_uv, 0.0).r, frame.near);
     if (abs(clip.w - scene) <= push.thickness) {
 
-    // Fade out toward everything the screen cannot answer for.
     vec2 border = min(hit_uv, 1.0 - hit_uv);
     float confidence = smoothstep(0.0, 0.08, min(border.x, border.y));
     confidence *= 1.0 - smoothstep(push.max_roughness * 0.6, push.max_roughness, roughness);
     confidence *= 1.0 - smoothstep(0.75, 1.0, high / reach);
-    // Rays coming back toward the camera would need the far side of things.
     confidence *= 1.0 - smoothstep(0.5, 0.9, dot(direction, -incoming));
     vec3 color = textureLod(TEX(push.color_texture, frame.sampler_linear_clamp), hit_uv, 0.0).rgb;
     result = vec4(color, confidence);
@@ -114,16 +103,11 @@ void main() {
     if (result.a < 0.999) {
         vec3 radiance;
         float distance_hit;
-        // Blurrier textures for rougher mirrors.
         int met = rtTracePicture(frame, push.tlas, origin, direction, push.max_distance, 1.0 + roughness * 8.0, radiance, distance_hit);
         if ((frame.flags & FRAME_FLUID_RAYS) != 0u) {
-            // Smoke and flame between the surface and what it mirrors;
-            // on a miss, between it and the sky the composite adds.
             if (met != RT_MISS) radiance = rtThroughFluids(frame, origin, direction, distance_hit, radiance);
         }
         if (met != RT_MISS) {
-            // What is hit is lit by the sun and the probes; its own
-            // highlights and anything animated or transparent are missing.
             float fade = 1.0 - smoothstep(push.max_roughness * 0.6, push.max_roughness, roughness);
             fade *= 1.0 - smoothstep(0.75, 1.0, distance_hit / push.max_distance);
             vec3 blended = mix(radiance, result.rgb, result.a);
@@ -132,15 +116,11 @@ void main() {
     }
 #endif
     if (push.history_texture != INVALID_ID) {
-        // Blend with where this surface point was last frame; what a ray
-        // hits flips between frames at thin things and at the edges of the
-        // screen, and averaging is what keeps reflections from sparkling.
         vec4 previous = frame.prev_view_proj_unjittered * vec4(position, 1.0);
         vec2 previous_uv = previous.xy / previous.w * 0.5 + 0.5;
         if (previous.w > 0.0 && all(greaterThanEqual(previous_uv, vec2(0.0))) && all(lessThanEqual(previous_uv, vec2(1.0)))) {
             vec4 history = textureLod(TEX(push.history_texture, frame.sampler_linear_clamp), previous_uv, 0.0);
-            // Premultiplied, so a confident color is not dragged toward
-            // the black of a miss.
+            // Premultiplied by confidence.
             vec4 blended = mix(vec4(history.rgb * history.a, history.a), vec4(result.rgb * result.a, result.a), push.history_blend);
             result = vec4(blended.a > 1e-4 ? blended.rgb / blended.a : vec3(0.0), blended.a);
         }

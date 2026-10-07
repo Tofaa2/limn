@@ -2,8 +2,8 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Last step: subtracts the pressure gradient, leaving a flow that neither
-// piles up nor thins out anywhere, and stops it at walls and obstacles.
+// Final solver step: subtracts the pressure gradient and enforces solid
+// boundaries.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;
@@ -33,7 +33,6 @@ void main() {
     float down = fluidPressure(fluid, p, cell - ivec3(0, 1, 0), center, solid_down);
     vec3 velocity = current.xyz;
     velocity.xy -= 0.5 * vec2(right - left, up - down);
-    // Nothing moves into a wall.
     if (solid_left) velocity.x = max(velocity.x, 0.0);
     if (solid_right) velocity.x = min(velocity.x, 0.0);
     if (solid_down) velocity.y = max(velocity.y, 0.0);

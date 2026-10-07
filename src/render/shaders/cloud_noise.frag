@@ -2,9 +2,8 @@
 #include "common.glsl"
 #include "volume.glsl"
 
-// Fills the cloud noise volume, once: tiling Perlin-Worley in red for the
-// overall shapes and three scales of tiling Worley noise for breaking
-// them up (after Schneider, "The Real-time Volumetric Cloudscapes of
+// Fills the cloud noise volume: tiling Perlin-Worley in r, three scales of
+// tiling Worley in gba (Schneider, "The Real-time Volumetric Cloudscapes of
 // Horizon Zero Dawn").
 layout(push_constant, scalar) uniform Push {
     ivec3 size;

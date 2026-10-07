@@ -4,13 +4,11 @@
 #include "media.glsl"
 #include "fluid.glsl"
 
-// Draws the scene's fluid volumes: each is ray-marched inside its box.
-// Smoke absorbs and scatters the sun (shadowed by the smoke itself, the
-// scene and the clouds) and ambient light; hot gas glows. Output is light
-// reaching the camera in rgb and how much of the scene shows through in a.
+// Ray-marches the scene's fluid volumes. Smoke scatters sun, local and ambient
+// light; hot gas emits. Output: radiance in rgb, transmittance in a.
 const uint MAX_FLUIDS = 8u;
 
-// Most local lights one fluid is lit by.
+// Maximum local lights per fluid.
 const uint MAX_FLUID_LAMPS = 16u;
 
 layout(push_constant, scalar) uniform Push {
@@ -19,7 +17,7 @@ layout(push_constant, scalar) uniform Push {
     uint count;
     int steps;
     int light_steps;
-    // 1 to work out motion vectors for the smoke as well.
+    // 1 to output motion vectors.
     uint motion;
     uint motion_pad;
     FluidRef fluids[MAX_FLUIDS];
@@ -27,8 +25,7 @@ layout(push_constant, scalar) uniform Push {
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_fluid;
-// Where the smoke and flame seen at this pixel moved on screen since the
-// last frame (xy), and how much of the pixel they cover (a).
+// Screen motion of the fluid (xy) and its coverage (a).
 layout(location = 1) out vec4 out_motion;
 
 void main() {
@@ -39,13 +36,11 @@ void main() {
     float scene_distance = depth > 0.0 ? length(end - camera) : 1e30;
     vec3 direction = normalize(end - camera);
 
-    // Where the ray is inside each box, nearest first.
+    // Ray span in each box, sorted near to far.
     float enter[MAX_FLUIDS];
     float leave[MAX_FLUIDS];
     uint order[MAX_FLUIDS];
-    // Initialised because pixels shaded together run the loop below for
-    // as long as any of them has a box left, the others with whatever is
-    // in here.
+    // Initialised: helper invocations may read it past their own box count.
     for (uint i = 0u; i < MAX_FLUIDS; i++) order[i] = 0u;
     uint hits = 0u;
     for (uint i = 0u; i < push.count; i++) {
@@ -99,7 +94,7 @@ void main() {
         int light_steps = push.light_steps;
         float self_shadow = fluid.data.shadow;
 
-        // Ambient light is taken once, at the middle of the box.
+        // Ambient is sampled once, at the box center.
         vec3 middle = (fluid.data.box_to_world * vec4(0.5, 0.5, 0.5, 1.0)).xyz;
         vec3 ambient = sky_ambient;
         if ((frame.flags & FRAME_GI) != 0u) {
@@ -108,12 +103,11 @@ void main() {
         }
         ambient *= fluid.data.ambient;
         vec3 sun = frame.sun_radiance * henyeyGreenstein(dot(direction, frame.sun_direction), fluid.data.anisotropy);
-        // The march toward the sun covers about half the box's height.
+        // Sun march covers about half the box height.
         float light_reach = 0.5 * length(fluid.data.box_to_world[1].xyz);
         float light_step = light_reach / float(max(light_steps, 1));
         vec3 sun_in_box = (world_to_box * vec4(frame.sun_direction * light_step, 0.0)).xyz;
 
-        // Local lights that reach the box.
         uint near_lights[MAX_FLUID_LAMPS];
         uint near_count = 0u;
         float box_radius = 0.5 * length(fluid.data.box_to_world[0].xyz + fluid.data.box_to_world[1].xyz + fluid.data.box_to_world[2].xyz);
@@ -142,7 +136,6 @@ void main() {
                         optical_depth += sampleVolume(scalars, linear, toward, size, tiles_x).x * absorption * light_step;
                     }
                 }
-                // Its own smoke is already counted in the march above.
                 light += sun * exp(-optical_depth * self_shadow) * cascadeVisibility(frame, position) * cloudShadow(frame, position);
             }
             for (uint i = 0u; i < near_count && sigma > 1e-4; i++) {
@@ -161,7 +154,6 @@ void main() {
                 float lamp_distance = sqrt(distance_squared);
                 attenuation *= lampVisibility(frame, lamp, position, to_lamp);
                 if (self_shadow > 0.0 && attenuation > 1e-5 && (lamp.flags & LIGHT_FIRE) == 0u) {
-                    // The smoke between here and the lamp, as for the sun.
                     float lamp_step = min(lamp_distance, light_reach) / float(max(light_steps, 1));
                     vec3 lamp_in_box = (world_to_box * vec4(to_lamp / lamp_distance * lamp_step, 0.0)).xyz;
                     float optical_depth = 0.0;
@@ -172,12 +164,10 @@ void main() {
                     }
                     attenuation *= exp(-optical_depth * self_shadow);
                 }
-                // Scattered evenly in all directions.
                 light += lamp.color * attenuation / (4.0 * PI);
             }
             float step_transmittance = exp(-sigma * step_length);
             if (push.motion != 0u) {
-                // What shows at this step, and which way it is drifting.
                 float shows = transmittance * max(1.0 - step_transmittance, min(dot(glow, vec3(0.33)) * step_length, 1.0));
                 vec3 cells = sampleVolume(fluid.data.velocity_texture, linear, uvw, size, tiles_x).xyz;
                 moving_position += position * shows;

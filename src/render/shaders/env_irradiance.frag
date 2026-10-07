@@ -25,7 +25,7 @@ void main() {
         float cos_theta = sqrt(1.0 - xi.y);
         float sin_theta = sqrt(xi.y);
         vec3 l = basis * vec3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
-        // Pick the mip whose texels match the solid angle of this sample.
+        // Mip whose texel solid angle matches the sample's.
         float pdf = cos_theta / PI;
         float sample_solid_angle = 1.0 / (float(sample_count) * pdf + 1e-4);
         float texel_solid_angle = 4.0 * PI / (6.0 * push.source_size * push.source_size);

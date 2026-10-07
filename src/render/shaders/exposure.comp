@@ -1,9 +1,8 @@
 #version 460
 #include "common.glsl"
 
-// Automatic exposure. Measures the log-average luminance of a small bloom
-// level and eases the stored exposure toward the value that maps it to
-// middle grey. Runs as a single invocation; the image is tiny.
+// Auto exposure: eases stored exposure toward mapping the log-average luminance
+// of a small bloom level to middle grey. Single invocation.
 layout(local_size_x = 1) in;
 
 layout(push_constant, scalar) uniform Push {
@@ -15,15 +14,13 @@ layout(push_constant, scalar) uniform Push {
     float max_luminance;
     float speed;
     uint reset;
-    // For autofocus: the depth buffer, and how quickly focus follows what
-    // is at the middle of the picture, per second.
+    // Autofocus: depth buffer and focus speed per second.
     uint depth_texture;
     float focus_speed;
 } push;
 
 void main() {
     FrameConstants frame = push.frame;
-    // Autofocus: ease toward the distance at the middle of the picture.
     float seen = 0.0;
     for (int i = 0; i < 5; i++) {
         vec2 offset = vec2(i == 1 ? 0.03 : (i == 2 ? -0.03 : 0.0), i == 3 ? 0.03 : (i == 4 ? -0.03 : 0.0));
@@ -53,11 +50,9 @@ void main() {
     float average = clamp(exp2(total / max(weight_total, 1e-5)), push.min_luminance, push.max_luminance);
     float previous = frame.exposure.average_luminance;
     if (push.reset != 0u || !(previous > 0.0)) previous = average;
-    // Adapt in log space; eyes adjust faster to brightening than darkening.
+    // Adapt in log space, faster when brightening.
     float rate = average > previous ? push.speed * 1.6 : push.speed;
-    // The metered value wobbles a little from frame to frame with sampling
-    // noise; following that would make the whole picture shimmer. Changes
-    // inside a small dead band (about 3%) are ignored.
+    // Dead band against metering noise.
     const float dead_band = 0.04;
     float stops = log2(average) - log2(previous);
     stops = sign(stops) * max(abs(stops) - dead_band, 0.0);

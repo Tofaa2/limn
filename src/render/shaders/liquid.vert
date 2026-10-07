@@ -2,20 +2,19 @@
 #include "common.glsl"
 #include "liquid.glsl"
 
-// A camera-facing square for every particle of a liquid, pulled straight
-// from its buffer: the fragment stage makes a sphere of each.
+// One camera-facing quad per liquid particle; the fragment stage shapes it into
+// a sphere.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     LiquidRef liquid;
     LiquidParticles particles;
     uint depth_texture;
-    // Drawn radius as a multiple of the particle's own, so that
-    // neighbours overlap into one surface.
+    // Drawn radius as a multiple of the particle radius.
     float swell;
 } push;
 
 layout(location = 0) out vec2 out_corner;
-// Center of the sphere in view space, and its radius.
+// View-space sphere center and radius.
 layout(location = 1) out vec4 out_sphere;
 
 void main() {

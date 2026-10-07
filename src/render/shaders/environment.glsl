@@ -1,4 +1,4 @@
-// Helpers for baking image-based lighting from an equirectangular panorama.
+// Helpers for baking image-based lighting.
 #ifndef ENVIRONMENT_GLSL
 #define ENVIRONMENT_GLSL
 
@@ -17,7 +17,7 @@ vec3 cubeDirection(uint face, vec2 uv) {
     return normalize(direction);
 }
 
-// Matches `equirectDirection` in src/asset/gltf.zig.
+// Must match `equirectDirection` in src/asset/gltf.zig.
 vec2 equirectUv(vec3 direction) {
     return vec2(atan(direction.z, direction.x) / (2.0 * PI) + 0.5, acos(clamp(direction.y, -1.0, 1.0)) / PI);
 }

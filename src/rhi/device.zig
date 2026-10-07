@@ -1,13 +1,6 @@
-//! The Vulkan device layer.
-//!
-//! `Device` owns the instance, logical device, a single graphics queue, every
-//! GPU resource, the bindless descriptor table and the frame loop. Resources
-//! are addressed with generation-checked handles; destruction is deferred
-//! until the GPU can no longer be using the object.
-//!
-//! Shaders see resources two ways only: sampled textures and samplers through
-//! one global descriptor set (indexed by `textureIndex` / `samplerIndex`),
-//! and buffers through device addresses passed in push constants.
+//! The Vulkan device layer: instance, device, queue, resources, the bindless
+//! table and the frame loop. Shaders reach textures and samplers through one
+//! global descriptor set and buffers through device addresses.
 const std = @import("std");
 const vk = @import("vulkan");
 const types = @import("types.zig");
@@ -17,86 +10,76 @@ const memory = @import("memory.zig");
 const HandleTable = @import("../handle.zig").HandleTable;
 const CommandEncoder = @import("command.zig").CommandEncoder;
 
-/// Frames the CPU may record before it waits for the GPU. Also how many
-/// submitted frames a destroyed resource outlives.
+/// Frames the CPU may record before waiting for the GPU; a destroyed
+/// resource outlives this many submitted frames.
 pub const frames_in_flight = 2;
-/// Most mip levels a texture can have: enough for 32768 texels a side.
 pub const max_mip_levels = 16;
-/// Regions per frame that `CommandEncoder.beginScope` can time. Further
-/// regions are still labelled for debuggers but get no timing.
+/// Regions per frame `CommandEncoder.beginScope` can time; further ones
+/// get no timing.
 pub const max_timing_scopes = 48;
-/// Bytes of the push constant block shared by every pipeline and shader
-/// stage; the limit for `CommandEncoder.pushConstants`.
+/// Bytes of the push constant block shared by every pipeline and stage.
 pub const push_constant_size = 256;
 const texture_capacity = 16384;
 const sampler_capacity = 256;
-// Nothing newer than Vulkan 1.3 is used: dynamic rendering,
-// synchronization2 and the descriptor indexing and buffer address features
-// of 1.2. Drivers that stop at 1.3 work.
+const storage_capacity = 1024;
 const required_api_version = vk.API_VERSION_1_3.toU32();
-const all_shader_stages = vk.ShaderStageFlags{ .vertex_bit = true, .fragment_bit = true, .compute_bit = true };
 
-/// Vulkan-level state of a buffer, from `Device.bufferResource`.
+/// From `Device.bufferResource`.
 pub const BufferResource = struct {
     handle: vk.Buffer,
     allocation: memory.Allocation,
-    /// Size in bytes that was asked for.
+    /// Requested size in bytes.
     size: u64,
-    /// Device address shaders use to reach the buffer.
     address: u64,
 };
 
 const SubView = struct { mip: u32, layer: u32, view: vk.ImageView };
+const StorageSlot = struct { mip: u32, slot: u32 };
 
-/// Vulkan-level state of a texture, from `Device.textureResource`.
+/// From `Device.textureResource`.
 pub const TextureResource = struct {
     image: vk.Image,
     /// Null for swapchain images, whose memory the swapchain owns.
     allocation: ?memory.Allocation,
-    /// View of every mip and layer; what the bindless table holds.
+    /// View of every mip and layer.
     view: vk.ImageView,
     info: types.TextureInfo,
     vk_format: vk.Format,
-    /// Depth or color, by format.
     aspect: vk.ImageAspectFlags,
-    /// Slot in the bindless table; null unless created with `sampled`.
+    /// Null unless created with `sampled`.
     bindless_index: ?u32,
-    /// State of each mip as of the commands recorded so far. Maintained by
-    /// the encoder's transitions; change it only to match barriers issued
-    /// by hand.
+    /// State of each mip as of the commands recorded so far; maintained by
+    /// the encoder's transitions.
     states: [max_mip_levels]types.TextureState = @splat(.undefined),
     /// Single mip/layer views, made on demand by `Device.subView`.
     sub_views: std.ArrayList(SubView) = .empty,
+    /// Storage image slots per mip, made on demand by `Device.storageIndex`.
+    storage_slots: std.ArrayList(StorageSlot) = .empty,
 };
 
 const SamplerResource = struct { handle: vk.Sampler, bindless_index: u32 };
 
-/// Vulkan-level state of an acceleration structure, from
-/// `Device.accelerationResource`.
+/// From `Device.accelerationResource`.
 pub const AccelerationResource = struct {
     handle: vk.AccelerationStructureKHR,
-    /// Buffer holding the structure; owned and destroyed with it.
+    /// Buffer holding the structure; destroyed with it.
     buffer: types.Buffer,
-    /// Device address, for referencing a BLAS from TLAS instances.
     address: u64,
     top_level: bool,
-    /// Kept for top-level structures, which are rebuilt every frame.
+    /// Kept for structures that are rebuilt every frame.
     scratch: ?types.Buffer = null,
-    /// Bytes of scratch memory a build needs.
     scratch_size: u64,
-    /// Rebuilt every frame (deformed geometry): built for speed rather
-    /// than for fast tracing, and its scratch memory is kept.
+    /// Rebuilt every frame: built for speed, scratch memory kept.
     dynamic: bool = false,
-    /// A dynamic structure that has been built once is refitted after that.
+    /// A built dynamic structure is refitted instead of rebuilt.
     built: bool = false,
     /// Triangles (bottom level) or instances (top level) it was sized for.
     capacity: u32 = 0,
 };
 
-/// Vulkan-level state of a pipeline, from `Device.pipelineResource`.
+/// From `Device.pipelineResource`.
 pub const PipelineResource = struct {
     handle: vk.Pipeline,
-    /// Graphics or compute; where `CommandEncoder.bindPipeline` binds it.
     bind_point: vk.PipelineBindPoint,
 };
 
@@ -109,42 +92,46 @@ const Deletion = union(enum) {
     acceleration: vk.AccelerationStructureKHR,
     texture_slot: u32,
     sampler_slot: u32,
+    storage_slot: u32,
 };
 
 const PendingDeletion = struct { frame: u64, object: Deletion };
 
+/// Work submitted to the second queue by `Device.submitDetached`.
+pub const Detached = struct {
+    command: vk.CommandBuffer,
+    fence: vk.Fence,
+};
+
 const PendingUpload = union(enum) {
     buffer: struct { staging: types.Buffer, destination: types.Buffer, offset: u64, size: u64 },
-    /// `offset` is where the level starts in the staging buffer, which
-    /// several levels may share; the entry marked `last` gives it up.
+    /// `offset` is the level's start in the staging buffer, which levels
+    /// may share; the entry marked `last` releases it.
     texture: struct { staging: types.Buffer, destination: types.Texture, mip: u32, layer: u32, offset: u64 = 0, last: bool = true },
     mips: types.Texture,
-    /// Buffer-to-buffer copy; the source is destroyed afterwards.
+    /// The source is destroyed afterwards.
     copy: struct { source: types.Buffer, destination: types.Buffer, size: u64 },
 };
 
 const Scope = struct { name: []const u8, depth: u8 };
 
-/// State of one slot of the frame loop. There are `frames_in_flight`
-/// slots, used in turn.
+/// One of the `frames_in_flight` slots of the frame loop.
 pub const FrameData = struct {
     pool: vk.CommandPool,
     command: vk.CommandBuffer,
     /// Signaled when the GPU has finished the slot's last frame.
     fence: vk.Fence,
-    /// Signaled when the swapchain image acquired for the frame is ready.
+    /// Signaled when the acquired swapchain image is ready.
     image_available: vk.Semaphore,
     /// Two timestamps per timing scope.
     query_pool: vk.QueryPool,
-    /// Scopes opened this frame, in order of `beginScope`.
+    /// Scopes opened this frame, in `beginScope` order.
     scopes: [max_timing_scopes]Scope = undefined,
     scope_count: u32 = 0,
-    /// The slot has been submitted at least once, so its queries can be
-    /// read back.
+    /// Submitted at least once, so its queries can be read back.
     submitted: bool = false,
-    /// A swapchain image was acquired for the slot and never presented:
-    /// `image_available` is left signaled and the image is held until the
-    /// swapchain is made again. See `Device.abandonAcquiredImage`.
+    /// An image was acquired and never presented; see
+    /// `Device.abandonAcquiredImage`.
     acquire_abandoned: bool = false,
 };
 
@@ -165,80 +152,66 @@ const Swapchain = struct {
     image_index: u32 = 0,
 };
 
-/// A frame being recorded, from `Device.beginFrame` or `startFrame`.
-/// Valid until the frame is submitted.
+/// A frame being recorded; valid until it is submitted.
 pub const Frame = struct {
-    /// Encoder for the frame's command buffer. The global descriptor table
-    /// is bound and the uploads queued so far are already recorded.
+    /// Globals are bound and queued uploads already recorded.
     cmd: *CommandEncoder,
-    /// The swapchain image for this frame, or null when running headless.
+    /// Null when headless.
     backbuffer: ?types.Texture,
-    /// Monotonic frame counter, starting at 0.
+    /// Frame counter, starting at 0.
     index: u64,
 };
 
-/// The Vulkan device; see the top of this file. Created on the heap by
-/// `init` and freed by `deinit`.
-///
-/// Not thread-safe unless a function says otherwise: use it from one
-/// thread, or guard it with a lock. `compileGraphicsPipeline` and
-/// `validationErrorCount` may be called from any thread, and
-/// `waitForFrame`, `acquireImage` and `presentFrame` may run outside
-/// such a lock.
-///
-/// The fields are public for code that needs to call Vulkan directly;
-/// treat them as read-only.
+/// Not movable, and not thread-safe except: `compileGraphicsPipeline` and
+/// `validationErrorCount` run on any thread; `waitForFrame`, `acquireImage`
+/// and `presentFrame` may run outside the caller's device lock.
 pub const Device = struct {
-    /// Allocator given to `init`; holds the device and its bookkeeping.
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// Function tables. `instance` and `vkd` point at the two wrappers,
-    /// which is why the device is not movable.
+    /// `instance` and `vkd` point at these wrappers.
     instance_wrapper: dispatch.InstanceWrapper,
     instance: dispatch.Instance,
     physical: vk.PhysicalDevice,
     device_wrapper: dispatch.DeviceWrapper,
-    /// The logical device, for Vulkan calls the RHI does not wrap.
     vkd: dispatch.Device,
-    /// The only queue: graphics, compute, transfer and present. Submit to
-    /// it under `queue_mutex`.
+    /// The only queue; submit under `queue_mutex`.
     queue: vk.Queue,
     queue_family: u32,
-    /// Adapter properties and limits.
     properties: vk.PhysicalDeviceProperties,
-    /// Suballocator for buffer and image memory.
     allocator: memory.Allocator,
     debug_messenger: vk.DebugUtilsMessengerEXT = .null_handle,
-    /// Objects are named and scopes labelled: validation or
-    /// `DeviceDesc.debug_names` is on.
+    /// Validation or `DeviceDesc.debug_names` is on.
     debug_labels: bool,
-    /// True when BC block-compressed texture formats can be used.
+    /// BC texture formats can be used.
     bc_textures: bool = false,
-    /// The surface is HDR10: the application must write PQ-encoded
-    /// Rec.2020 values to the backbuffer.
+    /// The surface is HDR10: the backbuffer takes PQ-encoded Rec.2020.
     hdr_active: bool = false,
-    /// HDR output was asked for and the instance can list HDR surfaces;
-    /// `hdr_active` says whether the swapchain got one.
+    /// HDR output was requested; `hdr_active` says whether it was granted.
     hdr_wanted: bool = false,
-    /// True when ray queries and acceleration structures are available.
+    /// Ray queries and acceleration structures are available.
     ray_tracing: bool = false,
+    /// Compute shaders can write textures (`TextureUsage.storage`).
+    storage_images: bool = false,
+    /// Pixels per shading rate texel each way; 0 when unsupported.
+    shading_rate_tile: u32 = 0,
+    /// Task and mesh shaders are available.
+    mesh_shaders: bool = false,
     accelerations: HandleTable(AccelerationResource, types.AccelerationTag),
     /// Read with `validationErrorCount`.
     validation_errors: std.atomic.Value(u32) = .init(0),
     surface: vk.SurfaceKHR = .null_handle,
     swapchain: ?Swapchain = null,
 
-    /// The bindless table: one descriptor set with sampled images at
-    /// binding 0 and samplers at binding 1.
+    /// The bindless set: sampled images at binding 0, samplers at binding 1.
     descriptor_layout: vk.DescriptorSetLayout,
     descriptor_pool: vk.DescriptorPool,
     descriptor_set: vk.DescriptorSet,
-    /// Layout shared by every pipeline: the bindless set plus
-    /// `push_constant_size` bytes of push constants.
+    /// Shared by every pipeline: the bindless set plus the push constants.
     pipeline_layout: vk.PipelineLayout,
     pipeline_cache: vk.PipelineCache,
     pipeline_cache_path: ?[]u8,
     texture_slots: SlotAllocator,
+    storage_slots: SlotAllocator,
     sampler_slots: SlotAllocator,
 
     buffers: HandleTable(BufferResource, types.BufferTag),
@@ -247,16 +220,14 @@ pub const Device = struct {
     pipelines: HandleTable(PipelineResource, types.PipelineTag),
 
     frames: [frames_in_flight]FrameData,
-    /// Frames submitted so far; also the index of the frame being
-    /// recorded.
+    /// Frames submitted so far; the index of the frame being recorded.
     frame_number: u64 = 0,
     /// True between `startFrame` and `submitFrame`.
     in_frame: bool = false,
-    /// Encoder of the frame being recorded; meaningful while `in_frame`.
+    /// Meaningful while `in_frame`.
     encoder: CommandEncoder = undefined,
-    /// Destroyed objects waiting until no frame in flight can use them.
+    /// Destroyed objects waiting out the frames in flight.
     deletions: std.ArrayList(PendingDeletion) = .empty,
-    /// Staged uploads waiting for the next flush.
     uploads: std.ArrayList(PendingUpload) = .empty,
     pending_upload_bytes: u64 = 0,
     timings: [max_timing_scopes]types.PassTiming = undefined,
@@ -266,22 +237,15 @@ pub const Device = struct {
     immediate_command: vk.CommandBuffer,
     /// Serializes queue submission and presentation.
     queue_mutex: std.Io.Mutex = .init,
+    /// Second queue, where the GPU has one, for `beginDetached` work.
+    detached_queue: ?vk.Queue = null,
+    detached_pool: vk.CommandPool = .null_handle,
+    /// Detached jobs submitted and not yet released.
+    detached_outstanding: u32 = 0,
 
-    /// Creates a device on the best adapter that supports Vulkan 1.3 and
-    /// the features the RHI needs: discrete before integrated, restricted
-    /// to names containing `desc.preferred_device` when that is set.
-    /// Blocks while the driver starts up. The swapchain is not created
-    /// until the first frame or `backbufferFormat`.
-    ///
-    /// The device is allocated with `gpa`, which it keeps, along with
-    /// `io`, until `deinit`. Strings in `desc` are only read during the
-    /// call; the window handles must stay valid for the device's life.
-    ///
-    /// Fails with `error.VulkanLoaderUnavailable` when there is no Vulkan
-    /// library, `error.Vulkan13Unavailable` when the loader is older than
-    /// 1.3, `error.NoSuitableDevice` when no adapter qualifies, and with
-    /// the driver's error when validation is asked for but the layers are
-    /// not installed.
+    /// Creates a device on the best Vulkan 1.3 adapter. Keeps `gpa` and `io`;
+    /// the window must outlive it. Fails with `error.VulkanLoaderUnavailable`,
+    /// `error.Vulkan13Unavailable` or `error.NoSuitableDevice`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, desc: types.DeviceDesc) !*Device {
         try loader.acquire(io);
         errdefer loader.release(io);
@@ -298,8 +262,6 @@ pub const Device = struct {
         var instance_extensions: [5][*:0]const u8 = undefined;
         var instance_extension_count: u32 = 0;
         var hdr_wanted = false;
-        // Validation brings the extension with its layer. Names alone are a
-        // convenience: where nothing provides it, the device goes without.
         const debug_utils = desc.validation or (desc.debug_names and try instanceExtensionAvailable(gpa, base, vk.extensions.ext_debug_utils.name));
         if (debug_utils) {
             instance_extensions[instance_extension_count] = vk.extensions.ext_debug_utils.name;
@@ -378,6 +340,7 @@ pub const Device = struct {
         const selected = try selectPhysicalDevice(gpa, self.instance, self.surface, desc.preferred_device);
         self.physical = selected.physical;
         self.queue_family = selected.queue_family;
+        const queue_count: u32 = @min(selected.queue_count, 2);
         self.properties = selected.properties;
 
         self.ray_tracing = desc.ray_tracing and try supportsRayQueries(gpa, self.instance, self.physical);
@@ -386,22 +349,45 @@ pub const Device = struct {
             self.instance.getPhysicalDeviceFeatures2(self.physical, &supported);
             break :blk supported.features.texture_compression_bc == .true;
         };
-        var ray_query_features = vk.PhysicalDeviceRayQueryFeaturesKHR{ .ray_query = .true };
+        self.storage_images = blk: {
+            var supported12 = vk.PhysicalDeviceVulkan12Features{};
+            var supported = vk.PhysicalDeviceFeatures2{ .p_next = &supported12, .features = .{} };
+            self.instance.getPhysicalDeviceFeatures2(self.physical, &supported);
+            break :blk supported.features.shader_storage_image_array_dynamic_indexing == .true and
+                supported.features.shader_storage_image_write_without_format == .true and
+                supported12.descriptor_binding_storage_image_update_after_bind == .true;
+        };
+        self.shading_rate_tile = try shadingRateTile(gpa, self.instance, self.physical);
+        self.mesh_shaders = desc.mesh_shaders and try supportsMeshShaders(gpa, self.instance, self.physical);
+        var mesh_shader_features = vk.PhysicalDeviceMeshShaderFeaturesEXT{ .task_shader = .true, .mesh_shader = .true };
+        var shading_rate_features = vk.PhysicalDeviceFragmentShadingRateFeaturesKHR{
+            .p_next = if (self.mesh_shaders) &mesh_shader_features else null,
+            .pipeline_fragment_shading_rate = .true,
+            .attachment_fragment_shading_rate = .true,
+        };
+        const after_shading_rate: ?*anyopaque = if (self.mesh_shaders) &mesh_shader_features else null;
+        const after_rays: ?*anyopaque = if (self.shading_rate_tile != 0) &shading_rate_features else after_shading_rate;
+        var ray_query_features = vk.PhysicalDeviceRayQueryFeaturesKHR{
+            .p_next = after_rays,
+            .ray_query = .true,
+        };
         var acceleration_features = vk.PhysicalDeviceAccelerationStructureFeaturesKHR{
             .p_next = &ray_query_features,
             .acceleration_structure = .true,
         };
         var features13 = vk.PhysicalDeviceVulkan13Features{
-            .p_next = if (self.ray_tracing) &acceleration_features else null,
+            .p_next = if (self.ray_tracing) @as(?*anyopaque, &acceleration_features) else after_rays,
             .synchronization_2 = .true,
             .dynamic_rendering = .true,
             .shader_demote_to_helper_invocation = .true,
+            .maintenance_4 = .true,
         };
         var features12 = vk.PhysicalDeviceVulkan12Features{
             .p_next = &features13,
             .descriptor_indexing = .true,
             .shader_sampled_image_array_non_uniform_indexing = .true,
             .descriptor_binding_sampled_image_update_after_bind = .true,
+            .descriptor_binding_storage_image_update_after_bind = if (self.storage_images) .true else .false,
             .descriptor_binding_update_unused_while_pending = .true,
             .descriptor_binding_partially_bound = .true,
             .runtime_descriptor_array = .true,
@@ -426,11 +412,22 @@ pub const Device = struct {
                 .geometry_shader = .true,
                 .image_cube_array = .true,
                 .texture_compression_bc = if (self.bc_textures) .true else .false,
+                .shader_clip_distance = .true,
+                .shader_storage_image_array_dynamic_indexing = if (self.storage_images) .true else .false,
+                .shader_storage_image_write_without_format = if (self.storage_images) .true else .false,
             },
         };
-        const queue_priority: f32 = 1;
-        var device_extensions: [4][*:0]const u8 = undefined;
+        const queue_priorities = [2]f32{ 1, 0.5 };
+        var device_extensions: [8][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
+        if (self.shading_rate_tile != 0) {
+            device_extensions[device_extension_count] = vk.extensions.khr_fragment_shading_rate.name;
+            device_extension_count += 1;
+        }
+        if (self.mesh_shaders) {
+            device_extensions[device_extension_count] = vk.extensions.ext_mesh_shader.name;
+            device_extension_count += 1;
+        }
         if (self.surface != .null_handle) {
             device_extensions[device_extension_count] = vk.extensions.khr_swapchain.name;
             device_extension_count += 1;
@@ -441,13 +438,20 @@ pub const Device = struct {
                 device_extension_count += 1;
             }
         }
+        // The FidelityFX SDK asks for these by their pre-core names.
+        for ([_][*:0]const u8{ vk.extensions.khr_get_memory_requirements_2.name, vk.extensions.khr_dedicated_allocation.name }) |extension| {
+            if (try deviceExtensionListed(gpa, self.instance, self.physical, extension)) {
+                device_extensions[device_extension_count] = extension;
+                device_extension_count += 1;
+            }
+        }
         const device_handle = try self.instance.createDevice(self.physical, &.{
             .p_next = &features,
             .queue_create_info_count = 1,
             .p_queue_create_infos = &.{.{
                 .queue_family_index = self.queue_family,
-                .queue_count = 1,
-                .p_queue_priorities = @ptrCast(&queue_priority),
+                .queue_count = queue_count,
+                .p_queue_priorities = &queue_priorities,
             }},
             .enabled_extension_count = device_extension_count,
             .pp_enabled_extension_names = &device_extensions,
@@ -456,6 +460,7 @@ pub const Device = struct {
         self.vkd = dispatch.Device.init(device_handle, &self.device_wrapper);
         errdefer self.vkd.destroyDevice(null);
         self.queue = self.vkd.getDeviceQueue(self.queue_family, 0);
+        self.detached_queue = if (queue_count > 1) self.vkd.getDeviceQueue(self.queue_family, 1) else null;
         self.allocator = memory.Allocator.init(gpa, self.vkd, self.instance.getPhysicalDeviceMemoryProperties(self.physical));
 
         self.buffers = .init(gpa);
@@ -464,10 +469,11 @@ pub const Device = struct {
         self.pipelines = .init(gpa);
         self.accelerations = .init(gpa);
         self.texture_slots = try SlotAllocator.init(gpa, texture_capacity);
+        self.storage_slots = try SlotAllocator.init(gpa, storage_capacity);
         self.sampler_slots = try SlotAllocator.init(gpa, sampler_capacity);
 
         try self.createDescriptorTable();
-        const push_range = vk.PushConstantRange{ .stage_flags = all_shader_stages, .offset = 0, .size = push_constant_size };
+        const push_range = vk.PushConstantRange{ .stage_flags = self.shaderStages(), .offset = 0, .size = push_constant_size };
         self.pipeline_layout = try self.vkd.createPipelineLayout(&.{
             .set_layout_count = 1,
             .p_set_layouts = @ptrCast(&self.descriptor_layout),
@@ -503,6 +509,8 @@ pub const Device = struct {
             };
         }
         self.immediate_pool = try self.vkd.createCommandPool(&.{ .queue_family_index = self.queue_family }, null);
+        if (self.detached_queue != null)
+            self.detached_pool = try self.vkd.createCommandPool(&.{ .flags = .{ .reset_command_buffer_bit = true }, .queue_family_index = self.queue_family }, null);
         try self.vkd.allocateCommandBuffers(&.{
             .command_pool = self.immediate_pool,
             .level = .primary,
@@ -517,16 +525,12 @@ pub const Device = struct {
         return self;
     }
 
-    /// Waits for the GPU to go idle, writes the pipeline cache file if a
-    /// path was given (a failure is only logged), then destroys everything:
-    /// pending deletions, the swapchain and any resource the application
-    /// did not destroy. The device pointer and every handle are invalid
-    /// afterwards.
+    /// Waits for the GPU, writes the pipeline cache and destroys everything,
+    /// including resources the application leaked. All handles become invalid.
     pub fn deinit(self: *Device) void {
         self.vkd.deviceWaitIdle() catch {};
         self.persistPipelineCache() catch |err| std.log.warn("could not persist pipeline cache: {}", .{err});
         self.destroySwapchain();
-        // Release whatever the application leaked so the driver shuts down cleanly.
         while (self.pipelines.popAny()) |pipeline| self.vkd.destroyPipeline(pipeline.handle, null);
         while (self.accelerations.popAny()) |acceleration| {
             self.vkd.destroyAccelerationStructureKHR(acceleration.handle, null);
@@ -557,6 +561,7 @@ pub const Device = struct {
         self.pipelines.deinit();
         self.accelerations.deinit();
         self.texture_slots.deinit(self.gpa);
+        self.storage_slots.deinit(self.gpa);
         self.sampler_slots.deinit(self.gpa);
         for (&self.frames) |*frame| {
             self.vkd.destroyQueryPool(frame.query_pool, null);
@@ -565,6 +570,7 @@ pub const Device = struct {
             self.vkd.destroyCommandPool(frame.pool, null);
         }
         self.vkd.destroyCommandPool(self.immediate_pool, null);
+        if (self.detached_pool != .null_handle) self.vkd.destroyCommandPool(self.detached_pool, null);
         self.vkd.destroyPipelineCache(self.pipeline_cache, null);
         if (self.pipeline_cache_path) |path| self.gpa.free(path);
         self.vkd.destroyPipelineLayout(self.pipeline_layout, null);
@@ -582,28 +588,23 @@ pub const Device = struct {
         loader.release(io);
     }
 
-    /// Adapter name as reported by the driver. The slice points into the
-    /// device.
+    /// Adapter name; the slice points into the device.
     pub fn name(self: *const Device) []const u8 {
         return std.mem.sliceTo(&self.properties.device_name, 0);
     }
 
-    /// Validation errors (not warnings) reported since `init`. Each one is
-    /// also logged. Always 0 without validation. Safe to call from any
-    /// thread.
+    /// Validation errors (not warnings) since `init`; 0 without validation.
+    /// Thread-safe.
     pub fn validationErrorCount(self: *const Device) u32 {
         return self.validation_errors.load(.acquire);
     }
 
-    /// Device memory reserved and in use by buffers and textures.
     /// Swapchain images are not counted.
     pub fn memoryStats(self: *const Device) types.MemoryStats {
         const stats = self.allocator.stats();
         return .{ .reserved_bytes = stats.reserved_bytes, .used_bytes = stats.used_bytes };
     }
 
-    /// What the GPU this device runs on is, for choosing how much to ask
-    /// of it; see `AdapterInfo`.
     pub fn adapterInfo(self: *const Device) types.AdapterInfo {
         var memory_bytes: u64 = 0;
         const heaps = self.allocator.properties;
@@ -624,17 +625,15 @@ pub const Device = struct {
         };
     }
 
-    /// GPU time of each `CommandEncoder.beginScope` region, from the most
-    /// recent frame whose results are available.
+    /// GPU time of each `beginScope` region of the most recent frame whose
+    /// results are available.
     pub fn passTimings(self: *const Device) []const types.PassTiming {
         return self.timings[0..self.timing_count];
     }
 
     // ---------------------------------------------------------------- buffers
 
-    /// Gives a Vulkan object a name that debuggers (RenderDoc) and
-    /// validation messages show. Does nothing unless debug names or
-    /// validation were asked for.
+    /// Names a Vulkan object for debuggers; no-op unless `debug_labels`.
     fn setName(self: *Device, object_type: vk.ObjectType, handle: u64, label: [:0]const u8) void {
         if (!self.debug_labels) return;
         self.vkd.setDebugUtilsObjectNameEXT(&.{
@@ -644,12 +643,8 @@ pub const Device = struct {
         }) catch {};
     }
 
-    /// Creates a buffer. It is usable at once: its address is fixed for
-    /// its life and host-visible kinds are already mapped. The contents
-    /// start undefined. Release it with `destroyBuffer`.
-    ///
-    /// Fails with `error.InvalidBufferSize` for a size of 0 and with the
-    /// driver's out-of-memory errors.
+    /// The address is fixed and host-visible kinds are mapped; contents start
+    /// undefined. Fails with `error.InvalidBufferSize` for a size of 0.
     pub fn createBuffer(self: *Device, desc: types.BufferDesc) !types.Buffer {
         if (desc.size == 0) return error.InvalidBufferSize;
         const handle = try self.vkd.createBuffer(&.{
@@ -685,8 +680,7 @@ pub const Device = struct {
         });
     }
 
-    /// Drops queued uploads that target a resource being destroyed, so a
-    /// create-upload-destroy sequence within one frame is harmless.
+    /// Drops queued uploads that target a resource being destroyed.
     fn cancelUploads(self: *Device, buffer: ?types.Buffer, texture: ?types.Texture) void {
         var write: usize = 0;
         var orphaned: [16]types.Buffer = undefined;
@@ -710,26 +704,20 @@ pub const Device = struct {
             write += 1;
         }
         self.uploads.items.len = write;
-        // Staging buffers are never upload destinations, so this cannot recurse deeply.
         for (orphaned[0..orphan_count]) |staging| self.destroyBuffer(staging);
     }
 
-    /// Invalidates the handle at once and drops uploads still queued into
-    /// the buffer. The Vulkan buffer and its memory are released later,
-    /// at the start of the frame after `frames_in_flight` more frames have
-    /// been submitted, or by the next `waitIdle`, `flushUploadsBlocking`
-    /// or `endImmediate` outside a frame. Commands already recorded with
-    /// the buffer therefore stay valid. A stale or invalid handle is
-    /// ignored.
+    /// Invalidates the handle at once; the buffer itself is released after
+    /// `frames_in_flight` more frames, or by the next `waitIdle`,
+    /// `flushUploadsBlocking` or `endImmediate`. Stale handles are ignored.
     pub fn destroyBuffer(self: *Device, buffer: types.Buffer) void {
         if (self.uploads.items.len != 0) self.cancelUploads(buffer, null);
         const resource = self.buffers.remove(buffer) orelse return;
         self.retire(.{ .buffer = .{ .handle = resource.handle, .allocation = resource.allocation } });
     }
 
-    /// Vulkan-level state of a buffer, for code that calls Vulkan
-    /// directly. Panics on a stale or invalid handle. The pointer is only
-    /// good until a buffer is created or destroyed.
+    /// Panics on a stale handle. The pointer is valid until a buffer is
+    /// created or destroyed.
     pub fn bufferResource(self: *Device, buffer: types.Buffer) *BufferResource {
         return self.buffers.get(buffer) orelse @panic("stale or invalid buffer handle");
     }
@@ -739,31 +727,26 @@ pub const Device = struct {
         return self.bufferResource(buffer).address;
     }
 
-    /// Size in bytes the buffer was created with. Panics on a stale or
-    /// invalid handle.
+    /// Panics on a stale handle.
     pub fn bufferSize(self: *Device, buffer: types.Buffer) u64 {
         return self.bufferResource(buffer).size;
     }
 
-    /// Persistently mapped bytes of a `cpu_to_gpu` / `gpu_to_cpu` buffer.
-    /// Panics for a buffer that lives on the GPU only.
+    /// Mapped bytes of a `cpu_to_gpu` / `gpu_to_cpu` buffer; panics for `gpu`.
     pub fn mapped(self: *Device, buffer: types.Buffer) []u8 {
         const resource = self.bufferResource(buffer);
         return (resource.allocation.mapped orelse @panic("buffer is not host visible"))[0..@intCast(resource.size)];
     }
 
-    /// `mapped` as a slice of `T`, leaving out trailing bytes that do not
-    /// make a whole `T`. The memory stays mapped for the buffer's life and
-    /// writes need no flush, but nothing orders them against a frame the
-    /// GPU is still drawing. Panics if the buffer is not host visible.
+    /// `mapped` as a slice of `T`, dropping trailing bytes. Writes are not
+    /// ordered against frames the GPU is still drawing.
     pub fn mappedSlice(self: *Device, comptime T: type, buffer: types.Buffer) []T {
         const bytes = self.mapped(buffer);
         return @alignCast(std.mem.bytesAsSlice(T, bytes[0 .. bytes.len - bytes.len % @sizeOf(T)]));
     }
 
-    /// Copies `data` into `buffer`. Host-visible buffers are written
-    /// immediately; device-local buffers are staged and the copy is recorded
-    /// at the start of the next frame (or the next `flushUploads`).
+    /// Host-visible buffers are written immediately; device-local ones are
+    /// staged and copied at the start of the next frame or `flushUploads`.
     pub fn uploadBuffer(self: *Device, buffer: types.Buffer, offset: u64, data: []const u8) !void {
         if (data.len == 0) return;
         const resource = self.bufferResource(buffer);
@@ -785,15 +768,9 @@ pub const Device = struct {
 
     // --------------------------------------------------------------- textures
 
-    /// Creates a texture in device-local memory. It starts in the
-    /// `undefined` state with no contents: upload to it or render to it
-    /// before sampling. A `sampled` texture takes one of the 16384 slots
-    /// of the bindless table. Release it with `destroyTexture`.
-    ///
-    /// Fails with `error.InvalidTextureDesc` for a zero size or a mip count
-    /// outside 1..16, `error.BindlessTableFull`, and the driver's
-    /// out-of-memory errors. Format support is not checked; see
-    /// `bc_textures`.
+    /// Starts in `undefined` with no contents. A `sampled` texture takes one
+    /// of 16384 bindless slots. Fails with `error.InvalidTextureDesc` or
+    /// `error.BindlessTableFull`; format support is not checked.
     pub fn createTexture(self: *Device, desc: types.TextureDesc) !types.Texture {
         if (desc.width == 0 or desc.height == 0 or desc.mip_levels == 0 or desc.mip_levels > max_mip_levels)
             return error.InvalidTextureDesc;
@@ -810,6 +787,8 @@ pub const Device = struct {
             .tiling = .optimal,
             .usage = .{
                 .sampled_bit = desc.usage.sampled,
+                .storage_bit = desc.usage.storage,
+                .fragment_shading_rate_attachment_bit_khr = desc.usage.shading_rate,
                 .color_attachment_bit = desc.usage.color_attachment,
                 .depth_stencil_attachment_bit = desc.usage.depth_attachment,
                 .transfer_src_bit = desc.usage.copy_src or desc.mip_levels > 1,
@@ -891,41 +870,60 @@ pub const Device = struct {
         });
     }
 
-    /// Invalidates the handle at once and drops uploads still queued into
-    /// the texture. The image, its views, its memory and its bindless slot
-    /// are released later, on the schedule described at `destroyBuffer`,
-    /// so shaders of frames in flight never see the slot reused. A stale
-    /// or invalid handle is ignored. Backbuffers belong to the swapchain
-    /// and must not be destroyed.
+    /// Deferred like `destroyBuffer`, including the bindless slot. Backbuffers
+    /// must not be destroyed.
     pub fn destroyTexture(self: *Device, texture: types.Texture) void {
         if (self.uploads.items.len != 0) self.cancelUploads(null, texture);
         var resource = self.textures.remove(texture) orelse return;
         for (resource.sub_views.items) |sub| self.retire(.{ .view = sub.view });
         resource.sub_views.deinit(self.gpa);
+        for (resource.storage_slots.items) |storage| self.retire(.{ .storage_slot = storage.slot });
+        resource.storage_slots.deinit(self.gpa);
         self.retire(.{ .view = resource.view });
         if (resource.bindless_index) |slot| self.retire(.{ .texture_slot = slot });
-        // Imported images (swapchain) are owned elsewhere.
+        // Swapchain images are owned by the swapchain.
         if (resource.allocation != null) self.retire(.{ .image = .{ .handle = resource.image, .allocation = resource.allocation } });
     }
 
-    /// Vulkan-level state of a texture, for code that calls Vulkan
-    /// directly. Panics on a stale or invalid handle. The pointer is only
-    /// good until a texture is created or destroyed, which includes a
-    /// swapchain rebuild.
+    /// Panics on a stale handle. The pointer is valid until a texture is
+    /// created or destroyed, including a swapchain rebuild.
     pub fn textureResource(self: *Device, texture: types.Texture) *TextureResource {
         return self.textures.get(texture) orelse @panic("stale or invalid texture handle");
     }
 
-    /// Size, format, mip count and layers of a texture. Panics on a stale
-    /// or invalid handle.
+    /// Panics on a stale handle.
     pub fn textureInfo(self: *Device, texture: types.Texture) types.TextureInfo {
         return self.textureResource(texture).info;
     }
 
-    /// Index of the texture in the global `textures[]` shader array.
-    /// Panics unless the texture was created with `.sampled` usage.
+    /// Index in the global `textures[]` shader array. Panics unless the
+    /// texture is `.sampled`.
     pub fn textureIndex(self: *Device, texture: types.Texture) u32 {
         return self.textureResource(texture).bindless_index orelse @panic("texture was not created with .sampled usage");
+    }
+
+    /// Index of one mip in the storage image table (`STORAGE` in common.glsl).
+    /// Needs `TextureUsage.storage`; the mip must be in `TextureState.storage`
+    /// while the shader runs.
+    pub fn storageIndex(self: *Device, texture: types.Texture, mip: u32) !u32 {
+        const resource = self.textureResource(texture);
+        for (resource.storage_slots.items) |storage| if (storage.mip == mip) return storage.slot;
+        const view = try self.subView(texture, mip, 0);
+        const slot = try self.storage_slots.allocate();
+        errdefer self.storage_slots.release(slot);
+        try resource.storage_slots.append(self.gpa, .{ .mip = mip, .slot = slot });
+        const image_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = view, .image_layout = .general };
+        self.vkd.updateDescriptorSets(&.{.{
+            .dst_set = self.descriptor_set,
+            .dst_binding = 2,
+            .dst_array_element = slot,
+            .descriptor_count = 1,
+            .descriptor_type = .storage_image,
+            .p_image_info = @ptrCast(&image_info),
+            .p_buffer_info = undefined,
+            .p_texel_buffer_view = undefined,
+        }}, &.{});
+        return slot;
     }
 
     /// View of a single mip/layer, used as a render attachment.
@@ -968,12 +966,10 @@ pub const Device = struct {
         self.pending_upload_bytes += data.len;
     }
 
-    /// Queues several mip levels of one layer at once, from `first_mip`
-    /// on, as they lie back to back in `data`, through a single staging
-    /// buffer.
+    /// Stages consecutive mips of one layer, from `first_mip`, packed back to
+    /// back in `data`.
     pub fn uploadTextureLevels(self: *Device, texture: types.Texture, first_mip: u32, layer: u32, data: []const u8) !void {
         const info = self.textureInfo(texture);
-        // Check that the data is whole levels before anything is queued.
         var total: usize = 0;
         var count: u32 = 0;
         while (total < data.len and first_mip + count < info.mip_levels) : (count += 1) {
@@ -1000,33 +996,30 @@ pub const Device = struct {
         self.pending_upload_bytes += data.len;
     }
 
-    /// Queues a full copy of `source` into `destination`, ordered with the
-    /// other pending uploads. `source` is destroyed once the copy is recorded.
+    /// Queues a copy ordered with the pending uploads; `source` is destroyed
+    /// once it is recorded.
     pub fn queueBufferCopy(self: *Device, source: types.Buffer, destination: types.Buffer, size: u64) !void {
         try self.uploads.append(self.gpa, .{ .copy = .{ .source = source, .destination = destination, .size = size } });
     }
 
-    /// Queues a blit chain filling every mip below level 0. Runs after
-    /// uploads queued before it.
+    /// Queues a blit chain filling every mip above 0, after earlier uploads.
     pub fn generateMips(self: *Device, texture: types.Texture) !void {
         try self.uploads.append(self.gpa, .{ .mips = texture });
     }
 
-    /// For tests: lets `after` more GPU memory allocations succeed and
-    /// fails the next one with `error.OutOfDeviceMemory`, once. Null
-    /// cancels a failure that has not happened yet.
+    /// For tests: after `after` more GPU allocations the next fails once with
+    /// `error.OutOfDeviceMemory`. Null cancels.
     pub fn failGpuAllocation(self: *Device, after: ?u32) void {
         self.allocator.fail_after = after;
     }
 
-    /// True while a failure asked for with `failGpuAllocation` is still to
-    /// come.
+    /// A `failGpuAllocation` failure is still to come.
     pub fn gpuAllocationFailurePending(self: *const Device) bool {
         return self.allocator.fail_after != null;
     }
 
-    /// Reads back mip 0 / layer 0. Blocks until the GPU is idle; intended for
-    /// screenshots and tests, not for use during a frame.
+    /// Reads back mip 0 / layer 0. Blocks until the GPU is idle; not for use
+    /// during a frame.
     pub fn readTexture(self: *Device, gpa: std.mem.Allocator, texture: types.Texture) ![]u8 {
         std.debug.assert(!self.in_frame);
         const info = self.textureInfo(texture);
@@ -1050,8 +1043,7 @@ pub const Device = struct {
         return gpa.dupe(u8, self.mapped(staging)[0..@intCast(size)]);
     }
 
-    /// Copies the first `size` bytes of a buffer back to the CPU. Waits for
-    /// the GPU; meant for tests and tools, between frames. The buffer needs
+    /// Reads back the first `size` bytes. Blocks; between frames only. Needs
     /// `copy_src` usage.
     pub fn readBuffer(self: *Device, gpa: std.mem.Allocator, buffer: types.Buffer, size: u64) ![]u8 {
         std.debug.assert(!self.in_frame);
@@ -1102,8 +1094,7 @@ pub const Device = struct {
         });
     }
 
-    /// Allocates a bottom-level structure sized for `desc`. Build it with
-    /// `CommandEncoder.buildBlas` once the geometry is on the GPU.
+    /// Sized for `desc`; build with `CommandEncoder.buildBlas`.
     pub fn createBlas(self: *Device, desc: types.BlasDesc) !types.AccelerationStructure {
         if (!self.ray_tracing) return error.RayTracingUnavailable;
         const geometry = self.blasGeometry(desc);
@@ -1150,9 +1141,7 @@ pub const Device = struct {
         return acceleration;
     }
 
-    /// Invalidates the handle at once. The structure, the buffer that
-    /// holds it and its scratch buffer are released later, on the schedule
-    /// described at `destroyBuffer`. A stale or invalid handle is ignored.
+    /// Deferred like `destroyBuffer`; also releases its buffers.
     pub fn destroyAcceleration(self: *Device, acceleration: types.AccelerationStructure) void {
         const resource = self.accelerations.remove(acceleration) orelse return;
         self.retire(.{ .acceleration = resource.handle });
@@ -1160,36 +1149,27 @@ pub const Device = struct {
         if (resource.scratch) |scratch| self.destroyBuffer(scratch);
     }
 
-    /// Vulkan-level state of an acceleration structure. Panics on a stale
-    /// or invalid handle. The pointer is only good until a structure is
+    /// Panics on a stale handle. The pointer is valid until a structure is
     /// created or destroyed.
     pub fn accelerationResource(self: *Device, acceleration: types.AccelerationStructure) *AccelerationResource {
         return self.accelerations.get(acceleration) orelse @panic("stale or invalid acceleration structure handle");
     }
 
-    /// Device address of a structure: what TLAS instances store for a
-    /// bottom-level one, and what shaders take for a top-level one.
+    /// What TLAS instances store for a BLAS and shaders take for a TLAS.
     pub fn accelerationAddress(self: *Device, acceleration: types.AccelerationStructure) u64 {
         return self.accelerationResource(acceleration).address;
     }
 
-    /// Whether a structure has been built at least once.
     pub fn accelerationBuilt(self: *Device, acceleration: types.AccelerationStructure) bool {
         return self.accelerationResource(acceleration).built;
     }
 
-    /// Records a bottom-level build into `command`. This is what
-    /// `CommandEncoder.buildBlas` calls; use that instead. `desc` must have
-    /// the triangle count the structure was created for. A `dynamic`
-    /// structure is built the first time and refitted from then on, and
-    /// keeps a scratch buffer of its own; any other gets a scratch buffer
-    /// that is released once the build can no longer be in flight. Fails
-    /// only when that buffer cannot be created.
+    /// Called by `CommandEncoder.buildBlas`; use that. `desc` must have the
+    /// triangle count the structure was created for. A `dynamic` structure is
+    /// refitted after its first build.
     pub fn buildBlasCommand(self: *Device, command: vk.CommandBuffer, blas: types.AccelerationStructure, desc: types.BlasDesc) !void {
         const resource = self.accelerationResource(blas);
         const geometry = self.blasGeometry(desc);
-        // Scratch memory is only needed during the build; a structure that
-        // is rebuilt every frame keeps its own instead of asking again.
         if (resource.dynamic and resource.scratch == null)
             resource.scratch = try self.createBuffer(.{ .name = "blas scratch", .size = resource.scratch_size + scratch_alignment, .usage = .{ .storage = true } });
         const scratch = resource.scratch orelse try self.createBuffer(.{ .name = "blas scratch", .size = resource.scratch_size + scratch_alignment, .usage = .{ .storage = true } });
@@ -1204,9 +1184,6 @@ pub const Device = struct {
         self.vkd.cmdBuildAccelerationStructuresKHR(command, &.{.{
             .type = .bottom_level_khr,
             .flags = .{ .prefer_fast_trace_bit_khr = !resource.dynamic, .prefer_fast_build_bit_khr = resource.dynamic, .allow_update_bit_khr = resource.dynamic },
-            // Deformed geometry keeps its triangles and only moves them, so
-            // after the first build the structure is refitted, which is far
-            // cheaper than building it again.
             .mode = if (resource.dynamic and resource.built) .update_khr else .build_khr,
             .src_acceleration_structure = if (resource.dynamic and resource.built) resource.handle else .null_handle,
             .dst_acceleration_structure = resource.handle,
@@ -1217,10 +1194,8 @@ pub const Device = struct {
         resource.built = true;
     }
 
-    /// Records a full top-level rebuild into `command`, without the
-    /// barriers `CommandEncoder.buildTlas` puts around it; use that
-    /// instead. `instance_count` must not exceed the `max_instances` given
-    /// to `createTlas`.
+    /// Called by `CommandEncoder.buildTlas`, which adds the barriers; use
+    /// that. `instance_count` must not exceed the TLAS's `max_instances`.
     pub fn buildTlasCommand(self: *Device, command: vk.CommandBuffer, tlas: types.AccelerationStructure, instances_address: u64, instance_count: u32) void {
         const resource = self.accelerationResource(tlas);
         std.debug.assert(instance_count <= resource.capacity);
@@ -1245,10 +1220,7 @@ pub const Device = struct {
 
     // --------------------------------------------------------------- samplers
 
-    /// Creates a sampler and gives it a slot in the bindless table; it is
-    /// usable at once through `samplerIndex`. `max_anisotropy` is clamped
-    /// to what the device supports. At most 256 samplers can exist at a
-    /// time: `error.BindlessTableFull` beyond that.
+    /// Takes one of 256 bindless slots; `error.BindlessTableFull` beyond that.
     pub fn createSampler(self: *Device, desc: types.SamplerDesc) !types.Sampler {
         const anisotropy = std.math.clamp(desc.max_anisotropy, 1, self.properties.limits.max_sampler_anisotropy);
         const handle = try self.vkd.createSampler(&.{
@@ -1284,45 +1256,31 @@ pub const Device = struct {
         return try self.samplers.insert(.{ .handle = handle, .bindless_index = slot });
     }
 
-    /// Invalidates the handle at once. The sampler and its bindless slot
-    /// are released later, on the schedule described at `destroyBuffer`.
-    /// A stale or invalid handle is ignored.
+    /// Deferred like `destroyBuffer`.
     pub fn destroySampler(self: *Device, sampler: types.Sampler) void {
         const resource = self.samplers.remove(sampler) orelse return;
         self.retire(.{ .sampler = resource.handle });
         self.retire(.{ .sampler_slot = resource.bindless_index });
     }
 
-    /// Index of the sampler in the global `samplers[]` shader array.
-    /// Panics on a stale or invalid handle.
+    /// Index in the global `samplers[]` shader array. Panics on a stale
+    /// handle.
     pub fn samplerIndex(self: *Device, sampler: types.Sampler) u32 {
         return (self.samplers.get(sampler) orelse @panic("stale or invalid sampler handle")).bindless_index;
     }
 
     // -------------------------------------------------------------- pipelines
 
-    /// Compiles a graphics pipeline and registers it, in one call. The
-    /// driver compiles on the calling thread, which can take a long time
-    /// for a pipeline that is not in the pipeline cache; use
-    /// `compileGraphicsPipeline` and `adoptPipeline` to do that part on
-    /// another thread. Both shaders use the entry point `main`.
-    ///
-    /// Fails with `error.InvalidSpirv` when a shader is empty or not a
-    /// whole number of 32-bit words, `error.TooManyShaderConstants`,
-    /// `error.TooManyVertexAttributes` (more than 16 each),
-    /// `error.TooManyColorTargets` (more than 8), and with the driver's
-    /// errors.
+    /// `compileGraphicsPipeline` followed by `adoptPipeline`.
     pub fn createGraphicsPipeline(self: *Device, desc: types.GraphicsPipelineDesc) !types.Pipeline {
         const compiled = try self.compileGraphicsPipeline(self.gpa, desc);
         return self.adoptPipeline(compiled, desc.name);
     }
 
-    /// A pipeline compiled by `compileGraphicsPipeline` and not yet handed
-    /// to the device.
+    /// Compiled by `compileGraphicsPipeline`, not yet adopted.
     pub const CompiledPipeline = struct { handle: vk.Pipeline };
 
-    /// Registers a compiled pipeline so it can be bound. Like the rest of
-    /// the device, to be called from the thread that renders.
+    /// Registers a compiled pipeline. Render thread only.
     pub fn adoptPipeline(self: *Device, compiled: CompiledPipeline, label: [:0]const u8) !types.Pipeline {
         errdefer self.vkd.destroyPipeline(compiled.handle, null);
         self.setName(.pipeline, @intFromEnum(compiled.handle), label);
@@ -1334,15 +1292,16 @@ pub const Device = struct {
         self.vkd.destroyPipeline(compiled.handle, null);
     }
 
-    /// Compiles a graphics pipeline without registering it. This is the
-    /// slow part of creating one, and unlike the rest of the device it may
-    /// be called from any thread, concurrently with rendering: it reads
-    /// only handles that never change after `init`, and Vulkan synchronizes
-    /// the pipeline cache itself. `gpa` must be safe to use from the
-    /// calling thread. Hand the result to `adoptPipeline`.
+    /// Compiles without registering. May be called from any thread, also
+    /// during rendering; `gpa` must be safe to use there. At most 16 shader
+    /// constants, 16 vertex attributes and 8 color targets.
     pub fn compileGraphicsPipeline(self: *const Device, gpa: std.mem.Allocator, desc: types.GraphicsPipelineDesc) !CompiledPipeline {
-        const vertex = try self.shaderModule(gpa, desc.vertex);
-        defer self.vkd.destroyShaderModule(vertex, null);
+        const vertex = if (desc.mesh == null) try self.shaderModule(gpa, desc.vertex) else .null_handle;
+        defer if (vertex != .null_handle) self.vkd.destroyShaderModule(vertex, null);
+        const mesh = if (desc.mesh) |bytes| try self.shaderModule(gpa, bytes) else .null_handle;
+        defer if (mesh != .null_handle) self.vkd.destroyShaderModule(mesh, null);
+        const task = if (desc.task) |bytes| try self.shaderModule(gpa, bytes) else .null_handle;
+        defer if (task != .null_handle) self.vkd.destroyShaderModule(task, null);
         const fragment = if (desc.fragment) |bytes| try self.shaderModule(gpa, bytes) else .null_handle;
         defer if (fragment != .null_handle) self.vkd.destroyShaderModule(fragment, null);
         var constant_entries: [16]vk.SpecializationMapEntry = undefined;
@@ -1358,10 +1317,20 @@ pub const Device = struct {
             .data_size = desc.fragment_constants.len * @sizeOf(u32),
             .p_data = @ptrCast(desc.fragment_constants.ptr),
         };
-        const stages = [_]vk.PipelineShaderStageCreateInfo{
-            .{ .stage = .{ .vertex_bit = true }, .module = vertex, .p_name = "main" },
-            .{ .stage = .{ .fragment_bit = true }, .module = fragment, .p_name = "main", .p_specialization_info = if (desc.fragment_constants.len != 0) &constants else null },
-        };
+        var stages: [3]vk.PipelineShaderStageCreateInfo = undefined;
+        var geometry_stages: u32 = 0;
+        if (desc.mesh == null) {
+            stages[0] = .{ .stage = .{ .vertex_bit = true }, .module = vertex, .p_name = "main" };
+            geometry_stages = 1;
+        } else {
+            if (desc.task != null) {
+                stages[0] = .{ .stage = .{ .task_bit_ext = true }, .module = task, .p_name = "main" };
+                geometry_stages = 1;
+            }
+            stages[geometry_stages] = .{ .stage = .{ .mesh_bit_ext = true }, .module = mesh, .p_name = "main" };
+            geometry_stages += 1;
+        }
+        stages[geometry_stages] = .{ .stage = .{ .fragment_bit = true }, .module = fragment, .p_name = "main", .p_specialization_info = if (desc.fragment_constants.len != 0) &constants else null };
 
         var attributes: [16]vk.VertexInputAttributeDescription = undefined;
         var binding = vk.VertexInputBindingDescription{ .binding = 0, .stride = 0, .input_rate = .vertex };
@@ -1467,10 +1436,16 @@ pub const Device = struct {
             .depth_attachment_format = if (desc.depth) |depth| vkFormat(depth.format) else .undefined,
             .stencil_attachment_format = .undefined,
         };
+        const shading_rate = vk.PipelineFragmentShadingRateStateCreateInfoKHR{
+            .p_next = &rendering,
+            .fragment_size = .{ .width = 1, .height = 1 },
+            .combiner_ops = .{ .keep_khr, .replace_khr },
+        };
         var result: [1]vk.Pipeline = undefined;
         _ = try self.vkd.createGraphicsPipelines(self.pipeline_cache, &.{.{
-            .p_next = &rendering,
-            .stage_count = if (desc.fragment != null) 2 else 1,
+            .p_next = if (self.shading_rate_tile != 0) @as(?*const anyopaque, &shading_rate) else @as(?*const anyopaque, &rendering),
+            .flags = .{ .rendering_fragment_shading_rate_attachment_bit_khr = self.shading_rate_tile != 0 },
+            .stage_count = if (desc.fragment != null) geometry_stages + 1 else geometry_stages,
             .p_stages = &stages,
             .p_vertex_input_state = &vertex_input,
             .p_input_assembly_state = &assembly,
@@ -1487,10 +1462,7 @@ pub const Device = struct {
         return .{ .handle = result[0] };
     }
 
-    /// Compiles a compute pipeline on the calling thread and registers
-    /// it. The shader uses the entry point `main`. Fails with
-    /// `error.InvalidSpirv` when the shader is empty or not a whole number
-    /// of 32-bit words, and with the driver's errors.
+    /// Compiles on the calling thread and registers the pipeline.
     pub fn createComputePipeline(self: *Device, desc: types.ComputePipelineDesc) !types.Pipeline {
         const module = try self.createShaderModule(desc.shader);
         defer self.vkd.destroyShaderModule(module, null);
@@ -1505,25 +1477,22 @@ pub const Device = struct {
         return try self.pipelines.insert(.{ .handle = result[0], .bind_point = .compute });
     }
 
-    /// Invalidates the handle at once. The pipeline itself is released
-    /// later, on the schedule described at `destroyBuffer`, so it may be
-    /// destroyed in the frame that last draws with it. A stale or invalid
-    /// handle is ignored.
+    /// Deferred like `destroyBuffer`, so the frame that last draws with it
+    /// may destroy it.
     pub fn destroyPipeline(self: *Device, pipeline: types.Pipeline) void {
         const resource = self.pipelines.remove(pipeline) orelse return;
         self.retire(.{ .pipeline = resource.handle });
     }
 
-    /// Vulkan-level state of a pipeline. Panics on a stale or invalid
-    /// handle. The pointer is only good until a pipeline is created or
-    /// destroyed.
+    /// Panics on a stale handle. The pointer is valid until a pipeline is
+    /// created or destroyed.
     pub fn pipelineResource(self: *Device, pipeline: types.Pipeline) *PipelineResource {
         return self.pipelines.get(pipeline) orelse @panic("stale or invalid pipeline handle");
     }
 
     // ------------------------------------------------------------- frame loop
 
-    /// Format of the swapchain images, for building pipelines that draw to it.
+    /// Format of the swapchain images.
     pub fn backbufferFormat(self: *Device) !types.Format {
         if (self.swapchain == null) return error.NoSurface;
         if (self.swapchain.?.handle == .null_handle) try self.recreateSwapchain();
@@ -1537,9 +1506,8 @@ pub const Device = struct {
         };
     }
 
-    /// Width and height of the swapchain images in pixels, which the
-    /// window system may make differ from what `resize` was given. Zero
-    /// when headless and before the swapchain is first created.
+    /// Swapchain image size in pixels, which may differ from `resize`. Zero
+    /// when headless and before the swapchain exists.
     pub fn backbufferSize(self: *const Device) [2]u32 {
         const swapchain = self.swapchain orelse return .{ 0, 0 };
         return .{ swapchain.extent.width, swapchain.extent.height };
@@ -1555,9 +1523,7 @@ pub const Device = struct {
         }
     }
 
-    /// Turns vsync on or off. Takes effect when the swapchain is rebuilt
-    /// by the next `prepareSurface` (or `beginFrame`), which waits for the
-    /// GPU to go idle. Does nothing when headless.
+    /// Takes effect at the next swapchain rebuild. No-op when headless.
     pub fn setVsync(self: *Device, vsync: bool) void {
         if (self.swapchain) |*swapchain| {
             if (swapchain.vsync == vsync) return;
@@ -1566,13 +1532,8 @@ pub const Device = struct {
         }
     }
 
-    /// Starts a frame. Returns null when there is nothing to draw to (the
-    /// window is minimized or the swapchain had to be rebuilt); just try again
-    /// on the next iteration.
-    ///
-    /// This is `waitForFrame` + `prepareSurface` + `acquireImage` +
-    /// `startFrame` in one call. Callers that share the device between
-    /// threads use the pieces so the blocking ones run outside their lock.
+    /// `waitForFrame` + `prepareSurface` + `acquireImage` + `startFrame`.
+    /// Returns null when there is nothing to draw to; try again next time.
     pub fn beginFrame(self: *Device) !?Frame {
         try self.waitForFrame();
         if (!try self.prepareSurface()) return null;
@@ -1586,15 +1547,15 @@ pub const Device = struct {
         try self.presentFrame();
     }
 
-    /// Blocks until the GPU has finished the frame whose resources the next
-    /// frame will reuse. Touches no shared device state.
+    /// Blocks until the GPU has finished the frame whose slot is reused next.
+    /// Touches no shared device state.
     pub fn waitForFrame(self: *Device) !void {
         const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
         _ = try self.vkd.waitForFences(&.{frame.fence}, .true, std.math.maxInt(u64));
     }
 
-    /// Rebuilds the swapchain if the window changed. Returns false while
-    /// the window has no drawable area. Always true when headless.
+    /// Rebuilds the swapchain if the window changed. False while the window
+    /// has no drawable area; always true when headless.
     pub fn prepareSurface(self: *Device) !bool {
         const swapchain = if (self.swapchain) |*value| value else return true;
         if (swapchain.requested_width == 0 or swapchain.requested_height == 0) return false;
@@ -1602,9 +1563,8 @@ pub const Device = struct {
         return true;
     }
 
-    /// Acquires the next swapchain image; may block on the compositor.
-    /// Returns false if the swapchain went out of date. Touches only state
-    /// owned by the frame loop, so it may run outside a device lock.
+    /// May block on the compositor. False if the swapchain went out of date.
+    /// May run outside a device lock.
     pub fn acquireImage(self: *Device) !bool {
         const swapchain = if (self.swapchain) |*value| value else return true;
         const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
@@ -1620,9 +1580,8 @@ pub const Device = struct {
         return true;
     }
 
-    /// Begins recording the frame after `waitForFrame` and `acquireImage`.
-    /// If it fails, the image that was acquired is abandoned (see
-    /// `abandonAcquiredImage`) and the next frame starts cleanly.
+    /// Begins recording, after `waitForFrame` and `acquireImage`. On failure
+    /// the acquired image is abandoned.
     pub fn startFrame(self: *Device) !Frame {
         std.debug.assert(!self.in_frame);
         const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
@@ -1632,7 +1591,6 @@ pub const Device = struct {
         var backbuffer: ?types.Texture = null;
         if (self.swapchain) |*swapchain| {
             backbuffer = swapchain.textures.items[swapchain.image_index];
-            // Whatever the compositor left in the image is irrelevant.
             self.textureResource(backbuffer.?).states[0] = .undefined;
         }
         try self.vkd.resetCommandPool(frame.pool, .{});
@@ -1646,11 +1604,8 @@ pub const Device = struct {
         return .{ .cmd = &self.encoder, .backbuffer = backbuffer, .index = self.frame_number };
     }
 
-    /// Ends recording and submits the frame to the GPU. If that fails the
-    /// frame is over all the same: its image is abandoned (see
-    /// `abandonAcquiredImage`) and the slot's fence is left signaled, so
-    /// that the next frame to use the slot does not wait for a submit that
-    /// never happened.
+    /// Ends recording and submits. On failure the image is abandoned and the
+    /// slot's fence is left signaled.
     pub fn submitFrame(self: *Device) !void {
         std.debug.assert(self.in_frame);
         const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
@@ -1696,19 +1651,15 @@ pub const Device = struct {
         self.frame_number += 1;
     }
 
-    /// Notes that the swapchain image acquired for `frame` will not be
-    /// presented. Vulkan has no way to hand one back, so the swapchain is
-    /// made again before the next frame, which releases it, and the
-    /// semaphore the acquire signaled, which no other acquire may wait
-    /// on, is replaced then.
+    /// Marks the image acquired for `frame` as never presented: the swapchain
+    /// and the acquire semaphore are recreated before the next frame.
     fn abandonAcquiredImage(self: *Device, frame: *FrameData) void {
         const swapchain = if (self.swapchain) |*value| value else return;
         swapchain.stale = true;
         frame.acquire_abandoned = true;
     }
 
-    /// Presents the image submitted by `submitFrame`; may block on vsync.
-    /// Like `acquireImage`, safe to call outside a device lock.
+    /// May block on vsync. May run outside a device lock.
     pub fn presentFrame(self: *Device) !void {
         const swapchain = if (self.swapchain) |*value| value else return;
         if (!swapchain.present_pending) return;
@@ -1728,10 +1679,8 @@ pub const Device = struct {
         if (result == .suboptimal_khr) swapchain.stale = true;
     }
 
-    /// Makes a frame whose recording failed part-way submittable: closes
-    /// the open render pass and timing scopes. Follow with `submitFrame`.
-    /// The commands recorded so far have already updated tracked texture
-    /// states and consumed queued uploads, so they must still run.
+    /// Closes the open render pass and timing scopes of a frame whose
+    /// recording failed. `submitFrame` must still follow.
     pub fn closeFailedFrame(self: *Device) void {
         std.debug.assert(self.in_frame);
         if (self.encoder.rendering) self.encoder.endRendering();
@@ -1748,9 +1697,7 @@ pub const Device = struct {
         if (!self.in_frame) self.collectGarbage(true);
     }
 
-    /// Records every queued upload and submits it immediately, blocking until
-    /// done. Useful for loading screens and headless tools; during normal
-    /// rendering uploads ride along with the next frame instead.
+    /// Records and submits every queued upload, blocking until done.
     pub fn flushUploadsBlocking(self: *Device) !void {
         std.debug.assert(!self.in_frame);
         if (self.uploads.items.len == 0) return;
@@ -1760,18 +1707,64 @@ pub const Device = struct {
         self.collectGarbage(true);
     }
 
-    /// Bytes staged by `uploadBuffer` (for device-local buffers),
-    /// `uploadTexture` and `uploadTextureLevels` that no flush has recorded
-    /// yet. Back to 0 after a flush. Uploads cancelled by destroying their
-    /// target still count until then.
+    /// Staged bytes no flush has recorded yet, including cancelled uploads.
     pub fn pendingUploadBytes(self: *const Device) u64 {
         return self.pending_upload_bytes;
     }
 
     // ---------------------------------------------------------------- private
 
-    /// Starts a one-off command buffer outside the frame loop. Finish it
-    /// with `endImmediate`, which blocks until the GPU has executed it.
+    /// The shader stages push constants and the table of textures reach.
+    pub fn shaderStages(self: *const Device) vk.ShaderStageFlags {
+        return .{ .vertex_bit = true, .fragment_bit = true, .compute_bit = true, .task_bit_ext = self.mesh_shaders, .mesh_bit_ext = self.mesh_shaders };
+    }
+
+    /// Starts a command buffer for the second queue, or null where the GPU
+    /// has one queue. While it runs it must not touch what a frame writes nor
+    /// write what a frame reads. Finish with `submitDetached`.
+    pub fn beginDetached(self: *Device) !?CommandEncoder {
+        if (self.detached_queue == null) return null;
+        var command: vk.CommandBuffer = undefined;
+        try self.vkd.allocateCommandBuffers(&.{
+            .command_pool = self.detached_pool,
+            .level = .primary,
+            .command_buffer_count = 1,
+        }, @ptrCast(&command));
+        errdefer self.vkd.freeCommandBuffers(self.detached_pool, &.{command});
+        try self.vkd.beginCommandBuffer(command, &.{ .flags = .{ .one_time_submit_bit = true } });
+        var encoder = CommandEncoder{ .device = self, .command = command, .frame = null };
+        encoder.bindGlobals();
+        return encoder;
+    }
+
+    /// Submits without waiting; poll `detachedDone`, then `releaseDetached`.
+    pub fn submitDetached(self: *Device, encoder: CommandEncoder) !Detached {
+        errdefer self.vkd.freeCommandBuffers(self.detached_pool, &.{encoder.command});
+        try self.vkd.endCommandBuffer(encoder.command);
+        const fence = try self.vkd.createFence(&.{}, null);
+        errdefer self.vkd.destroyFence(fence, null);
+        const command_info = vk.CommandBufferSubmitInfo{ .command_buffer = encoder.command, .device_mask = 0 };
+        try self.vkd.queueSubmit2(self.detached_queue.?, &.{.{
+            .command_buffer_info_count = 1,
+            .p_command_buffer_infos = @ptrCast(&command_info),
+        }}, fence);
+        self.detached_outstanding += 1;
+        return .{ .command = encoder.command, .fence = fence };
+    }
+
+    pub fn detachedDone(self: *Device, job: Detached) bool {
+        return (self.vkd.getFenceStatus(job.fence) catch return false) == .success;
+    }
+
+    /// Waits for the job if it is still running.
+    pub fn releaseDetached(self: *Device, job: Detached) void {
+        _ = self.vkd.waitForFences(&.{job.fence}, .true, std.math.maxInt(u64)) catch {};
+        self.vkd.destroyFence(job.fence, null);
+        self.vkd.freeCommandBuffers(self.detached_pool, &.{job.command});
+        self.detached_outstanding -= 1;
+    }
+
+    /// Starts a one-off command buffer; finish with `endImmediate`.
     pub fn beginImmediate(self: *Device) !CommandEncoder {
         std.debug.assert(!self.in_frame);
         try self.vkd.resetCommandPool(self.immediate_pool, .{});
@@ -1781,10 +1774,8 @@ pub const Device = struct {
         return encoder;
     }
 
-    /// Submits the command buffer from `beginImmediate` and blocks until
-    /// the GPU has executed it and is idle. Everything waiting for
-    /// deferred destruction is then released. The encoder must not be
-    /// used afterwards.
+    /// Submits and blocks until the GPU is idle, then runs all deferred
+    /// destruction. The encoder must not be used afterwards.
     pub fn endImmediate(self: *Device) !void {
         try self.vkd.endCommandBuffer(self.immediate_command);
         const fence = try self.vkd.createFence(&.{}, null);
@@ -1799,7 +1790,6 @@ pub const Device = struct {
             }}, fence);
         }
         _ = try self.vkd.waitForFences(&.{fence}, .true, std.math.maxInt(u64));
-        // Nothing is in flight any more, so staging memory can go right away.
         try self.waitIdle();
     }
 
@@ -1814,10 +1804,8 @@ pub const Device = struct {
         return staging;
     }
 
-    /// Hands the queue of staged uploads to the caller and leaves it
-    /// empty. This is what `CommandEncoder.flushUploads` calls; use that
-    /// instead. The caller owns the list, to be freed with `gpa`, and
-    /// must record the copies and destroy the staging buffers in it.
+    /// Called by `CommandEncoder.flushUploads`; use that. The caller owns the
+    /// list (free with `gpa`) and must record and destroy its staging buffers.
     pub fn takeUploads(self: *Device) std.ArrayList(PendingUpload) {
         const result = self.uploads;
         self.uploads = .empty;
@@ -1839,10 +1827,12 @@ pub const Device = struct {
 
     fn createDescriptorTable(self: *Device) !void {
         const all_bindings = [_]vk.DescriptorSetLayoutBinding{
-            .{ .binding = 0, .descriptor_type = .sampled_image, .descriptor_count = texture_capacity, .stage_flags = all_shader_stages },
-            .{ .binding = 1, .descriptor_type = .sampler, .descriptor_count = sampler_capacity, .stage_flags = all_shader_stages },
+            .{ .binding = 0, .descriptor_type = .sampled_image, .descriptor_count = texture_capacity, .stage_flags = self.shaderStages() },
+            .{ .binding = 1, .descriptor_type = .sampler, .descriptor_count = sampler_capacity, .stage_flags = self.shaderStages() },
+            .{ .binding = 2, .descriptor_type = .storage_image, .descriptor_count = storage_capacity, .stage_flags = .{ .compute_bit = true } },
         };
-        const count: u32 = all_bindings.len;
+        // The last is left out where the GPU cannot update it while bound.
+        const count: u32 = if (self.storage_images) all_bindings.len else all_bindings.len - 1;
         const binding_flags: [all_bindings.len]vk.DescriptorBindingFlags = @splat(.{
             .update_after_bind_bit = true,
             .update_unused_while_pending_bit = true,
@@ -1861,6 +1851,7 @@ pub const Device = struct {
         const sizes = [_]vk.DescriptorPoolSize{
             .{ .type = .sampled_image, .descriptor_count = texture_capacity },
             .{ .type = .sampler, .descriptor_count = sampler_capacity },
+            .{ .type = .storage_image, .descriptor_count = storage_capacity },
         };
         self.descriptor_pool = try self.vkd.createDescriptorPool(&.{
             .flags = .{ .update_after_bind_bit = true },
@@ -1877,7 +1868,6 @@ pub const Device = struct {
 
     fn retire(self: *Device, object: Deletion) void {
         self.deletions.append(self.gpa, .{ .frame = self.frame_number, .object = object }) catch {
-            // Out of memory for the queue: fall back to a synchronous destroy.
             self.vkd.deviceWaitIdle() catch {};
             self.destroyNow(object);
         };
@@ -1887,7 +1877,8 @@ pub const Device = struct {
     fn collectGarbage(self: *Device, everything: bool) void {
         var write: usize = 0;
         for (self.deletions.items) |pending| {
-            if (everything or pending.frame + frames_in_flight <= self.frame_number) {
+            // A detached job may still be reading what a frame let go of.
+            if (everything or (self.detached_outstanding == 0 and pending.frame + frames_in_flight <= self.frame_number)) {
                 self.destroyNow(pending.object);
             } else {
                 self.deletions.items[write] = pending;
@@ -1912,6 +1903,7 @@ pub const Device = struct {
             .pipeline => |pipeline| self.vkd.destroyPipeline(pipeline, null),
             .acceleration => |acceleration| self.vkd.destroyAccelerationStructureKHR(acceleration, null),
             .texture_slot => |slot| self.texture_slots.release(slot),
+            .storage_slot => |slot| self.storage_slots.release(slot),
             .sampler_slot => |slot| self.sampler_slots.release(slot),
         }
     }
@@ -2108,8 +2100,6 @@ const SlotAllocator = struct {
     }
 };
 
-/// The Vulkan format behind a `Format`, for code that calls Vulkan
-/// directly.
 pub fn vkFormat(format: types.Format) vk.Format {
     return switch (format) {
         .r8_unorm => .r8_unorm,
@@ -2126,6 +2116,7 @@ pub fn vkFormat(format: types.Format) vk.Format {
         .rgba32_float => .r32g32b32a32_sfloat,
         .r32_float => .r32_sfloat,
         .r32_uint => .r32_uint,
+        .r8_uint => .r8_uint,
         .b10g11r11_float => .b10g11r11_ufloat_pack32,
         .a2b10g10r10_unorm => .a2b10g10r10_unorm_pack32,
         .bc7_unorm => .bc7_unorm_block,
@@ -2257,6 +2248,7 @@ fn blendState(mode: types.BlendMode) vk.PipelineColorBlendAttachmentState {
 const SelectedDevice = struct {
     physical: vk.PhysicalDevice,
     queue_family: u32,
+    queue_count: u32,
     properties: vk.PhysicalDeviceProperties,
     score: u32,
 };
@@ -2292,6 +2284,7 @@ fn selectPhysicalDevice(
             if (best == null or score > best.?.score) best = .{
                 .physical = physical,
                 .queue_family = @intCast(index),
+                .queue_count = family.queue_count,
                 .properties = properties,
                 .score = score,
             };
@@ -2313,6 +2306,7 @@ fn supportsRequiredFeatures(instance: dispatch.Instance, physical: vk.PhysicalDe
         features.features.depth_clamp == .true and
         features.features.shader_int_64 == .true and
         features.features.geometry_shader == .true and
+        features.features.shader_clip_distance == .true and
         features11.shader_draw_parameters == .true and
         features12.descriptor_indexing == .true and
         features12.runtime_descriptor_array == .true and
@@ -2391,6 +2385,51 @@ fn tlasGeometry(instances_address: u64) vk.AccelerationStructureGeometryKHR {
             .data = .{ .device_address = instances_address },
         } },
     };
+}
+
+/// Tile size of shading rate textures on this GPU, or 0 when unsupported.
+fn shadingRateTile(gpa: std.mem.Allocator, instance: dispatch.Instance, physical: vk.PhysicalDevice) !u32 {
+    const available = try instance.enumerateDeviceExtensionPropertiesAlloc(physical, null, gpa);
+    defer gpa.free(available);
+    var found = false;
+    for (available) |extension| {
+        if (std.mem.eql(u8, std.mem.sliceTo(&extension.extension_name, 0), vk.extensions.khr_fragment_shading_rate.name)) found = true;
+    }
+    if (!found) return 0;
+    var rate = vk.PhysicalDeviceFragmentShadingRateFeaturesKHR{};
+    var features = vk.PhysicalDeviceFeatures2{ .p_next = &rate, .features = .{} };
+    instance.getPhysicalDeviceFeatures2(physical, &features);
+    if (rate.pipeline_fragment_shading_rate != .true or rate.attachment_fragment_shading_rate != .true) return 0;
+    var limits = std.mem.zeroInit(vk.PhysicalDeviceFragmentShadingRatePropertiesKHR, .{});
+    var properties = vk.PhysicalDeviceProperties2{ .p_next = &limits, .properties = undefined };
+    instance.getPhysicalDeviceProperties2(physical, &properties);
+    const smallest = limits.min_fragment_shading_rate_attachment_texel_size.width;
+    const largest = limits.max_fragment_shading_rate_attachment_texel_size.width;
+    if (smallest == 0 or largest == 0) return 0;
+    return std.math.clamp(16, smallest, largest);
+}
+
+fn deviceExtensionListed(gpa: std.mem.Allocator, instance: dispatch.Instance, physical: vk.PhysicalDevice, name: [*:0]const u8) !bool {
+    const available = try instance.enumerateDeviceExtensionPropertiesAlloc(physical, null, gpa);
+    defer gpa.free(available);
+    for (available) |extension| {
+        if (std.mem.eql(u8, std.mem.sliceTo(&extension.extension_name, 0), std.mem.span(name))) return true;
+    }
+    return false;
+}
+
+fn supportsMeshShaders(gpa: std.mem.Allocator, instance: dispatch.Instance, physical: vk.PhysicalDevice) !bool {
+    const available = try instance.enumerateDeviceExtensionPropertiesAlloc(physical, null, gpa);
+    defer gpa.free(available);
+    var found = false;
+    for (available) |extension| {
+        if (std.mem.eql(u8, std.mem.sliceTo(&extension.extension_name, 0), vk.extensions.ext_mesh_shader.name)) found = true;
+    }
+    if (!found) return false;
+    var mesh = vk.PhysicalDeviceMeshShaderFeaturesEXT{};
+    var features = vk.PhysicalDeviceFeatures2{ .p_next = &mesh, .features = .{} };
+    instance.getPhysicalDeviceFeatures2(physical, &features);
+    return mesh.task_shader == .true and mesh.mesh_shader == .true;
 }
 
 fn supportsRayQueries(gpa: std.mem.Allocator, instance: dispatch.Instance, physical: vk.PhysicalDevice) !bool {

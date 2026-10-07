@@ -1,6 +1,5 @@
-//! Stepping what a scene simulates on the GPU: liquids, water surfaces,
-//! and smoke and fire.
-//! Internal to the renderer.
+//! GPU simulation: liquids, water surfaces, smoke and fire. Internal to the
+//! renderer.
 const std = @import("std");
 const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
@@ -17,11 +16,10 @@ const SceneData = render.SceneData;
 const liquid_cell_slots = render.liquid_cell_slots;
 const packTint = render.packTint;
 
-/// The box a liquid is held in: its axes (unit length), its size
-/// along each, and its low corner.
+/// A liquid's box: unit axes, size along each, and low corner.
 pub const LiquidBox = struct { axes: [3]Vec3, extent: Vec3, corner: Vec3 };
 
-/// The box that `transform` makes of the unit cube centered on the origin.
+/// The box `transform` makes of the unit cube centered on the origin.
 pub fn liquidBox(transform: Mat4) LiquidBox {
     var box: LiquidBox = undefined;
     const center = Vec3{ transform[12], transform[13], transform[14] };
@@ -35,8 +33,7 @@ pub fn liquidBox(transform: Mat4) LiquidBox {
     return box;
 }
 
-/// Density, in the solver's own units, of particles at rest: a
-/// lattice half a reach apart.
+/// Rest density in solver units: a lattice h / 2 apart.
 pub fn liquidRestDensity() f32 {
     var sum: f32 = 0;
     var x: i32 = -2;
@@ -55,15 +52,8 @@ pub fn liquidRestDensity() f32 {
     return sum;
 }
 
-/// Steps every water surface of a scene by one frame.
-/// The time a simulation steps by this frame. Frames arrive at any
-/// length: a few millionths of a second when two follow hard on each
-/// other, a tenth when the window is in the background. A solver fed
-/// those as they come divides by nearly nothing or leaps too far,
-/// and its surface flies apart. So time is saved up in `owed` until
-/// there is at least a two-hundredth of a second of it, and never
-/// more than a thirtieth is stepped at once (the rest is dropped:
-/// the simulation slows rather than breaks). 0 means do not step.
+/// Fixed-range time step: accumulates `elapsed` in `owed` until at least 1/200
+/// s and steps at most 1/30 s, dropping the rest. Returns 0 for no step.
 pub fn steadyStep(owed: *f32, elapsed: f32) f32 {
     if (!(elapsed > 0)) return 0;
     owed.* = @min(owed.* + elapsed, 1.0 / 30.0);
@@ -73,9 +63,7 @@ pub fn steadyStep(owed: *f32, elapsed: f32) f32 {
     return step;
 }
 
-/// The spray of a water surface: drops thrown up and out, falling
-/// back, of the water's own color. Emits nothing until something
-/// hits the surface.
+/// Splash emitter of a water surface; emits only when something hits it.
 pub fn splashDesc(desc: WaterDesc) EmitterDesc {
     const t = desc.transform;
     const tint = [3]f32{ 0.55 + desc.color[0] * 0.45, 0.6 + desc.color[1] * 0.4, 0.65 + desc.color[2] * 0.35 };
@@ -94,7 +82,7 @@ pub fn splashDesc(desc: WaterDesc) EmitterDesc {
     };
 }
 
-/// Steps every liquid of a scene: once per scene per frame.
+/// Steps every liquid of a scene, once per frame.
 pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, arena: *FrameArena, delta_time: f32) !void {
     if (scene.liquids.items.len == 0) return;
     const device = renderer.device;
@@ -150,7 +138,6 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
                 .velocity = .{ math.dot(source.velocity, box.axes[0]), math.dot(source.velocity, box.axes[1]), math.dot(source.velocity, box.axes[2]) },
             };
         }
-        // Entities in the liquid's way, as the spheres around them.
         if (desc.obstacles) for (scene.entities.items) |entity_handle| {
             if (record.sphere_count == record.spheres.len) break;
             const entity = renderer.entities.get(entity_handle) orelse continue;
@@ -164,8 +151,6 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             inline for (0..3) |axis| {
                 if (local[axis] < -reach or local[axis] > box.extent[axis] + reach) inside = false;
             }
-            // The box itself and whatever is larger than it are not
-            // things in the liquid.
             if (!inside or reach > @min(box.extent[0], @min(box.extent[1], box.extent[2])) * 0.45) continue;
             record.spheres[record.sphere_count] = .{ local[0], local[1], local[2], reach };
             record.sphere_count += 1;
@@ -181,23 +166,16 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             .flip = 0,
         };
         const steps: u32 = if (frame_dt > 0) substeps else 0;
-        // One record a step, worked out first and copied into GPU
-        // memory in one go: the shader reads it for every particle
-        // and every neighbour, far too often for memory the CPU can
-        // see. Standing still, one record to draw by.
         const records = try arena.alloc(device, gpu.Liquid, @max(steps, 1));
         records.items[0] = record;
         for (0..steps) |step| {
             record.live_before = state.live;
-            // Births: the starting block, once, then what the jets owe.
             if (!state.started) {
                 state.started = true;
                 state.live = record.block_count;
             }
             for (state.sources[0..state.source_count], 0..) |source, index| {
                 const speed = math.length(source.velocity);
-                // A jet comes out a layer at a time: at its own speed
-                // a layer for every particle's width it travels.
                 const mouth = @max(source.radius, radius);
                 const per_layer = @max(@round(std.math.pi * mouth * mouth / (spacing * spacing)), 1);
                 const layers_a_second = if (source.rate > 0) source.rate / per_layer else speed / spacing;
@@ -262,8 +240,6 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
         }
         state.params = params_address + (records.items.len - 1) * stride;
         state.params_frame = renderer.frame_index;
-        // The stand-in for rays: the tank's footprint, as high as the
-        // liquid would stand if it lay still.
         if (state.proxy) |stand_in| if (renderer.entities.get(stand_in)) |proxy| {
             const volume = @as(f32, @floatFromInt(state.live)) * spacing * spacing * spacing;
             const filled = std.math.clamp(volume / (box.extent[0] * box.extent[1] * box.extent[2]), 0.002, 1);
@@ -273,8 +249,7 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
     }
 }
 
-/// Steps the scene's water surfaces: their ripples, and the spray where
-/// something breaks them.
+/// Steps the scene's water surfaces and their splashes.
 pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, arena: *FrameArena, delta_time: f32) !void {
     if (scene.waters.items.len == 0) return;
     const device = renderer.device;
@@ -295,7 +270,6 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         const t = desc.transform;
         const width = @max(math.length(.{ t[0], t[1], t[2] }), 1e-6);
         const up = @max(math.length(.{ t[4], t[5], t[6] }), 1e-6);
-        // Rain: drops at random places, a share of a drop carried over.
         state.rain_pending += @max(desc.rain, 0) * dt;
         var random = std.Random.DefaultPrng.init(renderer.frame_index *% 0x9e3779b97f4a7c15 +% 7);
         const rng = random.random();
@@ -308,8 +282,6 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             state.ripple_count += 1;
         }
         state.rain_pending = @min(state.rain_pending, 1);
-        // Whatever moves through the surface leaves a dent where it is.
-        // The hardest hit on the surface this frame, for the spray.
         var splash_strength: f32 = state.hit_strength;
         var splash_at: Vec3 = state.hit_at;
         var splash_radius: f32 = state.hit_radius;
@@ -326,8 +298,6 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
                 const center = math.transformPoint(entity.transform, model.info.bounds_center);
                 const radius = model.info.bounds_radius * math.maxScale(entity.transform);
                 const local = math.transformPoint(to_sheet, center);
-                // Height above the sheet in world units, and whether the
-                // sphere cuts it inside the sheet's edges.
                 const above = local[1] * up;
                 if (@abs(above) >= radius or @abs(local[0]) > 0.5 or @abs(local[2]) > 0.5) continue;
                 const cut = @sqrt(radius * radius - above * above);
@@ -348,7 +318,6 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         }
         if (state.splash) |spraying| if (renderer.emitters.get(spraying)) |emitter| {
             var spray = splashDesc(desc);
-            // Still water throws nothing; a slow wade little.
             if (splash_strength > 0.15) {
                 spray.position = splash_at;
                 spray.radius = splash_radius * 0.7;
@@ -357,8 +326,6 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             }
             emitter.desc = spray;
         };
-        // Two copies: the step reads the surface as it was, the views
-        // read it as it is afterwards.
         var record = gpu.Water{
             .transform = t,
             .size = .{ @intCast(state.size[0]), @intCast(state.size[1]) },
@@ -399,8 +366,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     }
 }
 
-/// Steps every fluid of a scene by one frame and leaves each one's
-/// description on the GPU for the views to draw from.
+/// Steps every fluid of a scene and uploads its description for drawing.
 pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, arena: *FrameArena, delta_time: f32) !void {
     if (scene.fluids.items.len == 0) return;
     const device = renderer.device;
@@ -418,8 +384,6 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
             state.cleared = true;
             state.mask_key = 0;
         }
-        // A long frame is simulated as a short one: the solver is
-        // stable at any step, but big steps smear the flow.
         const dt = steadyStep(&state.time_owed, delta_time * desc.time_scale);
         const cells: f32 = @floatFromInt(state.size[1]);
         const box_to_world = math.mul(desc.transform, math.translation(.{ -0.5, -0.5, -0.5 }));
@@ -475,16 +439,13 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
         state.params_frame = renderer.frame_index;
         const Push = extern struct { fluid: u64, a: u32 = 0, b: u32 = 0, c: u32 = 0, pad: u32 = 0 };
         params.items[0].solid = device.textureIndex(state.solid);
-        // The scene's own geometry as obstacles needs its acceleration
-        // structure, which exists once global illumination has run.
+        // Scene geometry as obstacles needs the TLAS.
         const scene_tlas: u64 = if (desc.scene_obstacles and device.ray_tracing and scene.tlas_hash != 0)
             (if (scene.tlas) |tlas| device.accelerationAddress(tlas) else 0)
         else
             0;
         if (state.obstacle_count != 0 or scene_tlas != 0) {
             params.items[0].solid_mask = 1;
-            // Redrawn only when the obstacles, the box or the scene's
-            // geometry changed since the mask was last made.
             var hasher = std.hash.Wyhash.init(0);
             hasher.update(std.mem.asBytes(&desc.transform));
             hasher.update(std.mem.asBytes(&state.size));
@@ -524,7 +485,6 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
                 cmd.transition(state.carried, .shader_read);
                 cmd.transition(state.carried_velocity, .shader_read);
             }
-            // Carry everything along the flow; burn, fade, emit.
             try cmd.beginRendering(.{ .color = &.{
                 .{ .texture = state.velocity[new], .load = .discard },
                 .{ .texture = state.scalars[new], .load = .discard },
@@ -557,7 +517,6 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
             cmd.endRendering();
             cmd.transition(state.divergence, .shader_read);
 
-            // The pressure of the last step is a good first guess.
             cmd.bindPipeline(renderer.pipelines.fluid_pressure);
             for (0..std.math.clamp(desc.pressure_iterations, 1, 200)) |_| {
                 const from = state.pressure_current;

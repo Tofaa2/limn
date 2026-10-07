@@ -1,10 +1,6 @@
-// Finding what a ray hits, two ways with one face. With RAY_TRACED
-// defined the GPU's own ray tracing answers, through the scene's
-// acceleration structure. Without it the shader walks a tree of boxes
-// built on the CPU (see `bvh.zig`): one over the scene's instances, and
-// under each instance one over the triangles of its mesh. Either way the
-// answer names an instance, a triangle of its mesh and a place on that
-// triangle, so what follows a hit is the same code.
+// Ray-scene intersection. With RAY_TRACED: ray queries against the TLAS.
+// Without: a software BVH (bvh.zig), one over the instances and one per mesh.
+// Both return instance, triangle and barycentrics.
 #ifndef TRACE_GLSL
 #define TRACE_GLSL
 
@@ -13,16 +9,16 @@ struct TraceHit {
     float t;
     // Index into the frame's instances.
     uint instance;
-    // Triangle of the instance's mesh, counted in its full-detail indices.
+    // Triangle index in the mesh's full-detail indices.
     uint primitive;
-    // Weights of the triangle's second and third corner.
+    // Barycentric weights of the second and third vertex.
     vec2 barycentric;
 };
 
 #ifdef RAY_TRACED
 
-// The includer enables GL_EXT_ray_query and declares `traceScene()`,
-// which returns the address of the acceleration structure.
+// The includer enables GL_EXT_ray_query and declares `traceScene()`, which
+// returns the TLAS address.
 bool traceClosest(vec3 origin, vec3 direction, float max_distance, out TraceHit hit) {
     rayQueryEXT query;
     rayQueryInitializeEXT(query, accelerationStructureEXT(traceScene()), gl_RayFlagsOpaqueEXT, 0xffu, origin, 0.0, direction, max_distance);
@@ -44,7 +40,7 @@ bool traceAny(vec3 origin, vec3 direction, float max_distance) {
 
 #else
 
-// `Node` in bvh.zig.
+// Must match `Node` in bvh.zig.
 struct BvhNode {
     vec3 lo;
     uint first;
@@ -52,8 +48,7 @@ struct BvhNode {
     uint count;
 };
 
-// One instance of the scene's tree: how to take a ray into the space of
-// its mesh, and which of the frame's instances it is.
+// Scene BVH leaf: world-to-mesh transform and instance index.
 struct BvhInstance {
     mat4x3 to_mesh;
     uint instance;
@@ -66,17 +61,15 @@ layout(buffer_reference, scalar) readonly buffer BvhNodes { BvhNode data[]; };
 layout(buffer_reference, scalar) readonly buffer BvhItems { uint data[]; };
 layout(buffer_reference, scalar) readonly buffer BvhInstances { BvhInstance data[]; };
 
-// The includer declares these: the scene's tree and its instances, the
-// trees of all meshes in one array and the triangles their leaves list,
-// and the frame, for the triangles themselves.
+// Declared by the includer: scene nodes and instances, mesh nodes, leaf
+// triangle lists and the frame.
 BvhNodes traceSceneNodes();
 BvhInstances traceSceneInstances();
 BvhNodes traceMeshNodes();
 BvhItems traceMeshItems();
 FrameConstants traceFrame();
 
-// How far along the ray it enters the box, or a negative number when it
-// misses or the box lies beyond `nearest`.
+// Entry distance into the box; negative on a miss or beyond `nearest`.
 float traceBox(vec3 lo, vec3 hi, vec3 origin, vec3 inverse, float nearest) {
     vec3 a = (lo - origin) * inverse;
     vec3 b = (hi - origin) * inverse;
@@ -88,18 +81,16 @@ float traceBox(vec3 lo, vec3 hi, vec3 origin, vec3 inverse, float nearest) {
 }
 
 vec3 traceInverse(vec3 direction) {
-    // A direction along an axis divides by nothing; a tiny number stands
-    // in, which the box test then treats as it should.
     vec3 safe = mix(direction, vec3(1e-20), lessThan(abs(direction), vec3(1e-20)));
     return 1.0 / safe;
 }
 
-// One mesh, in its own space. `nearest` is the closest hit so far and is
-// brought closer by what is found. Returns whether anything was.
+// Traces one mesh in its own space. `nearest` is the closest hit so far and is
+// updated. Returns whether anything was hit.
 bool traceMesh(Instance instance, uint instance_index, vec3 origin, vec3 direction, bool any_hit, inout float nearest, inout TraceHit hit) {
     FrameConstants frame = traceFrame();
     Mesh mesh = frame.meshes.data[instance.mesh];
-    // A mesh no tree has been built for is not there for rays.
+    // Meshes without a BVH are invisible to rays.
     if (mesh.bvh == INVALID_ID) return false;
     BvhNodes nodes = traceMeshNodes();
     BvhItems items = traceMeshItems();
@@ -147,7 +138,7 @@ bool traceMesh(Instance instance, uint instance_index, vec3 origin, vec3 directi
             current = stack[--depth];
             continue;
         }
-        // Children are stored relative to the mesh's own root.
+        // Child indices are relative to the mesh root.
         uint left = root + node.first;
         BvhNode a = nodes.data[left];
         BvhNode b = nodes.data[left + 1u];
@@ -161,7 +152,6 @@ bool traceMesh(Instance instance, uint instance_index, vec3 origin, vec3 directi
         } else if (tb < 0.0) {
             current = left;
         } else {
-            // The nearer child first; the other waits.
             bool a_first = ta <= tb;
             current = a_first ? left : left + 1u;
             if (depth < 32) stack[depth++] = a_first ? left + 1u : left;
@@ -192,9 +182,8 @@ bool traceWalk(vec3 origin, vec3 direction, float max_distance, bool any_hit, ou
             for (uint i = 0u; i < node.count; i++) {
                 BvhInstance placed = instances.data[node.first + i];
                 Instance instance = frame.instances.data[placed.instance];
-                // The ray in the mesh's space, its direction left at the
-                // length it comes to: distances along it then stay those
-                // of the world.
+                // The direction is not renormalized in mesh space, so t stays
+                // in world units.
                 vec3 mesh_origin = placed.to_mesh * vec4(origin, 1.0);
                 vec3 mesh_direction = placed.to_mesh * vec4(direction, 0.0);
                 if (traceMesh(instance, placed.instance, mesh_origin, mesh_direction, any_hit, nearest, hit)) {

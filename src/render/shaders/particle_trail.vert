@@ -3,8 +3,7 @@
 #include "shading.glsl"
 #include "particles.glsl"
 
-// A ribbon behind every particle, through the places it has been: one
-// camera-facing quad per stretch between two remembered points.
+// Particle trails: one camera-facing quad per segment between recorded points.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     EmitterRef emitter;
@@ -21,16 +20,15 @@ layout(location = 2) out float out_view_depth;
 layout(location = 3) out vec4 out_clip;
 layout(location = 4) out vec4 out_previous_clip;
 
-// Point `k` of a particle's ribbon: 0 is the particle itself, then its
-// remembered positions from the newest back.
+// Ribbon point `k`: 0 is the particle, then recorded positions newest first.
 vec3 ribbonPoint(EmitterData emitter, uint slot, vec3 head, uint k) {
     if (k == 0u) return head;
     uint count = emitter.trail_count;
     uint index = (emitter.trail_head + count - (k - 1u)) % count;
     vec3 point = push.trail.data[slot * count + index].xyz;
     if (k == count && count > 1u) {
-        // The oldest point slides toward the next one as it is about to
-        // be forgotten, so the tail shortens smoothly instead of jumping.
+        // The oldest point slides toward the next so the tail shortens
+        // smoothly.
         uint newer = (emitter.trail_head + count - (k - 2u)) % count;
         point = mix(point, push.trail.data[slot * count + newer].xyz, emitter.trail_fraction);
     }
@@ -53,7 +51,7 @@ void main() {
         out_previous_clip = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
-    // Across the ribbon, and which end of the stretch.
+    // x: side of the ribbon, y: end of the segment.
     const vec2 corners[6] = vec2[](vec2(-1, 0), vec2(1, 0), vec2(1, 1), vec2(-1, 0), vec2(1, 1), vec2(-1, 1));
     vec2 corner = corners[gl_VertexIndex % 6];
     uint k = segment + uint(corner.y);
@@ -78,7 +76,6 @@ void main() {
         uint key = min(uint(at), emitter.curve_counts.y - 2u);
         size = mix(emitter.curve_sizes[key], emitter.curve_sizes[key + 1u], at - float(key));
     }
-    // The ribbon narrows and fades toward its tail.
     float taper = 1.0 - along;
     vec3 world = center + across * corner.x * size * 0.5 * taper;
 
@@ -104,12 +101,9 @@ void main() {
         color.rgb *= light;
     }
     out_color = color;
-    // Without an image the ribbon is soft across its width only; with one,
-    // the image runs once along its length.
     out_uv = vec2(corner.x * 0.5 + 0.5, emitter.image != INVALID_ID ? along : 0.5);
     out_view_depth = -(frame.view * vec4(world, 1.0)).z;
     gl_Position = frame.view_proj * vec4(world, 1.0);
     out_clip = frame.view_proj_unjittered * vec4(world, 1.0);
-    // The ribbon stays where it was laid; only its head moves.
     out_previous_clip = frame.prev_view_proj_unjittered * vec4(world - (k == 0u ? particle.velocity * frame.delta_time : vec3(0.0)), 1.0);
 }

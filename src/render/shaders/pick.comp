@@ -1,7 +1,7 @@
 #version 460
 #include "common.glsl"
 
-// Reports what the visibility buffer holds under one pixel.
+// Reads the visibility buffer under one pixel.
 layout(local_size_x = 1) in;
 
 layout(buffer_reference, scalar) writeonly buffer PickResult {

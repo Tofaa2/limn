@@ -2,17 +2,15 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// First step of the fluid solver: carries velocity, smoke, heat and fuel
-// along the flow (semi-Lagrangian: look back to where each cell's contents
-// came from), burns fuel, lets things fade, and adds what the sources emit.
+// Solver step 1: semi-Lagrangian advection of velocity, smoke, heat and fuel,
+// then combustion, dissipation and sources.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;
     uint scalars_texture;
-    // The first guess from fluid_carry.frag, or INVALID_ID to do without
-    // the correction.
+    // Forward guess from fluid_carry.frag, or INVALID_ID for no correction.
     uint carried_texture;
-    // The same for velocity, or INVALID_ID.
+    // Same for velocity.
     uint carried_velocity_texture;
 } push;
 
@@ -28,8 +26,7 @@ void main() {
     out_velocity = vec4(0.0);
     out_scalars = vec4(0.0);
     if (cell.z >= size.z) return;
-    // Inside an obstacle nothing moves and nothing collects; the flag in
-    // velocity.w tells the passes that follow.
+    // Obstacle cells are cleared; velocity.w flags them for later passes.
     if (fluidObstacle(fluid, cell)) {
         out_velocity = vec4(0.0, 0.0, 0.0, 1.0);
         return;
@@ -44,10 +41,7 @@ void main() {
     velocity = fluidSample(fluid, push.velocity_texture, source).xyz;
     vec4 scalars = fluidSample(fluid, push.scalars_texture, source);
     if (push.carried_texture != INVALID_ID) {
-        // Carry the guess back again: had it been exact, that would give
-        // what was here to begin with. Half the difference is the error,
-        // which sharpens what plain advection blurs. The result is kept
-        // within what was actually upstream, so it cannot overshoot.
+        // MacCormack correction, clamped to the upstream neighbourhood.
         vec4 guess = fluidFetch(fluid, push.carried_texture, cell);
         vec3 ahead = position + velocity_here * dt;
         if (size.z == 1) ahead.z = 0.5;
@@ -63,9 +57,7 @@ void main() {
         }
         scalars = clamp(corrected, low, high);
         if (push.carried_velocity_texture != INVALID_ID) {
-            // The flow carried by itself, corrected the same way. Cells
-            // next to an obstacle keep the plain result: the guess there
-            // mixes in the stillness of the solid.
+            // Same for velocity, except next to obstacles.
             vec3 guess_velocity = fluidFetch(fluid, push.carried_velocity_texture, cell).xyz;
             vec3 returned_velocity = fluidSample(fluid, push.carried_velocity_texture, ahead).xyz;
             vec3 corrected_velocity = guess_velocity + 0.5 * (velocity_here - returned_velocity);
@@ -81,14 +73,13 @@ void main() {
             if (solid == 0.0) velocity = clamp(corrected_velocity, slowest, fastest);
         }
     }
-    // What comes in through an open side is clear, still air.
+    // Inflow through open sides is clear, still air.
     ivec3 from = ivec3(floor(source));
     if (!fluidInside(fluid, from) && !fluidWall(fluid, from)) {
         scalars = vec4(0.0);
         velocity = vec3(0.0);
     }
 
-    // Fuel burns only where it is hot enough, and heats what is around it.
     float burning = scalars.z * (1.0 - fluid.data.fuel_keep) * smoothstep(0.05, 0.3, scalars.y);
     scalars.z -= burning;
     scalars.y += burning * fluid.data.heat;

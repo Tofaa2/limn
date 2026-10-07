@@ -6,10 +6,9 @@ const dispatch = @import("dispatch.zig");
 var references: usize = 0;
 var mutex: std.Io.Mutex = .init;
 
-/// Loads the system Vulkan library through volk on the first call and
-/// counts a reference on every call. Pair each success with `release`.
-/// Safe to call from any thread. Fails with
-/// `error.VulkanLoaderUnavailable` when no Vulkan loader is installed.
+/// Loads the Vulkan library through volk on first use and counts a
+/// reference; pair with `release`. Thread-safe. Fails with
+/// `error.VulkanLoaderUnavailable`.
 pub fn acquire(io: std.Io) !void {
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
@@ -18,8 +17,7 @@ pub fn acquire(io: std.Io) !void {
     references += 1;
 }
 
-/// Drops a reference taken by `acquire` and unloads the library with the
-/// last one. No Vulkan call may be made after that.
+/// Drops a reference; the last one unloads the library.
 pub fn release(io: std.Io) void {
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
@@ -35,17 +33,14 @@ fn getInstanceProcAddr(handle: vk.Instance, name: [*:0]const u8) callconv(.c) vk
     ));
 }
 
-/// Entry points usable without an instance, for creating one. Needs a
-/// successful `acquire`. Entries the library lacks are left null, as
-/// `vkEnumerateInstanceVersion` is on a Vulkan 1.0 loader.
+/// Pre-instance entry points; needs a successful `acquire`. Entries the
+/// library lacks are null.
 pub fn base() dispatch.Base {
     return dispatch.Base.load(getInstanceProcAddr);
 }
 
-/// Loads the instance-level entry points for `handle`. This also points
-/// volk's global instance functions at `handle`, so with several
-/// instances alive the globals belong to whichever was loaded last; the
-/// returned table is unaffected.
+/// Instance-level entry points for `handle`. Also repoints volk's global
+/// instance functions at `handle`.
 pub fn instance(io: std.Io, handle: vk.Instance) dispatch.InstanceWrapper {
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
@@ -62,10 +57,13 @@ pub fn instance(io: std.Io, handle: vk.Instance) dispatch.InstanceWrapper {
     return result;
 }
 
-/// Loads the device-level entry points for `handle` straight from the
-/// driver, skipping the loader's dispatch. Debug-utils commands come from
-/// the globals of the instance loaded last; entries that cannot be
-/// resolved are null.
+/// Vulkan's `vkGetDeviceProcAddr`.
+pub fn deviceProcAddr() *const anyopaque {
+    return @ptrCast(c.vkGetDeviceProcAddr.?);
+}
+
+/// Device-level entry points for `handle`, loaded straight from the driver.
+/// Unresolved entries are null.
 pub fn device(io: std.Io, handle: vk.Device) dispatch.DeviceWrapper {
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
@@ -73,8 +71,7 @@ pub fn device(io: std.Io, handle: vk.Device) dispatch.DeviceWrapper {
     c.volkLoadDeviceTable(&table, @ptrFromInt(@intFromEnum(handle)));
     var result: dispatch.DeviceWrapper = undefined;
     inline for (@typeInfo(dispatch.DeviceDispatch).@"struct".fields) |field| {
-        // Debug-utils commands are instance-level in volk; fall back to the
-        // instance-loaded global for anything missing from the device table.
+        // Debug-utils commands are instance-level in volk.
         @field(result.dispatch, field.name) = if (@hasField(c.VolkDeviceTable, field.name))
             @ptrCast(@field(table, field.name))
         else if (@hasDecl(c, field.name))

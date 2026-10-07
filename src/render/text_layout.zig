@@ -1,22 +1,9 @@
-//! Turns one line of text from the order it is typed in into the glyphs
-//! that are drawn, left to right:
-//!
-//!  * Latin f-ligatures (ff, fi, fl, ffi, ffl) where the font has them;
-//!  * Arabic letters take their isolated, initial, medial or final shape
-//!    from their neighbours, and lam + alef fuse;
-//!  * right-to-left runs (Hebrew, Arabic) are reversed in place, with
-//!    numbers inside them kept left to right and brackets mirrored.
-//!
-//! Shapes are chosen through Unicode's precomposed "presentation form"
-//! code points rather than the font's own substitution tables, so it works
-//! with any font that carries those glyphs (most do) and needs no shaping
-//! engine. It does not do the font-specific substitutions and mark
-//! positioning a full shaper would, nor scripts that need reordering
-//! (Indic, Thai).
+//! Shapes one line of text from typing order into glyphs in drawing order:
+//! Latin f-ligatures, Arabic joining forms and bidirectional reordering.
+//! Uses Unicode presentation forms, not the font's substitution tables.
 const std = @import("std");
 
-/// True if `text` contains anything `shapeLine` would change. Plain text
-/// can skip it.
+/// True if `text` contains anything `shapeLine` would change.
 pub fn needsShaping(text: []const u8) bool {
     for (text, 0..) |byte, index| {
         if (byte >= 0xd6) return true; // Hebrew starts at U+0590 (0xD6 0x90)
@@ -28,15 +15,11 @@ pub fn needsShaping(text: []const u8) bool {
     return false;
 }
 
-/// `control` is an embedding marker: it has a level but takes no part in
-/// working out directions.
-/// `separator` (plus, minus), `common_separator` (comma, full stop, colon,
-/// slash) and `terminator` (percent and currency signs) are what the
-/// bidirectional algorithm calls weak types: they become part of a number
-/// they touch and are neutral otherwise.
+/// `control` is an embedding marker: it has a level but no direction.
+/// `separator`, `common_separator` and `terminator` are the bidi weak
+/// types: part of a number they touch, neutral otherwise.
 const Class = enum { left, right, arabic, number, arabic_number, neutral, control, separator, common_separator, terminator };
 
-// The explicit direction controls of the Unicode bidirectional algorithm.
 const lre = 0x202a;
 const rle = 0x202b;
 const pdf = 0x202c;
@@ -61,9 +44,8 @@ fn isInvisible(c: u21) bool {
     };
 }
 
-/// Whether the first strong character of an isolate, whose content
-/// `rest` starts with, is a right-to-left one. Nested isolates do not
-/// count.
+/// Whether the first strong character of the isolate content `rest` starts
+/// with is right-to-left. Nested isolates do not count.
 fn firstStrongIsRight(rest: []const u21) bool {
     var nested: u32 = 0;
     for (rest) |c| {
@@ -89,18 +71,14 @@ fn classOf(c: u21) Class {
         else => {},
     }
     return switch (c) {
-        // The invisible direction marks: strong characters with no glyph.
         0x200e => .left,
         0x200f => .right,
         '0'...'9' => .number,
         0x0660...0x0669, 0x066b, 0x066c => .arabic_number,
-        // The last plane names glyphs of right-to-left scripts that have
-        // no character of their own (`font.glyph_codepoints_rtl`).
-        // (0xc8000 and up: changes of spacing in right-to-left text,
-        // `font.spacing_codepoints`.)
+        // 0x100000 and up: `font.glyph_codepoints_rtl`.
+        // 0xc8000 and up: `font.spacing_codepoints`.
         0x0590...0x05ff, 0xfb1d...0xfb4f, 0x100000...0x10ffff, 0xc8000...0xcffff => .right,
-        // (0xe1100 and up: which part of a ligature a mark is on,
-        // `font.component_codepoints`.)
+        // 0xe1100 and up: `font.component_codepoints`.
         0x0600...0x065f, 0x066d...0x06ff, 0x0750...0x077f, 0xfb50...0xfdff, 0xfe70...0xfeff, 0xd0000...0xdffff, 0xe1100...0xe11ff => .arabic,
         0...0x2f, 0x3a...0x40, 0x5b...0x60, 0x7b...0xbf, 0x2000...0x200d, 0x2010...0x206f => .neutral,
         else => .left,
@@ -124,8 +102,8 @@ fn mirrored(c: u21) u21 {
 }
 
 const Joining = struct {
-    /// Isolated presentation form; the final form follows it, and for
-    /// letters with four forms the initial and medial ones after that.
+    /// Isolated presentation form; the final form follows it, then for
+    /// letters with four forms the initial and medial ones.
     base: u21,
     forms: u3,
 };
@@ -159,19 +137,18 @@ fn isTatweel(c: u21) bool {
 
 /// Marks sit on a letter and do not interrupt joining.
 fn isArabicMark(c: u21) bool {
-    // The last range names mark glyphs that have no character of their
-    // own (`font.glyph_codepoints_rtl_mark`).
+    // 0xd0000 and up: `font.glyph_codepoints_rtl_mark`.
     return (c >= 0x064b and c <= 0x065f) or c == 0x0670 or (c >= 0xd0000 and c <= 0xdffff);
 }
 
-/// Can `c` connect to the letter after it?
+/// Whether `c` connects to the letter after it.
 fn joinsForward(c: u21) bool {
     if (isTatweel(c)) return true;
     const entry = joining(c) orelse return false;
     return entry.forms == 4;
 }
 
-/// Can `c` connect to the letter before it?
+/// Whether `c` connects to the letter before it.
 fn joinsBackward(c: u21) bool {
     if (isTatweel(c)) return true;
     const entry = joining(c) orelse return false;
@@ -188,9 +165,8 @@ fn lamAlef(alef: u21) ?u21 {
     };
 }
 
-/// The script a character belongs to, as OpenType names it. Null for what
-/// has none of its own (spaces, digits, punctuation, combining marks) and
-/// goes with its neighbours.
+/// The OpenType script tag of a character. Null for characters with no
+/// script of their own (spaces, digits, punctuation, combining marks).
 pub fn scriptOf(c: u21) ?[4]u8 {
     return switch (c) {
         'A'...'Z', 'a'...'z', 0xaa, 0xba, 0xc0...0xd6, 0xd8...0xf6, 0xf8...0x2af, 0x1e00...0x1eff, 0x2c60...0x2c7f, 0xa720...0xa7ff, 0xfb00...0xfb06 => "latn".*,
@@ -220,9 +196,8 @@ pub fn scriptOf(c: u21) ?[4]u8 {
     };
 }
 
-/// Whether a line may change under a font's own substitutions: anything
-/// beyond plain ASCII (accents, other scripts), or what `needsShaping`
-/// already looks for.
+/// Whether a font's own substitutions may change a line: any non-ASCII
+/// text, or what `needsShaping` looks for.
 pub fn mayBeSubstituted(text: []const u8) bool {
     for (text) |byte| {
         if (byte >= 0x80) return true;
@@ -230,25 +205,20 @@ pub fn mayBeSubstituted(text: []const u8) bool {
     return needsShaping(text);
 }
 
-/// A ligature found by `Coverage.ligature`: how many characters of the run
-/// it stands for, and the code point drawn in their place.
+/// How many characters of the run a ligature replaces, and the code point
+/// drawn in their place.
 pub const LigatureMatch = struct { consumed: usize, codepoint: u21 };
 
-/// Answers whether a glyph exists for a code point, across the fonts in use.
-/// The callbacks are only called during the shaping call the value is
-/// passed to, so `context` need only live that long.
+/// Glyph coverage across the fonts in use. `context` need only live for
+/// the shaping call the value is passed to.
 pub const Coverage = struct {
-    /// Passed back to every callback unchanged.
     context: *const anyopaque,
-    /// Whether any font in use has a glyph for `codepoint`.
     has: *const fn (context: *const anyopaque, codepoint: u21) bool,
-    /// The font's own ligature at the start of a run of characters, if it
-    /// has one: how many characters, and the character drawn instead.
-    /// Null leaves only the built-in f-ligatures.
+    /// The font's own ligature at the start of a run, if any. Null leaves
+    /// only the built-in f-ligatures.
     ligature: ?*const fn (context: *const anyopaque, rest: []const u21) ?LigatureMatch = null,
-    /// The fonts' own substitutions for a whole line, in typing order:
-    /// appends to `out` the characters to draw. Null leaves the line as
-    /// typed.
+    /// Appends to `out` the characters to draw for a whole line in typing
+    /// order, after the fonts' own substitutions. Null leaves it as typed.
     substitute: ?*const fn (context: *const anyopaque, gpa: std.mem.Allocator, line: []const u21, out: *std.ArrayList(u21)) anyerror!void = null,
 
     fn covers(self: Coverage, codepoint: u21) bool {
@@ -256,10 +226,8 @@ pub const Coverage = struct {
     }
 };
 
-/// Thai and Lao write one vowel (sara am) as a single character that is
-/// drawn as two: a ring above the consonant and a letter after it. The
-/// ring belongs under any tone mark typed before the vowel, so it goes in
-/// front of those.
+/// Splits Thai and Lao sara am into a ring above the consonant and a
+/// following letter, moving the ring before any preceding tone marks.
 fn splitSaraAm(gpa: std.mem.Allocator, out: *std.ArrayList(u21), start: usize) !void {
     var index = start;
     while (index < out.items.len) : (index += 1) {
@@ -268,7 +236,6 @@ fn splitSaraAm(gpa: std.mem.Allocator, out: *std.ArrayList(u21), start: usize) !
         if (c != 0x0e33 and !lao) continue;
         const ring: u21 = if (lao) 0x0ecd else 0x0e4d;
         out.items[index] = if (lao) 0x0eb2 else 0x0e32;
-        // Back over the tone marks the vowel was typed after.
         var at = index;
         while (at > start) : (at -= 1) {
             const before = out.items[at - 1];
@@ -296,7 +263,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
     }
     const line = out.items[start..];
 
-    // Latin ligatures, in typing order.
     var write: usize = 0;
     var read: usize = 0;
     while (read < line.len) {
@@ -310,7 +276,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
             .{ .sequence = &.{ 'f', 'l' }, .glyph = 0xfb02 },
         };
         var replaced = false;
-        // The font's own ligatures first: it knows which it has.
         if (coverage.ligature) |find| if (find(coverage.context, rest)) |match| {
             if (match.consumed >= 2 and match.consumed <= rest.len) {
                 line[write] = match.codepoint;
@@ -337,7 +302,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
     out.items.len = start + write;
     var shaped = out.items[start..];
 
-    // Arabic: pick each letter's form from what it connects to.
     var has_arabic = false;
     for (shaped) |c| if (classOf(c) == .arabic) {
         has_arabic = true;
@@ -355,7 +319,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
                 write += 1;
                 continue;
             }
-            // The next letter, looking past marks.
             var next: u21 = 0;
             var next_index = read;
             while (next_index < shaped.len and isArabicMark(shaped[next_index])) next_index += 1;
@@ -387,11 +350,8 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
         shaped = out.items[start..];
     }
 
-    // Direction: find the embedding level of every glyph, then reverse
-    // runs from the deepest level outward.
     var any_right = false;
     for (shaped) |c| {
-        // A right-to-left control can turn even Latin text around.
         if (c == rle or c == rlo or c == rli) any_right = true;
         switch (classOf(c)) {
             .right, .arabic => any_right = true,
@@ -400,7 +360,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
         if (any_right) break;
     }
     if (!any_right) {
-        // Nothing to reorder; a stray mark is still not drawn.
         var kept_plain: usize = start;
         for (out.items[start..]) |c| {
             if (isInvisible(c)) continue;
@@ -415,13 +374,9 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
     defer gpa.free(levels);
     const classes = try gpa.alloc(Class, shaped.len);
     defer gpa.free(classes);
-    // Which run each glyph is resolved with: glyphs directly inside the
-    // same embedding or isolate, not separated by a nested embedding.
     const runs = try gpa.alloc(u16, shaped.len);
     defer gpa.free(runs);
 
-    // The line reads in the direction of its first strong character,
-    // not counting what is inside isolates.
     var base: u8 = 0;
     {
         var isolates: u32 = 0;
@@ -441,9 +396,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
         }
     }
 
-    // Embeddings, overrides and isolates: each opens a deeper level until
-    // it is closed, and an override also forces a direction on what it
-    // holds.
     const Frame = struct { level: u8, override: ?Class, isolate: bool, run: u16 };
     var stack: [max_embedding + 1]Frame = undefined;
     var depth: usize = 0;
@@ -458,8 +410,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
         switch (c) {
             lre, rle, lro, rlo, lri, rli, fsi => {
                 const isolate = isIsolateStart(c);
-                // An isolate stands in the text around it as one neutral
-                // character; an embedding's own markers take no part.
                 classes[at] = if (isolate) .neutral else .control;
                 var right = c == rle or c == rlo or c == rli;
                 if (c == fsi) right = firstStrongIsRight(shaped[at + 1 ..]);
@@ -481,7 +431,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
                     ignored -= 1;
                 } else if (depth > 0 and !top.isolate) {
                     depth -= 1;
-                    // The text around an embedding resumes as a new run.
                     stack[depth].run = run_count;
                     run_count += 1;
                 }
@@ -490,8 +439,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
                 if (ignored != 0) {
                     ignored -= 1;
                 } else {
-                    // Closes the nearest isolate and any embedding left
-                    // open inside it.
                     var open = depth;
                     while (open > 0 and !stack[open].isolate) open -= 1;
                     if (open > 0) depth = open - 1;
@@ -504,10 +451,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
         }
     }
 
-    // Within each run: letters set the direction, numbers read left to
-    // right even inside right-to-left text, and neutrals between two
-    // stretches of the same direction join it; otherwise they follow the
-    // run.
     const unresolved = 0xff;
     var members: std.ArrayList(u32) = .empty;
     defer members.deinit(gpa);
@@ -518,9 +461,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
             if (owner == run and class != .control) try members.append(gpa, @intCast(at));
         }
         if (members.items.len == 0) continue;
-        // Signs that go with numbers: a separator between two numbers of
-        // one kind joins them, percent and currency signs next to a
-        // European number join it, and whatever is left is neutral.
         for (members.items, 0..) |at, index| {
             const class = classes[at];
             if (class != .separator and class != .common_separator) continue;
@@ -578,8 +518,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
         }
     }
 
-    // The controls have done their work and are not drawn; drop them
-    // before reordering.
     {
         var kept: usize = 0;
         for (shaped, levels) |c, level| {
@@ -612,9 +550,8 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
             index = end;
         }
     }
-    // A mark is laid out after its letter whichever way the run reads:
-    // reversing a right-to-left run put its marks in front, so each
-    // letter's marks go back behind it, in the order they were typed.
+    // Reversing a right-to-left run put marks before their letter: move each
+    // letter's marks back behind it, in typing order.
     index = 0;
     while (index < shaped.len) {
         if (levels[index] % 2 == 0 or !isCombiningMark(shaped[index])) {
@@ -631,8 +568,8 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
     }
 }
 
-/// Marks that sit on the letter before them and take no room: the
-/// combining diacritics and the points of Hebrew and Arabic.
+/// Marks that sit on the preceding letter and take no room: combining
+/// diacritics and the points of Hebrew and Arabic.
 fn isCombiningMark(c: u21) bool {
     return (c >= 0x0300 and c <= 0x036f) or (c >= 0x0591 and c <= 0x05bd) or c == 0x05bf or c == 0x05c1 or c == 0x05c2 or
         c == 0x05c4 or c == 0x05c5 or c == 0x05c7 or (c >= 0x0610 and c <= 0x061a) or (c >= 0x064b and c <= 0x065f) or
@@ -677,69 +614,43 @@ test "latin ligatures" {
 }
 
 test "hebrew runs are reversed inside left-to-right text, numbers are not" {
-    // "ab " + alef bet gimel + " cd": the Hebrew word reads right to left.
     try expectShaped("ab \u{05d0}\u{05d1}\u{05d2} cd", &.{ 'a', 'b', ' ', 0x05d2, 0x05d1, 0x05d0, ' ', 'c', 'd' });
-    // A right-to-left line: letters reversed, the number kept in order, the
-    // brackets mirrored so they still enclose it.
     try expectShaped("\u{05d0}\u{05d1} (12)", &.{ '(', '1', '2', ')', ' ', 0x05d1, 0x05d0 });
 }
 
 test "arabic letters take contextual forms and lam-alef fuses" {
-    // beh + beh + beh: initial, medial, final; drawn right to left.
     try expectShaped("\u{0628}\u{0628}\u{0628}", &.{ 0xfe90, 0xfe92, 0xfe91 });
-    // lam + alef -> the isolated ligature.
     try expectShaped("\u{0644}\u{0627}", &.{0xfefb});
-    // alef does not join forward: beh after it starts a new group.
     try expectShaped("\u{0627}\u{0628}", &.{ 0xfe8f, 0xfe8d });
 }
 
 test "direction marks steer neutral characters and are not drawn" {
-    // Without a mark the exclamation mark sits between a Hebrew word and
-    // Latin text and follows the line's direction: it stays after the word.
     try expectShaped("ab \u{05d0}\u{05d1}! cd", &.{ 'a', 'b', ' ', 0x05d1, 0x05d0, '!', ' ', 'c', 'd' });
-    // A right-to-left mark after it puts it between two right-to-left
-    // characters, so it joins the Hebrew run and ends up on its left.
     try expectShaped("ab \u{05d0}\u{05d1}!\u{200f} cd", &.{ 'a', 'b', ' ', '!', 0x05d1, 0x05d0, ' ', 'c', 'd' });
-    // A left-to-right mark alone changes nothing visible.
     try expectShaped("a\u{200e}b", &.{ 'a', 'b' });
 }
 
 test "overrides, embeddings and isolates" {
-    // An override turns even Latin letters around.
     try expectShaped("a\u{202e}bcd\u{202c}e", &.{ 'a', 'd', 'c', 'b', 'e' });
-    // Unisolated, the exclamation mark sits between Hebrew and Latin and
-    // follows the line; isolated, it ends the Hebrew phrase.
     try expectShaped("ab \u{05d0}\u{05d1}! cd", &.{ 'a', 'b', ' ', 0x05d1, 0x05d0, '!', ' ', 'c', 'd' });
     try expectShaped("ab \u{2067}\u{05d0}\u{05d1}!\u{2069} cd", &.{ 'a', 'b', ' ', '!', 0x05d1, 0x05d0, ' ', 'c', 'd' });
-    // A first-strong isolate takes its direction from what it holds.
     try expectShaped("ab \u{2068}\u{05d0}\u{05d1}!\u{2069} cd", &.{ 'a', 'b', ' ', '!', 0x05d1, 0x05d0, ' ', 'c', 'd' });
     try expectShaped("\u{05d0} \u{2068}ab!\u{2069} \u{05d1}", &.{ 0x05d1, ' ', 'a', 'b', '!', ' ', 0x05d0 });
-    // A left-to-right embedding inside right-to-left text keeps a phrase
-    // with its punctuation in reading order.
     try expectShaped("\u{05d0} \u{202a}a-b!\u{202c} \u{05d1}", &.{ 0x05d1, ' ', 'a', '-', 'b', '!', ' ', 0x05d0 });
-    // Unclosed and unmatched controls are harmless.
     try expectShaped("a\u{202c}b\u{2069}c\u{2067}", &.{ 'a', 'b', 'c' });
 }
 
 test "signs next to numbers stay with them in right-to-left text" {
-    // A percent sign after a number, and a currency sign before one.
     try expectShaped("\u{05d0}\u{05d1} 100% \u{05d2}", &.{ 0x05d2, ' ', '1', '0', '0', '%', ' ', 0x05d1, 0x05d0 });
     try expectShaped("\u{05d0} $5 \u{05d1}", &.{ 0x05d1, ' ', '$', '5', ' ', 0x05d0 });
-    // Separators inside a number keep it in one piece.
     try expectShaped("\u{05d0} 1,234.5 \u{05d1}", &.{ 0x05d1, ' ', '1', ',', '2', '3', '4', '.', '5', ' ', 0x05d0 });
-    // A full stop that only follows a number is punctuation of the
-    // sentence: it goes where the sentence ends, on the left.
     try expectShaped("\u{05d0} 12.", &.{ '.', '1', '2', ' ', 0x05d0 });
-    // In left-to-right text nothing changes.
     try expectShaped("a 50% b", &.{ 'a', ' ', '5', '0', '%', ' ', 'b' });
 }
 
 test "marks stay behind their letters in right-to-left runs" {
-    // alef with a vowel point, then bet: drawn bet, alef, point.
     try expectShaped("\u{05d0}\u{05b8}\u{05d1}", &.{ 0x05d1, 0x05d0, 0x05b8 });
-    // Two marks on one letter keep the order they were typed in.
     try expectShaped("\u{05d1}\u{05d0}\u{05b8}\u{05bc}", &.{ 0x05d0, 0x05b8, 0x05bc, 0x05d1 });
-    // Left-to-right text is untouched.
     try expectShaped("e\u{0301}a", &.{ 'e', 0x0301, 'a' });
 }
 
@@ -752,11 +663,9 @@ test "sara am is drawn as a ring under the tone mark and a letter" {
     };
     var out: std.ArrayList(u21) = .empty;
     defer out.deinit(gpa);
-    // no nu, mai tho, sara am: the ring goes before the tone mark.
     try shapeLine(gpa, "\u{e19}\u{e49}\u{e33}", .{ .context = undefined, .has = Any.has }, &out);
     try std.testing.expectEqualSlices(u21, &.{ 0xe19, 0xe4d, 0xe49, 0xe32 }, out.items);
     out.clearRetainingCapacity();
-    // Without a tone mark it simply comes apart.
     try shapeLine(gpa, "\u{e01}\u{e33}", .{ .context = undefined, .has = Any.has }, &out);
     try std.testing.expectEqualSlices(u21, &.{ 0xe01, 0xe4d, 0xe32 }, out.items);
 }

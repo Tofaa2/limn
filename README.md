@@ -1,6 +1,9 @@
 # Limn
 A high quality, performant, realtime, concurrency-first, physically based renderer written in zig with Vulkan 1.3
 
+# Path tracing
+Path tracing is WIP and contains noise, unfortunately RTX is an oversold concept for marketting that requires vendor locked software and tooling to make it look actually good. Its recommended to keep regular ray tracing enabled and path tracing disabled.
+
 ![Sponza, path traced](.github/images/rtx_path.png)
 
 | ![meadow](.github/images/meadow.png) | ![rtx](.github/images/rtx.png) | ![world](.github/images/world.png) |
@@ -18,6 +21,8 @@ A high quality, performant, realtime, concurrency-first, physically based render
 | **instancing** | **views** | **shader** |
 | ![text](.github/images/text.png) | ![canvas](.github/images/canvas.png) | ![triangle](.github/images/triangle.png) |
 | **text** | **canvas** | **triangle** |
+| ![asteroids](.github/images/asteroids.png) | ![voxels](.github/images/voxels.png) | |
+| **asteroids** | **voxels** | |
 
 Every picture is an example in `examples/`: run it with `zig build <name>`.
 
@@ -80,5 +85,8 @@ Apache-2.0; see [`LICENSE`](LICENSE). Bundled work keeps its own terms:
 
 - meshoptimizer (MIT): `src/third_party/meshoptimizer`
 - Basis Universal transcoder (Apache-2.0): `src/third_party/basisu`
+- FidelityFX Denoiser, reflection part (MIT): `src/third_party/ffx_denoiser`
+- FidelityFX Super Resolution 1 (MIT): `src/third_party/ffx_fsr1`
+- FidelityFX SDK 1.1.4, for Super Resolution 2 and 3 (MIT): `src/third_party/ffx_sdk`
 - DejaVu Sans, the built-in font: `src/render/fonts/LICENSE`
 - Example models, environments and fonts: `examples/assets/README.md`

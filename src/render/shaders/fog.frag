@@ -3,10 +3,8 @@
 #include "gi.glsl"
 #include "media.glsl"
 
-// Volumetric fog at half resolution: ray-marches from the camera to the
-// surface, accumulating sun light (shadowed by the cascades, which is what
-// produces light shafts) and ambient sky light. Output is in-scattered
-// radiance in rgb and transmittance in a.
+// Half-resolution volumetric fog: ray-marches camera to surface with shadowed
+// sun and ambient light. Output: in-scattering in rgb, transmittance in a.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint depth_texture;
@@ -43,14 +41,11 @@ void main() {
     float jitter = interleavedGradientNoise(gl_FragCoord.xy, frame.frame_index);
     vec3 scattered = vec3(0.0);
     float transmittance = 1.0;
-    // Probe ambient is refreshed twice along the ray.
     int ambient_interval = max(push.step_count / 2, 1);
     vec3 ambient = sky_ambient;
     for (int i = 0; i < push.step_count; i++) {
         vec3 position = frame.camera_position + direction * (float(i) + jitter) * step_length;
         float sigma = push.density * exp(-max(position.y, 0.0) * push.height_falloff);
-        // Inside the probe volume the fog is lit by local bounce light, not
-        // by the open sky; refreshed every few steps to bound the cost.
         if (i % ambient_interval == 0) {
             ambient = sky_ambient;
             if ((frame.flags & FRAME_GI) != 0u) {

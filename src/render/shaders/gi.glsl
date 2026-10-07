@@ -1,11 +1,6 @@
-// Irradiance probe volume (DDGI, Majercik et al. 2019): a regular grid of
-// probes, each storing cosine-weighted incoming radiance and depth moments
-// in small octahedral maps packed into two atlases.
-//
-// There can be two grids: the main one, and a coarse one covering the whole
-// scene for when the main grid follows the camera and does not reach
-// everywhere. Lookups blend from the main grid to the coarse one at the
-// main grid's edge.
+// Irradiance probe volume (DDGI, Majercik et al. 2019): a grid of probes
+// storing irradiance and depth moments in octahedral maps packed into two
+// atlases. Up to three nested grids; lookups blend outward at each grid's edge.
 #ifndef GI_GLSL
 #define GI_GLSL
 
@@ -20,10 +15,9 @@ struct GiGrid {
     uint visibility;
     // Storage offset of the grid's first cell, per axis.
     ivec3 scroll;
-    // Where each probe has been moved to get it out of a wall: a texture
-    // with a texel per probe holding the offset from its grid position
-    // and a mark of which cell it was worked out for. INVALID_ID when
-    // probes stay on the grid. `nearest` is a sampler to fetch it with.
+    // Probe relocation texture, one texel per probe: offset from the grid
+    // position (rgb) and a mark of the cell it was computed for (a). INVALID_ID
+    // when unused. `nearest` is a sampler to fetch it with.
     uint offsets;
     uint nearest;
 };
@@ -32,9 +26,7 @@ ivec3 giUnpackScroll(uint packed) {
     return ivec3(packed & 1023u, (packed >> 10) & 1023u, (packed >> 20) & 1023u);
 }
 
-// Grid 0 is the main one, grid 1 the coarse one over the whole scene, and
-// grid 2 a middle one between them for worlds so large that the coarse
-// grid's probes are very far apart.
+// Grid 0: main, 1: coarse (whole scene), 2: middle.
 GiGrid giGrid(FrameConstants frame, uint index) {
     if (index == 0u)
         return GiGrid(frame.gi_origin, frame.gi_spacing, frame.gi_counts, frame.gi_irradiance, frame.gi_visibility, giUnpackScroll(frame.gi_scroll), frame.gi_offsets, frame.sampler_nearest_clamp);
@@ -55,9 +47,8 @@ ivec3 giProbeCoord(int index, ivec3 counts) {
     return ivec3(index % counts.x, (index / counts.x) % counts.y, index / (counts.x * counts.y));
 }
 
-// Probes are stored by their world cell modulo the grid size, so a grid can
-// move with the camera without moving any data. These convert between a
-// probe's place in the grid and its place in the atlases.
+// Probes are stored by world cell modulo the grid size, so the grid scrolls
+// without moving data.
 ivec3 giStorageCoord(GiGrid grid, ivec3 coord) {
     return (coord + grid.scroll) % grid.counts;
 }
@@ -66,21 +57,18 @@ ivec3 giGridCoord(GiGrid grid, ivec3 storage) {
     return (storage - grid.scroll + grid.counts) % grid.counts;
 }
 
-// Where a probe would be if it stayed on the grid.
+// Probe position without relocation.
 vec3 giProbeGridPosition(GiGrid grid, ivec3 coord) {
     return grid.origin + vec3(coord) * grid.spacing;
 }
 
-// A mark for the world cell a probe stands for. Storage is reused as the
-// grid moves, so an offset is only good for the cell it was made for.
+// Mark identifying the world cell a probe stands for.
 float giProbeMark(GiGrid grid, vec3 grid_position) {
     return fract(dot(round(grid_position / grid.spacing), vec3(0.3731, 0.6113, 0.8297)));
 }
 
-// A probe's offset from its grid position; zero when probes are not
-// moved or the stored one belongs to another cell.
+// Probe relocation offset; zero when unused or stored for another cell.
 vec3 giProbeOffset(GiGrid grid, ivec3 coord, vec3 grid_position) {
-    // Left out of shading passes built for scenes that do not move probes.
     if ((SHADE_FEATURES & FEATURE_GI_RELOCATION) == 0u || grid.offsets == INVALID_ID) return vec3(0.0);
     ivec3 storage = giStorageCoord(grid, coord);
     vec4 moved = texelFetch(TEX(grid.offsets, grid.nearest), ivec2(storage.x + storage.z * grid.counts.x, storage.y), 0);
@@ -93,7 +81,7 @@ vec3 giProbePosition(GiGrid grid, ivec3 coord) {
     return grid_position + giProbeOffset(grid, coord, grid_position);
 }
 
-// Atlas texture coordinate of `direction` in one probe's octahedral map.
+// Atlas UV of `direction` in one probe's octahedral map.
 vec2 giProbeUv(ivec3 coord, vec3 direction, int texels, ivec3 counts) {
     vec2 tile = vec2(coord.x + coord.z * counts.x, coord.y);
     vec2 inner = encodeNormal(direction) * float(texels - 2) + 1.0;
@@ -108,8 +96,7 @@ float giGridCoverage(GiGrid grid, vec3 position) {
     return clamp(1.0 - distance_outside / grid.spacing, 0.0, 1.0);
 }
 
-// How much of the answer comes from probes at `position` (as opposed to
-// plain sky light): 1 inside either grid.
+// Probe weight at `position` versus plain sky light: 1 inside any grid.
 float giCoverage(FrameConstants frame, vec3 position) {
     float main_coverage = giGridCoverage(giGrid(frame, 0u), position);
     if (!giHasCoarse(frame) || main_coverage >= 1.0) return main_coverage;
@@ -128,8 +115,7 @@ vec3 giGridIrradiance(FrameConstants frame, GiGrid grid, vec3 position, vec3 nor
     vec3 cell = (position - grid.origin) / grid.spacing;
     ivec3 base = clamp(ivec3(floor(cell)), ivec3(0), counts - 2);
     vec3 alpha = clamp(cell - vec3(base), 0.0, 1.0);
-    // Query visibility from a point nudged off the surface to avoid
-    // self-shadowing by the geometry the point sits on.
+    // Bias the query point off the surface against self-shadowing.
     vec3 biased = position + (normal * 0.2 + view * 0.8) * (0.3 * grid.spacing);
 
     vec3 total = vec3(0.0);
@@ -142,12 +128,12 @@ vec3 giGridIrradiance(FrameConstants frame, GiGrid grid, vec3 position, vec3 nor
         vec3 trilinear = mix(1.0 - alpha, alpha, vec3(offset));
         float weight = trilinear.x * trilinear.y * trilinear.z;
 
-        // Probes behind the surface contribute less ("smooth backface").
+        // Smooth backface weighting.
         vec3 to_probe = normalize(probe - position);
         float facing = (dot(to_probe, normal) + 1.0) * 0.5;
         weight *= facing * facing + 0.2;
 
-        // Chebyshev visibility test against the probe's depth moments.
+        // Chebyshev visibility test on the depth moments.
         vec3 from_probe = biased - probe;
         float distance_to_probe = length(from_probe);
         vec2 moments = textureLod(TEX(grid.visibility, s), giProbeUv(stored, from_probe / distance_to_probe, GI_VISIBILITY_TEXELS, counts), 0.0).rg;
@@ -158,8 +144,7 @@ vec3 giGridIrradiance(FrameConstants frame, GiGrid grid, vec3 position, vec3 nor
             weight *= max(chebyshev * chebyshev * chebyshev, 0.0);
         }
         weight = max(weight, 1e-6);
-        // Suppress very small weights smoothly so dark leaks do not dominate
-        // after normalization.
+        // Crush small weights smoothly to limit leaks after normalization.
         const float threshold = 0.2;
         if (weight < threshold) weight *= weight * weight / (threshold * threshold);
 
@@ -170,8 +155,7 @@ vec3 giGridIrradiance(FrameConstants frame, GiGrid grid, vec3 position, vec3 nor
     return total / weight_total;
 }
 
-// Cosine-weighted mean incoming radiance at a surface point, i.e. diffuse
-// irradiance divided by pi.
+// Cosine-weighted mean incoming radiance: irradiance / pi.
 vec3 giIrradiance(FrameConstants frame, vec3 position, vec3 normal, vec3 view) {
     GiGrid main_grid = giGrid(frame, 0u);
     if (!giHasCoarse(frame)) return giGridIrradiance(frame, main_grid, position, normal, view);
@@ -180,7 +164,6 @@ vec3 giIrradiance(FrameConstants frame, vec3 position, vec3 normal, vec3 view) {
     if (main_coverage > 0.0) result = giGridIrradiance(frame, main_grid, position, normal, view) * main_coverage;
     float rest = 1.0 - main_coverage;
     if (rest > 0.0 && giHasMiddle(frame)) {
-        // Past the main grid, the middle one as far as it reaches.
         GiGrid middle_grid = giGrid(frame, 2u);
         float middle = giGridCoverage(middle_grid, position);
         if (middle > 0.0) result += giGridIrradiance(frame, middle_grid, position, normal, view) * (rest * middle);
@@ -208,8 +191,8 @@ vec3 giGridAmbient(FrameConstants frame, GiGrid grid, vec3 position) {
     return total;
 }
 
-// Cheap, direction-averaged probe lookup for participating media: trilinear
-// between the surrounding probes without the visibility test.
+// Direction-averaged trilinear probe lookup without the visibility test, for
+// participating media.
 vec3 giAmbient(FrameConstants frame, vec3 position) {
     GiGrid main_grid = giGrid(frame, 0u);
     if (!giHasCoarse(frame)) return giGridAmbient(frame, main_grid, position);

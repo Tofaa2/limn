@@ -1,0 +1,166 @@
+#version 460
+#include "common.glsl"
+#include "cull_view.glsl"
+#include "vsm.glsl"
+
+// Allocates atlas slots for the pages vsm_mark.comp requested and picks the
+// pages to draw this frame, writing their cull and draw views. One invocation
+// walks every page.
+layout(local_size_x = 1) in;
+
+// The frame's culling views (`CullView` in cull_view.glsl) as raw words.
+layout(buffer_reference, scalar) buffer CullViews { uint data[]; };
+
+layout(push_constant, scalar) uniform Push {
+    FrameConstants frame;
+    Vsm vsm;
+    // Culling views: the camera's, and the first of those reserved for pages.
+    CullViews views;
+    uint first_page_view;
+    uint pad;
+} push;
+
+const uint cull_view_words = 108u;
+const uint cull_view_plane_count = 27u;
+const uint cull_view_cone_culling = 28u;
+const uint cull_view_blended_casters = 52u;
+const uint cull_view_lod_band = 53u;
+const uint cull_view_min_radius = 54u;
+const uint cull_view_receiver_culling = 55u;
+
+// Copies the camera's culling view to page `which`; returns its word offset.
+uint pageCullView(uint which) {
+    uint first = (push.first_page_view + which) * cull_view_words;
+    for (uint word = 0u; word < cull_view_words; word++) push.views.data[first + word] = push.views.data[word];
+    push.views.data[first + cull_view_cone_culling] = 0u;
+    push.views.data[first + cull_view_blended_casters] = 0u;
+    push.views.data[first + cull_view_lod_band] = floatBitsToUint(1.0);
+    push.views.data[first + cull_view_min_radius] = floatBitsToUint(0.0);
+    push.views.data[first + cull_view_receiver_culling] = 0u;
+    return first;
+}
+
+void setPlane(uint first, uint plane, vec4 value) {
+    for (uint part = 0u; part < 4u; part++) push.views.data[first + plane * 4u + part] = floatBitsToUint(value[part]);
+}
+
+
+bool moved(Vsm vsm, uint level, ivec2 page) {
+    if (vsm.all_moved != 0u) return true;
+    float size = vsmExtent(vsm, level) / float(vsm_pages);
+    vec2 low = vec2(page) * size;
+    for (uint index = 0u; index < vsm.mover_count; index++) {
+        vec4 sphere = vsm.movers.data[index];
+        vec2 middle = (vsm.light_view * vec4(sphere.xyz, 1.0)).xy;
+        vec2 nearest = clamp(middle, low, low + size);
+        if (distance(nearest, middle) <= sphere.w) return true;
+    }
+    return false;
+}
+
+void drawPage(Vsm vsm, uint which, uint level, ivec2 page, uint place) {
+    float size = vsmExtent(vsm, level) / float(vsm_pages);
+    vec2 low = vec2(page) * size;
+    ivec2 in_atlas = ivec2(int(place) % vsm_atlas_pages, int(place) / vsm_atlas_pages);
+    float across = 2.0 / float(vsm_atlas_pages);
+    vec2 corner = vec2(in_atlas) * across - 1.0;
+    mat4 fit = mat4(1.0);
+    fit[0][0] = across / size;
+    fit[1][1] = across / size;
+    fit[2][2] = 1.0 / vsm.depth_range;
+    fit[3] = vec4(corner.x - low.x * across / size, corner.y - low.y * across / size, -vsm.depth_from / vsm.depth_range, 1.0);
+    VsmPageView view;
+    view.view_proj = fit * vsm.light_view;
+    view.bounds = vec4(corner, corner + across);
+    vsm.page_views.data[which] = view;
+
+    vec3 right = vec3(vsm.light_view[0][0], vsm.light_view[1][0], vsm.light_view[2][0]);
+    vec3 up = vec3(vsm.light_view[0][1], vsm.light_view[1][1], vsm.light_view[2][1]);
+    vec2 offset = vec2(vsm.light_view[3][0], vsm.light_view[3][1]);
+    uint cull = pageCullView(which);
+    setPlane(cull, 0u, vec4(right, offset.x - low.x));
+    setPlane(cull, 1u, vec4(-right, low.x + size - offset.x));
+    setPlane(cull, 2u, vec4(up, offset.y - low.y));
+    setPlane(cull, 3u, vec4(-up, low.y + size - offset.y));
+    push.views.data[cull + cull_view_plane_count] = 4u;
+}
+
+void main() {
+    Vsm vsm = push.vsm;
+    uint per_level = uint(vsm_pages * vsm_pages);
+    uint total = vsm.levels * per_level;
+    uint places = uint(vsm_atlas_pages * vsm_atlas_pages);
+
+    // Re-key the table for the camera position; pages outside the window free
+    // their slots.
+    for (uint slot = 0u; slot < total; slot++) {
+        uint level = slot / per_level;
+        ivec2 window = vsmWindow(vsm, level);
+        ivec2 wrapped = ivec2(int(slot % per_level) % vsm_pages, int(slot % per_level) / vsm_pages);
+        ivec2 page = window + ((wrapped - window) & (vsm_pages - 1));
+        VsmPage entry = vsm.pages.data[slot];
+        uint key = vsmKey(page);
+        if (vsm.reset != 0u || entry.key != key) {
+            if (entry.place != 0u) vsm.owners.data[entry.place - 1u] = 0u;
+            entry = VsmPage(key, 0u, 0u, 0u);
+        }
+        if (vsm.requested.data[slot] == vsm.frame) entry.used = vsm.frame;
+        if (entry.place != 0u && (entry.flags & VSM_READY) != 0u && moved(vsm, level, page)) entry.flags = VSM_STALE;
+        vsm.pages.data[slot] = entry;
+    }
+
+    uint drawn = 0u;
+    uint search = 0u;
+    // Two rounds: stale pages first, then new ones.
+    for (uint slot = 0u; slot < total * 2u; slot++) {
+        bool stale_round = slot < total;
+        VsmPage entry = vsm.pages.data[slot % total];
+        if (entry.used != vsm.frame || ((entry.flags & VSM_STALE) != 0u) != stale_round) continue;
+        uint level = (slot % total) / per_level;
+        ivec2 window = vsmWindow(vsm, level);
+        ivec2 wrapped = ivec2(int((slot % total) % per_level) % vsm_pages, int((slot % total) % per_level) / vsm_pages);
+        ivec2 page = window + ((wrapped - window) & (vsm_pages - 1));
+        if (entry.place == 0u) {
+            // A free slot, else the least recently requested.
+            uint found = places;
+            for (uint tried = 0u; tried < places && found == places; tried++) {
+                uint place = (search + tried) % places;
+                if (vsm.owners.data[place] == 0u) found = place;
+            }
+            if (found == places) {
+                uint oldest = vsm.frame;
+                for (uint place = 0u; place < places; place++) {
+                    uint used = vsm.pages.data[vsm.owners.data[place] - 1u].used;
+                    if (used < oldest) {
+                        oldest = used;
+                        found = place;
+                    }
+                }
+                if (found == places) continue;
+                uint evicted = vsm.owners.data[found] - 1u;
+                vsm.pages.data[evicted].place = 0u;
+                vsm.pages.data[evicted].flags = 0u;
+            }
+            search = found + 1u;
+            vsm.owners.data[found] = slot % total + 1u;
+            entry.place = found + 1u;
+            entry.flags = 0u;
+        }
+        if ((entry.flags & VSM_READY) == 0u && drawn < vsm_pages_per_frame) {
+            drawPage(vsm, drawn, level, page, entry.place - 1u);
+            entry.flags = VSM_READY;
+            drawn++;
+        }
+        vsm.pages.data[slot % total] = entry;
+    }
+
+    for (uint which = drawn; which < vsm_pages_per_frame; which++) {
+        VsmPageView view;
+        view.view_proj = mat4(0.0);
+        view.bounds = vec4(0.0);
+        vsm.page_views.data[which] = view;
+        uint cull = pageCullView(which);
+        setPlane(cull, 0u, vec4(0.0, 0.0, 0.0, -1.0e30));
+        push.views.data[cull + cull_view_plane_count] = 1u;
+    }
+}

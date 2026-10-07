@@ -1,17 +1,6 @@
-//! The high-level renderer: scenes of glTF models lit by a sun, point lights
-//! and an HDR environment, drawn through a GPU-driven visibility-buffer
-//! pipeline.
-//!
-//! Frame outline (see `renderScene`):
-//!
-//!   skinning and meshlet culling (compute) -> visibility buffer with
-//!   two-phase occlusion culling -> sun and local shadow maps -> probe GI
-//!   update -> GTAO -> shading -> transparency -> fog -> TAA -> bloom ->
-//!   exposure -> tonemap -> draw lists
-//!
-//! All geometry lives in a handful of global buffers and every view is drawn
-//! with two multi-draw-indirect calls, so CPU cost per frame is independent
-//! of triangle and meshlet count.
+//! High-level renderer: glTF scenes lit by a sun, local lights and an HDR
+//! environment, drawn through a GPU-driven visibility-buffer pipeline.
+//! Frame outline: see `renderScene`.
 const std = @import("std");
 const rhi = @import("../rhi/rhi.zig");
 const math = @import("../math.zig");
@@ -31,6 +20,7 @@ const text_layout = @import("text_layout.zig");
 const api = @import("api.zig");
 const renderer_state = @import("state.zig");
 const scene_pass = @import("scene_pass.zig");
+const frame_graph = @import("frame_graph.zig");
 const geometry_passes = @import("passes/geometry.zig");
 const shadow_passes = @import("passes/shadows.zig");
 const shading_passes = @import("passes/shading.zig");
@@ -40,6 +30,10 @@ const path_tracing_pass = @import("passes/path_tracing.zig");
 const post_passes = @import("passes/post.zig");
 const simulation_passes = @import("passes/simulation.zig");
 const particle_passes = @import("passes/particles.zig");
+const hair_passes = @import("passes/hair.zig");
+const impostor_passes = @import("passes/impostors.zig");
+const lightmap_passes = @import("passes/lightmaps.zig");
+const virtual_shadow_passes = @import("passes/virtual_shadows.zig");
 const gi_passes = @import("passes/gi.zig");
 
 pub const Mat4 = math.Mat4;
@@ -75,6 +69,16 @@ pub const Emitter = api.Emitter;
 pub const ReflectionProbe = api.ReflectionProbe;
 pub const Fluid = api.Fluid;
 pub const Water = api.Water;
+pub const Hair = api.Hair;
+pub const HairDesc = api.HairDesc;
+pub const HairSimulation = api.HairSimulation;
+pub const ImpostorDesc = api.ImpostorDesc;
+pub const LightmapDesc = api.LightmapDesc;
+const HairTag = api.HairTag;
+pub const CollisionField = api.CollisionField;
+const CollisionFieldTag = api.CollisionFieldTag;
+const collision_field = @import("collision_field.zig");
+const HairState = renderer_state.HairState;
 pub const Liquid = api.Liquid;
 pub const InstanceGroup = api.InstanceGroup;
 pub const Pose = api.Pose;
@@ -155,6 +159,7 @@ const ao_depth_mips = renderer_state.ao_depth_mips;
 pub const view_count = renderer_state.view_count;
 pub const main_late_view = renderer_state.main_late_view;
 pub const local_view_base = renderer_state.local_view_base;
+pub const vsm_view_base = renderer_state.vsm_view_base;
 pub const max_local_shadow_views = renderer_state.max_local_shadow_views;
 const max_movers = renderer_state.max_movers;
 pub const local_shadow_tiles_per_side = renderer_state.local_shadow_tiles_per_side;
@@ -222,6 +227,9 @@ pub const liquid_cell_slots = renderer_state.liquid_cell_slots;
 const LiquidTargets = renderer_state.LiquidTargets;
 const LiquidState = renderer_state.LiquidState;
 const max_waters = renderer_state.max_waters;
+pub const max_hair_colliders = renderer_state.max_hair_colliders;
+pub const hair_density_size = renderer_state.hair_density_size;
+pub const CollisionFieldState = renderer_state.CollisionFieldState;
 pub const water_quads = renderer_state.water_quads;
 const WaterState = renderer_state.WaterState;
 const FluidState = renderer_state.FluidState;
@@ -238,31 +246,26 @@ const SeenTag = renderer_state.SeenTag;
 const DrawPipelines = renderer_state.DrawPipelines;
 const ImageEntry = renderer_state.ImageEntry;
 
-/// The renderer: owns the device and every model, scene, view, font and
-/// image made through it. Create one with `init`, call `render` once per
-/// frame and `deinit` at the end.
-///
-/// Methods lock the renderer themselves (see `lock`), so models can be
-/// loaded and scenes edited from other threads while one thread renders.
-/// The fields are internal, apart from `device` and `options`.
+/// Owns the device and everything made through it. Methods lock internally
+/// (see `lock`), so other threads may load and edit while one renders.
+/// Only `device` and `options` are public fields.
 pub const Renderer = struct {
     gpa: std.mem.Allocator,
-    /// Creation-time choices that stay fixed for the renderer's lifetime.
+    /// Fixed for the renderer's lifetime.
     options: Options,
     io: std.Io,
-    /// The underlying device, for custom passes and offscreen targets.
+    /// For custom passes and offscreen targets.
     device: *rhi.Device,
 
     pipelines: Pipelines,
     tonemap_pipelines: std.ArrayList(TonemapPipeline) = .empty,
-    /// Builds of the shading pass for the feature sets seen so far.
+    /// Shading pass builds, one per feature set seen.
     shade_variants: std.ArrayList(ShadeVariant) = .empty,
-    /// This frame's animated entities, and scratch space for each thread
-    /// that works out their poses.
+    /// This frame's animated entities.
     posed: std.ArrayList(Entity) = .empty,
-    /// Where the round of ray-tracing structure refits has got to.
+    /// Progress through the round of acceleration structure refits.
     refit_cursor: usize = 0,
-    /// Loaded models with per-texture coordinate transforms.
+    /// Count of loaded models with per-texture UV transforms.
     texture_transform_users: u32 = 0,
     pose_scratch: [max_pose_threads]std.ArrayList(animation.Local) = @splat(.empty),
     draw_pipelines: std.ArrayList(DrawPipelines) = .empty,
@@ -284,12 +287,10 @@ pub const Renderer = struct {
     morph_deltas: Pool,
     indices: Pool,
     meshlets: Pool,
-    /// Trees over the triangles of meshes, and the triangles their leaves
-    /// list, for following rays without the GPU's ray tracing.
+    /// Per-mesh triangle BVHs for the path tracing fallback.
     bvh_nodes: Pool,
     bvh_items: Pool,
-    /// The box of every mesh that has a tree, by its place among the
-    /// mesh records, in the mesh's own space.
+    /// Mesh-space box of each mesh with a BVH, by mesh record index.
     mesh_boxes: std.ArrayList(?[2][3]f32) = .empty,
     meshes: Pool,
     materials: Pool,
@@ -297,11 +298,23 @@ pub const Renderer = struct {
     arenas: [rhi.frames_in_flight]FrameArena,
     cull_commands: ?rhi.Buffer = null,
     cull_capacity: u32 = 0,
+    /// Views `cull_commands` has room for.
+    cull_views: u32 = 0,
+    /// Draws each view's second list (masked, two-sided, LOD-fading) has
+    /// room for; the first has `cull_capacity`.
+    cull_masked_capacity: u32 = 0,
     cull_counts: rhi.Buffer,
+    /// One `gpu.CullDispatch` per view of a frame.
+    cull_dispatch: rhi.Buffer,
+    /// The `gpu.DrawIndirect` that draws a view's impostors.
+    impostor_draw: rhi.Buffer,
+    scratch_impostors: std.ArrayList(gpu.Impostor) = .empty,
+    /// Two `gpu.MeshDraw`s per view, one per meshlet list; mesh shaders only.
+    cull_mesh_draws: rhi.Buffer,
     count_readback: [rhi.frames_in_flight]rhi.Buffer = undefined,
-    /// Counts the rounds of texture streaming (see `EntityData.seen_round`).
+    /// Texture streaming round counter (see `EntityData.seen_round`).
     seen_round: u64 = 0,
-    /// Bound in place of a view's cascades while it draws without shadows.
+    /// Bound in place of cascades for views drawn without shadows.
     shadow_map: rhi.Texture,
     /// Shadow atlas for spot and point lights.
     local_shadow_map: rhi.Texture,
@@ -319,8 +332,10 @@ pub const Renderer = struct {
     probes: handle.HandleTable(ProbeData, ReflectionProbeTag),
     fluids: handle.HandleTable(FluidState, FluidTag),
     waters: handle.HandleTable(WaterState, WaterTag),
+    hairs: handle.HandleTable(HairState, HairTag),
+    collision_fields: handle.HandleTable(CollisionFieldState, CollisionFieldTag),
     liquids: handle.HandleTable(LiquidState, LiquidTag),
-    /// The box liquids stand in as for rays; made with the first liquid.
+    /// Ray-tracing stand-in box for liquids; made with the first liquid.
     liquid_proxy_model: ?Model = null,
     instance_groups: handle.HandleTable(InstanceGroupData, InstanceGroupTag),
     /// Bumped whenever the set of ready models changes.
@@ -329,8 +344,7 @@ pub const Renderer = struct {
 
     views: handle.HandleTable(ViewData, ViewTag),
     main_view: View = undefined,
-    /// Targets drawn to so far this frame; the first view to touch one
-    /// clears it, later ones draw over it.
+    /// Targets drawn to this frame; the first view to touch one clears it.
     frame_targets: [16]rhi.Texture = undefined,
     frame_target_count: u32 = 0,
     /// Scene views recorded so far this frame.
@@ -338,16 +352,15 @@ pub const Renderer = struct {
     /// Scene whose lights the local shadow atlas currently holds.
     local_shadow_scene: ?Scene = null,
     local_shadow_frame: u64 = std.math.maxInt(u64),
-    /// What the atlas was last drawn from; see where it is compared.
+    /// Key of what the atlas was last drawn from.
     local_shadow_key: u64 = 0,
-    /// Whether something moving was in each tile when it was last drawn.
+    /// Whether each tile held a mover when last drawn.
     local_tile_had_mover: [max_local_shadow_views]bool = @splat(false),
-    /// Some computed sky is waiting to be rebuilt.
+    /// A computed sky is waiting to be rebuilt.
     skies_dirty: bool = false,
-    /// Shading pipelines of custom material shaders; slot 0 is the standard
-    /// material.
+    /// Pipelines of custom material shaders; slot 0 is the standard material.
     material_shaders: [32]?MaterialPipelines = @splat(null),
-    /// Loaded materials using each slot; unused shaders cost nothing.
+    /// Loaded materials using each slot.
     material_shader_users: [32]u32 = @splat(0),
     pick_buffer: rhi.Buffer = undefined,
     pick_readback: [rhi.frames_in_flight]rhi.Buffer = undefined,
@@ -364,23 +377,16 @@ pub const Renderer = struct {
     skin_weights: std.ArrayList(f32) = .empty,
     /// Meshes whose meshlet bounds are worked out after skinning.
     bounds_jobs: std.ArrayList(BoundsJob) = .empty,
-    /// Acceleration structures of deformed meshes to rebuild once this
-    /// frame's skinning has run.
+    /// Deformed-mesh acceleration structures to rebuild after skinning.
     blas_jobs: std.ArrayList(BlasJob) = .empty,
     scratch_locals: std.ArrayList(animation.Local) = .empty,
     scratch_refs: std.ArrayList(gpu.MeshletRef) = .empty,
     scratch_instances: std.ArrayList(gpu.Instance) = .empty,
+    scratch_static_cull: std.ArrayList(gpu.StaticCull) = .empty,
 
-    /// Creates the device and the renderer on it, and returns once the
-    /// built-in pipelines, the main view and the default font are ready.
-    /// The result is allocated with `gpa`, which the renderer keeps for
-    /// all its own allocations and which must outlive it; `io` is kept
-    /// likewise and runs the background loading jobs. Free with `deinit`.
-    ///
-    /// Fails when no suitable Vulkan device is found or a GPU resource
-    /// cannot be created. A missing optional feature (ray tracing, BC
-    /// formats, HDR output) is not an error: what depends on it is left
-    /// out.
+    /// Creates the device and renderer. `gpa` and `io` are kept and must
+    /// outlive it. Missing optional features (ray tracing, BC, HDR output)
+    /// are not errors. Free with `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Renderer {
         const device = try rhi.Device.init(gpa, io, .{
             .application_name = options.application_name,
@@ -391,6 +397,7 @@ pub const Renderer = struct {
             .debug_names = options.debug_names,
             .hdr_output = options.hdr_output,
             .ray_tracing = options.ray_tracing,
+            .mesh_shaders = options.mesh_shaders,
         });
         errdefer device.deinit();
         gltf.acquireLibraries(io);
@@ -434,6 +441,9 @@ pub const Renderer = struct {
             .materials = try Pool.init(device, "materials", @sizeOf(gpu.Material), 1 << 12, storage),
             .arenas = undefined,
             .cull_counts = try device.createBuffer(.{ .name = "cull counts", .size = view_count * 2 * @sizeOf(u32), .usage = .{ .storage = true, .indirect = true, .copy_src = true } }),
+            .cull_mesh_draws = try device.createBuffer(.{ .name = "cull mesh draws", .size = view_count * 2 * @sizeOf(gpu.MeshDraw), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } }),
+            .impostor_draw = try device.createBuffer(.{ .name = "impostor draw", .size = @sizeOf(gpu.DrawIndirect), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } }),
+            .cull_dispatch = try device.createBuffer(.{ .name = "cull dispatch", .size = view_count * @sizeOf(gpu.CullDispatch), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } }),
             .sampler_local_shadow = try device.createSampler(.{
                 .address_u = .clamp_to_edge,
                 .address_v = .clamp_to_edge,
@@ -474,13 +484,15 @@ pub const Renderer = struct {
             .probes = .init(gpa),
             .fluids = .init(gpa),
             .waters = .init(gpa),
+            .hairs = .init(gpa),
+            .collision_fields = .init(gpa),
             .liquids = .init(gpa),
             .instance_groups = .init(gpa),
         };
         for (&self.arenas) |*arena| arena.* = try FrameArena.init(device, 4 * 1024 * 1024);
         if (device.ray_tracing) self.gi_pipelines = try createGiPipelines(device);
         for (&self.count_readback) |*buffer| {
-            buffer.* = try device.createBuffer(.{ .name = "cull count readback", .size = view_count * 2 * @sizeOf(u32), .usage = .{}, .memory = .gpu_to_cpu });
+            buffer.* = try device.createBuffer(.{ .name = "cull count readback", .size = (view_count * 2 + 1) * @sizeOf(u32), .usage = .{}, .memory = .gpu_to_cpu });
             @memset(device.mapped(buffer.*), 0);
         }
         self.main_view = try self.insertView();
@@ -497,9 +509,6 @@ pub const Renderer = struct {
             _ = gltf.trimCache(gpa, self.io, directory, options.asset_cache_max_bytes) catch |err| std.log.warn("asset cache not trimmed: {}", .{err});
         };
 
-        // One-time setup that needs the GPU: the DFG lookup table, and
-        // defined contents for the shadow map so it can be sampled even
-        // before the first shadow pass.
         var cmd = try device.beginImmediate();
         try cmd.flushUploads();
         try cmd.beginRendering(.{ .color = &.{.{ .texture = self.brdf_lut, .load = .discard }} });
@@ -519,11 +528,8 @@ pub const Renderer = struct {
         return self;
     }
 
-    /// Waits for the GPU to finish, then destroys everything the renderer
-    /// still holds (scenes, entities, models, environments, fonts, images,
-    /// views), the device and the renderer itself. Every handle and font
-    /// pointer from it is invalid afterwards. Takes no lock: no other
-    /// thread may be using the renderer.
+    /// Waits for the GPU, then destroys everything, including the device and
+    /// the renderer. Takes no lock: no other thread may be using it.
     pub fn deinit(self: *Renderer) void {
         const device = self.device;
         device.waitIdle() catch {};
@@ -554,6 +560,10 @@ pub const Renderer = struct {
         self.fluids.deinit();
         while (self.waters.popAny()) |water| for (water.state) |texture| device.destroyTexture(texture);
         self.waters.deinit();
+        while (self.hairs.popAny()) |hair| self.freeHair(hair);
+        self.hairs.deinit();
+        while (self.collision_fields.popAny()) |field| device.destroyTexture(field.texture);
+        self.collision_fields.deinit();
         for (self.liquids.slots.items) |*slot| if (slot.value) |*state| state.deinit(self.device);
         self.liquids.deinit();
         while (self.instance_groups.popAny()) |group| {
@@ -617,6 +627,10 @@ pub const Renderer = struct {
         self.mesh_boxes.deinit(self.gpa);
         for (&self.arenas) |*arena| arena.deinit(device);
         device.destroyBuffer(self.cull_counts);
+        device.destroyBuffer(self.cull_dispatch);
+        device.destroyBuffer(self.impostor_draw);
+        self.scratch_impostors.deinit(self.gpa);
+        device.destroyBuffer(self.cull_mesh_draws);
         for (self.count_readback) |buffer| device.destroyBuffer(buffer);
         device.destroyBuffer(self.pick_buffer);
         for (self.material_shaders) |shader| if (shader) |pipelines| {
@@ -635,6 +649,7 @@ pub const Renderer = struct {
         self.scratch_locals.deinit(self.gpa);
         self.scratch_refs.deinit(self.gpa);
         self.scratch_instances.deinit(self.gpa);
+        self.scratch_static_cull.deinit(self.gpa);
         var overrides = shader_overrides.valueIterator();
         while (overrides.next()) |code| self.gpa.free(code.*);
         shader_overrides.deinit(self.gpa);
@@ -646,27 +661,23 @@ pub const Renderer = struct {
         device.deinit();
     }
 
-    /// Tells the renderer the window's framebuffer is now `width` by
-    /// `height` pixels. The swapchain is rebuilt when the next frame
-    /// starts, not here, so this is cheap to call on every resize event
-    /// and does nothing when the size is unchanged or there is no window.
-    /// Safe from any thread.
+    /// Records the new framebuffer size in pixels; the swapchain is rebuilt
+    /// at the next frame. Safe from any thread.
     pub fn resize(self: *Renderer, width: u32, height: u32) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.device.resize(width, height);
     }
 
-    /// How `Settings.path_tracing` would run on this device; see
-    /// `PathTracing`. Fixed for the life of the renderer. Safe from any
+    /// How `Settings.path_tracing` would run on this device. Safe from any
     /// thread.
     pub fn pathTracing(self: *const Renderer) PathTracing {
         if (self.device.ray_tracing) return .hardware;
         return if (self.options.path_tracing_fallback) .shader else .unavailable;
     }
 
-    /// Counters from the last frame rendered, with the loading count and
-    /// GPU memory use as they are now. Safe from any thread.
+    /// Last frame's counters, with current loading count and GPU memory use.
+    /// Safe from any thread.
     pub fn getStats(self: *Renderer) Stats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -682,9 +693,8 @@ pub const Renderer = struct {
         return .{ .clusters = self.options.cluster_lods, .normal_weight = self.options.lod_normal_weight, .uv_weight = self.options.lod_uv_weight };
     }
 
-    /// Starts loading a glTF model in the background and returns
-    /// immediately. Entities may reference the model right away; they appear
-    /// once it has streamed in.
+    /// Starts loading a glTF model in the background. Entities may reference
+    /// it at once; they appear when it is ready.
     pub fn loadModel(self: *Renderer, path: []const u8) !Model {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -709,10 +719,9 @@ pub const Renderer = struct {
         return model;
     }
 
-    /// Creates a model from geometry in memory (see `MeshDesc`). The model
-    /// becomes ready on the next frame or `waitUntilLoaded`.
+    /// Creates a model from geometry in memory. Ready on the next frame or
+    /// `waitUntilLoaded`.
     pub fn createModel(self: *Renderer, meshes: []const MeshDesc) !Model {
-        // Mesh processing needs no renderer state.
         var source = try gltf.fromMeshes(self.options.job_allocator orelse std.heap.smp_allocator, meshes, self.lodOptions());
         errdefer source.deinit();
         self.mutex.lockUncancelable(self.io);
@@ -722,9 +731,7 @@ pub const Renderer = struct {
         return model;
     }
 
-    /// Whether a model is still loading, ready to draw, or failed (see
-    /// `modelError`). A handle that names no model reports `.failed`.
-    /// Safe from any thread.
+    /// A handle that names no model reports `.failed`. Safe from any thread.
     pub fn modelState(self: *Renderer, model: Model) AssetState {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -746,8 +753,7 @@ pub const Renderer = struct {
         return if (entry.state == .ready) entry.info else null;
     }
 
-    /// How many animation clips a model has; valid `Pose.animation`
-    /// indices are below it. 0 until the model is ready.
+    /// Number of animation clips; 0 until the model is ready.
     pub fn animationCount(self: *Renderer, model: Model) u32 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -756,10 +762,8 @@ pub const Renderer = struct {
         return @intCast(entry.source.?.animations.len);
     }
 
-    /// Name and length in seconds of one of a model's animation clips.
-    /// Null until the model is ready, or when `index` is out of range.
-    /// The name is not copied: it stays valid until the model is
-    /// destroyed.
+    /// Null until the model is ready or when `index` is out of range. The
+    /// name is not copied: valid until the model is destroyed.
     pub fn animationInfo(self: *Renderer, model: Model, index: u32) ?AnimationInfo {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -769,8 +773,8 @@ pub const Renderer = struct {
         return .{ .name = clip.name, .duration = clip.duration };
     }
 
-    /// Index of the node (bone) with this name, for `Pose.Blend.root`.
-    /// Null until the model has loaded, or if there is no such node.
+    /// Index of the named node, for `Pose.Blend.root`. Null until loaded or
+    /// if there is none.
     pub fn findNode(self: *Renderer, model: Model, name: []const u8) ?u32 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -782,11 +786,8 @@ pub const Renderer = struct {
         return null;
     }
 
-    /// How far an animation carries one node (the root bone, see
-    /// `findNode`) between two times, in the model's space. Play the clip
-    /// with `Pose.in_place` set to that node and move the entity by this
-    /// each frame: the character then travels exactly as far as its feet
-    /// do. Times past the clip's length count whole loops.
+    /// How far an animation carries `node` between two times, in model
+    /// space. Times past the clip's length count whole loops.
     pub fn rootMotion(self: *Renderer, model: Model, animation_index: u32, node: u32, from: f32, to: f32) !Vec3 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -796,14 +797,11 @@ pub const Renderer = struct {
         if (node >= source.nodes.len) return error.InvalidNode;
         try self.scratch_locals.resize(self.gpa, source.nodes.len * 3);
         const moved = animation.rootMotion(source, self.scratch_locals.items, animation_index, node, from, to, true);
-        // From the node's parent space into the model's.
         return if (source.nodes[node].parent) |parent| math.transformDirection(entry.node_world[parent], moved) else moved;
     }
 
-    /// Finds an animation by name, e.g. "Walking", and returns its index
-    /// for `Pose.animation`. The match is exact and case-sensitive; the
-    /// first clip with the name wins. Null until the model has loaded, or
-    /// if there is no such clip.
+    /// Index of the first clip with exactly this name, for `Pose.animation`.
+    /// Null until loaded or if there is none.
     pub fn findAnimation(self: *Renderer, model: Model, name: []const u8) ?u32 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -827,12 +825,9 @@ pub const Renderer = struct {
         self.asset_generation += 1;
     }
 
-    /// Starts loading an environment for image-based lighting and the sky:
-    /// an equirectangular `.hdr` panorama, or a KTX2 cube map of half
-    /// floats or BC6H blocks (any size; its mips are used when it is
-    /// larger than the sky cube). Radiance is clamped to `max_radiance` so
-    /// a sun baked into the picture does not produce fireflies. A BC6H cube
-    /// is not decoded here, so its `brightest_direction` stays straight up.
+    /// Starts loading an environment: an equirectangular `.hdr`, or a KTX2
+    /// cube of half floats or BC6H. Radiance is clamped to `max_radiance`.
+    /// A BC6H cube's `brightest_direction` stays straight up.
     pub fn loadEnvironment(self: *Renderer, path: []const u8, max_radiance: f32) !Environment {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -846,10 +841,7 @@ pub const Renderer = struct {
         return environment;
     }
 
-    /// Creates an environment from a computed clear sky. It is ready on
-    /// return and is used like one loaded from a file: `setEnvironment`
-    /// makes it the scene's backdrop, ambient light and reflections. Pair
-    /// it with `skySun(desc)` for matching sunlight.
+    /// Creates an environment from a computed clear sky; ready on return.
     pub fn createSky(self: *Renderer, desc: SkyDesc) !Environment {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -865,9 +857,8 @@ pub const Renderer = struct {
         return environment;
     }
 
-    /// Changes a sky made with `createSky`, for time of day or weather. The
-    /// maps are rebuilt during the next frame, which costs about a
-    /// millisecond of GPU time; change it as often as the sun visibly moves.
+    /// Changes a `createSky` sky; rebuilt during the next frame (about 1 ms
+    /// of GPU time).
     pub fn setSky(self: *Renderer, environment: Environment, desc: SkyDesc) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -879,27 +870,18 @@ pub const Renderer = struct {
         self.skies_dirty = true;
     }
 
-    /// Draws a computed sky into its cube and filters the lighting from
-    /// it: all at once with `whole`, otherwise as many faces as the
-    /// description's `rebuild_frames` allows per call, picking up where
-    /// the last call stopped.
+    /// Draws a computed sky's cube and filters its lighting: all at once
+    /// with `whole`, else `rebuild_frames` worth per call, resuming.
     fn bakeSky(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.CommandEncoder, whole: bool) !void {
         const sky = entry.sky.?;
         cmd.beginScope("sky bake");
         defer cmd.endScope();
         if (entry.bake_step == 0) {
-            // A rebuild is drawn from the description as it was when it
-            // began; changes made meanwhile start another afterwards.
             entry.bake_desc = entry.sky_desc.?;
             entry.sky_dirty = false;
         }
         const desc = entry.bake_desc;
-        // With a cloud layer the cube is drawn twice: with clouds, to
-        // derive the lighting from, then clear, as the backdrop the real
-        // clouds are drawn over.
         const passes: u32 = if (entry.clouds != null) 2 else 1;
-        // One pass can be taken a step at a time: six faces, the diffuse
-        // cube, then each roughness level of the reflection cube.
         const stepped = passes == 1;
         const total = if (stepped) 6 + 1 + env_specular_mips else passes * 6;
         const spread = if (whole or entry.clouds != null) 1 else @max(desc.rebuild_frames, 1);
@@ -942,20 +924,18 @@ pub const Renderer = struct {
             }
         }
         if (entry.bake_step >= total) entry.bake_step = 0;
-        // More to draw, or a change that came in meanwhile: again next frame.
         if (entry.bake_step != 0 or entry.sky_dirty) self.skies_dirty = true;
     }
 
-    /// Whether an environment is still loading, ready, or failed. A handle
-    /// that names no environment reports `.failed`. Safe from any thread.
+    /// A handle that names no environment reports `.failed`. Safe from any
+    /// thread.
     pub fn environmentState(self: *Renderer, environment: Environment) AssetState {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return (self.environments.get(environment) orelse return .failed).state;
     }
 
-    /// What was measured while the environment loaded. Null until it is
-    /// ready.
+    /// Null until the environment is ready.
     pub fn environmentInfo(self: *Renderer, environment: Environment) ?EnvironmentInfo {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -963,9 +943,8 @@ pub const Renderer = struct {
         return if (entry.state == .ready) .{ .brightest_direction = entry.brightest_direction } else null;
     }
 
-    /// Frees an environment and its textures, cancelling the load if it is
-    /// still under way. A scene that still has it set (`setEnvironment`)
-    /// draws as if it had none. A handle that names nothing is ignored.
+    /// Frees an environment, cancelling a load under way. Scenes that have it
+    /// set draw as if they had none.
     pub fn destroyEnvironment(self: *Renderer, environment: Environment) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -981,9 +960,7 @@ pub const Renderer = struct {
         return self.loading_count != 0;
     }
 
-    /// Blocks until every pending asset is decoded and on the GPU. Meant for
-    /// tools and tests; interactive applications should keep rendering and
-    /// let assets stream in.
+    /// Blocks until every pending asset is on the GPU. For tools and tests.
     pub fn waitUntilLoaded(self: *Renderer) !void {
         while (true) {
             {
@@ -994,7 +971,7 @@ pub const Renderer = struct {
                     var cmd = try self.device.beginImmediate();
                     _ = try self.pumpAssets(&cmd, std.math.maxInt(u64));
                     try cmd.flushUploads();
-                    try self.buildPendingBlas(&cmd);
+                    try self.buildPendingBlas(&cmd, null);
                     try cmd.flushUploads();
                     try self.device.endImmediate();
                     continue;
@@ -1016,7 +993,7 @@ pub const Renderer = struct {
     }
 
     /// Moves finished decode jobs onto the GPU, spending at most
-    /// `budget_bytes` of texture uploads so frames stay responsive.
+    /// `budget_bytes` on texture uploads.
     fn pumpAssets(self: *Renderer, cmd: *rhi.CommandEncoder, budget_bytes: u64) !bool {
         const zone = Zone.start(self.options.profiler, "stream assets");
         defer zone.stop();
@@ -1072,25 +1049,19 @@ pub const Renderer = struct {
         }
         const source = &entry.source.?;
 
-        // Textures first, a budgeted few per call.
         while (entry.next_image < source.images.len) : (entry.next_image += 1) {
             if (budget.* == 0) return false;
             const image = source.images[entry.next_image];
             if (image.compressed) |data| {
-                // Encoded at load (or read from the cache) with its mips.
                 const mips = if (image.mip_levels != 0) image.mip_levels else rhi.TextureDesc.fullMipCount(image.width, image.height);
                 const compressed_format = blockFormat(image.block, image.one_channel, image.two_channel, image.srgb);
                 if (self.options.texture_streaming) |streaming| {
-                    // Start with the small levels; the rest arrive when a
-                    // camera gets close enough to need them.
                     var floor: u32 = 0;
                     while (floor + 1 < mips and @max(image.width, image.height) >> @intCast(floor) > streaming.min_size) floor += 1;
                     const stream = &entry.streams[entry.next_image];
                     stream.* = .{ .data = source.takeCompressed(entry.next_image), .width = image.width, .height = image.height, .levels = mips, .srgb = image.srgb, .two_channel = image.two_channel, .one_channel = image.one_channel, .block = image.block, .floor = floor, .resident = floor, .wanted = floor };
                     stream.total = stream.data.len;
                     if (streaming.from_cache and floor > 0 and image.block == .bc7 and image.cache_key != 0) if (self.options.asset_cache_dir) |directory| {
-                        // Keep only the small levels here; the cache file
-                        // holds the rest for when they are wanted.
                         const extension: []const u8 = if (image.two_channel) "bc5" else if (image.one_channel) "bc4" else "bc7";
                         const path = try std.fmt.allocPrint(self.gpa, "{s}/{x:0>16}.{s}", .{ directory, image.cache_key, extension });
                         const tail_offset = stream.levelOffset(floor);
@@ -1122,7 +1093,6 @@ pub const Renderer = struct {
                     .mip_levels = mips,
                 });
                 entry.textures[entry.next_image] = texture;
-                // Every level through one staging buffer.
                 const offset = data.len;
                 try device.uploadTextureLevels(texture, 0, 0, data);
                 source.releaseImage(entry.next_image);
@@ -1147,8 +1117,6 @@ pub const Renderer = struct {
         }
 
         entry.material_base = try self.materials.alloc(self, @intCast(source.materials.len));
-        // Materials whose textures are not all transformed alike get a
-        // block of per-texture transforms next to the material records.
         var transform_count: u32 = 0;
         for (source.materials) |material| {
             if (material.hasOwnTransforms()) transform_count += 1;
@@ -1197,6 +1165,7 @@ pub const Renderer = struct {
                 .meshlet_count = @intCast(mesh.meshlets.len),
                 .material = entry.material_base + mesh.material,
                 .blend = source.materials[mesh.material].alpha_mode == .blend or source.materials[mesh.material].transmission > 0,
+                .masked = source.materials[mesh.material].alpha_mode != .@"opaque" or source.materials[mesh.material].transmission > 0 or source.materials[mesh.material].double_sided,
                 .blas = null,
                 .coarse_vertex_count = mesh.coarse_vertex_count,
                 .coarse_error = mesh.coarse_error,
@@ -1204,9 +1173,6 @@ pub const Renderer = struct {
             try self.vertices.write(device, out.vertex_offset, std.mem.sliceAsBytes(mesh.vertices));
             try self.indices.write(device, out.index_offset, std.mem.sliceAsBytes(mesh.indices));
             try self.meshlets.write(device, out.meshlet_offset, std.mem.sliceAsBytes(mesh.meshlets));
-            // Without the GPU's ray tracing, path tracing walks a tree
-            // over the mesh's triangles; skinned meshes, whose
-            // triangles move, are left out of it.
             if (self.options.path_tracing_fallback and !device.ray_tracing and mesh.skin == null) try self.buildMeshTree(mesh, out, entry.mesh_base + @as(u32, @intCast((@intFromPtr(out) - @intFromPtr(entry.meshes.ptr)) / @sizeOf(ModelMesh))));
             if (mesh.skin) |skin| {
                 out.skin_offset = try self.skin_vertices.alloc(self, @intCast(skin.len));
@@ -1235,8 +1201,6 @@ pub const Renderer = struct {
         try self.scratch_locals.resize(gpa, source.nodes.len * 3);
         animation.evaluate(source, entry.order, null, self.scratch_locals.items, entry.node_world);
         {
-            // Posing an entity only has to work out the nodes something is
-            // drawn at or skinned by, and their ancestors.
             const needed = try gpa.alloc(bool, source.nodes.len);
             defer gpa.free(needed);
             @memset(needed, false);
@@ -1244,8 +1208,7 @@ pub const Renderer = struct {
             for (source.skins) |skin| for (skin.joints) |joint| {
                 needed[joint] = true;
             };
-            // Children come after their parents, so walking the order
-            // backwards reaches every ancestor.
+            // Children come after their parents, so walk the order backwards.
             var remaining = entry.order.len;
             var count: usize = 0;
             while (remaining > 0) {
@@ -1303,34 +1266,30 @@ pub const Renderer = struct {
             .bounds_radius = math.length(math.sub(maximum, minimum)) * 0.5,
         };
         if (device.ray_tracing) {
-            // Static meshes get a bottom-level structure for ray queries;
-            // it is built once their geometry upload has been recorded.
             for (entry.meshes) |*mesh| {
                 if (mesh.skin_offset != null) continue;
-                mesh.blas = try device.createBlas(geometry_passes.blasDesc(self, mesh.*));
+                const made = try device.createBlas(geometry_passes.blasDesc(self, mesh.*));
+                if (device.detached_queue != null) mesh.blas_building = made else mesh.blas = made;
             }
             entry.blas_pending = true;
+            entry.blas_frame = null;
             self.blas_pending += 1;
         }
         entry.state = .ready;
         return true;
     }
 
-    /// One instance of the scene's tree as the shader reads it
-    /// (`BvhInstance` in trace.glsl).
+    /// `BvhInstance` in trace.glsl.
     const TraceInstance = extern struct {
-        /// World to the mesh's own space, three rows of each of four
-        /// columns.
+        /// World to mesh space: 3 rows of each of 4 columns.
         to_mesh: [12]f32,
         instance: u32,
         pad: [3]u32 = .{ 0, 0, 0 },
     };
 
-    /// Builds the tree over the scene's instances that path tracing
-    /// walks without the GPU's ray tracing, if what it would hold has
-    /// changed: every instance whose mesh has a tree of its own.
-    /// `entities` are this frame's entity records; instance groups
-    /// follow them, as in the instance buffer.
+    /// Rebuilds the scene's instance BVH for the path tracing fallback if
+    /// its contents changed. `entities` are this frame's entity records;
+    /// instance groups follow them, as in the instance buffer.
     fn buildSceneTree(self: *Renderer, scene: *SceneData, entities: []const gpu.Instance) !void {
         const gpa = self.gpa;
         const device = self.device;
@@ -1340,7 +1299,7 @@ pub const Renderer = struct {
         for (entities, 0..) |record, index| {
             if (record.flags & (gpu.instance_skinned | gpu.instance_proxy) != 0) continue;
             if (record.mesh >= self.mesh_boxes.items.len or self.mesh_boxes.items[record.mesh] == null) continue;
-            try placed.append(gpa, .{ .transform = record.transform, .mesh = record.mesh, .instance = @intCast(index) });
+            try placed.append(gpa, .{ .transform = gpu.expand(record.transform), .mesh = record.mesh, .instance = @intCast(index) });
         }
         var record: u32 = @intCast(entities.len);
         for (scene.groups.items) |group_handle| {
@@ -1412,8 +1371,8 @@ pub const Renderer = struct {
         scene.trace_ready = true;
     }
 
-    /// Builds the tree over a mesh's full-detail triangles and puts it
-    /// in the tree pools; see `Options.path_tracing_fallback`.
+    /// Builds a mesh's full-detail triangle BVH into the BVH pools; see
+    /// `Options.path_tracing_fallback`.
     fn buildMeshTree(self: *Renderer, mesh: gltf.Mesh, out: *ModelMesh, record: u32) !void {
         const gpa = self.gpa;
         const triangles = mesh.lod0_index_count / 3;
@@ -1439,8 +1398,7 @@ pub const Renderer = struct {
         errdefer self.bvh_items.free(self, items, triangles);
         const nodes = try self.bvh_nodes.alloc(self, @intCast(tree.nodes.len));
         errdefer self.bvh_nodes.free(self, nodes, @intCast(tree.nodes.len));
-        // Leaves name their triangles by place in the pool; children
-        // stay relative to the root, which the shader adds.
+        // Leaves index triangles in the pool; children stay root-relative.
         for (tree.nodes) |*node| {
             if (node.count != 0) node.first += items;
         }
@@ -1458,12 +1416,10 @@ pub const Renderer = struct {
 
     // ----------------------------------------------------- geometry streaming
 
-    /// Releases the geometry of models nothing near a camera is drawn
-    /// with, and brings back that of models something near one is.
+    /// Releases geometry of models far from every camera and restores it for
+    /// near ones.
     fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
         const streaming = self.options.geometry_streaming orelse return;
-        // How near a model has to be found before its nearest copy need not
-        // be looked for any further.
         const near_enough = if (streaming.coarse_distance > 0) @min(streaming.distance, streaming.coarse_distance * 0.9) else streaming.distance;
         const zone = Zone.start(self.options.profiler, "geometry streaming");
         defer zone.stop();
@@ -1487,7 +1443,6 @@ pub const Renderer = struct {
                 const model = self.models.get(group.model) orelse continue;
                 if (model.state != .ready) continue;
                 for (group.transforms) |transform| {
-                    // Near is near: no need to find the nearest of them.
                     if (model.stream_distance < near_enough) break;
                     const center = math.transformPoint(transform, model.info.bounds_center);
                     const radius = model.info.bounds_radius * math.maxScale(transform);
@@ -1507,18 +1462,13 @@ pub const Renderer = struct {
             var bytes: u64 = 0;
             for (entry.meshes) |mesh| bytes += @as(u64, mesh.vertex_count) * @sizeOf(gpu.Vertex) + @as(u64, mesh.index_count) * @sizeOf(u32);
             if (entry.geometry_resident) {
-                // Deforming meshes are worked on every frame where they
-                // lie; what nothing is drawn with is left alone.
                 if (source.skins.len != 0 or entry.geometry_pinned or entry.blas_pending) continue;
                 const far = entry.stream_distance != std.math.inf(f32) and entry.stream_distance > streaming.distance * @max(streaming.release_factor, 1);
                 if (!far) {
-                    // Still wanted: whole, or only its coarse part.
                     const coarse_wanted = streaming.coarse_distance > 0 and entry.stream_distance != std.math.inf(f32) and entry.stream_distance > streaming.coarse_distance;
                     if (coarse_wanted and !entry.geometry_coarse) {
                         if (self.keepCoarse(entry)) changed = true;
                     } else if (entry.geometry_coarse and entry.stream_distance < streaming.coarse_distance * 0.9 and bytes <= budget) {
-                        // Back whole: what is there goes, and all of
-                        // it is put back from system memory.
                         for (entry.meshes) |*mesh| self.freeMeshGeometry(mesh);
                         entry.geometry_resident = false;
                         entry.geometry_coarse = false;
@@ -1555,14 +1505,12 @@ pub const Renderer = struct {
         self.stats.geometry_models_released = released;
         self.stats.geometry_bytes_released = released_bytes;
         self.stats.geometry_models_coarse = coarse_models;
-        // What is drawn with them joins or leaves its scene.
         if (changed) for (self.scenes.slots.items) |*slot| if (slot.value) |*scene| {
             scene.layout_dirty = true;
         };
     }
 
-    /// Frees what a mesh holds in the vertex and index pools: all of it,
-    /// or the coarse part that is left of it.
+    /// Frees a mesh's vertex and index pool ranges, whole or coarse.
     fn freeMeshGeometry(self: *Renderer, mesh: *ModelMesh) void {
         if (mesh.coarse) {
             self.vertices.free(self, mesh.vertex_offset, mesh.coarse_vertex_count);
@@ -1574,19 +1522,14 @@ pub const Renderer = struct {
         }
     }
 
-    /// Lets go of a model's finest level of detail: the vertices only it
-    /// uses and its indices, for every mesh that can be split so. The
-    /// rest stays where it is, so nothing that is drawn has to move.
-    /// Returns whether anything was freed.
+    /// Frees the vertices and indices only the finest LOD uses, for every
+    /// mesh that can be split. Returns whether anything was freed.
     fn keepCoarse(self: *Renderer, entry: *ModelEntry) bool {
         var any = false;
         for (entry.meshes) |*mesh| {
-            // A mesh with a tree for path tracing is walked triangle by
-            // triangle of its finest level.
             if (mesh.coarse or mesh.coarse_vertex_count == 0 or mesh.bvh_nodes != null or mesh.skin_offset != null) continue;
             self.vertices.free(self, mesh.vertex_offset + mesh.coarse_vertex_count, mesh.vertex_count - mesh.coarse_vertex_count);
             self.indices.free(self, mesh.index_offset, mesh.lod0_index_count);
-            // Rays would look its triangles up among what has gone.
             if (mesh.blas) |blas| self.device.destroyAcceleration(blas);
             mesh.blas = null;
             mesh.coarse = true;
@@ -1596,15 +1539,13 @@ pub const Renderer = struct {
         return any;
     }
 
-    /// Puts a released model's vertices and indices back in GPU memory,
-    /// from the copy kept in system memory.
+    /// Restores a released model's geometry from the copy in system memory.
     fn restoreGeometry(self: *Renderer, entry: *ModelEntry) !void {
         const device = self.device;
         const source = &entry.source.?;
         const records = try self.gpa.alloc(gpu.Mesh, entry.meshes.len);
         defer self.gpa.free(records);
-        // Reserved first, so that running out of memory leaves the model
-        // released rather than half there.
+        // Reserve everything first so running out leaves the model released.
         var reserved: usize = 0;
         errdefer for (entry.meshes[0..reserved]) |mesh| {
             self.vertices.free(self, mesh.vertex_offset, mesh.vertex_count);
@@ -1635,9 +1576,11 @@ pub const Renderer = struct {
         if (device.ray_tracing) {
             for (entry.meshes) |*mesh| {
                 if (mesh.skin_offset != null) continue;
-                mesh.blas = try device.createBlas(geometry_passes.blasDesc(self, mesh.*));
+                const made = try device.createBlas(geometry_passes.blasDesc(self, mesh.*));
+                if (device.detached_queue != null) mesh.blas_building = made else mesh.blas = made;
             }
             entry.blas_pending = true;
+            entry.blas_frame = null;
             self.blas_pending += 1;
         }
         entry.geometry_resident = true;
@@ -1648,8 +1591,6 @@ pub const Renderer = struct {
     fn createStreamTexture(self: *Renderer, stream: *const TextureStream, wanted_first: u32) !rhi.Texture {
         const device = self.device;
         var first = wanted_first;
-        // Levels that are not in memory come from the cache file, in one
-        // read; if that fails the texture makes do with what is here.
         var from_file: []u8 = &.{};
         defer self.gpa.free(from_file);
         const file_start = stream.levelOffset(first);
@@ -1680,8 +1621,8 @@ pub const Renderer = struct {
         return texture;
     }
 
-    /// Part of a texture's mip chain from its file in the asset cache
-    /// (twelve bytes of header, then the chain). Caller frees.
+    /// Reads part of a texture's mip chain from its asset cache file (12-byte
+    /// header, then the chain). Caller frees.
     fn readStreamLevels(self: *Renderer, stream: *const TextureStream, offset: usize, size: usize) ![]u8 {
         const file = try std.Io.Dir.cwd().openFile(self.io, stream.path, .{});
         defer file.close(self.io);
@@ -1691,9 +1632,8 @@ pub const Renderer = struct {
         return bytes;
     }
 
-    /// Lowers the wanted level of each texture a model's meshes use, given
-    /// where one copy of the model is and how large a meter at distance one
-    /// appears on screen.
+    /// Lowers the wanted mip level of each texture a model's meshes use, for
+    /// one copy of the model and the on-screen size of a meter at distance 1.
     fn wantModelTextures(
         model: *ModelEntry,
         transform: Mat4,
@@ -1701,8 +1641,7 @@ pub const Renderer = struct {
         pixels_at_one_meter: f32,
         bias: f32,
         frustum: ?StreamFrustum,
-        /// Per mesh of the model, whether a camera drew it; null to ask for
-        /// all of them.
+        /// Per mesh, whether a camera drew it; null asks for all.
         drawn: ?[]const u32,
     ) void {
         const source = &model.source.?;
@@ -1716,8 +1655,6 @@ pub const Renderer = struct {
             const distance = @max(math.length(math.sub(center, camera.position)) - mesh.bounds_radius * scale, camera.near);
             if (frustum) |seen| if (!seen.touches(center, mesh.bounds_radius * scale)) continue;
             const material = source.materials[mesh.material];
-            // Fraction of a texture's width that one pixel covers when the
-            // surface faces the camera, which is the finest it gets.
             const uv_per_pixel = mesh.uv_density * @max(@abs(material.uv_scale[0]), @abs(material.uv_scale[1])) / scale * distance / pixels_at_one_meter;
             inline for (.{ "base_color_texture", "normal_texture", "metallic_roughness_texture", "occlusion_texture", "emissive_texture" }) |field| {
                 if (@field(material, field)) |ref| {
@@ -1733,9 +1670,8 @@ pub const Renderer = struct {
         }
     }
 
-    /// Which of a scene's instances a camera drew a few frames ago, or null
-    /// when that is not known: nothing has been read back yet, or the
-    /// scene has been laid out anew since.
+    /// Instances a camera drew a few frames ago; null when not known (no
+    /// readback yet, or the scene's layout changed since).
     fn seenInstances(device: *rhi.Device, scene: *const SceneData, frame: rhi.Frame) ?[]const u32 {
         if (scene.layout_dirty) return null;
         const slot: usize = @intCast(frame.index % rhi.frames_in_flight);
@@ -1745,8 +1681,8 @@ pub const Renderer = struct {
         return device.mappedSlice(u32, buffer)[0..tag.count];
     }
 
-    /// Decides which mip levels of each streamed texture the frame's views
-    /// need, fits that to the budget, and loads or drops levels to match.
+    /// Decides which mip levels the frame's views need, fits them to the
+    /// budget, and loads or drops levels to match.
     fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc) !void {
         const streaming = self.options.texture_streaming orelse return;
         const zone = Zone.start(self.options.profiler, "texture streaming");
@@ -1776,8 +1712,6 @@ pub const Renderer = struct {
                     .tan_y = tan_y,
                 };
             } else null;
-            // What the cameras drew a few frames ago, when only that is to
-            // ask for detail and it is known.
             const seen: ?[]const u32 = if (streaming.skip_occluded) seenInstances(device, scene, frame) else null;
             self.seen_round += 1;
             if (seen != null) for (scene.layout.items, 0..) |placed, index| {
@@ -1791,7 +1725,6 @@ pub const Renderer = struct {
                 if (!entity.visible) continue;
                 const model = self.models.get(entity.model) orelse continue;
                 if (model.state != .ready or model.streamed == 0) continue;
-                // Of a model's meshes, only those drawn ask for detail.
                 const parts: ?[]const u32 = if (seen) |drawn| blk: {
                     if (entity.seen_round != self.seen_round) continue;
                     const count = model.source.?.instances.len;
@@ -1804,8 +1737,6 @@ pub const Renderer = struct {
                 const group = self.instance_groups.get(item) orelse continue;
                 const model = self.models.get(group.model) orelse continue;
                 if (model.state != .ready or model.streamed == 0 or group.transforms.len == 0) continue;
-                // The copy nearest the camera decides for the whole group
-                // (the nearest one drawn, when only those are to count).
                 var nearest: ?usize = null;
                 var nearest_distance = std.math.inf(f32);
                 for (group.transforms, 0..) |transform, index| {
@@ -1828,7 +1759,6 @@ pub const Renderer = struct {
             }
         }
 
-        // Over budget: every texture gives up the same number of levels.
         var extra: u32 = 0;
         var resident_bytes: u64 = 0;
         var count: u32 = 0;
@@ -1886,8 +1816,6 @@ pub const Renderer = struct {
                 }
             };
         }
-        // Materials name textures by index, and a reloaded texture has a
-        // new one.
         for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
             if (!entry.materials_stale) continue;
             entry.materials_stale = false;
@@ -1907,9 +1835,7 @@ pub const Renderer = struct {
         return self.device.textureIndex(texture);
     }
 
-    /// Samplers shared by all materials. Color and normal maps get
-    /// anisotropic filtering; data maps (roughness, occlusion, emissive)
-    /// use plain trilinear, which is markedly cheaper per pixel.
+    /// Shared material samplers; `anisotropic` for color and normal maps.
     fn materialSampler(self: *Renderer, data: gltf.SamplerData, anisotropic: bool) !rhi.Sampler {
         const key = @as(usize, @intFromBool(anisotropic)) * 18 + @as(usize, @intFromBool(data.linear)) * 9 +
             @as(usize, @intFromEnum(data.repeat_u)) * 3 + @intFromEnum(data.repeat_v);
@@ -1928,6 +1854,8 @@ pub const Renderer = struct {
 
     fn freeModel(self: *Renderer, entry: *ModelEntry) void {
         const gpa = self.gpa;
+        if (entry.blas_job) |job| self.device.releaseDetached(job);
+        entry.blas_job = null;
         if (entry.job) |job| {
             job.group.cancel(job.io);
             if (job.model) |*model| model.deinit();
@@ -1957,6 +1885,7 @@ pub const Renderer = struct {
             if (mesh.skin_offset) |offset| self.skin_vertices.free(self, offset, mesh.vertex_count);
             if (mesh.morph_offset) |offset| self.morph_deltas.free(self, offset, mesh.vertex_count * mesh.morph_targets);
             if (mesh.blas) |blas| self.device.destroyAcceleration(blas);
+            if (mesh.blas_building) |blas| self.device.destroyAcceleration(blas);
         }
         for (0..entry.meshes.len) |index| {
             if (entry.mesh_base + index < self.mesh_boxes.items.len) self.mesh_boxes.items[entry.mesh_base + index] = null;
@@ -1998,7 +1927,6 @@ pub const Renderer = struct {
         }
         if (job.failure) |err| return err;
 
-        // The source: a panorama, or a cube map as stored in the file.
         var from_cube = false;
         const source = if (job.cube) |cube| blk: {
             from_cube = true;
@@ -2054,7 +1982,7 @@ pub const Renderer = struct {
     }
 
     /// One face of a sky cube from a panorama or another cube, with the
-    /// cloud layer over it if one is given.
+    /// cloud layer over it if given.
     fn drawEnvironmentFace(self: *Renderer, cmd: *rhi.CommandEncoder, entry: *const EnvironmentEntry, target: rhi.Texture, source: rhi.Texture, from_cube: bool, face: u32, layer: ?gpu.Clouds) !void {
         const device = self.device;
         var clouds = std.mem.zeroes(gpu.Clouds);
@@ -2078,17 +2006,14 @@ pub const Renderer = struct {
         cmd.endRendering();
     }
 
-    /// A loaded environment under a cloud layer: the lighting cubes are
-    /// filtered from the picture with the clouds laid over it, and the
-    /// backdrop is then put back as it was, since the real clouds are
-    /// drawn over it. Without a layer the lighting goes back to clear.
+    /// Filters a loaded environment's lighting cubes with the cloud layer
+    /// over it, then restores the clear backdrop.
     fn bakeLoadedClouds(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.CommandEncoder) !void {
         entry.sky_dirty = false;
         const sky = entry.sky orelse return;
         cmd.beginScope("environment clouds");
         defer cmd.endScope();
         if (entry.clear == null) {
-            // The picture as it was loaded, kept aside from now on.
             if (entry.clouds == null) return;
             const clear = try self.device.createTexture(.{
                 .name = "environment clear sky",
@@ -2149,8 +2074,7 @@ pub const Renderer = struct {
         entry.irradiance = irradiance;
     }
 
-    /// Derives diffuse irradiance and roughness-filtered reflections from an
-    /// environment's sky cube map.
+    /// Derives the diffuse and reflection cubes from the sky cube.
     fn filterEnvironment(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.CommandEncoder) !void {
         try self.filterIrradiance(entry, cmd);
         for (0..env_specular_mips) |mip| try self.filterSpecularMip(entry, cmd, @intCast(mip));
@@ -2213,41 +2137,33 @@ pub const Renderer = struct {
 
     // ------------------------------------------------- locking and 2D assets
 
-    /// Takes the renderer lock. Every public method already locks
-    /// internally; hold it yourself only to use `device` directly from a
-    /// thread other than the one rendering, or to make several calls atomic.
-    /// Not reentrant: do not call renderer methods while holding it.
+    /// Takes the renderer lock. Public methods lock internally; hold it only
+    /// to use `device` from a non-rendering thread. Not reentrant: call no
+    /// renderer methods while holding it.
     pub fn lock(self: *Renderer) void {
         self.mutex.lockUncancelable(self.io);
     }
 
-    /// Releases the lock taken with `lock`, from the same thread.
+    /// Must be called from the thread that took the lock.
     pub fn unlock(self: *Renderer) void {
         self.mutex.unlock(self.io);
     }
 
-    /// The built-in font (DejaVu Sans, printable ASCII and Latin-1). Valid
-    /// for the lifetime of the renderer.
+    /// The built-in font (DejaVu Sans, printable ASCII and Latin-1).
     pub fn defaultFont(self: *const Renderer) *const Font {
         return self.default_font;
     }
 
-    /// Loads a TrueType font and bakes a distance-field atlas for `ranges`
-    /// (see `font.default_ranges`). The font is immutable and may be used
-    /// from any thread until `destroyFont`.
+    /// Loads a TrueType font and bakes a distance-field atlas for `ranges`.
+    /// The font is immutable and usable from any thread until `destroyFont`.
     pub fn loadFont(self: *Renderer, path: []const u8, ranges: []const font_module.Range) !*const Font {
         const bytes = try gltf.readFile(self.gpa, self.io, path);
         defer self.gpa.free(bytes);
         return self.loadFontFromMemory(bytes, ranges);
     }
 
-    /// As `loadFont`, from the bytes of a TrueType file already in memory.
-    /// `bytes` and `ranges` are not kept: both may be freed once this
-    /// returns. Parsing and baking run on the calling thread without the
-    /// lock; only the atlas upload takes it. The font belongs to the
-    /// renderer: free it with `destroyFont`, or leave it to `deinit`.
+    /// As `loadFont`, from bytes in memory. `bytes` and `ranges` are not kept.
     pub fn loadFontFromMemory(self: *Renderer, bytes: []const u8, ranges: []const font_module.Range) !*const Font {
-        // Parsing and baking need no renderer state; only the upload does.
         const font = try self.gpa.create(Font);
         errdefer self.gpa.destroy(font);
         font.* = try font_module.load(self.gpa, bytes, ranges);
@@ -2281,17 +2197,12 @@ pub const Renderer = struct {
         try self.font_textures.append(self.gpa, texture);
     }
 
-    /// Adds the font's own ligature glyphs to its atlas: every ligature of
-    /// its substitution table (`liga`, `rlig`) whose parts are in the
-    /// atlas already. Text drawn afterwards uses them where the letters
-    /// meet (fi, ffl and whatever else the font was drawn with). Call it
-    /// again after `prepareText` adds letters that have ligatures.
+    /// Adds to the atlas every `liga`/`rlig` ligature whose parts are already
+    /// in it. Call again after `prepareText` adds letters.
     pub fn prepareLigatures(self: *Renderer, font: *const Font) !void {
         const missing = try font.missingLigatures(self.gpa);
         defer self.gpa.free(missing);
         if (missing.len == 0) return;
-        // They are named by characters of a private plane; hand those on
-        // as text.
         const text = try self.gpa.alloc(u8, missing.len * 4);
         defer self.gpa.free(text);
         var length: usize = 0;
@@ -2299,20 +2210,15 @@ pub const Renderer = struct {
         try self.prepareText(font, text[0..length]);
     }
 
-    /// Makes sure `font` can draw every character of `text`, baking any
-    /// glyphs the font file has that are not in its atlas yet. Use it for
-    /// text whose characters are not known up front (names, chat, other
-    /// scripts) instead of loading huge ranges. Call it before drawing
-    /// with the font in that frame, and not while another thread is
-    /// drawing text with the same font. Costs nothing when there is
-    /// nothing new.
+    /// Bakes any glyphs of `text` the font has that are not in its atlas yet.
+    /// Call before drawing with the font that frame, and not while another
+    /// thread draws text with it.
     pub fn prepareText(self: *Renderer, font: *const Font, text: []const u8) !void {
         return self.prepareTextWith(font, text, null, &.{});
     }
 
-    /// `prepareText` for text drawn with a language or with font features
-    /// asked for by name (`TextOptions.language`, `TextOptions.features`):
-    /// also bakes the glyphs those bring in.
+    /// `prepareText` that also bakes glyphs brought in by `language` and
+    /// `features`.
     pub fn prepareTextWith(self: *Renderer, font: *const Font, text: []const u8, language: ?[4]u8, features: []const [4]u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2341,9 +2247,6 @@ pub const Renderer = struct {
                 }
             }
         }
-        // The glyphs the font puts in place of what was typed (ligatures,
-        // forms that depend on the neighbours or the language, features
-        // asked for), script by script.
         {
             var typed: std.ArrayList(u21) = .empty;
             defer typed.deinit(self.gpa);
@@ -2367,9 +2270,7 @@ pub const Renderer = struct {
             }
         }
         if (missing.items.len == 0) return;
-        // The new glyphs go into a bake of their own, which replaces the
-        // one in use only once its atlas is on the GPU: threads laying
-        // out text meanwhile keep the old bake, glyphs and atlas together.
+        // The new bake replaces the old only once its atlas is on the GPU.
         const next = (try mutable.extend(missing.items)) orelse return;
         errdefer mutable.discard(next);
         const device = self.device;
@@ -2410,11 +2311,8 @@ pub const Renderer = struct {
         }
     }
 
-    /// As `createImage`, but stored block-compressed (BC7) with a full mip
-    /// chain: a quarter of the GPU memory, at the cost of encoding time
-    /// here and a slight loss. Falls back to `createImage` on a device
-    /// without block compression. Good for large sprites, decals and
-    /// backgrounds; not for images that are updated often.
+    /// As `createImage`, but stored as BC7 with a full mip chain. Falls back
+    /// to `createImage` on a device without block compression.
     pub fn createImageCompressed(self: *Renderer, width: u32, height: u32, pixels: []const u8, srgb: bool) !Image {
         if (!self.device.bc_textures) return self.createImage(width, height, pixels, srgb);
         if (pixels.len != @as(usize, width) * height * 4) return error.InvalidTextureData;
@@ -2431,7 +2329,7 @@ pub const Renderer = struct {
     }
 
     /// Creates an image for draw lists from tightly packed RGBA8 pixels.
-    /// `srgb` should be true for color art, false for data.
+    /// `srgb`: true for color, false for data.
     pub fn createImage(self: *Renderer, width: u32, height: u32, pixels: []const u8, srgb: bool) !Image {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2452,24 +2350,16 @@ pub const Renderer = struct {
         return .{ .index = index, .width = width, .height = height };
     }
 
-    /// Decodes an image file (PNG, JPEG, ...) to RGBA8. The pixels belong
-    /// to `gpa`. For tools and tests; `loadImage` is the way to get an
-    /// image onto the screen.
+    /// Decodes an image file to RGBA8. The pixels belong to `gpa`.
     pub fn readImageFile(self: *Renderer, gpa: std.mem.Allocator, path: []const u8) !png.Image {
         var decoded = try gltf.loadImage(self.gpa, self.io, path);
         defer decoded.deinit();
         return .{ .width = decoded.width, .height = decoded.height, .pixels = try gpa.dupe(u8, decoded.data) };
     }
 
-    /// Decodes a PNG/JPEG/TGA/BMP file into an sRGB image with a full mip
-    /// chain, or loads a KTX2 file as it is: its own format, color space
-    /// and mips, with no decoding. Reads and decodes on the calling thread
-    /// and returns when the image is on the GPU. Destroy it with
-    /// `destroyImage`.
-    ///
-    /// A KTX2 file must hold one flat picture (no cube or array), and a
-    /// block-compressed one needs hardware with BC formats; otherwise
-    /// `error.UnsupportedTextureFormat`.
+    /// Decodes a PNG/JPEG/TGA/BMP file into an sRGB image with full mips, or
+    /// loads a KTX2 file as is. Blocks until it is on the GPU. Fails with
+    /// `error.UnsupportedTextureFormat` for a KTX2 cube, array or missing BC.
     pub fn loadImage(self: *Renderer, path: []const u8) !Image {
         const bytes = try gltf.readFile(self.gpa, self.io, path);
         defer self.gpa.free(bytes);
@@ -2483,14 +2373,11 @@ pub const Renderer = struct {
         return self.createImage(decoded.width, decoded.height, decoded.data, true);
     }
 
-    /// Makes an image from mip levels that are already in a GPU format, as
-    /// read from a KTX2 file.
+    /// Makes an image from mip levels already in a GPU format.
     fn createImageFromLevels(self: *Renderer, source: ktx2.Texture) !Image {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const device = self.device;
-        // An image is one flat picture: cube maps are environments, and
-        // nothing here draws from an array.
         if (source.faces != 1 or source.layers != 1) return error.UnsupportedTextureFormat;
         if (source.format != .rgba8 and source.format != .rgba16f and !device.bc_textures) return error.UnsupportedTextureFormat;
         const format: rhi.Format = switch (source.format) {
@@ -2518,17 +2405,15 @@ pub const Renderer = struct {
         return .{ .index = index, .width = source.width, .height = source.height };
     }
 
-    /// Deletes the oldest files in the asset cache until it takes at most
-    /// `max_bytes`, and returns how many bytes that freed. Files are aged
-    /// by when they were written, not when they were last read.
+    /// Deletes the oldest-written cache files until at most `max_bytes`
+    /// remain; returns the bytes freed.
     pub fn trimAssetCache(self: *Renderer, max_bytes: u64) !u64 {
         const directory = self.options.asset_cache_dir orelse return 0;
         return gltf.trimCache(self.gpa, self.io, directory, max_bytes);
     }
 
-    /// Compresses an RGBA8 picture to BC7 with a full mip chain and writes
-    /// it as a KTX2 file, which `loadImage` and models can then load
-    /// without decoding or encoding anything.
+    /// Compresses an RGBA8 picture to BC7 with full mips and writes it as a
+    /// KTX2 file.
     pub fn writeKtx2(self: *Renderer, path: []const u8, width: u32, height: u32, pixels: []const u8, srgb: bool) !void {
         const chain = try texture_codec.encodeBc7Chain(self.gpa, pixels, width, height, srgb);
         defer self.gpa.free(chain);
@@ -2544,10 +2429,9 @@ pub const Renderer = struct {
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = file });
     }
 
-    /// Makes a light profile from brightness values spread evenly from
-    /// "along the light's direction" (first) to "straight behind it"
-    /// (last). Values are relative; the brightest becomes 1. Destroy it
-    /// with `destroyImage`.
+    /// Makes a light profile from relative brightness values spread evenly
+    /// from along the light's direction (first) to straight behind (last).
+    /// Normalized so the brightest is 1.
     pub fn createLightProfile(self: *Renderer, values: []const f32) !Image {
         if (values.len == 0) return error.EmptyProfile;
         var peak: f32 = 0;
@@ -2556,7 +2440,6 @@ pub const Renderer = struct {
         const width = 256;
         var pixels: [width * 4]u8 = undefined;
         for (0..width) |x| {
-            // Linear interpolation between the given values.
             const position = @as(f32, @floatFromInt(x)) / (width - 1) * @as(f32, @floatFromInt(values.len - 1));
             const low: usize = @intFromFloat(@floor(position));
             const high = @min(low + 1, values.len - 1);
@@ -2567,9 +2450,8 @@ pub const Renderer = struct {
         return self.createImage(width, 1, &pixels, false);
     }
 
-    /// Loads a measured light distribution in the IES LM-63 format that
-    /// lamp manufacturers publish. The result is the fixture's brightness
-    /// by angle from its axis, averaged around the axis.
+    /// Loads an IES LM-63 light distribution: brightness by angle from the
+    /// fixture's axis, averaged around it.
     pub fn loadLightProfile(self: *Renderer, path: []const u8) !Image {
         const bytes = try gltf.readFile(self.gpa, self.io, path);
         defer self.gpa.free(bytes);
@@ -2578,10 +2460,8 @@ pub const Renderer = struct {
         return self.createLightProfile(values);
     }
 
-    /// Frees an image made by `createImage`, `loadImage` or one of the
-    /// light profile functions. It must no longer be used by a draw list,
-    /// light, decal or setting in a frame rendered after this. An image
-    /// the renderer does not own (such as a `targetImage`) is ignored.
+    /// Frees an image. It must not be used in any later frame. Images the
+    /// renderer does not own (such as a `targetImage`) are ignored.
     pub fn destroyImage(self: *Renderer, image: Image) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2595,19 +2475,15 @@ pub const Renderer = struct {
 
     // ---------------------------------------------------------------- views
 
-    /// Creates the persistent state for one more camera. The renderer has a
-    /// built-in main view, so this is only needed when several cameras are
-    /// drawn in the same frame (split screen, a camera shown on a surface,
-    /// a mirror). Its render targets are allocated on first use and follow
-    /// the size it is drawn at.
+    /// Creates persistent state for an extra camera. Its render targets are
+    /// allocated on first use and follow the size it is drawn at.
     pub fn createView(self: *Renderer) !View {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.insertView();
     }
 
-    /// Destroys a view created with `createView`. The main view cannot be
-    /// destroyed.
+    /// The main view cannot be destroyed.
     pub fn destroyView(self: *Renderer, view: View) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2624,9 +2500,8 @@ pub const Renderer = struct {
         return self.views.insert(.{ .exposure = exposure });
     }
 
-    /// Creates a texture that views can draw into (`Target.texture`) and
-    /// that draw lists can show (`targetImage`). Destroy it with
-    /// `destroyTarget`.
+    /// Creates a texture views can draw into (`Target.texture`) and draw
+    /// lists can show (`targetImage`).
     pub fn createTarget(self: *Renderer, width: u32, height: u32) !rhi.Texture {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2638,7 +2513,6 @@ pub const Renderer = struct {
             .usage = .{ .sampled = true, .color_attachment = true, .copy_src = true },
         });
         errdefer self.device.destroyTexture(texture);
-        // Defined contents, so it can be shown before anything is drawn.
         var cmd = try self.device.beginImmediate();
         try cmd.beginRendering(.{ .color = &.{.{ .texture = texture, .load = .clear, .clear = .{ 0, 0, 0, 1 } }} });
         cmd.endRendering();
@@ -2647,16 +2521,15 @@ pub const Renderer = struct {
         return texture;
     }
 
-    /// Destroys a texture made by `createTarget`. Images obtained from it
-    /// with `targetImage` must not be drawn afterwards.
+    /// Its `targetImage` images must not be drawn afterwards.
     pub fn destroyTarget(self: *Renderer, target: rhi.Texture) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.device.destroyTexture(target);
     }
 
-    /// The picture in a target texture, for drawing with a `DrawList`. A
-    /// view listed earlier in the same frame has already drawn into it.
+    /// A target texture as an image for a `DrawList`. Views listed earlier in
+    /// the same frame have already drawn into it.
     pub fn targetImage(self: *Renderer, target: rhi.Texture) Image {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2664,12 +2537,9 @@ pub const Renderer = struct {
         return .{ .index = self.device.textureIndex(target), .width = info.width, .height = info.height };
     }
 
-    /// Recompiles the renderer's own shaders from their source files with
-    /// `glslc` and rebuilds every pipeline, without restarting. A
-    /// development tool: it needs the source tree the renderer was built
-    /// from and `glslc` on the path. If any shader fails to compile, the
-    /// compiler's message is logged, nothing changes, and an error is
-    /// returned. Returns the number of shaders compiled.
+    /// Recompiles the built-in shaders from source with `glslc` and rebuilds
+    /// every pipeline. On a compile error nothing changes. Returns the number
+    /// of shaders compiled.
     pub fn reloadShaders(self: *Renderer) !u32 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2714,7 +2584,6 @@ pub const Renderer = struct {
             try compiled.append(gpa, result.stdout);
         }
 
-        // Everything compiled: swap the code in and rebuild the pipelines.
         // Variants still compiling read the old code, so they go first.
         self.dropShadeVariants();
         for (shader_sources.names, compiled.items) |name, *code| {
@@ -2736,7 +2605,6 @@ pub const Renderer = struct {
             inline for (@typeInfo(GiPipelines).@"struct".fields) |field| device.destroyPipeline(@field(old, field.name));
             self.gi_pipelines = rebuilt;
         }
-        // These are built on first use per target format; drop them.
         for (self.tonemap_pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
         self.tonemap_pipelines.clearRetainingCapacity();
         for (self.draw_pipelines.items) |entry| {
@@ -2749,13 +2617,9 @@ pub const Renderer = struct {
 
     // ------------------------------------------------------ material shaders
 
-    /// Registers application surface code. `spirv` is a fragment shader made
-    /// of `#define CUSTOM_MATERIAL`, `#include "shade.glsl"` and a
-    /// definition of `customMaterial()`; see `examples/shaders/lava.frag`. The
-    /// function receives what the standard material computed for the pixel
-    /// and may change any of it; lighting, shadows, global illumination and
-    /// antialiasing then proceed as for any surface. Assign it to materials
-    /// with `Material.shader` or `setMaterialShader`.
+    /// Registers a custom material. `spirv` is a fragment shader that defines
+    /// `CUSTOM_MATERIAL`, includes "shade.glsl" and defines
+    /// `customMaterial()`; see `examples/shaders/lava.frag`.
     pub fn createMaterialShader(self: *Renderer, spirv: []const u8) !MaterialShader {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2784,8 +2648,7 @@ pub const Renderer = struct {
         return error.TooManyMaterialShaders;
     }
 
-    /// Materials still referring to the shader fall back to the standard
-    /// material.
+    /// Materials still using the shader fall back to the standard material.
     pub fn destroyMaterialShader(self: *Renderer, shader: MaterialShader) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2797,10 +2660,9 @@ pub const Renderer = struct {
         self.material_shaders[shader.slot] = null;
     }
 
-    /// Changes which shader a loaded model's material uses, and its
-    /// parameters. `material` indexes the model's materials; null applies to
-    /// all of them. `shader` null restores the standard material. The model
-    /// must have finished loading.
+    /// Sets a loaded model's material shader and parameters. `material` null
+    /// applies to all materials; `shader` null restores the standard one. The
+    /// model must have finished loading.
     pub fn setMaterialShader(self: *Renderer, model: Model, material: ?u32, shader: ?MaterialShader, params: [4]f32) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2819,13 +2681,9 @@ pub const Renderer = struct {
         }
     }
 
-    /// Gives a material of a model images made with `createImage`,
-    /// `createImageCompressed` or `loadImage` as its textures: the way to
-    /// texture a model built from meshes in memory, and to swap a loaded
-    /// model's textures. `material` indexes the model's materials (for
-    /// `createModel`, one per mesh); null applies to all of them. Create
-    /// color images as sRGB and data images (normal, roughness, occlusion)
-    /// as linear. The images must outlive the model's use of them.
+    /// Sets a model material's textures from images. `material` null applies
+    /// to all. Color images should be sRGB, data images linear. The images
+    /// must outlive the model's use of them.
     pub fn setMaterialTextures(self: *Renderer, model: Model, material: ?u32, textures: MaterialTextures) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2841,8 +2699,6 @@ pub const Renderer = struct {
             if (material) |only| if (only != index) continue;
             images.* = textures;
         }
-        // A model still on its way to the GPU picks them up when it gets
-        // there.
         if (entry.state != .ready) return;
         for (source.materials, 0..) |item, index| {
             if (material) |only| if (only != index) continue;
@@ -2884,7 +2740,6 @@ pub const Renderer = struct {
             .flags = flags,
             .shader = if (material.shader < self.material_shaders.len) material.shader else 0,
             .params = material.params,
-            // Scale, then rotate, then offset, as glTF defines it.
             .uv_transform = uvMatrix(material.uv_scale, material.uv_rotation),
             .texture_transforms = transformSlot(entry, index),
             .sway = material.sway,
@@ -2900,7 +2755,6 @@ pub const Renderer = struct {
             .anisotropy_rotation = material.anisotropy_rotation,
             .subsurface = std.math.clamp(material.subsurface, 0, 1),
         };
-        // Application images take the place of the model's own textures.
         if (index < entry.material_images.len) {
             const images = entry.material_images[index];
             inline for (.{
@@ -2921,10 +2775,8 @@ pub const Renderer = struct {
         return encoded;
     }
 
-    /// Gives the scene a layer of volumetric clouds, or takes it away with
-    /// null. They are lit by the scene's sun and environment, drift with
-    /// the wind, and are drawn by every view of the scene that has
-    /// `Settings.clouds` on.
+    /// Sets the scene's volumetric cloud layer; null removes it. Drawn by
+    /// views with `Settings.clouds` on.
     pub fn setClouds(self: *Renderer, scene: Scene, clouds: ?CloudDesc) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2932,9 +2784,8 @@ pub const Renderer = struct {
         data.clouds = clouds;
     }
 
-    /// The lightning flash in a scene's cloud layer right now, if any:
-    /// where it is and how bright, for a light of the application's own
-    /// (`setLights`) so that the ground flickers with the cloud.
+    /// Position and brightness of the lightning flash in the scene's clouds
+    /// right now, if any.
     pub fn cloudFlash(self: *Renderer, scene: Scene) ?CloudFlash {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2950,8 +2801,8 @@ pub const Renderer = struct {
         };
     }
 
-    /// Replaces the scene's decals. They apply to opaque surfaces, before
-    /// lighting, so they are lit and shadowed like the surface itself.
+    /// Replaces the scene's decals. They apply to opaque surfaces before
+    /// lighting.
     pub fn setDecals(self: *Renderer, scene: Scene, decals: []const DecalDesc) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2963,13 +2814,9 @@ pub const Renderer = struct {
 
     // ------------------------------------------------------------ instances
 
-    /// Places many copies of a model at once: foliage, rocks, debris,
-    /// buildings, crowds of static props. The copies are stored on the GPU
-    /// and cost no CPU time per frame however many there are; they are
-    /// culled, shadowed, lit and picked like entities. They do not animate
-    /// (a skinned model is shown in its rest pose), blended meshes in the
-    /// model are skipped. They block and bounce probe light while the scene
-    /// holds no more than `Options.gi_instance_limit` of them.
+    /// Places many static copies of a model, stored on the GPU. They do not
+    /// animate and blended meshes are skipped. They take part in probe GI
+    /// while the scene holds at most `Options.gi_instance_limit` of them.
     pub fn createInstances(self: *Renderer, scene: Scene, model: Model, transforms: []const Mat4) !InstanceGroup {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2993,7 +2840,6 @@ pub const Renderer = struct {
         const scene = self.scenes.get(data.scene) orelse return error.InvalidScene;
         if (transforms.len == data.transforms.len) {
             @memcpy(data.transforms, transforms);
-            // Same shape: only the records need rewriting.
             scene.static_version += 1;
             return;
         }
@@ -3003,10 +2849,8 @@ pub const Renderer = struct {
         scene.layout_dirty = true;
     }
 
-    /// Gives each copy in a group its own color, multiplied with the
-    /// model's base color: one per transform, in the same order. An empty
-    /// slice removes them. They must be set again after `setInstances`
-    /// changes the number of copies.
+    /// Per-copy colors multiplied with the base color, one per transform; an
+    /// empty slice removes them. Set again after the copy count changes.
     pub fn setInstanceColors(self: *Renderer, group: InstanceGroup, colors: []const [3]f32) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3020,11 +2864,8 @@ pub const Renderer = struct {
         scene.static_version += 1;
     }
 
-    /// Gives each copy in a group four numbers of its own for custom
-    /// material shaders (`MaterialContext.instance_params`): one set per
-    /// transform, in the same order. An empty slice removes them. They
-    /// must be set again after `setInstances` changes the number of
-    /// copies.
+    /// Per-copy `MaterialContext.instance_params`, one per transform; an
+    /// empty slice removes them. Set again after the copy count changes.
     pub fn setInstanceParams(self: *Renderer, group: InstanceGroup, params: []const [4]f32) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3037,11 +2878,32 @@ pub const Renderer = struct {
         scene.static_version += 1;
     }
 
-    /// Makes every copy of a group take the pose of `entity`, which must
-    /// be a visible entity of the same model in the same scene: a crowd
-    /// that moves as one, deformed once however many copies there are.
-    /// Null, or an entity that is not being posed, leaves the copies in
-    /// the model's rest pose. The copies do not take part in ray tracing.
+    /// Draws copies smaller on screen than `ImpostorDesc.pixels` as impostor
+    /// cards; null turns that off. Only for single-mesh models; groups that
+    /// take an entity's pose are never impostors.
+    pub fn setInstancesImpostor(self: *Renderer, group: InstanceGroup, desc: ?ImpostorDesc) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const data = self.instance_groups.get(group) orelse return error.InvalidInstanceGroup;
+        const scene = self.scenes.get(data.scene) orelse return error.InvalidScene;
+        if (data.impostor) |old| {
+            self.device.destroyTexture(old.color);
+            self.device.destroyTexture(old.normal);
+            data.impostor = null;
+        }
+        scene.static_version += 1;
+        const wanted = desc orelse return;
+        const resolution = std.math.clamp(wanted.resolution, 16, 256);
+        const size = resolution * impostor_passes.frames;
+        const color = try self.device.createTexture(.{ .name = "impostor color", .width = size, .height = size, .format = .rgba8_srgb, .usage = .{ .sampled = true, .color_attachment = true } });
+        errdefer self.device.destroyTexture(color);
+        const normal = try self.device.createTexture(.{ .name = "impostor normal", .width = size, .height = size, .format = .rgba8_unorm, .usage = .{ .sampled = true, .color_attachment = true } });
+        data.impostor = .{ .color = color, .normal = normal, .pixels = @max(wanted.pixels, 0), .resolution = resolution };
+    }
+
+    /// Makes every copy take the pose of `entity`, a visible entity of the
+    /// same model in the same scene; null gives the rest pose. Posed copies
+    /// do not take part in ray tracing.
     pub fn setInstancesPose(self: *Renderer, group: InstanceGroup, entity: ?Entity) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3051,12 +2913,15 @@ pub const Renderer = struct {
         scene.static_version += 1;
     }
 
-    /// Removes an instance group and all its copies from its scene and
-    /// releases its hold on the model. A stale handle is ignored.
+    /// A stale handle is ignored.
     pub fn destroyInstances(self: *Renderer, group: InstanceGroup) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const removed = self.instance_groups.remove(group) orelse return;
+        if (removed.impostor) |impostor| {
+            self.device.destroyTexture(impostor.color);
+            self.device.destroyTexture(impostor.normal);
+        }
         self.gpa.free(removed.transforms);
         self.gpa.free(removed.tints);
         self.gpa.free(removed.params);
@@ -3071,10 +2936,7 @@ pub const Renderer = struct {
 
     // ---------------------------------------------------------------- water
 
-    /// Adds a sheet of simulated water to a scene: ripples spread across
-    /// it, bounce off its edges and die down. It mirrors the scene (by ray
-    /// where ray tracing is available, else the sky), shows what is under
-    /// it bent by the waves, and takes on its own color with depth.
+    /// Adds a sheet of simulated water to a scene.
     pub fn createWater(self: *Renderer, scene: Scene, desc: WaterDesc) !Water {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3092,7 +2954,7 @@ pub const Renderer = struct {
     }
 
     /// Replaces a water surface's description. Changing the resolution
-    /// flattens it; anything else applies to the moving surface.
+    /// flattens it.
     pub fn setWater(self: *Renderer, water: Water, desc: WaterDesc) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3110,9 +2972,8 @@ pub const Renderer = struct {
         }
     }
 
-    /// Dents the water at a point in the world, as something falling in or
-    /// moving through it would: `radius` and `depth` in world units. Up to
-    /// 16 per frame take effect; further ones are dropped.
+    /// Dents the water at a world position; `radius` and `depth` in world
+    /// units. At most 16 per frame; further ones are dropped.
     pub fn addRipple(self: *Renderer, water: Water, position: Vec3, radius: f32, depth: f32) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3128,7 +2989,6 @@ pub const Renderer = struct {
             .depth = depth / up,
         };
         state.ripple_count += 1;
-        // As deep a dent as this is something falling in: it splashes.
         const strength = depth * 12 * radius;
         if (strength > state.hit_strength) {
             state.hit_strength = strength;
@@ -3137,9 +2997,7 @@ pub const Renderer = struct {
         }
     }
 
-    /// Removes a water sheet from its scene and frees its simulation
-    /// textures, along with the splash emitter it made for itself, if
-    /// any. A stale handle is ignored.
+    /// Also frees the splash emitter it made. A stale handle is ignored.
     pub fn destroyWater(self: *Renderer, water: Water) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3153,20 +3011,144 @@ pub const Renderer = struct {
         };
     }
 
+    // --------------------------------------------------------------- hair
+
+    /// Adds strands of hair, fur or grass to a scene (see `HairDesc`).
+    pub fn createHair(self: *Renderer, scene: Scene, desc: HairDesc) !Hair {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const data = self.scenes.get(scene) orelse return error.InvalidScene;
+        if (desc.points_per_strand < 2 or desc.points.len < desc.points_per_strand or desc.points.len % desc.points_per_strand != 0) return error.InvalidHair;
+        if (desc.simulation != null and desc.points_per_strand > 64) return error.TooManyPointsPerStrand;
+        const Point = extern struct { position: [3]f32, along: f32 };
+        const staged = try self.gpa.alloc(Point, desc.points.len);
+        defer self.gpa.free(staged);
+        const last: f32 = @floatFromInt(desc.points_per_strand - 1);
+        for (staged, desc.points, 0..) |*point, position, index| {
+            point.* = .{ .position = position, .along = @as(f32, @floatFromInt(index % desc.points_per_strand)) / last };
+        }
+        const points = try self.device.createBuffer(.{
+            .name = "hair",
+            .size = staged.len * @sizeOf(Point),
+            .usage = .{ .storage = true, .copy_dst = true },
+        });
+        errdefer self.device.destroyBuffer(points);
+        try self.device.uploadBuffer(points, 0, std.mem.sliceAsBytes(staged));
+        var kept = desc;
+        kept.points = &.{};
+        kept.simulation = null;
+        const strands: u32 = @intCast(desc.points.len / desc.points_per_strand);
+        const hair = try self.hairs.insert(.{ .scene = scene, .desc = kept, .points = points, .stretches = strands * (desc.points_per_strand - 1), .strands = strands });
+        errdefer _ = self.hairs.remove(hair);
+        try data.hairs.append(self.gpa, hair);
+        const state = self.hairs.get(hair).?;
+        var low: Vec3 = desc.points[0];
+        var high: Vec3 = desc.points[0];
+        for (desc.points) |position| inline for (0..3) |axis| {
+            low[axis] = @min(low[axis], position[axis]);
+            high[axis] = @max(high[axis], position[axis]);
+        };
+        const middle = math.scale(math.add(low, high), 0.5);
+        state.bounds = .{ middle[0], middle[1], middle[2], math.length(math.sub(high, middle)) };
+        setHairMotion(state, desc.simulation);
+        return hair;
+    }
+
+    fn setHairMotion(state: *HairState, simulation: ?HairSimulation) void {
+        state.simulation = simulation;
+        state.collider_count = 0;
+        const wanted = simulation orelse return;
+        state.collider_count = @intCast(@min(wanted.colliders.len, renderer_state.max_hair_colliders));
+        @memcpy(state.colliders[0..state.collider_count], wanted.colliders[0..state.collider_count]);
+        state.simulation.?.colliders = &.{};
+    }
+
+    fn freeHair(self: *Renderer, state: HairState) void {
+        self.device.destroyBuffer(state.points);
+        if (state.moving) |moving| {
+            for (moving.points) |buffer| self.device.destroyBuffer(buffer);
+            for (moving.density) |buffer| self.device.destroyBuffer(buffer);
+        }
+    }
+
+    /// Builds a distance field of a mesh for `HairSimulation.field`, with
+    /// `resolution` (8 to 128) cells per side. The mesh should be closed, or
+    /// open only downward along its z axis.
+    pub fn createCollisionField(self: *Renderer, positions: []const [3]f32, indices: []const u32, resolution: u32) !CollisionField {
+        const field = try collision_field.build(self.gpa, positions, indices, resolution);
+        defer field.deinit(self.gpa);
+        const halves = try self.gpa.alloc(f16, field.distances.len);
+        defer self.gpa.free(halves);
+        for (halves, field.distances) |*half, distance| half.* = @floatCast(distance);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const texture = try self.device.createTexture(.{
+            .name = "collision field",
+            .width = field.size,
+            .height = field.size,
+            .layers = field.size,
+            .kind = .@"2d_array",
+            .format = .r16_float,
+            .usage = .{ .sampled = true, .copy_dst = true },
+        });
+        errdefer self.device.destroyTexture(texture);
+        const per_layer = @as(usize, field.size) * field.size;
+        for (0..field.size) |layer| try self.device.uploadTexture(texture, 0, @intCast(layer), std.mem.sliceAsBytes(halves[layer * per_layer ..][0..per_layer]));
+        return self.collision_fields.insert(.{ .texture = texture, .low = field.low, .cell = field.cell, .size = field.size });
+    }
+
+    /// A stale handle is ignored.
+    pub fn destroyCollisionField(self: *Renderer, field: CollisionField) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const removed = self.collision_fields.remove(field) orelse return;
+        self.device.destroyTexture(removed.texture);
+    }
+
+    /// Sets a hair's simulation (wind, colliders, stiffness); null freezes
+    /// it as combed. A stale handle is ignored.
+    pub fn setHairSimulation(self: *Renderer, hair: Hair, simulation: ?HairSimulation) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const state = self.hairs.get(hair) orelse return;
+        setHairMotion(state, simulation);
+        if (simulation == null) if (state.moving) |moving| {
+            for (moving.points) |buffer| self.device.destroyBuffer(buffer);
+            for (moving.density) |buffer| self.device.destroyBuffer(buffer);
+            state.moving = null;
+        };
+    }
+
+    /// Sets the hair-to-world transform. A stale handle is ignored.
+    pub fn setHairTransform(self: *Renderer, hair: Hair, transform: Mat4) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const state = self.hairs.get(hair) orelse return;
+        state.desc.transform = transform;
+    }
+
+    /// A stale handle is ignored.
+    pub fn destroyHair(self: *Renderer, hair: Hair) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const removed = self.hairs.remove(hair) orelse return;
+        self.freeHair(removed);
+        const scene = self.scenes.get(removed.scene) orelse return;
+        for (scene.hairs.items, 0..) |item, index| if (std.meta.eql(item, hair)) {
+            _ = scene.hairs.orderedRemove(index);
+            break;
+        };
+    }
+
     // ------------------------------------------------------------- liquid
 
-    /// Adds a volume of liquid to a scene.
     pub fn createLiquid(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
         const liquid = try self.createLiquidAlone(scene, desc);
-        // The stand-in is a nicety: a liquid without one is only missing
-        // from ray-traced reflections.
         self.attachLiquidProxy(scene, liquid, desc) catch |err| std.log.debug("liquid: no stand-in for rays: {s}", .{@errorName(err)});
         return liquid;
     }
 
-    /// Gives a liquid the box that rays meet in its place: see-through,
-    /// in the liquid's color, resized each frame to how much liquid
-    /// there is.
+    /// Gives a liquid the see-through box that rays hit in its place.
     fn attachLiquidProxy(self: *Renderer, scene: Scene, liquid: Liquid, desc: LiquidDesc) !void {
         if (!self.device.ray_tracing) return;
         const model = self.liquid_proxy_model orelse made: {
@@ -3179,8 +3161,7 @@ pub const Renderer = struct {
             if (self.liquid_proxy_model == null) self.liquid_proxy_model = created;
             break :made self.liquid_proxy_model.?;
         };
-        // Hidden until it is marked as for rays only, so that no frame
-        // draws it.
+        // Hidden until marked rays-only, so that no frame draws it.
         const entity = try self.spawn(scene, .{ .model = model, .transform = desc.transform, .visible = false, .tint = desc.color });
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3206,8 +3187,6 @@ pub const Renderer = struct {
             grid[axis] = @intFromFloat(@max(@ceil(box.extent[axis] / reach), 1));
             cell_count *= @intCast(grid[axis]);
         }
-        // A box this much larger than its grain would need a grid that
-        // does not fit: ask for coarser particles.
         if (cell_count > 2 * 1024 * 1024) return error.LiquidTooFine;
         const capacity = std.math.clamp(desc.capacity, 64, 1 << 20);
         var block: [3]u32 = undefined;
@@ -3240,9 +3219,8 @@ pub const Renderer = struct {
         return liquid;
     }
 
-    /// Replaces a liquid's description. The box's size, the particle
-    /// radius, the capacity and the starting block stay as they were
-    /// when it was created; the rest applies to the liquid as it is.
+    /// Replaces a liquid's description. Box size, particle radius, capacity
+    /// and the starting block keep their creation values.
     pub fn setLiquid(self: *Renderer, liquid: Liquid, desc: LiquidDesc) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3253,7 +3231,7 @@ pub const Renderer = struct {
         state.setSources(desc.sources);
     }
 
-    /// How many particles of a liquid are in use.
+    /// Particles of a liquid currently in use.
     pub fn liquidParticles(self: *Renderer, liquid: Liquid) u32 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3261,8 +3239,7 @@ pub const Renderer = struct {
         return state.live;
     }
 
-    /// Removes a liquid from its scene and frees its particle buffers. A
-    /// stale handle is ignored.
+    /// A stale handle is ignored.
     pub fn destroyLiquid(self: *Renderer, liquid: Liquid) void {
         // The stand-in goes once the lock below has been let go.
         var proxy: ?Entity = null;
@@ -3299,9 +3276,7 @@ pub const Renderer = struct {
 
     // --------------------------------------------------------------- fluids
 
-    /// Adds a box of simulated smoke and fire to a scene. The simulation
-    /// runs on the GPU once per frame and every view of the scene draws
-    /// the result, lit by the sun, the sky and the probes.
+    /// Adds a box of GPU-simulated smoke and fire to a scene.
     pub fn createFluid(self: *Renderer, scene: Scene, desc: FluidDesc) !Fluid {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3319,8 +3294,8 @@ pub const Renderer = struct {
         return fluid;
     }
 
-    /// Replaces a fluid's description. Changing the resolution starts the
-    /// simulation over; anything else takes effect on the running one.
+    /// Replaces a fluid's description. Changing the resolution restarts the
+    /// simulation.
     pub fn setFluid(self: *Renderer, fluid: Fluid, desc: FluidDesc) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3343,10 +3318,9 @@ pub const Renderer = struct {
         if (self.fluids.get(fluid)) |state| state.cleared = false;
     }
 
-    /// A picture of the fluid seen along its depth, redrawn every frame the
-    /// fluid's scene is rendered: smoke as coverage, fire as glow. Draw it
-    /// with a draw list for 2D smoke and fire. It is `resolution` pixels
-    /// in size and lasts as long as the fluid.
+    /// The fluid seen along its depth (smoke as coverage, fire as glow),
+    /// redrawn each frame its scene renders. `resolution` pixels in size;
+    /// lasts as long as the fluid.
     pub fn fluidImage(self: *Renderer, fluid: Fluid) !Image {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3364,10 +3338,8 @@ pub const Renderer = struct {
         return .{ .index = self.device.textureIndex(state.picture.?), .width = state.size[0], .height = state.size[1] };
     }
 
-    /// Saves the fluid's picture (see `fluidImage`) as a PNG with alpha:
-    /// one frame of a sprite animation baked from the simulation. Call it
-    /// between frames; it waits for the GPU. `fluidImage` must have been
-    /// asked for and at least one frame rendered since.
+    /// Saves the fluid's picture as a PNG with alpha. Waits for the GPU; call
+    /// between frames, after `fluidImage` and at least one rendered frame.
     pub fn saveFluidImage(self: *Renderer, fluid: Fluid, path: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3376,15 +3348,10 @@ pub const Renderer = struct {
         try self.saveHdrPicture(picture, state.size[0], state.size[1], path);
     }
 
-    /// Starts recording the fluid's picture (as `fluidImage` shows it)
-    /// into a sheet of `columns` x `rows` frames, one every `interval`
-    /// simulation steps, filled left to right, top row first. The sheet is
-    /// returned at once and fills in as the frames go by: give it to an
-    /// emitter (`EmitterDesc.image` with `sheet`) or a draw list, or write
-    /// it out with `saveFluidFlipbook` once `fluidFlipbookFrames` says it
-    /// is full. It lasts as long as the fluid keeps its resolution;
-    /// calling this again starts over, and with a different size replaces
-    /// the sheet.
+    /// Starts recording the fluid's picture into a `columns` x `rows` sheet,
+    /// one frame every `interval` steps, row-major from the top left. The
+    /// sheet lasts while the fluid keeps its resolution; calling again
+    /// restarts it.
     pub fn recordFluidFlipbook(self: *Renderer, fluid: Fluid, desc: FluidFlipbookDesc) !Image {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3413,8 +3380,7 @@ pub const Renderer = struct {
         return .{ .index = self.device.textureIndex(state.flipbook.?), .width = width, .height = height };
     }
 
-    /// How many frames of the fluid's flipbook have been recorded so far;
-    /// `columns * rows` when it is full.
+    /// Flipbook frames recorded so far; `columns * rows` when full.
     pub fn fluidFlipbookFrames(self: *Renderer, fluid: Fluid) u32 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3422,8 +3388,8 @@ pub const Renderer = struct {
         return state.flipbook_recorded;
     }
 
-    /// Saves the fluid's flipbook as a PNG with alpha, as far as it has
-    /// been recorded. Call it between frames; it waits for the GPU.
+    /// Saves the flipbook as recorded so far as a PNG with alpha. Waits for
+    /// the GPU; call between frames.
     pub fn saveFluidFlipbook(self: *Renderer, fluid: Fluid, path: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3452,8 +3418,7 @@ pub const Renderer = struct {
         try png.write(self.gpa, self.io, path, .{ .width = width, .height = height, .pixels = pixels });
     }
 
-    /// Removes a fluid from its scene and frees its simulation textures. A
-    /// stale handle is ignored.
+    /// A stale handle is ignored.
     pub fn destroyFluid(self: *Renderer, fluid: Fluid) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3469,7 +3434,6 @@ pub const Renderer = struct {
     fn createFluidTextures(self: *Renderer, state: *FluidState) !void {
         const device = self.device;
         inline for (0..3) |axis| state.size[axis] = std.math.clamp(state.desc.resolution[axis], if (axis == 2) 1 else 8, 256);
-        // The slices are laid out as a roughly square sheet.
         state.tiles_x = @intFromFloat(@ceil(@sqrt(@as(f32, @floatFromInt(state.size[2])))));
         const tiles_y = (state.size[2] + state.tiles_x - 1) / state.tiles_x;
         const width = state.size[0] * state.tiles_x;
@@ -3483,7 +3447,6 @@ pub const Renderer = struct {
                 .name = "fluid",
                 .width = width,
                 .height = height,
-                // Pressure and divergence: a number and the solid flag.
                 .format = if (index == 8) .r8_unorm else if (index >= 4 and index < 7) .rg16_float else .rgba16_float,
                 .usage = usage,
             });
@@ -3503,9 +3466,7 @@ pub const Renderer = struct {
 
     // ------------------------------------------------------------ particles
 
-    /// Adds a particle emitter to a scene. Particles are simulated and
-    /// drawn entirely on the GPU; the cost on the CPU does not depend on
-    /// how many there are.
+    /// Adds a GPU-simulated particle emitter to a scene.
     pub fn createEmitter(self: *Renderer, scene: Scene, desc: EmitterDesc) !Emitter {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3527,8 +3488,7 @@ pub const Renderer = struct {
         defer self.gpa.free(zeros);
         @memset(zeros, 0);
         try self.device.uploadBuffer(buffer, 0, zeros);
-        // The sort works on a power of two; the slots past the capacity
-        // hold entries that sort last and draw nothing.
+        // The sort needs a power of two; slots past the capacity sort last.
         const order_count = std.math.ceilPowerOfTwo(u32, capacity) catch capacity;
         const order: ?rhi.Buffer = if (desc.sorted) try self.device.createBuffer(.{
             .name = "particle order",
@@ -3536,7 +3496,6 @@ pub const Renderer = struct {
             .usage = .{ .storage = true, .copy_src = true },
         }) else null;
         errdefer if (order) |value| self.device.destroyBuffer(value);
-        // Remembered positions for trails; newborns fill theirs in.
         const trail_points = @min(desc.trail, max_trail_points);
         const trail: ?rhi.Buffer = if (trail_points != 0) try self.device.createBuffer(.{
             .name = "particle trails",
@@ -3550,9 +3509,8 @@ pub const Renderer = struct {
         return emitter;
     }
 
-    /// For tests: the sort keys of a sorted emitter in drawing order, as
-    /// left by the last view that drew it. Smaller is farther; dead slots
-    /// are large and come last. Waits for the GPU. Caller frees.
+    /// For tests: a sorted emitter's sort keys in drawing order (smaller is
+    /// farther; dead slots come last). Waits for the GPU. Caller frees.
     pub fn emitterSortKeys(self: *Renderer, gpa: std.mem.Allocator, emitter: Emitter) ![]f32 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3572,13 +3530,9 @@ pub const Renderer = struct {
         if (self.emitters.get(emitter)) |data| data.desc = desc;
     }
 
-    /// Adds a local reflection probe to a scene. Its six pictures are
-    /// taken at the end of the next frames that draw anything (one
-    /// picture a frame, so six frames a probe, each costing a small view
-    /// of the scene), without
-    /// screen-space reflections or other probes' help on the first take;
-    /// call `updateReflectionProbe` after the scene or its lighting
-    /// changes, or again to pick up light bounced between mirrors.
+    /// Adds a local reflection probe. Its six faces are captured one per
+    /// frame from the next frames that draw; call `updateReflectionProbe`
+    /// after the scene or its lighting changes.
     pub fn createReflectionProbe(self: *Renderer, scene: Scene, desc: ReflectionProbeDesc) !ReflectionProbe {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3604,8 +3558,7 @@ pub const Renderer = struct {
         return probe;
     }
 
-    /// Changes where a probe is and what it covers. A new position takes
-    /// effect with the next `updateReflectionProbe`.
+    /// A new position takes effect with the next `updateReflectionProbe`.
     pub fn setReflectionProbe(self: *Renderer, probe: ReflectionProbe, desc: ReflectionProbeDesc) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3616,15 +3569,14 @@ pub const Renderer = struct {
         data.cubes.max_radiance = desc.max_radiance;
     }
 
-    /// Asks for a probe's pictures to be taken again.
+    /// Asks for a probe to be captured again.
     pub fn updateReflectionProbe(self: *Renderer, probe: ReflectionProbe) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.probes.get(probe)) |data| data.dirty = true;
     }
 
-    /// Removes a reflection probe from its scene and frees its pictures
-    /// and the view they were taken with. A stale handle is ignored.
+    /// A stale handle is ignored.
     pub fn destroyReflectionProbe(self: *Renderer, probe: ReflectionProbe) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3646,29 +3598,24 @@ pub const Renderer = struct {
         }
     }
 
-    /// Takes the six pictures of the first probe that is waiting for
-    /// them, and filters them into its reflection cube.
+    /// Captures the first waiting probe, one face per frame, and filters the
+    /// result into its reflection cube.
     fn captureProbes(self: *Renderer, frame: rhi.Frame, delta_time: f32, arena: *FrameArena) !void {
         for (self.probes.slots.items) |*slot| if (slot.value) |*probe| {
             if (!probe.dirty and probe.face == 0) continue;
-            // Bounced light takes some frames to settle after a scene
-            // appears; a picture taken before then is lit by the sun alone.
             if (!probe.captured and probe.face == 0 and probe.waited < probe.desc.settle_frames) {
                 probe.waited += 1;
                 continue;
             }
             const scene = self.scenes.get(probe.scene) orelse continue;
-            // Wait for something to mirror.
             if (scene.layout.items.len == 0 and scene.static_count == 0) continue;
-            // One picture a frame: a view can be drawn once per frame, and
-            // six at once would be a spike.
+            // One face per frame: a view can be drawn only once per frame.
             if (probe.face == 0) probe.dirty = false;
             probe.capturing = true;
             defer probe.capturing = false;
             const cmd = frame.cmd;
             const device = self.device;
             try self.ensureEnvironmentTextures(&probe.cubes);
-            // Each face's camera: where it looks and which way is up.
             const faces = [6][2]Vec3{
                 .{ .{ 1, 0, 0 }, .{ 0, 1, 0 } },  .{ .{ -1, 0, 0 }, .{ 0, 1, 0 } },
                 .{ .{ 0, 1, 0 }, .{ 0, 0, -1 } }, .{ .{ 0, -1, 0 }, .{ 0, 0, 1 } },
@@ -3682,8 +3629,6 @@ pub const Renderer = struct {
                     .scene = probe.scene,
                     .camera = .{ .position = probe.desc.position, .forward = axes[0], .up = axes[1], .fov_y = std.math.pi * 0.5, .near = 0.05 },
                     .target = .{ .texture = probe.target },
-                    // The plain lit scene: nothing that depends on the
-                    // frames before, on the screen, or on the lens.
                     .settings = .{
                         .temporal_antialiasing = false,
                         .screen_space_reflections = false,
@@ -3728,8 +3673,7 @@ pub const Renderer = struct {
         };
     }
 
-    /// Removes an emitter from its scene and frees its particle buffers;
-    /// particles still alive vanish at once. A stale handle is ignored.
+    /// Live particles vanish at once. A stale handle is ignored.
     pub fn destroyEmitter(self: *Renderer, emitter: Emitter) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3749,8 +3693,8 @@ pub const Renderer = struct {
         };
     }
 
-    /// Waits for every shading variant being compiled and frees them all.
-    /// Called before the shader code they are built from goes away.
+    /// Waits for shading variants being compiled and frees them all. Must
+    /// run before the shader code they are built from goes away.
     fn dropShadeVariants(self: *Renderer) void {
         for (self.shade_variants.items) |*variant| {
             if (variant.job) |job| {
@@ -3763,10 +3707,8 @@ pub const Renderer = struct {
         self.shade_variants.clearRetainingCapacity();
     }
 
-    /// Blocks until the shading variants being compiled in the background
-    /// are done, so that the next frame uses them. For tools, tests and
-    /// benchmarks that measure a handful of frames; an application just
-    /// keeps rendering.
+    /// Blocks until background shading variant compiles are done. For tools,
+    /// tests and benchmarks.
     pub fn waitForShaderVariants(self: *Renderer) !void {
         while (true) {
             {
@@ -3794,8 +3736,8 @@ pub const Renderer = struct {
         };
     }
 
-    /// Works out the node matrices of every animated entity of a scene for
-    /// this frame, on several threads when there are enough of them.
+    /// Computes node matrices of the scene's animated entities for this
+    /// frame, across threads when there are enough.
     fn evaluatePoses(self: *Renderer, scene: *SceneData) !void {
         const zone = Zone.start(self.options.profiler, "poses");
         defer zone.stop();
@@ -3815,15 +3757,13 @@ pub const Renderer = struct {
             else => |asked| @min(asked, max_pose_threads),
         };
         const threads = std.math.clamp(count / pose_batch, 1, allowed);
-        // The threads only read and write memory set aside here: nothing
-        // is allocated off this thread.
+        // Threads only use memory set aside here; they allocate nothing.
         for (self.pose_scratch[0..threads]) |*scratch| try scratch.resize(self.gpa, most_nodes * 3);
         if (threads == 1) return self.poseEntities(self.posed.items, self.pose_scratch[0].items);
         var group: std.Io.Group = .init;
         const share = (count + threads - 1) / threads;
         for (1..threads) |index| {
             const batch = self.posed.items[@min(index * share, count)..@min((index + 1) * share, count)];
-            // If no thread is to be had, the work is done here instead.
             group.concurrent(self.io, poseEntities, .{ self, batch, self.pose_scratch[index].items }) catch
                 self.poseEntities(batch, self.pose_scratch[index].items);
         }
@@ -3831,8 +3771,8 @@ pub const Renderer = struct {
         group.await(self.io) catch {};
     }
 
-    /// Runs on any thread. Entities are only read, apart from each one's
-    /// own node matrices, and no two batches share an entity.
+    /// Runs on any thread. Writes only each entity's own node matrices; no
+    /// two batches share an entity.
     fn poseEntities(self: *Renderer, entities: []const Entity, scratch: []animation.Local) void {
         for (entities) |handle_value| {
             const entity = self.entities.get(handle_value).?;
@@ -3845,12 +3785,9 @@ pub const Renderer = struct {
 
     // -------------------------------------------------------------- picking
 
-    /// Asks which entity is under `pixel` of a view (null for the main
-    /// view), in that view's own pixel coordinates. The answer is read from
-    /// the frame the GPU renders next and arrives through `takePick` a few
-    /// frames later, so nothing waits on the GPU. A new request replaces
-    /// one that has not been picked up by a frame yet. Blended (transparent)
-    /// surfaces are not pickable.
+    /// Asks which entity is under `pixel` (in the view's pixels; null is the
+    /// main view). The answer arrives through `takePick` a few frames later.
+    /// A new request replaces an unserved one. Blended surfaces do not pick.
     pub fn requestPick(self: *Renderer, view: ?View, pixel: [2]u32) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3865,8 +3802,7 @@ pub const Renderer = struct {
         return self.pick_result;
     }
 
-    /// Collects the answer the GPU wrote for a pick issued in this frame
-    /// slot's previous use.
+    /// Collects the pick the GPU wrote in this frame slot's previous use.
     fn resolvePick(self: *Renderer, slot: usize) void {
         const pending = self.pick_pending[slot] orelse return;
         self.pick_pending[slot] = null;
@@ -3877,7 +3813,6 @@ pub const Renderer = struct {
         const scene = self.scenes.get(pending.scene) orelse return;
         if (scene.layout_version != pending.layout_version) return;
         if (raw.instance >= scene.layout.items.len) {
-            // Past the entities: a copy in one of the instance groups.
             for (scene.groups.items) |group_handle| {
                 const group = self.instance_groups.get(group_handle) orelse continue;
                 if (group.per_copy == 0 or raw.instance < group.base) continue;
@@ -3906,10 +3841,8 @@ pub const Renderer = struct {
 
     // --------------------------------------------------------------- scenes
 
-    /// Creates an empty scene: no entities or lights, the sun off, no
-    /// environment. Scenes are independent of one another and of views;
-    /// a view draws one by naming it in `ViewDesc.scene`. Free it with
-    /// `destroyScene`.
+    /// Creates an empty scene: no entities or lights, sun off, no
+    /// environment.
     pub fn createScene(self: *Renderer) !Scene {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3952,6 +3885,8 @@ pub const Renderer = struct {
             for (removed.state) |texture| self.device.destroyTexture(texture);
         };
         scene.waters.deinit(self.gpa);
+        for (scene.hairs.items) |hair| if (self.hairs.remove(hair)) |removed| self.freeHair(removed);
+        scene.hairs.deinit(self.gpa);
         for (scene.liquids.items) |liquid| if (self.liquids.remove(liquid)) |removed_liquid| {
             var removed = removed_liquid;
             removed.deinit(self.device);
@@ -3962,6 +3897,10 @@ pub const Renderer = struct {
         scene.decals.deinit(self.gpa);
         scene.movers.deinit(self.gpa);
         for (scene.groups.items) |group| if (self.instance_groups.remove(group)) |removed| {
+            if (removed.impostor) |impostor| {
+                self.device.destroyTexture(impostor.color);
+                self.device.destroyTexture(impostor.normal);
+            }
             self.gpa.free(removed.transforms);
             self.gpa.free(removed.tints);
             self.gpa.free(removed.params);
@@ -3974,6 +3913,11 @@ pub const Renderer = struct {
         scene.static_transparent.deinit(self.gpa);
         scene.layout.deinit(self.gpa);
         if (scene.refs) |buffer| self.device.destroyBuffer(buffer);
+        scene.static_ranges.deinit(self.gpa);
+        if (scene.static_cull) |buffer| self.device.destroyBuffer(buffer);
+        if (scene.impostor_table) |buffer| self.device.destroyBuffer(buffer);
+        if (scene.impostor_list) |buffer| self.device.destroyBuffer(buffer);
+        if (scene.candidates) |buffer| self.device.destroyBuffer(buffer);
         if (scene.seen) |buffer| self.device.destroyBuffer(buffer);
         for (scene.seen_readback) |readback| if (readback) |buffer| self.device.destroyBuffer(buffer);
         if (scene.skin_bounds) |buffer| self.device.destroyBuffer(buffer);
@@ -3983,9 +3927,7 @@ pub const Renderer = struct {
         if (scene.gi_middle) |volume| volume.deinit(self.device);
     }
 
-    /// Replaces the scene's sun, taking effect from the next frame. An
-    /// `intensity` of 0 turns it, and its shadows, off. A stale scene
-    /// handle is ignored.
+    /// Replaces the scene's sun. `intensity` 0 turns it and its shadows off.
     pub fn setSun(self: *Renderer, scene: Scene, sun: Sun) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -4012,13 +3954,9 @@ pub const Renderer = struct {
         data.lights_version += 1;
     }
 
-    /// Adds an entity to a scene: one placement of `desc.model`. The model
-    /// need not have finished loading; the entity is drawn from the frame
-    /// it becomes ready. The entity holds a reference to the model (see
-    /// `destroyModel`) until `despawn` or `destroyScene`.
-    ///
-    /// Fails with `error.InvalidScene` or `error.InvalidModel` for a
-    /// stale handle. Safe from any thread.
+    /// Adds an entity; the model may still be loading. The entity holds a
+    /// reference to the model until `despawn` or `destroyScene`. Fails with
+    /// `error.InvalidScene` or `error.InvalidModel` for a stale handle.
     pub fn spawn(self: *Renderer, scene: Scene, desc: EntityDesc) !Entity {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -4041,9 +3979,8 @@ pub const Renderer = struct {
         return entity;
     }
 
-    /// Removes an entity from its scene, frees its skinning storage and
-    /// releases its reference to the model. The handle is stale
-    /// afterwards; a stale handle is ignored.
+    /// Removes an entity and releases its model reference. A stale handle is
+    /// ignored.
     pub fn despawn(self: *Renderer, entity: Entity) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -4060,6 +3997,10 @@ pub const Renderer = struct {
     }
 
     fn freeEntityStorage(self: *Renderer, entity: EntityData) void {
+        if (entity.lightmap) |lightmap| {
+            for (lightmap.gathered) |texture| self.device.destroyTexture(texture);
+            self.device.destroyTexture(lightmap.shown);
+        }
         if (self.models.get(entity.model)) |model| {
             if (model.source) |source| for (entity.skin_offsets, 0..) |offset, index| {
                 if (offset == no_skin) continue;
@@ -4074,18 +4015,15 @@ pub const Renderer = struct {
         self.gpa.free(entity.previous_node_world);
     }
 
-    /// Moves an entity: `transform` places the model's space in the world.
-    /// The difference from last frame's transform counts as motion, for
-    /// motion vectors, temporal antialiasing and motion blur; use
-    /// `teleport` for a jump that should not. A stale handle is ignored.
+    /// Sets the model-to-world transform. The change from last frame counts
+    /// as motion; use `teleport` for a jump that should not.
     pub fn setTransform(self: *Renderer, entity: Entity, transform: Mat4) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.entities.get(entity)) |data| data.transform = transform;
     }
 
-    /// Like `setTransform`, but also resets motion history so the move is
-    /// not smeared by temporal antialiasing.
+    /// Like `setTransform`, but resets motion history.
     pub fn teleport(self: *Renderer, entity: Entity, transform: Mat4) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -4102,18 +4040,16 @@ pub const Renderer = struct {
         if (self.entities.get(entity)) |data| data.tint = packTint(tint);
     }
 
-    /// Sets the numbers an entity hands to custom material shaders
-    /// (`MaterialContext.instance_params`).
+    /// Sets the entity's `MaterialContext.instance_params`.
     pub fn setParams(self: *Renderer, entity: Entity, params: [4]f32) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.entities.get(entity)) |data| data.params = params;
     }
 
-    /// Sets the weights of an entity's morph targets (blend shapes: facial
-    /// expressions, muscle bulges) by hand, on every mesh of it that has
-    /// any; up to 64, in the order the model lists them. Null hands them
-    /// back to the animation. Only skinned meshes morph.
+    /// Overrides morph target weights (up to 64, in model order) on every
+    /// mesh that has any; null returns them to the animation. Only skinned
+    /// meshes morph.
     pub fn setMorphWeights(self: *Renderer, entity: Entity, weights: ?[]const f32) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -4125,11 +4061,47 @@ pub const Renderer = struct {
         } else data.morph_weights = null;
     }
 
-    /// Shows or hides an entity without removing it. A hidden entity is
-    /// left out of the scene's instance list, so it is not drawn and casts
-    /// no shadows; showing it again starts its motion history afresh. A
-    /// change rebuilds that list on the next frame, as `spawn` and
-    /// `despawn` do; setting the value it already has costs nothing.
+    /// Bakes a lightmap for a static entity over `LightmapDesc.frames`
+    /// frames; it replaces the irradiance probes on its surfaces. Null removes
+    /// it. Needs non-overlapping `MeshDesc.uvs1`, ray tracing
+    /// (`error.RayTracingUnavailable`) and `Settings.global_illumination`.
+    pub fn bakeLightmap(self: *Renderer, entity: Entity, desc: ?LightmapDesc) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const data = self.entities.get(entity) orelse return error.InvalidEntity;
+        const scene = self.scenes.get(data.scene) orelse return error.InvalidScene;
+        if (data.lightmap) |old| {
+            for (old.gathered) |texture| self.device.destroyTexture(texture);
+            self.device.destroyTexture(old.shown);
+            data.lightmap = null;
+        }
+        const wanted = desc orelse return;
+        if (self.pipelines.lightmap_bake == null) return error.RayTracingUnavailable;
+        const size = std.math.clamp(wanted.resolution, 16, 4096);
+        var made: [3]?rhi.Texture = @splat(null);
+        errdefer for (made) |texture| if (texture) |value| self.device.destroyTexture(value);
+        for (&made) |*texture| texture.* = try self.device.createTexture(.{ .name = "lightmap", .width = size, .height = size, .format = hdr_format, .usage = .{ .sampled = true, .color_attachment = true } });
+        data.lightmap = .{
+            .gathered = .{ made[0].?, made[1].? },
+            .shown = made[2].?,
+            .wanted = @max(wanted.frames, 1),
+            .rays = std.math.clamp(wanted.rays, 1, 256),
+            .reach = @max(wanted.reach, 0.01),
+        };
+        scene.lightmaps_baking += 1;
+    }
+
+    /// Baked fraction of an entity's lightmap, 0 to 1; null if it has none.
+    pub fn lightmapProgress(self: *Renderer, entity: Entity) ?f32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const data = self.entities.get(entity) orelse return null;
+        const lightmap = data.lightmap orelse return null;
+        return @as(f32, @floatFromInt(@min(lightmap.rounds, lightmap.wanted))) / @as(f32, @floatFromInt(lightmap.wanted));
+    }
+
+    /// Shows or hides an entity. A hidden entity is not drawn and casts no
+    /// shadows; showing it again resets its motion history.
     pub fn setVisible(self: *Renderer, entity: Entity, visible: bool) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -4147,8 +4119,7 @@ pub const Renderer = struct {
         if (self.entities.get(entity)) |data| data.pose = pose;
     }
 
-    /// Allocates per-entity animation state the first time its model is seen
-    /// ready.
+    /// Allocates per-entity animation state once its model is ready.
     fn resolveEntity(self: *Renderer, entity: *EntityData, model: *ModelEntry) !void {
         if (entity.resolved) return;
         const source = &model.source.?;
@@ -4172,8 +4143,7 @@ pub const Renderer = struct {
         entity.resolved = true;
     }
 
-    /// The entity whose pose a group's copies take, if it is being posed
-    /// this frame: visible, of the group's model and in its scene.
+    /// The entity whose pose a group's copies take, if posed this frame.
     fn groupDriver(self: *Renderer, group: *const InstanceGroupData, model_instances: usize) ?*EntityData {
         const entity = self.entities.get(group.driver orelse return null) orelse return null;
         if (!entity.visible or !entity.resolved) return null;
@@ -4190,6 +4160,7 @@ pub const Renderer = struct {
         self.scratch_refs.clearRetainingCapacity();
         scene.joint_count = 0;
         scene.triangle_count = 0;
+        scene.masked_ref_count = 0;
         for (scene.entities.items) |entity_handle| {
             const entity = self.entities.get(entity_handle) orelse continue;
             if (!entity.visible) continue;
@@ -4203,11 +4174,9 @@ pub const Renderer = struct {
                 try scene.layout.append(gpa, .{ .entity = entity_handle, .model_instance = @intCast(index), .first_of_entity = index == 0 });
                 scene.triangle_count += mesh.lod0_index_count / 3;
                 if (entity.skin_offsets[index] != no_skin) scene.joint_count += @intCast(source.skins[instance.skin.?].joints.len);
-                // Blended meshes get references too: the culling pass keeps
-                // them out of the camera's visibility buffer (they are drawn
-                // by the transparent pass) but lets them cast shadows.
-                // What only rays meet has no meshlets to draw.
+                // Blended meshes get references too: they cast shadows.
                 if (entity.rays_only) continue;
+                if (mesh.masked) scene.masked_ref_count += mesh.meshlet_count;
                 try self.scratch_refs.ensureUnusedCapacity(gpa, mesh.meshlet_count);
                 for (0..mesh.meshlet_count) |meshlet| self.scratch_refs.appendAssumeCapacity(.{
                     .instance = instance_index,
@@ -4217,6 +4186,8 @@ pub const Renderer = struct {
         }
         // Instance groups follow the entities in the instance numbering.
         scene.static_count = 0;
+        scene.entity_ref_count = @intCast(self.scratch_refs.items.len);
+        scene.static_ranges.clearRetainingCapacity();
         for (scene.groups.items) |group_handle| {
             const group = self.instance_groups.get(group_handle) orelse continue;
             group.base = @as(u32, @intCast(scene.layout.items.len)) + scene.static_count;
@@ -4231,10 +4202,9 @@ pub const Renderer = struct {
                     const mesh = model.meshes[instance.mesh];
                     const instance_index = group.base + @as(u32, @intCast(copy)) * group.per_copy + slot;
                     slot += 1;
-                    // Blended meshes get references too, as for entities:
-                    // kept out of the camera's visibility buffer, drawn by
-                    // the transparent pass, and able to cast shadows.
                     scene.triangle_count += mesh.lod0_index_count / 3;
+                    try scene.static_ranges.append(gpa, .{ @intCast(self.scratch_refs.items.len), mesh.meshlet_count });
+                    if (mesh.masked) scene.masked_ref_count += mesh.meshlet_count;
                     try self.scratch_refs.ensureUnusedCapacity(gpa, mesh.meshlet_count);
                     for (0..mesh.meshlet_count) |meshlet| self.scratch_refs.appendAssumeCapacity(.{
                         .instance = instance_index,
@@ -4262,12 +4232,10 @@ pub const Renderer = struct {
         scene.layout_generation = self.asset_generation;
     }
 
-    /// An instance whose material glows the same all over (`Glowing` in
-    /// pathtrace.frag): which instance, and how many triangles its
-    /// full-detail level has to pick a point among.
+    /// `Glowing` in pathtrace.frag: an evenly emissive instance and the
+    /// triangle count of its full-detail level.
     const Glowing = extern struct { instance: u32, triangles: u32 };
-    /// Most glowing instances path tracing aims at; any more are found
-    /// by chance only, as all were before.
+    /// Most glowing instances path tracing samples directly.
     const max_glowing = 1024;
 
     /// Writes this frame's instance records and joint matrices and queues
@@ -4277,10 +4245,6 @@ pub const Renderer = struct {
         defer zone.stop();
         const device = self.device;
         if (scene.layout_dirty or scene.layout_generation != self.asset_generation) try self.rebuildLayout(scene);
-        // Instance records live in GPU memory, which shaders read far
-        // faster than memory the CPU can also see. Entities are written to
-        // the frame arena and copied across every frame; instance groups
-        // are uploaded only when they change.
         const entity_count = scene.layout.items.len;
         const total = entity_count + scene.static_count;
         const records = &scene.instance_slots[0];
@@ -4298,6 +4262,7 @@ pub const Renderer = struct {
         }
         const staged = try arena.alloc(device, gpu.Instance, entity_count);
         const instance_records = staged.items;
+        const staged_previous = try arena.alloc(device, [12]f32, entity_count);
         const group_rays = device.ray_tracing and scene.static_count != 0 and scene.static_count <= self.options.gi_instance_limit;
         const tlas_instances = try arena.alloc(device, rhi.AccelerationInstance, scene.layout.items.len + (if (group_rays) scene.static_count else 0));
         var tlas_count: u32 = 0;
@@ -4317,13 +4282,17 @@ pub const Renderer = struct {
         var shared_center: Vec3 = .{ 0, 0, 0 };
         var shared_radius: f32 = 0;
         var skinned_vertices: u32 = 0;
-        // Whether anything in the scene is in a different place than last
-        // frame, which is what forces shadow maps to be redrawn.
         var any_moving = false;
 
         try self.evaluatePoses(scene);
         scene.movers.clearRetainingCapacity();
         scene.movers_overflow = false;
+        for (scene.hairs.items) |hair_handle| {
+            const hair = self.hairs.get(hair_handle) orelse continue;
+            if (hair.simulation == null) continue;
+            const center = math.transformPoint(hair.desc.transform, hair.bounds[0..3].*);
+            self.noteMover(scene, .{ center[0], center[1], center[2], hair.bounds[3] * math.maxScale(hair.desc.transform) * 1.6 });
+        }
         scene.transparent.clearRetainingCapacity();
         scene.transmissive = false;
 
@@ -4338,13 +4307,8 @@ pub const Renderer = struct {
             const instance = source.instances[entry.model_instance];
             const mesh = model.meshes[instance.mesh];
             const skin_base = entity.skin_offsets[entry.model_instance];
-            // Blended meshes are drawn by the forward pass; remember where
-            // they ended up once this instance's transform is known.
             var aimed = false;
             {
-                // Path tracing aims at what glows evenly; a glow painted
-                // by a texture is left to chance, which finds its bright
-                // parts where aiming at any triangle would not.
                 const glow = source.materials[source.meshes[instance.mesh].material];
                 if (glow.emissive_texture == null and (glow.emissive[0] > 0 or glow.emissive[1] > 0 or glow.emissive[2] > 0) and mesh.lod0_index_count >= 3 and !mesh.coarse and glowing_count < max_glowing) {
                     glowing.items[glowing_count] = .{ .instance = @intCast(instance_index), .triangles = mesh.lod0_index_count / 3 };
@@ -4358,7 +4322,7 @@ pub const Renderer = struct {
                     .instance = @intCast(instance_index),
                     .first_index = mesh.index_offset,
                     .index_count = mesh.lod0_index_count,
-                    .center = math.transformPoint(out.transform, source.meshes[instance.mesh].bounds_center),
+                    .center = math.transformPoint(gpu.expand(out.transform), source.meshes[instance.mesh].bounds_center),
                     .transmissive = source.materials[source.meshes[instance.mesh].material].transmission > 0,
                 }) catch {};
             };
@@ -4372,18 +4336,18 @@ pub const Renderer = struct {
                     const moved_center = math.transformPoint(transform, bounds_of.bounds_center);
                     self.noteMover(scene, .{ moved_center[0], moved_center[1], moved_center[2], bounds_of.bounds_radius * math.maxScale(transform) });
                 }
+                staged_previous.items[instance_index] = gpu.affine(previous_transform);
                 out.* = .{
-                    .transform = transform,
-                    .previous_transform = previous_transform,
+                    .transform = gpu.affine(transform),
                     .bounding_sphere = .{ 0, 0, 0, 0 },
                     .mesh = model.mesh_base + instance.mesh,
                     .material = mesh.material,
                     .vertex_offset = mesh.vertex_offset,
                     .previous_vertex_offset = mesh.vertex_offset,
                     .coarse_error = if (mesh.coarse) mesh.coarse_error else 0,
-                    // Lets the resolve pass skip previous-frame fetches.
-                    .flags = (if (std.mem.eql(f32, &transform, &previous_transform)) 0 else gpu.instance_moving) | (if (entity.receive_decals) 0 else gpu.instance_no_decals) | (if (entity.rays_only) gpu.instance_proxy else 0) | (if (aimed) gpu.instance_aimed else 0),
+                    .flags = (if (std.mem.eql(f32, &transform, &previous_transform)) 0 else gpu.instance_moving | gpu.instance_previous) | (if (entity.receive_decals) 0 else gpu.instance_no_decals) | (if (entity.rays_only) gpu.instance_proxy else 0) | (if (aimed) gpu.instance_aimed else 0),
                     .tint = entity.tint,
+                    .lightmap = if (entity.lightmap) |lightmap| (if (lightmap.rounds != 0) device.textureIndex(lightmap.shown) else gpu.invalid_id) else gpu.invalid_id,
                     .params = entity.params,
                 };
                 if (mesh.blas != null) {
@@ -4400,16 +4364,14 @@ pub const Renderer = struct {
                             transform[1], transform[5], transform[9],  transform[13],
                             transform[2], transform[6], transform[10], transform[14],
                         },
-                        // See-through meshes are in the structure for rays
-                        // that draw a picture only; probes and shadows
-                        // look for the first of the two mask bits.
+                        // Blended meshes are hidden from probe and shadow rays.
                         .custom_index_and_mask = (@as(u32, @intCast(instance_index)) & 0x00ff_ffff) | (if (mesh.blend) @as(u32, 0x0200_0000) else 0xff00_0000),
                         // Disable facing-based culling: probes need hits from both sides.
                         .offset_and_flags = 0x0100_0000,
                         .blas = device.accelerationAddress(mesh.blas.?),
                     };
-                    // Hash the local copy: the arena is write-combined memory
-                    // and must never be read back.
+                    // Hash the local copy: the arena is write-combined
+                    // memory and must never be read back.
                     tlas_hasher.update(std.mem.asBytes(&tlas_instance));
                     tlas_instances.items[tlas_count] = tlas_instance;
                     tlas_count += 1;
@@ -4417,11 +4379,9 @@ pub const Renderer = struct {
                 continue;
             }
 
-            // Skinned: joint matrices are in model space, so the mesh node's
-            // own transform drops out and only the entity transform remains.
+            // Joint matrices are in model space: only the entity
+            // transform applies.
             const skin = source.skins[instance.skin.?];
-            // The meshes of one entity that share a skin share its joint
-            // matrices and the bounds worked out from them.
             if (shared_skin_entity != entry.entity.index or shared_skin != instance.skin.?) {
                 shared_skin_entity = entry.entity.index;
                 shared_skin = instance.skin.?;
@@ -4452,23 +4412,20 @@ pub const Renderer = struct {
             const padding = model.info.bounds_radius * 0.25 * math.maxScale(entity.transform);
             self.noteMover(scene, .{ center[0], center[1], center[2], shared_radius + padding });
             const current = skin_base + parity * mesh.vertex_count;
-            // Meshlet bounds of the deformed mesh, taken after skinning.
             const own_bounds = self.options.skinned_meshlet_bounds and mesh.meshlet_count != 0;
             const previous = skin_base + (1 - parity) * mesh.vertex_count;
             any_moving = true;
+            staged_previous.items[instance_index] = gpu.affine(entity.previous_transform);
             out.* = .{
-                .transform = entity.transform,
-                .previous_transform = entity.previous_transform,
+                .transform = gpu.affine(entity.transform),
                 .bounding_sphere = .{ center[0], center[1], center[2], shared_radius + padding },
                 .mesh = model.mesh_base + instance.mesh,
                 .material = mesh.material,
                 .vertex_offset = current,
                 .previous_vertex_offset = if (entity.history_frames != 0) previous else current,
-                .flags = gpu.instance_skinned | gpu.instance_moving,
+                .flags = gpu.instance_skinned | gpu.instance_moving | gpu.instance_previous,
                 .bounds_offset = if (own_bounds) bounds_cursor else gpu.invalid_id,
             };
-            // Morph targets: the weights the clip gives this node, else the
-            // mesh's own, unless the entity was given weights by hand.
             var morph_weights = source.meshes[instance.mesh].morph_weights;
             if (mesh.morph_targets != 0) {
                 if (entity.pose) |pose| animation.poseWeights(source, pose, instance.node, morph_weights[0..mesh.morph_targets]);
@@ -4493,8 +4450,6 @@ pub const Renderer = struct {
                 .weights_offset = weights_offset,
             });
             if (self.options.gi_dynamic_geometry and device.ray_tracing and !mesh.blend) {
-                // The deformed vertices are in world space up to the
-                // entity's transform, like the instance record says.
                 var dynamic_desc = geometry_passes.blasDesc(self, mesh);
                 dynamic_desc.vertex_offset = @as(u64, current) * @sizeOf(gpu.Vertex);
                 dynamic_desc.dynamic = true;
@@ -4528,8 +4483,7 @@ pub const Renderer = struct {
             });
         }
 
-        // Groups that follow an entity's pose are rewritten every frame:
-        // the deformed vertices they point at swap places each frame.
+        // Posed groups are rewritten every frame: their vertices swap buffers.
         var driven = false;
         for (scene.groups.items) |group_handle| {
             const group = self.instance_groups.get(group_handle) orelse continue;
@@ -4537,6 +4491,9 @@ pub const Renderer = struct {
         }
         if (driven or records.static_version != scene.static_version or records.entity_count != entity_count) {
             self.scratch_instances.clearRetainingCapacity();
+            self.scratch_static_cull.clearRetainingCapacity();
+            try self.scratch_static_cull.ensureTotalCapacity(self.gpa, scene.static_count);
+            self.scratch_impostors.clearRetainingCapacity();
             scene.static_transparent.clearRetainingCapacity();
             scene.static_transmissive = false;
             try self.scratch_instances.ensureTotalCapacity(self.gpa, scene.static_count);
@@ -4545,18 +4502,28 @@ pub const Renderer = struct {
                 if (group.per_copy == 0) continue;
                 const model = self.models.get(group.model) orelse continue;
                 const source = &model.source.?;
-                // The entity whose pose the copies take, if it is being
-                // posed this frame.
                 const driver = self.groupDriver(group, source.instances.len);
+                var impostor_index: u32 = 0;
+                if (group.impostor) |impostor| if (impostor.baked and group.per_copy == 1 and driver == null) {
+                    const whole = source.meshes[source.instances[0].mesh];
+                    try self.scratch_impostors.append(self.gpa, .{
+                        .center = whole.bounds_center,
+                        .radius = whole.bounds_radius,
+                        .color_texture = device.textureIndex(impostor.color),
+                        .normal_texture = device.textureIndex(impostor.normal),
+                        .pixels = impostor.pixels,
+                    });
+                    impostor_index = @intCast(self.scratch_impostors.items.len);
+                };
                 for (group.transforms, 0..) |placement, copy_index| {
                     const tint: u32 = if (group.tints.len == group.transforms.len) group.tints[copy_index] else 0xffffffff;
                     const params: [4]f32 = if (group.params.len == group.transforms.len) group.params[copy_index] else .{ 0, 0, 0, 0 };
                     var noted = false;
                     for (source.instances, 0..) |instance, model_instance| {
                         const mesh = model.meshes[instance.mesh];
+                        var world = math.mul(placement, model.node_world[instance.node]);
                         var record = gpu.Instance{
-                            .transform = math.mul(placement, model.node_world[instance.node]),
-                            .previous_transform = undefined,
+                            .transform = gpu.affine(world),
                             .bounding_sphere = .{ 0, 0, 0, 0 },
                             .mesh = model.mesh_base + instance.mesh,
                             .material = mesh.material,
@@ -4567,30 +4534,32 @@ pub const Renderer = struct {
                             .tint = tint,
                             .params = params,
                         };
-                        var center = math.transformPoint(record.transform, source.meshes[instance.mesh].bounds_center);
+                        var center = math.transformPoint(world, source.meshes[instance.mesh].bounds_center);
                         const skin_base = if (driver) |entity| entity.skin_offsets[model_instance] else no_skin;
                         if (skin_base != no_skin) {
-                            // Deformed vertices are in model space: only the
-                            // copy's own placement applies.
                             const entity = driver.?;
                             const current = skin_base + parity * mesh.vertex_count;
                             center = math.transformPoint(placement, entity.skin_bounds[0..3].*);
                             const radius = entity.skin_bounds[3] * math.maxScale(placement);
-                            record.transform = placement;
+                            world = placement;
+                            record.transform = gpu.affine(placement);
                             record.bounding_sphere = .{ center[0], center[1], center[2], radius };
                             record.vertex_offset = current;
                             record.previous_vertex_offset = if (entity.history_frames != 0) skin_base + (1 - parity) * mesh.vertex_count else current;
                             record.flags = gpu.instance_skinned | gpu.instance_moving;
-                            // The bounds are in model space too, so the
-                            // copies share the entity's.
                             record.bounds_offset = entity.bounds_offsets[model_instance];
                             any_moving = true;
                             if (!noted) self.noteMover(scene, record.bounding_sphere);
                             noted = true;
                         }
-                        record.previous_transform = record.transform;
+                        const range = scene.static_ranges.items[self.scratch_instances.items.len];
+                        self.scratch_static_cull.appendAssumeCapacity(.{
+                            .sphere = if (skin_base != no_skin) record.bounding_sphere else .{ center[0], center[1], center[2], source.meshes[instance.mesh].bounds_radius * math.maxScale(world) },
+                            .first_ref = range[0],
+                            .ref_count = range[1],
+                            .impostor = impostor_index,
+                        });
                         if (mesh.blend) {
-                            // Drawn by the forward pass, back to front.
                             if (source.materials[source.meshes[instance.mesh].material].transmission > 0) scene.static_transmissive = true;
                             try scene.static_transparent.append(self.gpa, .{
                                 .instance = @intCast(entity_count + self.scratch_instances.items.len),
@@ -4609,14 +4578,35 @@ pub const Renderer = struct {
                 @as(u64, entity_count) * @sizeOf(gpu.Instance),
                 std.mem.sliceAsBytes(self.scratch_instances.items),
             );
+            if (self.scratch_static_cull.items.len > scene.static_cull_capacity) {
+                if (scene.static_cull) |old| device.destroyBuffer(old);
+                scene.static_cull = null;
+                const capacity: u32 = @intCast(self.scratch_static_cull.items.len + @min(self.scratch_static_cull.items.len / 2, 1 << 16));
+                scene.static_cull = try device.createBuffer(.{
+                    .name = "instance bounds",
+                    .size = @as(u64, capacity) * @sizeOf(gpu.StaticCull),
+                    .usage = .{ .storage = true, .copy_dst = true },
+                });
+                scene.static_cull_capacity = capacity;
+            }
+            if (self.scratch_static_cull.items.len != 0) try device.uploadBuffer(scene.static_cull.?, 0, std.mem.sliceAsBytes(self.scratch_static_cull.items));
+            scene.impostor_count = @intCast(self.scratch_impostors.items.len);
+            if (scene.impostor_count > scene.impostor_table_capacity) {
+                if (scene.impostor_table) |old| device.destroyBuffer(old);
+                scene.impostor_table = null;
+                scene.impostor_table = try device.createBuffer(.{
+                    .name = "impostors",
+                    .size = @as(u64, scene.impostor_count) * @sizeOf(gpu.Impostor),
+                    .usage = .{ .storage = true, .copy_dst = true },
+                });
+                scene.impostor_table_capacity = scene.impostor_count;
+            }
+            if (scene.impostor_count != 0) try device.uploadBuffer(scene.impostor_table.?, 0, std.mem.sliceAsBytes(self.scratch_impostors.items));
             records.static_version = scene.static_version;
             records.entity_count = entity_count;
         }
         if (scene.static_transmissive) scene.transmissive = true;
         try scene.transparent.appendSlice(self.gpa, scene.static_transparent.items);
-        // Instance groups in the ray-tracing structure: their entries are
-        // worked out once per change of the groups and copied in each
-        // frame. Past the limit they are left out, as before.
         if (group_rays) {
             if (driven or scene.static_tlas_version != scene.static_version or scene.static_tlas_base != entity_count) {
                 scene.static_tlas.clearRetainingCapacity();
@@ -4633,9 +4623,6 @@ pub const Renderer = struct {
                             // Counted in step with the instance records above.
                             defer record += 1;
                             if (mesh.blend) continue;
-                            // A copy that follows an entity's pose shares
-                            // that entity's deformed structure, which is in
-                            // model space.
                             const posed: ?rhi.AccelerationStructure = if (driver) |entity| (if (entity.skin_offsets[model_instance] != no_skin and model_instance < entity.skin_blas.len) entity.skin_blas[model_instance] else null) else null;
                             const blas = posed orelse mesh.blas orelse continue;
                             const t = if (posed != null) placement else math.mul(placement, model.node_world[instance.node]);
@@ -4658,23 +4645,20 @@ pub const Renderer = struct {
             if (driven) tlas_hasher.update(std.mem.asBytes(&self.frame_index));
         }
 
-        // Everything drawn this frame becomes next frame's history.
         for (scene.layout.items) |entry| {
             if (!entry.first_of_entity) continue;
             const entity = self.entities.get(entry.entity).?;
-            // How far it travelled this frame, for the water it moves through.
             entity.travelled = math.length(math.sub(entity.transform[12..15].*, entity.previous_transform[12..15].*));
             entity.previous_transform = entity.transform;
             entity.history_frames +|= 1;
         }
-        // Without the GPU's ray tracing, path tracing walks a tree over
-        // the scene's instances, kept up while a view asks for it.
         if (scene.trace_wanted and !device.ray_tracing and self.options.path_tracing_fallback) {
             scene.trace_wanted = false;
             try self.buildSceneTree(scene, instance_records);
         }
         return .{
             .instances = device.bufferAddress(records.buffer.?),
+            .previous_transforms = staged_previous.address,
             .staged_buffer = staged.buffer,
             .staged_instances = staged.offset,
             .staged_size = @as(u64, entity_count) * @sizeOf(gpu.Instance),
@@ -4692,12 +4676,9 @@ pub const Renderer = struct {
 
     // ---------------------------------------------------------------- frame
 
-    /// Renders one frame. Returns false when the frame was skipped because
-    /// the window has no drawable surface right now.
-    ///
-    /// Call from one thread at a time. Other threads may keep using the
-    /// renderer meanwhile: the lock is held only while the frame is being
-    /// recorded, not while waiting for the GPU or the display.
+    /// Renders one frame; false when skipped because the window has no
+    /// drawable surface. Call from one thread at a time; the lock is held
+    /// only while recording, not while waiting for the GPU or display.
     pub fn render(self: *Renderer, desc: FrameDesc) !bool {
         const device = self.device;
         var failure: ?anyerror = null;
@@ -4714,10 +4695,8 @@ pub const Renderer = struct {
             const cpu_start = std.Io.Clock.Timestamp.now(self.io, .awake);
             const frame = try device.startFrame();
             self.renderFrame(frame, desc) catch |err| {
-                // What was recorded before the failure has already changed
-                // what the renderer knows about GPU state (uploads, texture
-                // states, acceleration structures), so the partial frame
-                // is still submitted; only the picture is lost.
+                // Recording already changed tracked GPU state, so the
+                // partial frame is still submitted.
                 failure = err;
                 device.closeFailedFrame();
                 for (self.frame_targets[0..self.frame_target_count]) |target| {
@@ -4730,6 +4709,7 @@ pub const Renderer = struct {
                     else |_| {}
                 };
             };
+            self.stats.indirect_draws = frame.cmd.indirect_draws;
             try device.submitFrame();
             self.stats.cpu_ms = @as(f32, @floatFromInt(cpu_start.untilNow(self.io).raw.nanoseconds)) / 1e6;
             self.frame_index += 1;
@@ -4766,16 +4746,13 @@ pub const Renderer = struct {
             };
         }
         try cmd.flushUploads();
-        // Gaps left in the geometry pools are closed a mesh at a time,
-        // which may move a pool to a smaller buffer: that move is
-        // flushed here too, before anything reads the pool.
+        // Compaction may move a pool; flush before anything reads it.
         if (try self.compactGeometry(cmd)) try cmd.flushUploads();
-        try self.buildPendingBlas(cmd);
+        try self.buildPendingBlas(cmd, frame.index);
         cmd.endScope();
 
         for (desc.views) |view_desc| try self.renderView(frame, view_desc, desc.delta_time, arena);
-        // Reflection probes are photographed after the frame's own views,
-        // so they disturb nothing those rely on, and serve from the next.
+        // After the frame's own views, so probes disturb nothing they rely on.
         try self.captureProbes(frame, desc.delta_time, arena);
         // A frame with no view for the window still has to present something.
         if (frame.backbuffer) |backbuffer| if (!self.targetWritten(backbuffer)) {
@@ -4784,14 +4761,12 @@ pub const Renderer = struct {
         };
     }
 
-    /// The quality level this renderer's GPU can be expected to hold; see
-    /// `Quality.recommended`. Safe from any thread.
+    /// See `Quality.recommended`. Safe from any thread.
     pub fn recommendedQuality(self: *const Renderer) Quality {
         return Quality.recommended(self.device.adapterInfo());
     }
 
-    /// True when the window surface is HDR10 (`Options.hdr_output` was set
-    /// and the display supports it).
+    /// True when the window surface is HDR10.
     pub fn hdrActive(self: *Renderer) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -4830,9 +4805,6 @@ pub const Renderer = struct {
             const scene = self.scenes.get(scene_handle) orelse return error.InvalidScene;
             const view = self.views.get(desc.view orelse self.main_view) orelse return error.InvalidView;
             if (view.last_frame == self.frame_index) return error.ViewUsedTwice;
-            // A view that covers its target tone-maps straight into it. One
-            // that covers a part goes through a texture of its own size, so
-            // its passes never deal with offsets.
             var color = target;
             if (!whole) {
                 if (view.output) |texture| {
@@ -4854,8 +4826,6 @@ pub const Renderer = struct {
                 }
                 color = view.output.?;
             }
-            // The scene may be rendered at a fraction (or a multiple) of
-            // the size it is shown at.
             const render_scale = std.math.clamp(desc.settings.render_scale, 0.25, 2);
             const internal_width: u32 = @max(@as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(region.width)) * render_scale))), 1);
             const internal_height: u32 = @max(@as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(region.height)) * render_scale))), 1);
@@ -4879,7 +4849,6 @@ pub const Renderer = struct {
                     .color = device.textureIndex(color),
                     .bloom = gpu.invalid_id,
                     .bloom_strength = 0,
-                    // Already encoded for this format; copy as is.
                     .encode_srgb = 0,
                     .sharpen = 0,
                     .bloom_scale = 0,
@@ -4902,8 +4871,8 @@ pub const Renderer = struct {
         if (desc.target == .texture) cmd.transition(target, .shader_read);
     }
 
-    /// Draws the 2D/3D draw lists over the finished scene (or over a cleared
-    /// target when there is no scene).
+    /// Draws the draw lists over the finished scene, or over a cleared target
+    /// when there is no scene.
     fn renderDrawLists(self: *Renderer, cmd: *rhi.CommandEncoder, desc: ViewDesc, output: Output, arena: *FrameArena) !void {
         const zone = Zone.start(self.options.profiler, "draw lists");
         defer zone.stop();
@@ -4939,14 +4908,12 @@ pub const Renderer = struct {
             viewport: [2]f32,
             sampler_linear: u32,
             sampler_nearest: u32,
-            /// Scene depth to test against, or `invalid_id`; and where
-            /// the view starts in the target.
+            /// Scene depth to test against, or `invalid_id`.
             depth_texture: u32,
             /// HDR10 targets: brightness of white in nits.
             hdr_paper_white: f32,
             origin: [2]f32,
-            /// 1 to read text from the three-channel field, which keeps
-            /// the corners of glyphs sharp at large sizes.
+            /// 1 to read text from the three-channel field.
             sharp_text: u32,
             pad: u32 = 0,
         };
@@ -4970,15 +4937,15 @@ pub const Renderer = struct {
         if (any_world) {
             const view_matrix = math.lookTo(desc.camera.position, desc.camera.forward, desc.camera.up);
             const inv_view = math.inverse(view_matrix);
-            push.transform = math.mul(math.perspective(desc.camera.fov_y, width / height, desc.camera.near), view_matrix);
+            var projection = math.perspective(desc.camera.fov_y, width / height, desc.camera.near);
+            projection[8] = -desc.camera.lens_shift[0] * height / width;
+            projection[9] = -desc.camera.lens_shift[1];
+            push.transform = math.mul(projection, view_matrix);
             push.camera_right = inv_view[0..3].*;
             push.camera_up = inv_view[4..7].*;
-            // World-space items are depth-tested against the scene.
             try cmd.beginRendering(.{ .color = &.{.{ .texture = output.texture, .load = load, .clear = output.clear }} });
             cmd.setViewport(region.x, region.y, region.width, region.height);
             load = .load;
-            // World-space items are tested against the scene's depth in
-            // the shader, so the scene may be at another resolution.
             push.depth_texture = if (output.depth) |texture| device.textureIndex(texture) else gpu.invalid_id;
             cmd.bindPipeline(pipelines.flat);
             for (desc.draw_lists) |list| try self.drawBatch(cmd, arena, &list.world, &push, region);
@@ -4991,7 +4958,6 @@ pub const Renderer = struct {
                 0,         0,          1, 0,
                 -1,        -1,         0, 1,
             };
-            // Screen-space items are never hidden by the scene.
             push.depth_texture = gpu.invalid_id;
             push.camera_right = .{ 0, 0, 0 };
             push.camera_up = .{ 0, 0, 0 };
@@ -5018,7 +4984,6 @@ pub const Renderer = struct {
             cmd.draw(total, 1, 0, 0);
             return;
         }
-        // One draw per stretch of indices that shares a clip rectangle.
         defer cmd.setScissor(region.x, region.y, region.width, region.height);
         var first: u32 = 0;
         var clip: ?draw_list.Rect = null;
@@ -5039,8 +5004,7 @@ pub const Renderer = struct {
     fn applyClip(self: *Renderer, cmd: *rhi.CommandEncoder, clip: ?draw_list.Rect, region: Region) void {
         _ = self;
         const rect = clip orelse return cmd.setScissor(region.x, region.y, region.width, region.height);
-        // Clip rectangles are in the view's pixels; the scissor is in the
-        // target's, and may not leave the view's region.
+        // Clip rectangles are in view pixels; the scissor is in target pixels.
         const x0 = std.math.clamp(rect.x, 0, @as(f32, @floatFromInt(region.width)));
         const y0 = std.math.clamp(rect.y, 0, @as(f32, @floatFromInt(region.height)));
         const x1 = std.math.clamp(rect.x + rect.width, x0, @as(f32, @floatFromInt(region.width)));
@@ -5077,6 +5041,336 @@ pub const Renderer = struct {
         return entry;
     }
 
+    /// A scene view's frame as a graph of passes (`frame_graph.zig`). When
+    /// the view is path traced, passes whose output the tracer replaces are
+    /// left out.
+    const SceneGraph = struct {
+        const Resource = enum {
+            cull_buffers,
+            simulated,
+            particles_stepped,
+            deformed,
+            culled,
+            visibility,
+            sun_shadows,
+            virtual_shadows,
+            light_clusters,
+            local_shadows,
+            occlusion,
+            probes,
+            lightmaps,
+            gathered_probes,
+            lit,
+            clouded,
+            reflected,
+            opaque_done,
+            impostor_pictures,
+            impostors,
+            hair,
+            liquids,
+            water,
+            transparent,
+            smoke,
+            fogged,
+            particles,
+            transparent_done,
+            traced,
+            resolved,
+            lensed,
+            bloom,
+            picture,
+        };
+        const Graph = frame_graph.Graph(Resource, SceneGraph);
+
+        renderer: *Renderer,
+        pass: *const ScenePass,
+        frame: rhi.Frame,
+        arena: *FrameArena,
+        delta_time: f32,
+        sun: *const SunShadows,
+        lighting: *const Lighting,
+        local_shadows: *const scene_pass.LocalShadows,
+        gi: ?*GiVolume,
+        flags: u32,
+        shadow_tlas: u64,
+        colored_shadows: bool,
+        cloud_address: u64,
+        fluid_list: *gpu.FluidList,
+        shadows_enabled: bool,
+        first_view: bool,
+        fresh_scene: bool,
+        instance_total: u32,
+        count_readback: rhi.Buffer,
+        target: rhi.Texture,
+        target_format: rhi.Format,
+        /// The view's virtual shadow map for this frame, or 0.
+        vsm_params: u64,
+        culling: scene_pass.CullState = undefined,
+        gathered_gi: ?rhi.Texture = null,
+        reflections: ?ReflectionTargets = null,
+        path_traced: bool = false,
+        resolved: rhi.Texture = undefined,
+        bloom_count: usize = 0,
+
+        fn set(comptime resources: anytype) Graph.Set {
+            var result = Graph.Set.initEmpty();
+            inline for (resources) |resource| result.insert(resource);
+            return result;
+        }
+
+        fn run(self: *SceneGraph) !void {
+            // Assumes a view traced last frame is traced this frame too.
+            const tracing = self.pass.settings.path_tracing and !self.pass.debugging and self.pass.view_data.path_traced;
+            const passes = [_]Graph.Pass{
+                .{ .name = "reset culling", .writes = set(.{.cull_buffers}), .run = resetCulling },
+                .{ .name = "simulation", .reads = set(.{.cull_buffers}), .writes = set(.{.simulated}), .always = true, .run = simulate },
+                .{ .name = "particle simulation", .reads = set(.{.simulated}), .writes = set(.{.particles_stepped}), .always = true, .run = stepParticles },
+                .{ .name = "deformed geometry", .reads = set(.{.cull_buffers}), .writes = set(.{.deformed}), .run = deform },
+                .{ .name = "culling", .reads = set(.{ .cull_buffers, .deformed }), .writes = set(.{.culled}), .run = cull },
+                .{ .name = "visibility", .reads = set(.{.culled}), .writes = set(.{.visibility}), .run = drawVisibility },
+                .{ .name = "sun shadows", .reads = set(.{.visibility}), .writes = set(.{.sun_shadows}), .run = sunShadows },
+                .{ .name = "virtual shadows", .reads = set(.{ .visibility, .sun_shadows }), .writes = set(.{.virtual_shadows}), .run = virtualShadows },
+                .{ .name = "light clusters", .reads = set(.{.simulated}), .writes = set(.{.light_clusters}), .run = clusterLights },
+                .{ .name = "local shadows", .reads = set(.{ .visibility, .light_clusters }), .writes = set(.{.local_shadows}), .run = localShadows },
+                .{ .name = "ambient occlusion", .reads = set(.{.visibility}), .writes = set(.{.occlusion}), .always = true, .run = occlusion },
+                .{ .name = "probes", .reads = set(.{ .visibility, .sun_shadows }), .writes = set(.{.probes}), .always = true, .run = updateProbes },
+                .{ .name = "lightmaps", .reads = set(.{.probes}), .writes = set(.{.lightmaps}), .always = true, .run = lightmaps },
+                .{ .name = "probe gather", .reads = set(.{.probes}), .writes = set(.{.gathered_probes}), .run = gatherProbes },
+                .{ .name = "shading", .reads = set(.{ .visibility, .sun_shadows, .virtual_shadows, .local_shadows, .light_clusters, .occlusion, .gathered_probes }), .writes = set(.{.lit}), .run = shade },
+                .{ .name = "clouds", .reads = set(.{.lit}), .writes = set(.{.clouded}), .run = clouds },
+                .{ .name = "reflections", .reads = set(.{.clouded}), .writes = set(.{.reflected}), .run = reflect },
+                .{ .name = "after opaque", .reads = set(.{.reflected}), .writes = set(.{.opaque_done}), .run = afterOpaque },
+                .{ .name = "impostor pictures", .reads = set(.{.cull_buffers}), .writes = set(.{.impostor_pictures}), .always = true, .run = impostorPictures },
+                .{ .name = "impostors", .reads = set(.{ .opaque_done, .impostor_pictures }), .writes = set(.{.impostors}), .run = impostors },
+                .{ .name = "hair", .reads = set(.{.impostors}), .writes = set(.{.hair}), .run = hair },
+                .{ .name = "liquids", .reads = set(.{ .hair, .particles_stepped }), .writes = set(.{.liquids}), .run = liquids },
+                .{ .name = "water", .reads = set(.{.liquids}), .writes = set(.{.water}), .run = water },
+                .{ .name = "transparency", .reads = set(.{.water}), .writes = set(.{.transparent}), .run = transparency },
+                .{ .name = "smoke", .reads = set(.{.transparent}), .writes = set(.{.smoke}), .run = smoke },
+                .{ .name = "fog", .reads = set(.{.smoke}), .writes = set(.{.fogged}), .run = fog },
+                .{ .name = "particles", .reads = set(.{.fogged}), .writes = set(.{.particles}), .run = particles },
+                .{ .name = "after transparency", .reads = set(.{.particles}), .writes = set(.{.transparent_done}), .run = afterTransparency },
+                .{ .name = "path tracing", .reads = if (tracing) set(.{ .lit, .probes }) else set(.{ .transparent_done, .probes }), .writes = set(.{.traced}), .run = trace },
+                .{ .name = "temporal antialiasing", .reads = set(.{.traced}), .writes = set(.{.resolved}), .run = resolve },
+                .{ .name = "lens", .reads = set(.{.resolved}), .writes = set(.{.lensed}), .run = lens },
+                .{ .name = "bloom and exposure", .reads = set(.{.lensed}), .writes = set(.{.bloom}), .run = bloom },
+                .{ .name = "tone mapping", .reads = set(.{.bloom}), .writes = set(.{.picture}), .run = tonemap },
+            };
+            try Graph.run(&passes, set(.{.picture}), self);
+        }
+
+        fn resetCulling(c: *SceneGraph) !void {
+            try geometry_passes.resetCullBuffers(c.renderer, c.pass, c.instance_total);
+        }
+
+        fn simulate(c: *SceneGraph) !void {
+            const p = c.pass;
+            if (c.fresh_scene) try simulation_passes.simulateFluids(c.renderer, p.cmd, p.scene, c.arena, c.delta_time);
+            if (c.fresh_scene) try simulation_passes.simulateWater(c.renderer, p.cmd, p.scene, c.arena, c.delta_time);
+            if (c.fresh_scene) try simulation_passes.simulateLiquids(c.renderer, p.cmd, p.scene, c.arena, c.delta_time);
+            if (c.fresh_scene) try hair_passes.simulateHair(c.renderer, p, c.delta_time);
+            // Built here and stored once: the arena must not be read back.
+            c.fluid_list.* = volume_passes.shadowingFluids(c.renderer, p);
+            // Per view, and after the fluids have been stepped.
+            volume_passes.lightFluids(c.renderer, p, c.lighting);
+        }
+
+        /// Runs after fluids, which may carry particles. Collides with the
+        /// depth this view drew last frame.
+        fn stepParticles(c: *SceneGraph) !void {
+            const p = c.pass;
+            const device = c.renderer.device;
+            if (c.fresh_scene) try particle_passes.simulateParticles(c.renderer, p.cmd, p.scene, c.arena, p.frame_address, c.delta_time, if (p.view.history_valid) device.textureIndex(p.view.depth) else null);
+        }
+
+        fn deform(c: *SceneGraph) !void {
+            if (!c.pass.has_geometry) return;
+            const zone = Zone.start(c.renderer.options.profiler, "deformed geometry");
+            defer zone.stop();
+            try geometry_passes.skinScene(c.renderer, c.pass);
+        }
+
+        fn cull(c: *SceneGraph) !void {
+            c.culling = try geometry_passes.cullScene(c.renderer, c.pass, c.sun, c.lighting, c.local_shadows.draw);
+        }
+
+        fn drawVisibility(c: *SceneGraph) !void {
+            const self = c.renderer;
+            const p = c.pass;
+            const cmd = p.cmd;
+            const scene = p.scene;
+            try geometry_passes.drawSceneVisibility(self, p, c.sun, &c.culling);
+            if (c.first_view) {
+                cmd.copyBuffer(self.cull_counts, c.count_readback, 0, 0, view_count * 2 * @sizeOf(u32));
+                if (scene.seen) |seen| cmd.copyBuffer(seen, c.count_readback, @as(u64, c.instance_total) * @sizeOf(u32), view_count * 2 * @sizeOf(u32), @sizeOf(u32));
+            }
+            if (p.mark_seen) {
+                const slot: usize = @intCast(c.frame.index % rhi.frames_in_flight);
+                cmd.copyBuffer(scene.seen.?, scene.seen_readback[slot].?, 0, 0, @as(u64, c.instance_total) * @sizeOf(u32));
+                scene.seen_tags[slot] = .{ .layout_version = scene.layout_version, .count = c.instance_total, .valid = true };
+            }
+        }
+
+        fn sunShadows(c: *SceneGraph) !void {
+            if (c.shadows_enabled) try shadow_passes.drawSunShadows(c.renderer, c.pass, c.sun);
+        }
+
+        fn virtualShadows(c: *SceneGraph) !void {
+            if (c.vsm_params != 0) try virtual_shadow_passes.draw(c.renderer, c.pass, &c.culling, c.vsm_params);
+        }
+
+        fn clusterLights(c: *SceneGraph) !void {
+            const self = c.renderer;
+            const cmd = c.pass.cmd;
+            if (c.lighting.light_count == 0 and c.pass.scene.decals.items.len == 0) return;
+            cmd.beginScope("light clusters");
+            cmd.bindPipeline(self.pipelines.cluster);
+            cmd.pushConstants(extern struct { frame: u64, z_near: f32, z_ratio: f32 }{
+                .frame = c.pass.frame_address,
+                .z_near = cluster_near,
+                .z_ratio = std.math.pow(f32, cluster_far / cluster_near, 1.0 / @as(f32, gpu.clusters_z)),
+            });
+            cmd.dispatch((gpu.cluster_count + 63) / 64, 1, 1);
+            cmd.sync(.compute_to_all);
+            cmd.endScope();
+        }
+
+        fn localShadows(c: *SceneGraph) !void {
+            if (c.local_shadows.draw) try shadow_passes.drawLocalShadows(c.renderer, c.pass, c.lighting, c.local_shadows);
+        }
+
+        /// First pass to sample depth and the visibility buffer; picks of this
+        /// view are answered here.
+        fn occlusion(c: *SceneGraph) !void {
+            const p = c.pass;
+            p.cmd.transition(p.view.visibility, .shader_read);
+            p.cmd.transition(p.view.depth, .shader_read);
+            geometry_passes.recordPick(c.renderer, p);
+            try shading_passes.ambientOcclusion(c.renderer, p);
+        }
+
+        fn updateProbes(c: *SceneGraph) !void {
+            const self = c.renderer;
+            const p = c.pass;
+            const scene = p.scene;
+            const volume = c.gi orelse return;
+            if (scene.gi_updated_frame == self.frame_index) return;
+            try gi_passes.updateGi(self, p.cmd, scene, volume, p.scene_frame, p.frame_address, p.settings, 0);
+            if (scene.gi_coarse) |*coarse| {
+                if (coarse.frames < 64 or self.frame_index % @max(p.settings.gi_coarse_interval, 1) == 0)
+                    try gi_passes.updateGi(self, p.cmd, scene, coarse, p.scene_frame, p.frame_address, p.settings, 1);
+            }
+            if (scene.gi_middle) |*middle| try gi_passes.updateGi(self, p.cmd, scene, middle, p.scene_frame, p.frame_address, p.settings, 2);
+            scene.gi_updated_frame = self.frame_index;
+        }
+
+        fn lightmaps(c: *SceneGraph) !void {
+            try lightmap_passes.bakeLightmaps(c.renderer, c.pass);
+        }
+
+        /// Optional reduced-resolution probe gather, upsampled by shading.
+        fn gatherProbes(c: *SceneGraph) !void {
+            const self = c.renderer;
+            const p = c.pass;
+            const cmd = p.cmd;
+            if (c.gi == null) return;
+            const texture = p.view.gi_gather orelse return;
+            cmd.beginScope("gi gather");
+            try cmd.beginRendering(.{ .color = &.{.{ .texture = texture, .load = .discard }} });
+            cmd.bindPipeline(self.pipelines.gi_gather);
+            cmd.pushConstants(extern struct { frame: u64, depth: u32, pad: u32 = 0 }{
+                .frame = p.frame_address,
+                .depth = self.device.textureIndex(p.view.depth),
+            });
+            cmd.drawFullscreen();
+            cmd.endRendering();
+            cmd.transition(texture, .shader_read);
+            cmd.endScope();
+            c.gathered_gi = texture;
+        }
+
+        fn shade(c: *SceneGraph) !void {
+            c.reflections = try shading_passes.shadeScene(c.renderer, c.pass, c.lighting, c.flags, c.shadow_tlas, c.colored_shadows, c.gathered_gi);
+        }
+
+        fn clouds(c: *SceneGraph) !void {
+            if (c.cloud_address != 0 and !c.pass.debugging) try volume_passes.drawClouds(c.renderer, c.pass, c.cloud_address);
+        }
+
+        fn reflect(c: *SceneGraph) !void {
+            if (c.reflections) |targets| try shading_passes.drawReflections(c.renderer, c.pass, targets, c.gi != null);
+        }
+
+        fn afterOpaque(c: *SceneGraph) !void {
+            const p = c.pass;
+            try c.renderer.runPasses(p, .after_opaque, p.view.hdr, hdr_format, p.width, p.height);
+        }
+
+        fn impostorPictures(c: *SceneGraph) !void {
+            try impostor_passes.bakeImpostors(c.renderer, c.pass);
+        }
+
+        fn impostors(c: *SceneGraph) !void {
+            try impostor_passes.drawImpostors(c.renderer, c.pass);
+        }
+
+        fn hair(c: *SceneGraph) !void {
+            try hair_passes.drawHair(c.renderer, c.pass);
+        }
+
+        fn liquids(c: *SceneGraph) !void {
+            try transparency_passes.drawLiquids(c.renderer, c.pass);
+        }
+
+        fn water(c: *SceneGraph) !void {
+            try transparency_passes.drawWater(c.renderer, c.pass);
+        }
+
+        fn transparency(c: *SceneGraph) !void {
+            try transparency_passes.drawTransparency(c.renderer, c.pass);
+        }
+
+        fn smoke(c: *SceneGraph) !void {
+            try volume_passes.drawFluids(c.renderer, c.pass);
+        }
+
+        fn fog(c: *SceneGraph) !void {
+            if (c.pass.settings.fog_density > 0 and !c.pass.debugging) try volume_passes.drawFog(c.renderer, c.pass);
+        }
+
+        fn particles(c: *SceneGraph) !void {
+            const p = c.pass;
+            if (!p.debugging) try particle_passes.drawParticles(c.renderer, p.cmd, p.scene, p.view, p.frame_address, p.desc.camera.position);
+        }
+
+        fn afterTransparency(c: *SceneGraph) !void {
+            const p = c.pass;
+            try c.renderer.runPasses(p, .after_transparency, p.view.hdr, hdr_format, p.width, p.height);
+        }
+
+        fn trace(c: *SceneGraph) !void {
+            c.path_traced = try path_tracing_pass.pathTrace(c.renderer, c.pass);
+        }
+
+        fn resolve(c: *SceneGraph) !void {
+            c.resolved = try post_passes.resolveTemporal(c.renderer, c.pass, c.path_traced);
+        }
+
+        fn lens(c: *SceneGraph) !void {
+            c.resolved = try post_passes.lensEffects(c.renderer, c.pass, c.resolved);
+        }
+
+        fn bloom(c: *SceneGraph) !void {
+            c.bloom_count = try post_passes.bloomAndExposure(c.renderer, c.pass, c.resolved);
+        }
+
+        fn tonemap(c: *SceneGraph) !void {
+            const p = c.pass;
+            try post_passes.tonemapScene(c.renderer, p, c.resolved, c.bloom_count, c.target, c.target_format);
+            try c.renderer.runPasses(p, .after_tonemap, c.target, c.target_format, p.output_width, p.output_height);
+        }
+    };
+
     /// Draws `scene` through `view` into `target` and returns the address
     /// of the frame constants it used.
     fn renderScene(
@@ -5100,14 +5394,11 @@ pub const Renderer = struct {
         const device = self.device;
         const cmd = frame.cmd;
         var settings = desc.settings;
-        // Path tracing on the GPU's ray tracing uses the structure that
-        // bounce light keeps up to date.
+        // Path tracing reuses the acceleration structure GI keeps up to date.
         if (settings.path_tracing and device.ray_tracing) settings.global_illumination = true;
         const first_view = self.frame_scene_views == 0;
         self.frame_scene_views += 1;
 
-        // Work that belongs to the scene, not the camera, happens for the
-        // first view that shows the scene this frame.
         cmd.beginScope("scene update");
         const fresh_scene = scene.prepared_frame != self.frame_index;
         if (fresh_scene) {
@@ -5116,7 +5407,7 @@ pub const Renderer = struct {
         }
         const scene_frame = scene.prepared;
         try cmd.flushUploads();
-        try self.buildPendingBlas(cmd);
+        try self.buildPendingBlas(cmd, frame.index);
         cmd.endScope();
 
         const scales = EffectScales{
@@ -5134,7 +5425,8 @@ pub const Renderer = struct {
             .liquid = scene.liquids.items.len != 0,
             .output_width = output_width,
             .output_height = output_height,
-            .temporal_upscale = settings.upscaling == .temporal and settings.temporal_antialiasing and settings.debug_view == .none and (output_width > width or output_height > height),
+            .fsr = settings.upscaling == .fsr,
+            .temporal_upscale = (settings.upscaling == .temporal or settings.upscaling == .fsr2 or settings.upscaling == .fsr3) and settings.temporal_antialiasing and settings.debug_view == .none and (output_width > width or output_height > height),
         };
         if (view_data.state == null or view_data.state.?.width != width or view_data.state.?.height != height or
             !std.meta.eql(view_data.state.?.scales, scales))
@@ -5143,60 +5435,56 @@ pub const Renderer = struct {
             view_data.state = null;
             view_data.state = try ViewState.init(device, width, height, scales);
             view_data.exposure_reset = true;
+            view_data.camera_known = false;
         }
         const view = &view_data.state.?;
         // History from a frame this view sat out no longer lines up.
         if (view_data.last_frame +% 1 != self.frame_index) {
+            view_data.camera_known = false;
             view.history_valid = false;
             view.ao_history_valid = false;
             if (view.reflections) |*targets| targets.history_valid = false;
             if (view.clouds) |*targets| targets.history_valid = false;
         }
 
-        // ------------------------------------------------------ frame data
         const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
         const view_matrix = math.lookTo(desc.camera.position, desc.camera.forward, desc.camera.up);
-        const proj_unjittered = math.perspective(desc.camera.fov_y, aspect, desc.camera.near);
+        var proj_unjittered = math.perspective(desc.camera.fov_y, aspect, desc.camera.near);
+        // clip.w is -view.z, hence the sign.
+        const lens_shift = [2]f32{ desc.camera.lens_shift[0] / aspect, desc.camera.lens_shift[1] };
+        proj_unjittered[8] = -lens_shift[0];
+        proj_unjittered[9] = -lens_shift[1];
         var jitter: [2]f32 = .{ 0, 0 };
         var proj = proj_unjittered;
         const debugging = settings.debug_view != .none;
         if (settings.temporal_antialiasing and !debugging) {
-            // Eight positions cover a pixel; when the picture is being built
-            // at a larger size, proportionally more are needed to cover
-            // each of the output's pixels.
             const upscale_area = @as(f32, @floatFromInt(output_width)) * @as(f32, @floatFromInt(output_height)) / (@as(f32, @floatFromInt(width)) * @as(f32, @floatFromInt(height)));
-            const jitter_count: u64 = if (settings.upscaling == .temporal and upscale_area > 1) @intFromFloat(@min(@ceil(8 * upscale_area), 64)) else 8;
+            const jitter_count: u64 = if ((settings.upscaling == .temporal or settings.upscaling == .fsr2 or settings.upscaling == .fsr3) and upscale_area > 1) @intFromFloat(@min(@ceil(8 * upscale_area), 64)) else 8;
             const sample: u32 = @intCast(view_data.frames % jitter_count + 1);
             const offset = [2]f32{ halton(sample, 2) - 0.5, halton(sample, 3) - 0.5 };
             jitter = .{ offset[0] / @as(f32, @floatFromInt(width)), offset[1] / @as(f32, @floatFromInt(height)) };
             // NDC shift of +2*jitter; clip.w is -view.z, hence the sign.
-            proj[8] = -2 * jitter[0];
-            proj[9] = -2 * jitter[1];
+            proj[8] -= 2 * jitter[0];
+            proj[9] -= 2 * jitter[1];
         }
         const view_proj = math.mul(proj, view_matrix);
         const view_proj_unjittered = math.mul(proj_unjittered, view_matrix);
         {
-            // The scene was shifted since this view last drew it: express
-            // last frame's camera in the new coordinates.
             var since: Vec3 = undefined;
             inline for (0..3) |axis| since[axis] = @floatCast(view_data.scene_origin[axis] - scene.origin[axis]);
             if (since[0] != 0 or since[1] != 0 or since[2] != 0)
                 view_data.previous_view_proj = math.mul(view_data.previous_view_proj, math.translation(math.scale(since, -1)));
             view_data.scene_origin = scene.origin;
         }
-        if (!view.history_valid) view_data.previous_view_proj = view_proj_unjittered;
+        if (!view_data.camera_known) view_data.previous_view_proj = view_proj_unjittered;
 
         const sun_travel = math.normalize(scene.sun.direction);
         const sun_enabled = scene.sun.intensity > 0 and math.dot(sun_travel, sun_travel) > 0.5;
         const shadows_enabled = settings.shadows and sun_enabled and scene.ref_count != 0;
         const has_geometry = scene.ref_count != 0;
-        // Which instances the cameras draw, for texture streaming that
-        // skips what is hidden.
         const instance_total: u32 = @as(u32, @intCast(scene.layout.items.len)) + scene.static_count;
         const mark_seen = has_geometry and instance_total != 0 and
             (if (self.options.texture_streaming) |streaming| streaming.skip_occluded else false);
-        // How levels of detail are chosen in the camera's own pass, and
-        // the band over which two of them cross-fade.
         const lod_scale: f32 = if (settings.lod_error_pixels > 0)
             @abs(proj_unjittered[5]) * @as(f32, @floatFromInt(height)) * 0.5 / settings.lod_error_pixels
         else
@@ -5222,6 +5510,7 @@ pub const Renderer = struct {
             .aspect = aspect,
             .view_matrix = view_matrix,
             .proj_unjittered = proj_unjittered,
+            .jitter = jitter,
             .view_proj = view_proj,
             .view_proj_unjittered = view_proj_unjittered,
             .sun_travel = sun_travel,
@@ -5243,15 +5532,12 @@ pub const Renderer = struct {
                 .kind = .@"2d_array",
             });
         }
-        // Switching it on or off changes what the cascades hold.
         if (view_data.shadows_colored != colored_shadows) {
             view_data.shadows_colored = colored_shadows;
             view_data.cascade_cache.valid = false;
         }
         const cascade_plan = shadow_passes.updateCascades(self, &pass, shadows_enabled);
         const cascades = view_data.cascade_cache.cascades;
-        // Each view keeps its own cascades: they follow its camera and are
-        // reused between its frames.
         if (shadows_enabled and view_data.shadow_map == null) {
             view_data.shadow_map = try device.createTexture(.{
                 .name = "shadow cascades",
@@ -5281,16 +5567,15 @@ pub const Renderer = struct {
         const gi = try gi_passes.prepareGi(self, scene, scene_frame, settings, desc.camera.position);
         const gi_coarse: ?*const GiVolume = if (gi != null) (if (scene.gi_coarse) |*volume| volume else null) else null;
         const gi_middle: ?*const GiVolume = if (gi_coarse != null) (if (scene.gi_middle) |*volume| volume else null) else null;
-        // Lights with a length cast shadows a point's shadow map cannot
-        // show; where rays are to be had they are shadowed by rays instead.
         const traced_shadows = settings.ray_traced_light_shadows and gi != null and device.ray_tracing and scene.tlas != null;
         const lighting = try self.prepareLights(scene, arena, settings.shadows, desc.camera.position, traced_shadows);
         const local_shadows = shadow_passes.planLocalShadows(self, &pass, &lighting);
-        // The cloud layer is described before the frame constants are
-        // written, because shading needs it for the shadows it casts.
+        // Before the frame constants: shading needs the clouds' shadows.
         const cloud_address = try volume_passes.prepareClouds(self, &pass);
         var flags: u32 = 0;
         if (shadows_enabled) flags |= gpu.frame_shadows;
+        const vsm_params: u64 = if (shadows_enabled and settings.virtual_shadow_maps and !debugging) try virtual_shadow_passes.prepare(self, &pass, sun_travel) else 0;
+        if (vsm_params != 0) flags |= gpu.frame_vsm;
         if (settings.ambient_occlusion) flags |= gpu.frame_ambient_occlusion;
         if (environment != null) flags |= gpu.frame_environment;
         if (gi != null) flags |= gpu.frame_gi;
@@ -5298,12 +5583,11 @@ pub const Renderer = struct {
         if (settings.specular_antialiasing) flags |= gpu.frame_specular_aa;
         if (settings.screen_space_reflections and !debugging) flags |= gpu.frame_ssr;
         if (settings.gi_local_lights) flags |= gpu.frame_gi_local_lights;
-        // Rays per pixel toward a light with a size, in four bits of the flags.
+        // Bits 16-19: shadow rays per pixel toward a light with a size.
         flags |= std.math.clamp(settings.light_shadow_rays, 1, 15) << 16;
-        // How many local lights bounce, in ten more.
+        // Bits 20-29: how many local lights bounce.
         flags |= std.math.clamp(settings.gi_bounce_lights, 1, 1023) << 20;
         const probes = try shading_passes.reflectionProbeList(self, &pass);
-        // Filled in once the fluids have been stepped, further down.
         const fluid_list = try arena.alloc(device, gpu.FluidList, 1);
         fluid_list.items[0] = .{};
         if (settings.fluid_shadows and scene.fluids.items.len != 0) flags |= gpu.frame_fluid_shadows;
@@ -5379,7 +5663,6 @@ pub const Renderer = struct {
             .gi3_offsets = if (gi_middle) |volume| (if (settings.gi_probe_relocation and volume.offsets_valid) device.textureIndex(volume.offsets[volume.offset_turn]) else gpu.invalid_id) else gpu.invalid_id,
             .gi2_offsets = if (gi_coarse) |volume| (if (settings.gi_probe_relocation and volume.offsets_valid) device.textureIndex(volume.offsets[volume.offset_turn]) else gpu.invalid_id) else gpu.invalid_id,
             .shadow_taps = settings.shadow_samples,
-            // Also what the soft shadow filter compares neighbours by.
             .contact_depth = if (!debugging) device.textureIndex(view.depth) else gpu.invalid_id,
             .contact_length = @max(settings.contact_shadows, 0),
             .tlas_low = @truncate(shadow_tlas),
@@ -5394,6 +5677,8 @@ pub const Renderer = struct {
             .meshes = device.bufferAddress(self.meshes.buffer),
             .materials = device.bufferAddress(self.materials.buffer),
             .instances = scene_frame.instances,
+            .previous_transforms = scene_frame.previous_transforms,
+            .vsm = vsm_params,
             .meshlet_refs = if (scene.refs) |buffer| device.bufferAddress(buffer) else 0,
             .lights = lighting.lights,
             .clusters = device.bufferAddress(self.clusters),
@@ -5409,119 +5694,47 @@ pub const Renderer = struct {
         const frame_address = constants.address;
         pass.frame_address = frame_address;
 
-        // ----------------------------------------------- skinning and culling
-        // Draw counts from two frames ago, for statistics.
         const count_readback = self.count_readback[@intCast(frame.index % rhi.frames_in_flight)];
         if (first_view) {
             const counted = device.mappedSlice(u32, count_readback);
             self.stats.meshlets_drawn = counted[0] + counted[1] + counted[main_late_view * 2] + counted[main_late_view * 2 + 1];
             self.stats.shadow_meshlets_drawn = 0;
             for (1..1 + gpu.cascade_count) |index| self.stats.shadow_meshlets_drawn += counted[index * 2] + counted[index * 2 + 1];
+            self.stats.instances_drawn = counted[view_count * 2];
         }
 
-        try geometry_passes.resetCullBuffers(self, &pass, instance_total);
-        if (fresh_scene) try simulation_passes.simulateFluids(self, cmd, scene, arena, delta_time);
-        if (fresh_scene) try simulation_passes.simulateWater(self, cmd, scene, arena, delta_time);
-        if (fresh_scene) try simulation_passes.simulateLiquids(self, cmd, scene, arena, delta_time);
-        // Built here and stored once: the arena must not be read back.
-        fluid_list.items[0] = volume_passes.shadowingFluids(self, &pass);
-        // Each view has its own light records, so the fires' light is
-        // worked out per view, after the fluids have been stepped.
-        volume_passes.lightFluids(self, &pass, &lighting);
-        // Particles may be carried by a fluid, so they come second. They
-        // collide with the depth this view drew last frame.
-        if (fresh_scene) try particle_passes.simulateParticles(self, cmd, scene, arena, frame_address, delta_time, if (view.history_valid) device.textureIndex(view.depth) else null);
-        if (has_geometry) {
-            const zone = Zone.start(self.options.profiler, "deformed geometry");
-            defer zone.stop();
-            try geometry_passes.skinScene(self, &pass);
-        }
-        const culling = try geometry_passes.cullScene(self, &pass, &sun_shadows, &lighting, local_shadows.draw);
-
-        try geometry_passes.drawSceneVisibility(self, &pass, &sun_shadows, &culling);
-        if (first_view) cmd.copyBuffer(self.cull_counts, count_readback, 0, 0, view_count * 2 * @sizeOf(u32));
-        if (mark_seen) {
-            // Every view of the scene adds to it; the last copy has all.
-            const slot: usize = @intCast(frame.index % rhi.frames_in_flight);
-            cmd.copyBuffer(scene.seen.?, scene.seen_readback[slot].?, 0, 0, @as(u64, instance_total) * @sizeOf(u32));
-            scene.seen_tags[slot] = .{ .layout_version = scene.layout_version, .count = instance_total, .valid = true };
-        }
-
-        if (shadows_enabled) try shadow_passes.drawSunShadows(self, &pass, &sun_shadows);
-
-        if (lighting.light_count != 0 or scene.decals.items.len != 0) {
-            cmd.beginScope("light clusters");
-            cmd.bindPipeline(self.pipelines.cluster);
-            cmd.pushConstants(extern struct { frame: u64, z_near: f32, z_ratio: f32 }{
-                .frame = frame_address,
-                .z_near = cluster_near,
-                .z_ratio = std.math.pow(f32, cluster_far / cluster_near, 1.0 / @as(f32, gpu.clusters_z)),
-            });
-            cmd.dispatch((gpu.cluster_count + 63) / 64, 1, 1);
-            cmd.sync(.compute_to_all);
-            cmd.endScope();
-        }
-        if (local_shadows.draw) try shadow_passes.drawLocalShadows(self, &pass, &lighting, &local_shadows);
-
-        // The passes below sample depth and the visibility buffer.
-        cmd.transition(view.visibility, .shader_read);
-        cmd.transition(view.depth, .shader_read);
-
-        geometry_passes.recordPick(self, &pass);
-        try shading_passes.ambientOcclusion(self, &pass);
-
-        if (gi) |volume| if (scene.gi_updated_frame != self.frame_index) {
-            try gi_passes.updateGi(self, cmd, scene, volume, scene_frame, frame_address, settings, 0);
-            // The coarse grid can be refreshed less often than the fine one.
-            if (scene.gi_coarse) |*coarse| {
-                if (coarse.frames < 64 or self.frame_index % @max(settings.gi_coarse_interval, 1) == 0)
-                    try gi_passes.updateGi(self, cmd, scene, coarse, scene_frame, frame_address, settings, 1);
-            }
-            if (scene.gi_middle) |*middle| try gi_passes.updateGi(self, cmd, scene, middle, scene_frame, frame_address, settings, 2);
-            scene.gi_updated_frame = self.frame_index;
+        var graph = SceneGraph{
+            .renderer = self,
+            .pass = &pass,
+            .frame = frame,
+            .arena = arena,
+            .delta_time = delta_time,
+            .sun = &sun_shadows,
+            .lighting = &lighting,
+            .local_shadows = &local_shadows,
+            .gi = gi,
+            .flags = flags,
+            .shadow_tlas = shadow_tlas,
+            .colored_shadows = colored_shadows,
+            .cloud_address = cloud_address,
+            .fluid_list = &fluid_list.items[0],
+            .shadows_enabled = shadows_enabled,
+            .first_view = first_view,
+            .fresh_scene = fresh_scene,
+            .instance_total = instance_total,
+            .count_readback = count_readback,
+            .target = target,
+            .target_format = target_format,
+            .vsm_params = vsm_params,
         };
-
-        // Optional reduced-resolution probe gather, upsampled by shading.
-        var gathered_gi: ?rhi.Texture = null;
-        if (gi != null) if (view.gi_gather) |texture| {
-            cmd.beginScope("gi gather");
-            try cmd.beginRendering(.{ .color = &.{.{ .texture = texture, .load = .discard }} });
-            cmd.bindPipeline(self.pipelines.gi_gather);
-            cmd.pushConstants(extern struct { frame: u64, depth: u32, pad: u32 = 0 }{
-                .frame = frame_address,
-                .depth = device.textureIndex(view.depth),
-            });
-            cmd.drawFullscreen();
-            cmd.endRendering();
-            cmd.transition(texture, .shader_read);
-            cmd.endScope();
-            gathered_gi = texture;
-        };
-
-        const reflections = try shading_passes.shadeScene(self, &pass, &lighting, flags, shadow_tlas, colored_shadows, gathered_gi);
-        if (cloud_address != 0 and !debugging) try volume_passes.drawClouds(self, &pass, cloud_address);
-        if (reflections) |targets| try shading_passes.drawReflections(self, &pass, targets, gi != null);
-        try self.runPasses(&pass, .after_opaque, view.hdr, hdr_format, width, height);
-
-        try transparency_passes.drawLiquids(self, &pass);
-        try transparency_passes.drawWater(self, &pass);
-        try transparency_passes.drawTransparency(self, &pass);
-        try volume_passes.drawFluids(self, &pass);
-        if (settings.fog_density > 0 and !debugging) try volume_passes.drawFog(self, &pass);
-        if (!debugging) try particle_passes.drawParticles(self, cmd, scene, view, frame_address, desc.camera.position);
-        try self.runPasses(&pass, .after_transparency, view.hdr, hdr_format, width, height);
-
-        const path_traced = try path_tracing_pass.pathTrace(self, &pass);
-        var resolved = try post_passes.resolveTemporal(self, &pass, path_traced);
-        resolved = try post_passes.lensEffects(self, &pass, resolved);
-        const bloom_count = try post_passes.bloomAndExposure(self, &pass, resolved);
-        try post_passes.tonemapScene(self, &pass, resolved, bloom_count, target, target_format);
-        try self.runPasses(&pass, .after_tonemap, target, target_format, output_width, output_height);
+        try graph.run();
+        view_data.path_traced = graph.path_traced;
 
         view_data.previous_view_proj = view_proj_unjittered;
         view_data.previous_jitter = jitter;
         view_data.frames += 1;
         view_data.last_frame = self.frame_index;
+        view_data.camera_known = true;
         if (first_view) {
             self.stats.instances = instance_total;
             self.stats.meshlets = scene.ref_count;
@@ -5554,7 +5767,6 @@ pub const Renderer = struct {
             ran = true;
         }
         if (!ran) return;
-        // Whatever the pass attached goes back to being readable.
         if (stage != .after_tonemap) cmd.transition(color, .shader_read);
         cmd.transition(p.view.depth, .shader_read);
         cmd.transition(p.view.motion, .shader_read);
@@ -5581,8 +5793,6 @@ pub const Renderer = struct {
         const tiles_per_side = std.math.clamp(self.options.local_shadow_tiles_per_side, 1, local_shadow_tiles_per_side);
         const tile_scale = 1.0 / @as(f32, @floatFromInt(tiles_per_side));
         const axes = [6]Vec3{ .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 } };
-        // Shadow tiles go to the lights that matter most to this camera:
-        // bright, far-reaching and near. The rest are lit without shadows.
         const granted = try self.gpa.alloc(bool, scene.lights.items.len);
         defer self.gpa.free(granted);
         @memset(granted, false);
@@ -5593,7 +5803,6 @@ pub const Renderer = struct {
             var candidate_count: usize = 0;
             for (scene.lights.items, 0..) |light, index| {
                 if (!light.cast_shadows or light.kind == .directional or light.kind == .rectangle) continue;
-                // A tube: rays aim along its length, a shadow map sees a point.
                 if (traced_shadows and light.kind != .spot and light.source_length > 0) continue;
                 const away = math.sub(light.position, camera_position);
                 candidates[candidate_count] = .{ .index = @intCast(index), .score = light.intensity * @max(light.color[0], @max(light.color[1], light.color[2])) * light.range / (math.dot(away, away) + 1) };
@@ -5639,7 +5848,6 @@ pub const Renderer = struct {
             };
             const faces: u32 = if (light.kind == .spot) 1 else 6;
             if (!has_tiles) {
-                // No shadow map for this one: a ray does it where it can.
                 if (shadows and light.cast_shadows) out.flags |= gpu.light_traced_shadow;
                 continue;
             }
@@ -5647,13 +5855,11 @@ pub const Renderer = struct {
             for (0..faces) |face| {
                 const forward = if (light.kind == .spot) direction else axes[face];
                 const up: Vec3 = if (@abs(forward[1]) > 0.99) .{ 0, 0, 1 } else .{ 0, 1, 0 };
-                // Point faces are slightly wider than 90 degrees so filter
-                // taps near an edge still land inside the tile.
+                // Over 90 degrees so edge filter taps stay inside the tile.
                 const fov: f32 = if (light.kind == .spot) @min(light.outer_angle * 2 + 0.05, 3.0) else 1.62;
                 const view_proj = math.mul(math.perspective(fov, 1, 0.05), math.lookTo(light.position, forward, up));
                 const index = result.tile_count;
                 var cull = cullView(view_proj, light.position, .perspective);
-                // Nothing beyond the light's range can cast a visible shadow.
                 cull.planes[5] = .{ -forward[0], -forward[1], -forward[2], math.dot(forward, light.position) + light.range };
                 cull.plane_count = 6;
                 result.tile_views[index] = cull;
@@ -5670,9 +5876,7 @@ pub const Renderer = struct {
                 result.tile_count += 1;
             }
         }
-        // Fires light the scene: one light record per fluid that asks for
-        // it. Its color and center are written on the GPU from the fluid
-        // itself (fluid_light.comp); everything else is set here.
+        // Fire lights: fluid_light.comp writes their color and center.
         var fluid_slot: usize = scene.lights.items.len;
         for (scene.fluids.items) |item| {
             const state = self.fluids.get(item) orelse continue;
@@ -5683,7 +5887,6 @@ pub const Renderer = struct {
                 .position = .{ t[12], t[13], t[14] },
                 .range = if (state.desc.light_range > 0) state.desc.light_range else height * 3,
                 .color = .{ 0, 0, 0 },
-                // Shadowed by rays where that is available.
                 .flags = gpu.light_fire | (if (shadows) gpu.light_traced_shadow else 0),
                 .source_radius = height * @max(state.desc.light_size, 0),
             };
@@ -5692,14 +5895,9 @@ pub const Renderer = struct {
         return result;
     }
 
-    /// Builds acceleration structures for models that just finished loading.
-    /// Must run after their geometry uploads have been recorded.
-    /// Closes gaps in the vertex and index pools: when a quarter or more
-    /// of what a pool spans lies free between meshes, the mesh nearest
-    /// its end is copied into the first gap that holds it, one mesh a
-    /// pool each frame. The end then draws back and the pool can move to
-    /// a smaller buffer (see `Pool.trim`). Returns whether anything was
-    /// moved.
+    /// Closes gaps in the vertex and index pools: when a quarter or more of
+    /// a pool's span is free, moves its last mesh into the first gap that
+    /// holds it, one mesh per pool per frame. Returns whether anything moved.
     fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
         var moved = false;
         inline for (.{ "vertices", "indices" }) |name| {
@@ -5707,9 +5905,7 @@ pub const Renderer = struct {
             const vertices = comptime std.mem.eql(u8, name, "vertices");
             var free_inside: u64 = 0;
             for (pool.ranges.free_ranges.items) |range| free_inside += range.count;
-            // Small pools and small gaps are not worth a copy.
             if (free_inside * 4 >= pool.ranges.top and @as(u64, pool.ranges.top) * pool.stride >= 1 << 20) find: {
-                // The mesh that ends the pool.
                 var last_entry: ?*ModelEntry = null;
                 var last_mesh: usize = 0;
                 var last_end: u32 = 0;
@@ -5725,17 +5921,13 @@ pub const Renderer = struct {
                     }
                 };
                 const entry = last_entry orelse break :find;
-                // Something else ends the pool (a posed copy of a skinned
-                // mesh), or its structure is still to be built from where
-                // it lies.
                 if (last_end != pool.ranges.top or entry.blas_pending) break :find;
                 const mesh = &entry.meshes[last_mesh];
                 const count = if (vertices) mesh.vertex_count else mesh.index_count;
                 const old = if (vertices) mesh.vertex_offset else mesh.index_offset;
                 if (count == 0 or @as(u64, count) * pool.stride > 16 << 20) break :find;
                 const new = pool.ranges.alloc(count) orelse break :find;
-                // Only into a gap wholly before it: a copy within one
-                // buffer may not overlap itself.
+                // Only into a gap wholly before it: the copy may not overlap.
                 if (new + count > old) {
                     pool.ranges.free(self.gpa, new, count);
                     break :find;
@@ -5745,7 +5937,6 @@ pub const Renderer = struct {
                 cmd.sync(.transfer_to_all);
                 if (vertices) mesh.vertex_offset = new else mesh.index_offset = new;
                 if (!vertices) {
-                    // The mesh's record names where its indices start.
                     const source_mesh = entry.source.?.meshes[last_mesh];
                     const record = gpu.Mesh{
                         .center = source_mesh.bounds_center,
@@ -5757,8 +5948,7 @@ pub const Renderer = struct {
                     };
                     try self.meshes.write(self.device, entry.mesh_base + @as(u32, @intCast(last_mesh)), std.mem.asBytes(&record));
                 }
-                // Instance groups keep their records between frames, and
-                // those name where the vertices are.
+                // Instance groups cache records that name vertex offsets.
                 if (vertices) for (self.scenes.slots.items) |*slot| if (slot.value) |*scene| {
                     scene.static_version += 1;
                 };
@@ -5770,30 +5960,76 @@ pub const Renderer = struct {
         return moved;
     }
 
-    fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder) !void {
+    /// Builds acceleration structures of newly loaded models. With
+    /// `frame_index` and a second GPU queue they build asynchronously and are
+    /// adopted when done; otherwise `cmd` builds them at once. Must run after
+    /// their geometry uploads have been recorded.
+    fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: ?u64) !void {
         if (self.blas_pending == 0) return;
-        self.blas_pending = 0;
+        const device = self.device;
+        var still_pending: u32 = 0;
+        var finished = false;
         for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
             if (!entry.blas_pending) continue;
-            entry.blas_pending = false;
-            for (entry.meshes) |mesh| if (mesh.blas) |blas| try cmd.buildBlas(blas, geometry_passes.blasDesc(self, mesh));
+            const frame_now = frame_index orelse {
+                if (entry.blas_job) |job| {
+                    device.releaseDetached(job);
+                    entry.blas_job = null;
+                } else for (entry.meshes) |mesh| {
+                    if (mesh.blas_building orelse mesh.blas) |blas| try cmd.buildBlas(blas, geometry_passes.blasDesc(self, mesh));
+                }
+                finished = self.adoptBlas(entry) or finished;
+                continue;
+            };
+            if (entry.blas_job) |job| {
+                if (!device.detachedDone(job)) {
+                    still_pending += 1;
+                    continue;
+                }
+                device.releaseDetached(job);
+                entry.blas_job = null;
+                finished = self.adoptBlas(entry) or finished;
+                continue;
+            }
+            var detached = false;
+            for (entry.meshes) |mesh| detached = detached or mesh.blas_building != null;
+            if (!detached) {
+                entry.blas_pending = false;
+                for (entry.meshes) |mesh| if (mesh.blas) |blas| try cmd.buildBlas(blas, geometry_passes.blasDesc(self, mesh));
+                continue;
+            }
+            still_pending += 1;
+            const carried = entry.blas_frame orelse {
+                entry.blas_frame = frame_now;
+                continue;
+            };
+            if (frame_now < carried + rhi.frames_in_flight) continue;
+            var encoder = (try device.beginDetached()).?;
+            for (entry.meshes) |mesh| if (mesh.blas_building) |blas| try encoder.buildBlas(blas, geometry_passes.blasDesc(self, mesh));
+            entry.blas_job = try device.submitDetached(encoder);
         };
+        self.blas_pending = still_pending;
+        if (finished) self.asset_generation += 1;
     }
 
-    /// Pins the irradiance probe volume to a world-space box. Pass null to
-    /// Moves everything in a scene by `offset` without it counting as
-    /// motion: entities, instance groups, lights, decals, emitters and
-    /// their particles, the probe volume and each view's history all move
-    /// together, so the picture does not change.
-    ///
-    /// This is how to keep precision in a large world. Positions are 32-bit
-    /// floats, which hold about a millimetre a few kilometres from zero and
-    /// far less beyond. Keep the application's own positions in 64 bits,
-    /// hand the renderer positions relative to a point near the camera, and
-    /// when the camera strays from that point, shift the scene back and
-    /// from then on hand in positions relative to the new point. The
-    /// camera, draw lists and settings given in world units (fog height)
-    /// are the caller's to shift.
+    /// Makes a model's finished acceleration structures the live ones.
+    /// Returns whether there were any.
+    fn adoptBlas(self: *Renderer, entry: *ModelEntry) bool {
+        _ = self;
+        var any = false;
+        for (entry.meshes) |*mesh| if (mesh.blas_building) |built| {
+            mesh.blas = built;
+            mesh.blas_building = null;
+            any = true;
+        };
+        entry.blas_pending = false;
+        entry.blas_frame = null;
+        return any;
+    }
+
+    /// Moves everything in a scene by `offset` without it counting as motion,
+    /// for keeping float precision in large worlds. The camera, draw lists
+    /// and world-unit settings are the caller's to shift.
     pub fn shiftScene(self: *Renderer, scene: Scene, offset: Vec3) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -5835,22 +6071,22 @@ pub const Renderer = struct {
             bounds[0] = math.add(bounds[0], offset);
             bounds[1] = math.add(bounds[1], offset);
         }
-        // Probe grids keep their probes: their cells are counted from the
-        // scene's origin, which moved the other way.
+        // Probe cells are counted from the scene's origin, which moved.
         inline for (.{ &data.gi, &data.gi_coarse, &data.gi_middle }) |slot| {
             if (slot.*) |*volume| volume.origin = math.add(volume.origin, offset);
         }
     }
 
-    /// Where the scene's zero sits in the application's world: minus the
-    /// sum of every `shiftScene` so far.
+    /// The scene's zero in the application's world: minus the sum of every
+    /// `shiftScene` offset.
     pub fn sceneOrigin(self: *Renderer, scene: Scene) [3]f64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return if (self.scenes.get(scene)) |data| data.origin else .{ 0, 0, 0 };
     }
 
-    /// derive it from the scene's static geometry (the default).
+    /// Pins the irradiance probe volume to a world-space box; null derives it
+    /// from the scene's static geometry (the default).
     pub fn setGiVolume(self: *Renderer, scene: Scene, bounds: ?[2]Vec3) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -5903,16 +6139,21 @@ fn createPipelines(device: *rhi.Device) !Pipelines {
         .skin = try device.createComputePipeline(.{ .name = "skin", .shader = shaderCode("skin.comp.spv") }),
         .skin_bounds = try device.createComputePipeline(.{ .name = "skin bounds", .shader = shaderCode("skin_bounds.comp.spv") }),
         .cull = try device.createComputePipeline(.{ .name = "cull", .shader = shaderCode("cull.comp.spv") }),
+        .cull_instances = try device.createComputePipeline(.{ .name = "cull instances", .shader = shaderCode("cull_instances.comp.spv") }),
         .cluster = try device.createComputePipeline(.{ .name = "light clusters", .shader = shaderCode("cluster.comp.spv") }),
         .local_shadow = try device.createGraphicsPipeline(.{
             .name = "local shadow",
             .vertex = shaderCode("visibility.vert.spv"),
+            .mesh = if (device.mesh_shaders) shaderCode("visibility.mesh.spv") else null,
+            .task = if (device.mesh_shaders) shaderCode("visibility.task.spv") else null,
             .depth = local_shadow_depth,
             .cull = .back,
         }),
         .local_shadow_masked = try device.createGraphicsPipeline(.{
             .name = "local shadow masked",
             .vertex = shaderCode("visibility.vert.spv"),
+            .mesh = if (device.mesh_shaders) shaderCode("visibility.mesh.spv") else null,
+            .task = if (device.mesh_shaders) shaderCode("visibility.task.spv") else null,
             .fragment = shaderCode("shadow_masked.frag.spv"),
             .depth = local_shadow_depth,
             .cull = .none,
@@ -5925,8 +6166,7 @@ fn createPipelines(device: *rhi.Device) !Pipelines {
             .depth = .{ .write = false, .compare = .greater_or_equal },
             .cull = .none,
         }),
-        // The other two transparency modes compile the large forward shader
-        // again each; they are made when a view first asks for them.
+        // The other transparency modes are built when first asked for.
         .forward_weighted = null,
         .oit_composite = try Local.pass(device, "transparency composite", shaderCode("oit_composite.frag.spv"), &.{.{ .format = hdr_format, .blend = .alpha }}),
         .forward_peel = null,
@@ -5934,10 +6174,16 @@ fn createPipelines(device: *rhi.Device) !Pipelines {
         .peel_composite = try Local.pass(device, "peel composite", shaderCode("copy.frag.spv"), &.{.{ .format = hdr_format, .blend = .premultiplied }}),
         .copy = try Local.pass(device, "copy", shaderCode("copy.frag.spv"), &.{.{ .format = hdr_format }}),
         .upscale = try Local.pass(device, "upscale", shaderCode("upscale.frag.spv"), &.{.{ .format = hdr_format }}),
+        .shading_rate = try Local.pass(device, "shading rate", shaderCode("shading_rate.frag.spv"), &.{.{ .format = .r8_uint }}),
+        .fsr_easu = try Local.pass(device, "fsr upscale", shaderCode("fsr_easu.frag.spv"), &.{.{ .format = hdr_format }}),
+        .fsr_rcas = try Local.pass(device, "fsr sharpen", shaderCode("fsr_rcas.frag.spv"), &.{.{ .format = hdr_format }}),
         .hiz = try Local.pass(device, "depth pyramid", shaderCode("hiz.frag.spv"), &.{.{ .format = .r32_float }}),
+        .hiz_compute = if (device.storage_images) try device.createComputePipeline(.{ .name = "depth pyramid", .shader = shaderCode("hiz.comp.spv") }) else null,
         .visibility = try device.createGraphicsPipeline(.{
             .name = "visibility",
             .vertex = shaderCode("visibility.vert.spv"),
+            .mesh = if (device.mesh_shaders) shaderCode("visibility.mesh.spv") else null,
+            .task = if (device.mesh_shaders) shaderCode("visibility.task.spv") else null,
             .fragment = shaderCode("visibility.frag.spv"),
             .color_targets = &.{.{ .format = .r32_uint }},
             .depth = .{},
@@ -5946,6 +6192,8 @@ fn createPipelines(device: *rhi.Device) !Pipelines {
         .visibility_masked = try device.createGraphicsPipeline(.{
             .name = "visibility masked",
             .vertex = shaderCode("visibility.vert.spv"),
+            .mesh = if (device.mesh_shaders) shaderCode("visibility.mesh.spv") else null,
+            .task = if (device.mesh_shaders) shaderCode("visibility.task.spv") else null,
             .fragment = shaderCode("visibility_masked.frag.spv"),
             .color_targets = &.{.{ .format = .r32_uint }},
             .depth = .{},
@@ -5954,21 +6202,25 @@ fn createPipelines(device: *rhi.Device) !Pipelines {
         .shadow = try device.createGraphicsPipeline(.{
             .name = "shadow",
             .vertex = shaderCode("visibility.vert.spv"),
+            .mesh = if (device.mesh_shaders) shaderCode("visibility.mesh.spv") else null,
+            .task = if (device.mesh_shaders) shaderCode("visibility.task.spv") else null,
             .depth = shadow_depth,
             .cull = .back,
         }),
         .shadow_masked = try device.createGraphicsPipeline(.{
             .name = "shadow masked",
             .vertex = shaderCode("visibility.vert.spv"),
+            .mesh = if (device.mesh_shaders) shaderCode("visibility.mesh.spv") else null,
+            .task = if (device.mesh_shaders) shaderCode("visibility.task.spv") else null,
             .fragment = shaderCode("shadow_masked.frag.spv"),
             .depth = shadow_depth,
             .cull = .none,
         }),
-        // See-through casters into a cascade's tint: no depth, every one
-        // of them counts.
         .shadow_color = try device.createGraphicsPipeline(.{
             .name = "shadow tint",
             .vertex = shaderCode("visibility.vert.spv"),
+            .mesh = if (device.mesh_shaders) shaderCode("visibility.mesh.spv") else null,
+            .task = if (device.mesh_shaders) shaderCode("visibility.task.spv") else null,
             .fragment = shaderCode("shadow_color.frag.spv"),
             .color_targets = &.{.{ .format = .rgba8_unorm, .blend = .tint }},
             .cull = .none,
@@ -6003,11 +6255,13 @@ fn createPipelines(device: *rhi.Device) !Pipelines {
         }),
         .underwater = try Local.pass(device, "underwater", shaderCode("underwater.frag.spv"), &.{.{ .format = hdr_format }}),
         .liquid_sim = try device.createComputePipeline(.{ .name = "liquid simulation", .shader = shaderCode("liquid_sim.comp.spv") }),
-        // Each frame writes the average so far beside the last frame's,
-        // which it reads; see pathtrace.frag.
-        .path_trace = try Local.pass(device, "path tracing", if (device.ray_tracing) shaderCode("pathtrace_rt.frag.spv") else shaderCode("pathtrace.frag.spv"), &.{ .{ .format = .rgba32_float }, .{ .format = .rgba16_float } }),
+        .path_trace = try Local.pass(device, "path tracing", if (device.ray_tracing) shaderCode("pathtrace_rt.frag.spv") else shaderCode("pathtrace.frag.spv"), &.{ .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float }, .{ .format = .rgba16_float } }),
         .path_denoise = try Local.pass(device, "path tracing denoise", shaderCode("pathtrace_denoise.frag.spv"), &.{.{ .format = .rgba16_float }}),
         .path_denoise_final = try Local.pass(device, "path tracing denoise (last)", shaderCode("pathtrace_denoise.frag.spv"), &.{.{ .format = hdr_format }}),
+        .reflection_reproject = try Local.pass(device, "reflection denoise: reproject", shaderCode("ffx_reflections_reproject.frag.spv"), &.{ .{ .format = .rgba16_float }, .{ .format = .r16_float } }),
+        .reflection_average = try Local.pass(device, "reflection denoise: average", shaderCode("ffx_reflections_average.frag.spv"), &.{.{ .format = .rgba16_float }}),
+        .reflection_prefilter = try Local.pass(device, "reflection denoise: prefilter", shaderCode("ffx_reflections_prefilter.frag.spv"), &.{.{ .format = .rgba16_float }}),
+        .reflection_resolve = try Local.pass(device, "reflection denoise: resolve", shaderCode("ffx_reflections_resolve.frag.spv"), &.{.{ .format = .rgba16_float }}),
         .liquid_surface = try device.createGraphicsPipeline(.{
             .name = "liquid surface depth",
             .vertex = shaderCode("fullscreen.vert.spv"),
@@ -6039,7 +6293,6 @@ fn createPipelines(device: *rhi.Device) !Pipelines {
         }),
         .liquid_blur = try Local.pass(device, "liquid smoothing", shaderCode("liquid_blur.frag.spv"), &.{.{ .format = .r32_float }}),
         .liquid = try Local.pass(device, "liquid", shaderCode("liquid.frag.spv"), &.{.{ .format = hdr_format, .blend = .alpha }}),
-        // The same surface again, into the depth buffer only.
         .water_depth = try device.createGraphicsPipeline(.{
             .name = "water depth",
             .vertex = shaderCode("water.vert.spv"),
@@ -6077,6 +6330,53 @@ fn createPipelines(device: *rhi.Device) !Pipelines {
             .vertex = shaderCode("particle_trail.vert.spv"),
             .fragment = shaderCode("particle.frag.spv"),
             .color_targets = &.{ .{ .format = hdr_format, .blend = .premultiplied }, .{ .format = .rg16_float, .blend = .alpha } },
+            .cull = .none,
+        }),
+        .impostor = try device.createGraphicsPipeline(.{
+            .name = "impostors",
+            .vertex = shaderCode("impostor.vert.spv"),
+            .fragment = shaderCode("impostor.frag.spv"),
+            .color_targets = &.{ .{ .format = hdr_format, .blend = .premultiplied }, .{ .format = .rg16_float, .blend = .alpha } },
+            .depth = .{ .write = true, .compare = .greater_or_equal },
+            .cull = .none,
+        }),
+        .impostor_bake = try device.createGraphicsPipeline(.{
+            .name = "impostor bake",
+            .vertex = shaderCode("impostor_bake.vert.spv"),
+            .fragment = shaderCode("impostor_bake.frag.spv"),
+            .color_targets = &.{ .{ .format = .rgba8_srgb }, .{ .format = .rgba8_unorm } },
+            .depth = .{ .write = true, .compare = .greater_or_equal },
+            .cull = .none,
+        }),
+        .lightmap_bake = if (device.ray_tracing) try device.createGraphicsPipeline(.{
+            .name = "lightmap bake",
+            .vertex = shaderCode("lightmap_bake.vert.spv"),
+            .fragment = shaderCode("lightmap_bake.frag.spv"),
+            .color_targets = &.{.{ .format = hdr_format }},
+            .cull = .none,
+        }) else null,
+        .vsm_mark = try device.createComputePipeline(.{ .name = "virtual shadow requests", .shader = shaderCode("vsm_mark.comp.spv") }),
+        .vsm_allocate = try device.createComputePipeline(.{ .name = "virtual shadow pages", .shader = shaderCode("vsm_allocate.comp.spv") }),
+        .vsm_clear = try device.createGraphicsPipeline(.{
+            .name = "virtual shadow clear",
+            .vertex = shaderCode("vsm_clear.vert.spv"),
+            .depth = .{ .compare = .always },
+            .cull = .none,
+        }),
+        .lightmap_dilate = try Local.pass(device, "lightmap dilate", shaderCode("lightmap_dilate.frag.spv"), &.{.{ .format = hdr_format }}),
+        .hair_simulation = try device.createComputePipeline(.{ .name = "hair simulation", .shader = shaderCode("hair_sim.comp.spv") }),
+        .hair_shadow = try device.createGraphicsPipeline(.{
+            .name = "hair shadow",
+            .vertex = shaderCode("hair_shadow.vert.spv"),
+            .depth = shadow_depth,
+            .cull = .none,
+        }),
+        .hair = try device.createGraphicsPipeline(.{
+            .name = "hair",
+            .vertex = shaderCode("hair.vert.spv"),
+            .fragment = shaderCode("hair.frag.spv"),
+            .color_targets = &.{ .{ .format = hdr_format, .blend = .premultiplied }, .{ .format = .rg16_float, .blend = .alpha } },
+            .depth = .{ .write = true, .compare = .greater_or_equal },
             .cull = .none,
         }),
         .particle_mesh = try device.createGraphicsPipeline(.{
@@ -6119,9 +6419,8 @@ pub fn cullView(view_proj: Mat4, camera_position: Vec3, kind: CullKind) gpu.Cull
     result.planes[1] = normalizePlane(addPlanes(r3, r0, -1));
     result.planes[2] = normalizePlane(addPlanes(r3, r1, 1));
     result.planes[3] = normalizePlane(addPlanes(r3, r1, -1));
-    // Reverse-Z perspective: near is w - z >= 0 and there is no far plane.
-    // Shadow views use forward Z and keep only the far plane (same
-    // expression), so casters between the light and the slice stay in.
+    // Reverse-Z perspective: near is w - z >= 0, no far plane. Shadow views
+    // use forward Z and keep only the far plane (same expression).
     result.planes[4] = normalizePlane(addPlanes(r3, r2, -1));
     result.planes[5] = .{ 0, 0, 0, 1 };
     return result;
@@ -6153,8 +6452,7 @@ pub const CascadeCache = struct {
 /// motion between refreshes stays inside the rendered area.
 const cascade_margin = [gpu.cascade_count]f32{ 1.0, 1.05, 1.08, 1.12 };
 
-/// The sun's shadow cascades: the matrix of each, where it ends along the
-/// view and the area it covers.
+/// The sun's shadow cascades: matrices, split distances and coverage.
 pub const Cascades = struct {
     /// World-space bounding sphere each map covers (`radii` includes the
     /// reuse margin, `tight_radii` does not).
@@ -6166,9 +6464,8 @@ pub const Cascades = struct {
     texel_size: [4]f32,
 };
 
-/// Fits each cascade to a bounding sphere of its frustum slice and snaps it
-/// to shadow-map texels, so the shadow does not shimmer as the camera moves
-/// or rotates.
+/// Fits each cascade to a bounding sphere of its frustum slice, snapped to
+/// shadow-map texels.
 pub fn computeCascades(camera: Camera, view_matrix: Mat4, aspect: f32, sun_travel: Vec3, shadow_distance: f32, shadow_resolution: u32, count: u32) Cascades {
     const active: usize = std.math.clamp(count, 1, gpu.cascade_count);
     var result: Cascades = undefined;
@@ -6214,8 +6511,7 @@ pub fn computeCascades(camera: Camera, view_matrix: Mat4, aspect: f32, sun_trave
         var light_center = math.transformPoint(light_view, center);
         light_center[0] = @floor(light_center[0] / texel) * texel;
         light_center[1] = @floor(light_center[1] / texel) * texel;
-        // Depth range reaches far back toward the light; casters in front of
-        // the near plane are kept by depth clamping.
+        // Casters in front of the near plane are kept by depth clamping.
         const caster_distance = 500;
         const depth_center = -light_center[2];
         const projection = math.orthographic(
@@ -6296,7 +6592,6 @@ fn createGiPipelines(device: *rhi.Device) !GiPipelines {
             .name = "gi irradiance",
             .vertex = shaderCode("fullscreen.vert.spv"),
             .fragment = shaderCode("gi_irradiance.frag.spv"),
-            // The steady atlas and the fast one, each with its own rate.
             .color_targets = &.{ .{ .format = hdr_format, .blend = .alpha }, .{ .format = hdr_format, .blend = .alpha } },
             .cull = .none,
         }),
@@ -6344,7 +6639,6 @@ pub fn shaderCode(comptime name: []const u8) []const u8 {
 /// Reads an IES LM-63 photometric file and returns brightness at 181
 /// angles, 0 to 180 degrees from the fixture's axis.
 fn parseIes(gpa: std.mem.Allocator, bytes: []const u8) ![]f32 {
-    // Everything after the TILT line is whitespace-separated numbers.
     const tilt = std.mem.indexOf(u8, bytes, "TILT=") orelse return error.InvalidIes;
     const after_tilt = std.mem.indexOfScalarPos(u8, bytes, tilt, '\n') orelse return error.InvalidIes;
     var numbers: std.ArrayList(f32) = .empty;
@@ -6366,7 +6660,6 @@ fn parseIes(gpa: std.mem.Allocator, bytes: []const u8) ![]f32 {
     errdefer gpa.free(result);
     for (result, 0..) |*out, degree| {
         const angle: f32 = @floatFromInt(degree);
-        // Outside the measured range the fixture emits nothing.
         if (angle < angles[0] or angle > angles[vertical - 1]) {
             out.* = 0;
             continue;

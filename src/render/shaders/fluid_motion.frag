@@ -1,9 +1,7 @@
 #version 460
 #include "common.glsl"
 
-// Lays the smoke's motion over the scene's motion vectors, by how much of
-// each pixel the smoke covers, so that antialiasing over frames follows
-// the smoke instead of what is behind it.
+// Blends fluid motion over the scene's motion vectors by fluid coverage.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;

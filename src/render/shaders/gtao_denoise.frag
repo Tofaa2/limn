@@ -1,20 +1,16 @@
 #version 460
 #include "common.glsl"
 
-// Joint bilateral upsample of the half-resolution GTAO result: blurs away
-// the sampling noise while keeping occlusion from bleeding across depth
-// discontinuities. With BOUNCE the light gathered along with the occlusion
-// is filtered in the same pass: it shares the taps, their weights and the
-// reprojection, so that costs little more than the occlusion alone.
+// Joint bilateral upsample of half-resolution GTAO with temporal accumulation.
+// BOUNCE filters the gathered light with the same taps.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint ao_texture;
     uint depth_texture;
-    // Last frame's result, or INVALID_ID to filter in space only.
+    // Last frame's result, or INVALID_ID for spatial filtering only.
     uint history_texture;
     float history_blend;
-    // With BOUNCE: the gathered light, and last frame's filtered light or
-    // INVALID_ID.
+    // BOUNCE: gathered light and its history, or INVALID_ID.
     uint bounce_texture;
     uint bounce_history_texture;
 } push;
@@ -46,7 +42,6 @@ void main() {
     for (int y = -1; y <= 2; y++) {
         for (int x = -1; x <= 2; x++) {
             ivec2 tap = clamp(base + ivec2(x, y), ivec2(0), ao_size - 1);
-            // Each tap carries the depth it was computed at.
             vec2 ao_depth = texelFetch(TEX(push.ao_texture, nearest), tap, 0).rg;
             float depth = ao_depth.g;
             vec2 offset = vec2(x, y) - f;
@@ -76,9 +71,6 @@ void main() {
     reproject = reproject || push.bounce_history_texture != INVALID_ID;
 #endif
     if (reproject && raw_depth > 0.0) {
-        // Where this surface point was last frame. Things that moved are
-        // looked up in the wrong place; clamping to what this frame's
-        // samples allow keeps that from showing as a trail.
         vec3 world = worldPositionFromDepth(in_uv, raw_depth, frame.inv_view_proj);
         vec4 previous = frame.prev_view_proj_unjittered * vec4(world, 1.0);
         vec2 previous_uv = previous.xy / previous.w * 0.5 + 0.5;

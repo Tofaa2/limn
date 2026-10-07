@@ -1,40 +1,29 @@
-//! KTX 2.0 texture containers: reading textures that ship already
-//! compressed for the GPU, and writing them.
-//!
-//! Supported payloads: BC1, BC3, BC4, BC5, BC6H (unsigned), BC7 and RGBA8
-//! (UNORM or sRGB where the format has both), stored plain or
-//! Zstandard-compressed, with any number of mip levels. Files holding one
-//! of Basis Universal's formats (ETC1S, UASTC and their relatives) are
-//! transcoded to BC7, or to BC6H when they hold a high dynamic range, by
-//! the library's own transcoder (src/third_party/basisu).
+//! KTX 2.0 reader and writer. Reads BC1/3/4/5/6H (unsigned)/7, RGBA8 and
+//! RGBA16F, plain or Zstandard-compressed; Basis Universal payloads are
+//! transcoded to BC7, or BC6H for HDR.
 const std = @import("std");
 
-/// The twelve bytes every KTX2 file starts with.
 pub const identifier = [12]u8{ 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, '\r', '\n', 0x1A, '\n' };
 
-/// Texel formats a `Texture` can hold. The BC formats are 4x4 blocks of 16
-/// bytes (8 for `bc1` and `bc4`); `rgba8` is 4 bytes a texel and `rgba16f`
-/// four half floats, 8 bytes. `bc6h` is the unsigned variant.
+/// BC formats are 4x4 blocks of 16 bytes (8 for `bc1` and `bc4`); `rgba8` is 4
+/// bytes a texel, `rgba16f` 8. `bc6h` is unsigned.
 pub const Format = enum { bc7, rgba8, bc1, bc3, bc4, bc5, bc6h, rgba16f };
 
-/// A texture as `read` returns it and `write` takes it.
 pub const Texture = struct {
     /// Size of the largest level, in texels.
     width: u32,
     height: u32,
     format: Format,
-    /// The file names the sRGB variant of the format. Always false for
-    /// `bc4`, `bc5`, `bc6h` and `rgba16f`.
+    /// Always false for `bc4`, `bc5`, `bc6h` and `rgba16f`.
     srgb: bool,
-    /// Mip levels in `data`, at least 1; each is half the one before, rounded
-    /// down, and not below one texel.
+    /// At least 1; each level is half the one before, rounded down, minimum 1.
     levels: u32,
     /// 6 for a cube map (+X, -X, +Y, -Y, +Z, -Z), otherwise 1.
     faces: u32 = 1,
     /// Array layers; 1 for a plain texture.
     layers: u32 = 1,
-    /// Every level back to back, largest first; within a level every
-    /// layer, and within a layer every face. Owned by the caller.
+    /// Levels back to back, largest first; per level every layer, per layer
+    /// every face. Owned by the caller.
     data: []u8,
 };
 
@@ -53,8 +42,7 @@ const vk_bc4_unorm = 139;
 const vk_bc5_unorm = 141;
 const vk_bc6h_ufloat = 143;
 
-/// Whether `bytes` starts with the KTX2 identifier. Says nothing about
-/// whether the rest can be read.
+/// Checks the identifier only.
 pub fn isKtx2(bytes: []const u8) bool {
     return bytes.len >= identifier.len and std.mem.eql(u8, bytes[0..identifier.len], &identifier);
 }
@@ -68,7 +56,6 @@ fn levelBytes(format: Format, width: u32, height: u32) usize {
     };
 }
 
-/// Decodes a KTX2 file held in memory.
 pub fn read(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     if (!isKtx2(bytes) or bytes.len < 80) return error.InvalidKtx2;
     const vk_format = std.mem.readInt(u32, bytes[12..16], .little);
@@ -80,11 +67,9 @@ pub fn read(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     const levels = @max(std.mem.readInt(u32, bytes[40..44], .little), 1);
     const scheme = std.mem.readInt(u32, bytes[44..48], .little);
     if (width == 0 or width > 16384 or height > 16384 or levels > 15) return error.InvalidKtx2;
-    // No volumes; cube maps have six faces.
     if (depth > 1) return error.UnsupportedKtx2;
     if ((faces != 1 and faces != 6) or layers > 2048) return error.InvalidKtx2;
     if (faces == 6 and width != height) return error.InvalidKtx2;
-    // No format of its own: one of Basis Universal's, to be transcoded.
     if (vk_format == 0) return readBasis(gpa, bytes);
     const images: usize = layers * faces;
     const format: Format, const srgb: bool = switch (vk_format) {
@@ -100,10 +85,8 @@ pub fn read(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
         vk_bc5_unorm => .{ .bc5, false },
         vk_bc6h_ufloat => .{ .bc6h, false },
         vk_r16g16b16a16_sfloat => .{ .rgba16f, false },
-        // Anything else this renderer has no use for.
         else => return error.UnsupportedKtx2,
     };
-    // 0: stored as is. 2: each level is a Zstandard frame.
     if (scheme != 0 and scheme != 2) return error.UnsupportedKtx2;
     if (bytes.len < 80 + @as(usize, levels) * 24) return error.InvalidKtx2;
 
@@ -139,9 +122,7 @@ extern fn rnd_basis_open(data: [*]const u8, size: u32, info: *[8]u32) ?*anyopaqu
 extern fn rnd_basis_level(handle: *anyopaque, level: u32, layer: u32, face: u32, out: [*]u8, blocks: u32, hdr: c_int) c_int;
 extern fn rnd_basis_close(handle: *anyopaque) void;
 
-/// Transcodes a KTX2 file holding one of Basis Universal's formats (ETC1S,
-/// UASTC and their relatives) into BC7, or BC6H when it holds a high
-/// dynamic range.
+/// Transcodes a Basis Universal KTX2 file to BC7, or BC6H for HDR.
 fn readBasis(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     if (bytes.len > std.math.maxInt(u32)) return error.UnsupportedKtx2;
     var info: [8]u32 = undefined;
@@ -172,8 +153,7 @@ fn readBasis(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     return .{ .width = width, .height = height, .format = format, .srgb = info[6] != 0 and !hdr, .levels = levels, .faces = faces, .layers = layers, .data = data };
 }
 
-/// Zstandard for the transcoder (see src/third_party/basisu/zstd/zstd.h):
-/// the bytes written, or the largest value when the data is bad.
+/// Returns the bytes written, or maxInt on bad data.
 export fn rnd_zstd_decompress(dst: [*]u8, dst_capacity: usize, src: [*]const u8, src_size: usize) callconv(.c) usize {
     const failed = std.math.maxInt(usize);
     const gpa = std.heap.smp_allocator;
@@ -184,8 +164,8 @@ export fn rnd_zstd_decompress(dst: [*]u8, dst_capacity: usize, src: [*]const u8,
     return decompress.reader.readSliceShort(dst[0..dst_capacity]) catch failed;
 }
 
-/// The decompressed size a Zstandard frame declares: all ones when it
-/// declares none, all ones less one when it is no frame at all.
+/// Declared decompressed size: maxInt when none is declared, maxInt - 1 when
+/// `src` is not a Zstandard frame.
 export fn rnd_zstd_content_size(src: [*]const u8, src_size: usize) callconv(.c) u64 {
     const unknown = std.math.maxInt(u64);
     const invalid = unknown - 1;
@@ -214,16 +194,12 @@ export fn rnd_zstd_content_size(src: [*]const u8, src_size: usize) callconv(.c) 
     };
 }
 
-/// Encodes a texture as an uncompressed-container KTX2 file. `data` holds
-/// `levels` mip levels back to back, largest first. The result is owned by
-/// the caller.
+/// Encodes an uncompressed-container KTX2 file. Result owned by the caller.
 pub fn write(gpa: std.mem.Allocator, texture: Texture) ![]u8 {
     const levels = texture.levels;
     const images: usize = texture.layers * texture.faces;
-    // A minimal data format descriptor: one basic block, no samples.
     const dfd_length: u32 = 4 + 24;
     const header_length: usize = 80 + @as(usize, levels) * 24;
-    // Level data is aligned to the block size and stored smallest first.
     const data_start = std.mem.alignForward(usize, header_length + dfd_length, 16);
     const out = try gpa.alloc(u8, data_start + std.mem.alignForward(usize, texture.data.len + @as(usize, levels) * 16, 16));
     errdefer gpa.free(out);
@@ -243,14 +219,12 @@ pub fn write(gpa: std.mem.Allocator, texture: Texture) ![]u8 {
     std.mem.writeInt(u32, out[16..20], if (texture.format == .rgba16f) 2 else 1, .little); // type size
     std.mem.writeInt(u32, out[20..24], texture.width, .little);
     std.mem.writeInt(u32, out[24..28], texture.height, .little);
-    // A layer count of 0 marks a texture that is not an array.
     std.mem.writeInt(u32, out[32..36], if (texture.layers > 1) texture.layers else 0, .little);
     std.mem.writeInt(u32, out[36..40], texture.faces, .little);
     std.mem.writeInt(u32, out[40..44], levels, .little);
     std.mem.writeInt(u32, out[48..52], @intCast(header_length), .little); // dfd offset
     std.mem.writeInt(u32, out[52..56], dfd_length, .little);
     std.mem.writeInt(u32, out[header_length..][0..4], dfd_length, .little);
-    // Descriptor block header: vendor 0, type 0, version 2, size 24.
     std.mem.writeInt(u16, out[header_length + 4 + 4 ..][0..2], 2, .little);
     std.mem.writeInt(u16, out[header_length + 4 + 6 ..][0..2], 24, .little);
 
@@ -280,7 +254,6 @@ pub fn write(gpa: std.mem.Allocator, texture: Texture) ![]u8 {
 test "a texture survives being written and read back" {
     var data: [(64 + 16) + 16]u8 = undefined;
     for (&data, 0..) |*byte, index| byte.* = @truncate(index * 7);
-    // 8x8 BC7 with three levels: 4 blocks, 1 block, 1 block.
     const original = Texture{ .width = 8, .height = 8, .format = .bc7, .srgb = true, .levels = 3, .data = &data };
     const file = try write(std.testing.allocator, original);
     defer std.testing.allocator.free(file);
@@ -297,7 +270,6 @@ test "a texture survives being written and read back" {
 }
 
 test "the other block formats are read with their own block sizes" {
-    // A 16x16 BC1 texture: 16 blocks of 8 bytes; BC6H: 16 blocks of 16.
     inline for (.{ .{ Format.bc1, 8 }, .{ Format.bc4, 8 }, .{ Format.bc3, 16 }, .{ Format.bc5, 16 }, .{ Format.bc6h, 16 } }) |case| {
         var data: [16 * 16]u8 = undefined;
         for (&data, 0..) |*byte, index| byte.* = @truncate(index * 13 + 5);
@@ -312,7 +284,6 @@ test "the other block formats are read with their own block sizes" {
 }
 
 test "cube maps and arrays keep every face and layer of every level" {
-    // A 4x4 half-float cube with two levels: 6 faces of 128 and of 32 bytes.
     var cube: [6 * (128 + 32)]u8 = undefined;
     for (&cube, 0..) |*byte, index| byte.* = @truncate(index * 11 + 3);
     {
@@ -325,7 +296,6 @@ test "cube maps and arrays keep every face and layer of every level" {
         try std.testing.expectEqual(@as(u32, 1), copy.layers);
         try std.testing.expectEqualSlices(u8, &cube, copy.data);
     }
-    // Three layers of 8x8 RGBA8.
     var array: [3 * 256]u8 = undefined;
     for (&array, 0..) |*byte, index| byte.* = @truncate(index * 5 + 1);
     const file = try write(std.testing.allocator, .{ .width = 8, .height = 8, .format = .rgba8, .srgb = true, .levels = 1, .layers = 3, .data = &array });

@@ -1,8 +1,7 @@
 #version 460
 #include "common.glsl"
 
-// Brings a picture rendered below (or above) the output resolution to it,
-// with a bicubic filter that keeps edges crisper than plain bilinear.
+// Bicubic resample to the output resolution.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;

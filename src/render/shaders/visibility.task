@@ -1,0 +1,57 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#include "common.glsl"
+
+layout(buffer_reference, scalar) readonly buffer MeshletList { uint data[]; };
+layout(buffer_reference, scalar) readonly buffer MeshletCount { uint value; };
+
+// Triangles per mesh shader group; larger meshlets take two.
+const uint triangles_per_group = 64u;
+// Listed meshlets per task shader group.
+const uint meshlets_per_task = 32u;
+
+struct MeshletTasks {
+    // Per mesh shader group: meshlet reference << 1 | which half of its
+    // triangles.
+    uint entries[meshlets_per_task * 2u];
+};
+
+// Dispatches the meshlets cull.comp listed for a view to visibility.mesh, 32
+// per group.
+layout(local_size_x = 1) in;
+
+#include "visibility_page.glsl"
+
+layout(push_constant, scalar) uniform Push {
+    FrameConstants frame;
+    // 1 in a shadow pass whose translucent casters go into the tint pass.
+    uint tinted;
+    // Nonzero when `page` supplies the view.
+    uint paged;
+    mat4 view_proj;
+    // LOD cross-fade, main camera pass only: LOD camera (xyz), error-to-pixels
+    // scale (w), band width (1 for none) and near plane.
+    vec4 lod;
+    float lod_band;
+    float lod_near;
+    // Meshlet references written by cull.comp, and their count.
+    MeshletList list;
+    MeshletCount count;
+    VisibilityPage page;
+} push;
+
+
+taskPayloadSharedEXT MeshletTasks tasks;
+
+void main() {
+    uint first = gl_WorkGroupID.x * meshlets_per_task;
+    uint listed = push.count.value;
+    uint groups = 0u;
+    for (uint i = 0u; i < meshlets_per_task && first + i < listed; i++) {
+        uint ref_index = push.list.data[first + i];
+        MeshletRef ref = push.frame.meshlet_refs.data[ref_index];
+        uint triangles = push.frame.meshlets.data[ref.meshlet].index_count / 3u;
+        for (uint part = 0u; part * triangles_per_group < triangles; part++) tasks.entries[groups++] = (ref_index << 1) | part;
+    }
+    EmitMeshTasksEXT(groups, 1u, 1u);
+}

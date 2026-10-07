@@ -1,8 +1,5 @@
-//! TrueType loading and signed-distance-field atlas baking.
-//!
-//! A `Font` is immutable once built: glyph metrics, kerning and one SDF
-//! atlas. Because the atlas stores distances rather than coverage, the same
-//! texture renders crisp text at any size, in 2D and in the 3D world.
+//! TrueType loading and signed-distance-field atlas baking. A `Font` holds
+//! glyph metrics, kerning and one SDF atlas usable at any size.
 const std = @import("std");
 const opentype = @import("opentype.zig");
 const indic = @import("indic.zig");
@@ -10,69 +7,61 @@ const arabic = @import("arabic.zig");
 
 /// Pixels per em in the atlas.
 pub const atlas_em: f32 = 40;
-/// Distance, in atlas pixels, mapped to the full 0..1 range on each side of
-/// the outline. Shared with the text shader.
+/// Distance, in atlas pixels, mapped to the 0..1 range on each side of the
+/// outline. Shared with the text shader.
 pub const sdf_spread: f32 = 5;
 
-/// First and last codepoint (inclusive) of a range to bake.
+/// First and last codepoint, inclusive.
 pub const Range = [2]u21;
 /// Printable ASCII plus Latin-1.
 pub const default_ranges: []const Range = &.{ .{ 32, 126 }, .{ 160, 255 } };
 
-/// One baked glyph: its metrics and where it sits in the atlas.
 pub const Glyph = struct {
-    /// The character it is drawn for. A glyph with no character of its own
-    /// is named from a private range; see `glyph_codepoints`.
+    /// A glyph with no character of its own gets one from a private range; see
+    /// `glyph_codepoints`.
     codepoint: u21,
-    /// The glyph's number in the font file.
+    /// Glyph index in the font file.
     id: u16 = 0,
-    /// Horizontal pen advance, in ems.
+    /// Horizontal advance, in ems.
     advance: f32,
-    /// Pen advance in text set downward, in ems; 0 when the font has no
-    /// metrics for that, and a column then takes one em a character.
+    /// Vertical advance, in ems; 0 when the font has no vertical metrics.
     advance_down: f32 = 0,
-    /// Quad corners relative to the pen position on the baseline, in ems,
-    /// y up: left, bottom, right, top. Zero-area for blank glyphs.
+    /// Quad corners relative to the pen on the baseline, in ems, y up: left,
+    /// bottom, right, top. Zero-area for blank glyphs.
     plane: [4]f32 = .{ 0, 0, 0, 0 },
     /// Atlas texture coordinates: left, top, right, bottom.
     uv: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
-/// Everything baked from a font file for one set of glyphs. It is never
-/// changed once a font points at it, so any thread may read it.
+/// One bake of a font. Immutable once a font points at it, so any thread may
+/// read it.
 pub const Baked = struct {
     /// Sorted by codepoint.
     glyphs: []Glyph,
-    /// Pair adjustments: left << 32 | right to ems; see `kern`.
+    /// left << 32 | right to ems; see `kern`.
     kerning: std.AutoHashMapUnmanaged(u64, f32) = .empty,
-    /// Where a combining mark sits on a base letter: base << 32 | mark to
-    /// the offset of the mark's origin from the base's, in ems, y up.
+    /// base << 32 | mark to the offset of the mark's origin from the base's, in
+    /// ems, y up.
     marks: std.AutoHashMapUnmanaged(u64, [2]f32) = .empty,
-    /// Where a mark sits on each part of a ligature; see
-    /// `ligatureMarkKey`.
+    /// Keyed by `ligatureMarkKey`.
     ligature_marks: std.AutoHashMapUnmanaged(u64, [2]f32) = .empty,
-    /// Where glyphs of a cursive script join their neighbours.
+    /// GPOS cursive attachment points.
     cursive: std.AutoHashMapUnmanaged(u21, Cursive) = .empty,
-    /// The font's ligatures among the baked glyphs, longest first.
+    /// Longest first.
     ligatures: []Ligature = &.{},
-    /// Size of the atlas, in texels.
+    /// In texels.
     atlas_width: u32,
     atlas_height: u32,
-    /// R8 distance field, row-major, top row first. Freed once a later
-    /// bake replaces this one; the texture made from it lives on.
+    /// R8 distance field, row-major, top row first. Freed once a later bake
+    /// replaces this one.
     atlas: []u8,
-    /// The same field in three channels (three bytes a texel), in which
-    /// the corners of the glyphs stay sharp; see `colorEdges`.
+    /// Three-channel distance field, three bytes a texel; see `colorEdges`.
     msdf: []u8 = &.{},
-    /// Index of the atlas in the renderer's bindless texture table; filled
-    /// in by the renderer before the bake is put to use.
+    /// Index in the renderer's bindless texture table; set by the renderer.
     texture_index: u32 = 0,
-    /// Where the next glyph goes in the atlas: the pen and the height of
-    /// the shelf it is on, so that glyphs can be added without moving the
-    /// ones already there.
+    /// Shelf packer state: the pen and the height of its shelf.
     pen: [2]u32 = .{ 1, 1 },
     shelf_height: u32 = 0,
-    /// The code point ranges this bake holds.
     ranges: []Range,
 
     fn deinit(self: *Baked, gpa: std.mem.Allocator) void {
@@ -87,13 +76,12 @@ pub const Baked = struct {
         gpa.free(self.ligatures);
     }
 
-    /// Glyph for `codepoint`, falling back to '?' and then to the first
-    /// baked glyph.
+    /// Falls back to '?' and then to the first baked glyph.
     pub fn glyph(self: *const Baked, codepoint: u21) *const Glyph {
         return self.find(codepoint) orelse self.find('?') orelse &self.glyphs[0];
     }
 
-    /// Glyph for `codepoint`, or null when it is not in this bake.
+    /// Null when `codepoint` is not in this bake.
     pub fn find(self: *const Baked, codepoint: u21) ?*const Glyph {
         var low: usize = 0;
         var high: usize = self.glyphs.len;
@@ -106,63 +94,55 @@ pub const Baked = struct {
         return null;
     }
 
-    /// Kerning adjustment between two codepoints, in ems.
+    /// Kerning adjustment, in ems.
     pub fn kern(self: *const Baked, left: u21, right: u21) f32 {
         return self.kerning.get(@as(u64, left) << 32 | right) orelse 0;
     }
 };
 
-/// What a font's substitutions are chosen by.
+/// Selects a font's substitutions.
 pub const Shaping = struct {
-    /// The script of the text, as OpenType names it (`latn`, `cyrl`, ...).
+    /// OpenType script tag (`latn`, `cyrl`, ...).
     script: opentype.Tag = "DFLT".*,
-    /// The language, as OpenType names it (`ROM `, `SRB `, ...), for
-    /// letters that are drawn differently in it; null for the script's
-    /// usual forms.
+    /// OpenType language tag (`ROM `, `SRB `, ...); null for the script's
+    /// default.
     language: ?opentype.Tag = null,
-    /// Features to apply besides the usual ones, by their OpenType names
-    /// (`smcp`, `salt`, `case`, `dlig`, ...); at most sixteen.
+    /// Extra OpenType features (`smcp`, `salt`, `case`, `dlig`, ...); at most
+    /// sixteen.
     features: []const opentype.Tag = &.{},
 };
 
-/// A font's substitutions for one script, language and set of features
-/// (see `Font.substitution`).
+/// A font's substitutions for one script, language and feature set (see
+/// `Font.substitution`).
 pub const Substitution = struct {
-    /// The parsed font file, its substitution table (GSUB) and the lookups
-    /// chosen from it. They point into the font's copy of the file.
+    /// Point into the font's copy of the file.
     tables: Tables,
     layout: opentype.Layout,
     plan: opentype.Plan,
-    /// For a script whose letters are drawn in another order than they
-    /// are typed in: what that order depends on in the font.
+    /// Set for Indic scripts, which need reordering.
     forms: ?indic.Forms = null,
-    /// For Arabic: letters take one of four forms by their neighbours,
-    /// and the script runs from right to left.
+    /// Arabic joining forms; right to left.
     joined: bool = false,
-    /// For Mongolian: the same four forms, in a script that runs from
-    /// left to right.
+    /// Mongolian joining forms; left to right.
     joining: bool = false,
-    /// The font's contextual positioning for the same script, if it has
-    /// any.
+    /// The font's contextual positioning for the same script.
     positions: ?Positions = null,
 
     const Positions = struct { layout: opentype.Layout, plan: opentype.Plan };
 
-    /// The range a glyph of this script is named in when it has no
-    /// character of its own.
+    /// The private range a glyph of this script is named in.
     fn nameOf(self: *const Substitution, id: u16) NameKind {
         if (!self.joined) return .ltr;
         return if (self.layout.isMark(id)) .rtl_mark else .rtl;
     }
 
-    /// Frees the plans. `gpa` is the allocator given to `Font.substitution`.
+    /// `gpa` must be the allocator given to `Font.substitution`.
     pub fn deinit(self: *Substitution, gpa: std.mem.Allocator) void {
         self.plan.deinit(gpa);
         if (self.positions) |*positions| positions.plan.deinit(gpa);
     }
 
-    /// The glyphs of `text` after the font's substitutions, with what its
-    /// contextual positioning adds to their advances; false when neither
+    /// Substitutes `text` and applies contextual advances; false when neither
     /// changed anything.
     fn run(self: *const Substitution, gpa: std.mem.Allocator, text: []const u21, glyphs: *std.ArrayList(opentype.Glyph)) !bool {
         var changed = try self.substituted(gpa, text, glyphs);
@@ -178,8 +158,7 @@ pub const Substitution = struct {
         return changed;
     }
 
-    /// The glyphs of `text` after substitution; false when nothing was
-    /// substituted.
+    /// Substitutes `text`; false when nothing changed.
     fn substituted(self: *const Substitution, gpa: std.mem.Allocator, text: []const u21, glyphs: *std.ArrayList(opentype.Glyph)) !bool {
         if (self.joined or self.joining) {
             const masks = try gpa.alloc(u32, text.len);
@@ -210,25 +189,22 @@ pub const Substitution = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => false,
             };
-            // The order alone is a change.
             return true;
         }
         try glyphs.ensureTotalCapacity(gpa, text.len);
         for (text, 0..) |codepoint, index| glyphs.appendAssumeCapacity(.{ .id = @intCast((self.tables.glyphIndex(codepoint) catch 0) & 0xffff), .cluster = @intCast(index) });
         return self.layout.substitutePlanned(gpa, glyphs, self.plan) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            // A table that does not hold together: the text as typed.
             else => false,
         };
     }
 };
 
-/// The substitutions every text gets: composition, forms of a language,
-/// ligatures and forms that depend on the letters around.
+/// Features applied to all text.
 const usual_features = [_]opentype.Tag{ "ccmp".*, "locl".*, "rlig".*, "rclt".*, "liga".*, "calt".*, "clig".* };
 
-/// The character a baked glyph is drawn by: a real one if the font has
-/// one for it, else its name by number, in the range for the direction
+/// The glyph's own character if it is baked under one, else its private name
+/// of `kind`; null when not baked.
 fn codepointOf(current: *const Baked, id: u16, kind: NameKind) ?u21 {
     var named: ?u21 = null;
     for (current.glyphs) |glyph| {
@@ -239,9 +215,8 @@ fn codepointOf(current: *const Baked, id: u16, kind: NameKind) ?u21 {
     return named;
 }
 
-/// The ranges glyphs without a character of their own are named in: text
-/// layout reads the direction a glyph runs in, and whether it is a mark
-/// that sits on the letter before it, from the range.
+/// The private ranges unmapped glyphs are named in. Text layout reads
+/// direction and mark-ness from the range.
 const NameKind = enum {
     ltr,
     rtl,
@@ -262,33 +237,28 @@ fn nameKind(codepoint: u21) NameKind {
     return .rtl_mark;
 }
 
-/// A font ready to draw with. Reading it (`glyph`, `kern`, `measure`, a
-/// draw list laying out text) is safe from any number of threads, also
-/// while another thread adds glyphs with `extend` and `adopt`: those build
-/// a new bake beside the one in use and swap it in whole, and the old one
-/// stays valid until the font is destroyed.
+/// Reading is safe from any number of threads, also while another thread
+/// adds glyphs with `extend` and `adopt`: bakes are swapped in whole and old
+/// ones stay valid until `deinit`.
 pub const Font = struct {
     gpa: std.mem.Allocator,
-    /// Distance from the baseline to the top of the line, in ems.
+    /// Baseline to the top of the line, in ems.
     ascent: f32,
-    /// Distance from the baseline to the bottom of the line, in ems (positive).
+    /// Baseline to the bottom of the line, in ems (positive).
     descent: f32,
-    /// Recommended baseline-to-baseline distance, in ems.
+    /// Baseline-to-baseline distance, in ems.
     line_height: f32,
-    /// The bake in use. Replaced as a whole, never edited.
+    /// Replaced as a whole, never edited.
     current: std.atomic.Value(*Baked),
-    /// Earlier bakes, kept so that a thread which picked one up before it
-    /// was replaced is not left with freed tables.
+    /// Earlier bakes, kept alive for threads still reading them.
     retired: std.ArrayList(*Baked) = .empty,
-    /// A number no other font loaded in this process has, for telling
-    /// fonts apart after one is gone and another sits where it was.
+    /// Unique among the fonts loaded in this process.
     id: u64 = 0,
-    /// The font file, kept so more glyphs can be added later (`extend`).
+    /// The font file, kept for `extend`.
     source: []u8 = &.{},
 
-    /// Frees every bake, the one in use and the retired ones, and the copy of
-    /// the font file. No thread may still be reading the font. The atlas
-    /// texture is the renderer's and is not touched here.
+    /// Frees every bake and the copy of the font file. No thread may still be
+    /// reading the font. The atlas texture belongs to the renderer.
     pub fn deinit(self: *Font) void {
         const now = self.current.load(.acquire);
         now.deinit(self.gpa);
@@ -302,31 +272,27 @@ pub const Font = struct {
         self.* = undefined;
     }
 
-    /// The bake in use right now. Take it once and use it for a whole
-    /// piece of text, so that glyph positions and the atlas they point
-    /// into belong together even if glyphs are added meanwhile.
+    /// The bake in use. Take it once per piece of text so glyph positions and
+    /// atlas match.
     pub fn baked(self: *const Font) *const Baked {
         return self.current.load(.acquire);
     }
 
-    /// Glyph for `codepoint`, falling back to '?' and then to the first
-    /// baked glyph.
+    /// Falls back to '?' and then to the first baked glyph.
     pub fn glyph(self: *const Font, codepoint: u21) *const Glyph {
         return self.baked().glyph(codepoint);
     }
 
-    /// Sets the atlas texture of the bake in use. For the renderer, before
-    /// the font is handed to anyone.
+    /// Sets the atlas texture of the bake in use. Renderer only, before the
+    /// font
+    /// is shared.
     pub fn setTexture(self: *Font, texture_index: u32) void {
         self.current.load(.acquire).texture_index = texture_index;
     }
 
-    /// Bakes glyphs for any of `codepoints` the font file has but the
-    /// atlas does not yet, into a new bake that is returned without being
-    /// put to use; null if there is nothing to add. Upload its atlas, set
-    /// its `texture_index`, and call `adopt` (or `discard`). The whole
-    /// atlas is rebuilt, so add characters in batches rather than one at a
-    /// time.
+    /// Bakes the `codepoints` the font has and the atlas lacks into a new bake,
+    /// not yet in use; null if there is nothing to add. Upload its atlas, set
+    /// `texture_index`, then `adopt` or `discard`. Rebuilds the whole atlas.
     pub fn extend(self: *Font, codepoints: []const u21) !?*Baked {
         if (self.source.len == 0) return null;
         const tables = try Tables.init(self.source);
@@ -353,11 +319,9 @@ pub const Font = struct {
         return next;
     }
 
-    /// Puts a bake from `extend` to use. Text laid out from now on uses
-    /// it; text being laid out on other threads finishes with the old one.
+    /// Puts a bake from `extend` to use. Other threads finish with the old one.
     pub fn adopt(self: *Font, next: *Baked) void {
         const old = self.current.swap(next, .acq_rel);
-        // Nothing reads the old atlas pixels: its texture is on the GPU.
         self.gpa.free(old.atlas);
         self.gpa.free(old.msdf);
         old.msdf = &.{};
@@ -371,37 +335,31 @@ pub const Font = struct {
         self.gpa.destroy(next);
     }
 
-    /// Whether the font has a glyph of its own for `codepoint`.
+    /// Whether the font maps `codepoint` to a glyph.
     pub fn has(self: *const Font, codepoint: u21) bool {
         return self.baked().find(codepoint) != null;
     }
 
-    /// Where `mark` goes when it follows `base`, if it is a combining
-    /// mark the font places on that letter: the offset of its origin
-    /// from the base's, in ems, y up. It then takes no room of its own.
+    /// Offset of `mark`'s origin from `base`'s, in ems, y up; null when the
+    /// font
+    /// does not place `mark` on `base`.
     pub fn markOffset(self: *const Font, base: u21, mark: u21) ?[2]f32 {
         return self.baked().marks.get(@as(u64, base) << 32 | mark);
     }
 
-    /// The characters to draw for `text` once the font's own
-    /// substitutions have been applied (ligatures, forms that depend on
-    /// what stands next to a letter or on the language, and whatever
-    /// `shaping` asks for by name), appended to `out`. A glyph with no
-    /// character of its own comes out as one of `glyph_codepoints`.
-    /// Returns false, adding nothing, when the font changes nothing or
-    /// the result needs a glyph that is not in the atlas (see
-    /// `missingSubstitutes`). For more than the odd line, work the
-    /// substitutions out once with `substitution`.
+    /// Appends to `out` the characters to draw for `text` after the font's
+    /// substitutions; unmapped glyphs appear as `glyph_codepoints`. Returns
+    /// false, adding nothing, when nothing changes or a needed glyph is not
+    /// baked (see `missingSubstitutes`).
     pub fn substitute(self: *const Font, gpa: std.mem.Allocator, text: []const u21, shaping: Shaping, out: *std.ArrayList(u21)) !bool {
         var with = (try self.substitution(gpa, shaping)) orelse return false;
         defer with.deinit(gpa);
         return self.substituteWith(gpa, text, &with, out);
     }
 
-    /// The font's substitutions for one script, language and set of
-    /// features, worked out once to be applied to any number of runs.
-    /// Null when the font has none. Owned by the caller; good for as
-    /// long as the font is.
+    /// Substitutions for one script, language and feature set, for reuse across
+    /// runs. Null when the font has none. Owned by the caller; valid as long as
+    /// the font.
     pub fn substitution(self: *const Font, gpa: std.mem.Allocator, shaping: Shaping) !?Substitution {
         if (self.source.len == 0) return null;
         const tables = Tables.init(self.source) catch return null;
@@ -409,11 +367,9 @@ pub const Font = struct {
         return shapingFor(gpa, tables, layout, shaping);
     }
 
-    /// The substitutions of a font given by its tables.
     fn shapingFor(gpa: std.mem.Allocator, tables: Tables, layout: opentype.Layout, shaping: Shaping) !?Substitution {
         var made = (try substitutionFor(gpa, tables, layout, shaping)) orelse return null;
         errdefer made.deinit(gpa);
-        // Spacing that depends on what stands around a glyph.
         if (tables.gpos) |gpos| if (opentype.Layout.initPositions(tables.reader.bytes, gpos, tables.gdef)) |positions| {
             var plan = positions.plan(gpa, shaping.script, shaping.language, &.{ "kern".*, "dist".* }, tables.glyph_count) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -434,8 +390,6 @@ pub const Font = struct {
         const extra = shaping.features[0..@min(shaping.features.len, 16)];
         if (indic.scriptOf(shaping.script)) |script| return indicScript(gpa, tables, layout, script, shaping.language, extra);
         if (std.mem.eql(u8, &shaping.script, "arab") or std.mem.eql(u8, &shaping.script, "mong")) return joinedScript(gpa, tables, layout, shaping.script, shaping.language, extra);
-        // Scripts that stack their letters without moving them (Tibetan):
-        // the font's forms for what sits above, below and after.
         if (std.mem.eql(u8, &shaping.script, "tibt")) {
             const stacking = [_]opentype.Tag{ "ccmp".*, "locl".*, "abvs".*, "blws".*, "psts".*, "rlig".*, "liga".*, "calt".*, "clig".* };
             var stacked: [stacking.len + 16]opentype.Tag = undefined;
@@ -463,10 +417,8 @@ pub const Font = struct {
         return .{ .tables = tables, .layout = layout, .plan = plan };
     }
 
-    /// The substitutions of Devanagari and its sister scripts, which come
-    /// in stages: first the
-    /// forms a consonant takes by its place in the syllable, one feature
-    /// at a time, then the ligatures and marks that dress the result.
+    /// Staged plan for Indic scripts: positional consonant forms one feature at
+    /// a time, then ligatures and marks.
     fn indicScript(gpa: std.mem.Allocator, tables: Tables, layout: opentype.Layout, written: *const indic.Script, language: ?opentype.Tag, extra: []const opentype.Tag) !?Substitution {
         const Tag = opentype.Tag;
         const all = indic.mask_all;
@@ -487,12 +439,9 @@ pub const Font = struct {
             .{ .features = &.{"pstf".*}, .mask = indic.mask_post },
             .{ .features = &.{"vatu".*}, .mask = all },
             .{ .features = &.{"cjct".*}, .mask = all },
-            // Forms for the start of a word.
             .{ .features = &.{"init".*}, .mask = indic.mask_initial },
             .{ .features = dressing[0 .. usual.len + extra.len], .mask = all },
         };
-        // The newer way of laying the script out, or the older if that
-        // is all the font knows.
         var script: Tag = written.tag;
         var plan = planOrNull(layout, gpa, script, language, &stages, tables.glyph_count) orelse return error.OutOfMemory;
         if (plan.lookups.len == 0) {
@@ -506,8 +455,6 @@ pub const Font = struct {
             return null;
         }
 
-        // What the font does with ra and halant, and which consonants it
-        // draws below or behind another: tried on the glyphs themselves.
         var forms = indic.Forms{ .script = written };
         const halant: u16 = @intCast((tables.glyphIndex(written.halant()) catch 0) & 0xffff);
         var glyphs: std.ArrayList(opentype.Glyph) = .empty;
@@ -519,7 +466,6 @@ pub const Font = struct {
             const ra: u16 = @intCast((tables.glyphIndex(written.ra()) catch 0) & 0xffff);
             glyphs.appendSliceAssumeCapacity(&.{ .{ .id = ra }, .{ .id = halant } });
             if (written.joiners) glyphs.appendAssumeCapacity(.{ .id = @intCast((tables.glyphIndex(0x200d) catch 0) & 0xffff) });
-            // A kinzi is moved whatever the font does with it.
             forms.reph = written.kinzi or (halant != 0 and ra != 0 and (layout.substitutePlanned(gpa, &glyphs, reph) catch false));
         }
         {
@@ -529,7 +475,6 @@ pub const Font = struct {
             while (below.lookups.len != 0 and codepoint < written.block + 0x80) : (codepoint += 1) {
                 const consonant: u16 = @intCast((tables.glyphIndex(codepoint) catch 0) & 0xffff);
                 if (consonant == 0 or halant == 0) continue;
-                // With the joiner between, where the script is written so.
                 if (written.joiners) {
                     const joiner: u16 = @intCast((tables.glyphIndex(0x200d) catch 0) & 0xffff);
                     glyphs.clearRetainingCapacity();
@@ -546,9 +491,8 @@ pub const Font = struct {
         return .{ .tables = tables, .layout = layout, .plan = plan, .forms = forms };
     }
 
-    /// The substitutions of Arabic: each of a letter's four forms from
-    /// its own feature, applied to the letters that take that form, then
-    /// the ligatures over the result.
+    /// Staged plan for Arabic: each joining form's feature on the letters that
+    /// take it, then ligatures.
     fn joinedScript(gpa: std.mem.Allocator, tables: Tables, layout: opentype.Layout, script: opentype.Tag, language: ?opentype.Tag, extra: []const opentype.Tag) !?Substitution {
         const Tag = opentype.Tag;
         const all = arabic.mask_all;
@@ -574,8 +518,8 @@ pub const Font = struct {
         return .{ .tables = tables, .layout = layout, .plan = plan, .joined = rtl, .joining = !rtl };
     }
 
-    /// A plan, empty if the font's tables do not hold together; null
-    /// only when memory runs out.
+    /// An empty plan if the font's tables are invalid; null only on out of
+    /// memory.
     fn planOrNull(layout: opentype.Layout, gpa: std.mem.Allocator, script: opentype.Tag, language: ?opentype.Tag, stages: []const opentype.Stage, glyph_count: u32) ?opentype.Plan {
         return layout.planStages(gpa, script, language, stages, glyph_count) catch |err| switch (err) {
             error.OutOfMemory => null,
@@ -583,7 +527,7 @@ pub const Font = struct {
         };
     }
 
-    /// `substitute` with substitutions worked out beforehand.
+    /// `substitute` with a prepared `Substitution`.
     pub fn substituteWith(self: *const Font, gpa: std.mem.Allocator, text: []const u21, with: *const Substitution, out: *std.ArrayList(u21)) !bool {
         var glyphs: std.ArrayList(opentype.Glyph) = .empty;
         defer glyphs.deinit(gpa);
@@ -591,24 +535,16 @@ pub const Font = struct {
         const current = self.baked();
         const start = out.items.len;
         errdefer out.items.len = start;
-        // Whether marks of a ligature's earlier parts have just gone by.
         var across = false;
         for (glyphs.items) |shaped| {
             const original = text[shaped.cluster];
-            // A joiner the font made nothing of has done its work and is
-            // not drawn.
             if ((original == 0x200c or original == 0x200d) and (with.tables.glyphIndex(original) catch 0) == shaped.id) continue;
             const codepoint = if ((with.tables.glyphIndex(original) catch 0) == shaped.id) original else codepointOf(current, shaped.id, with.nameOf(shaped.id)) orelse {
                 out.items.len = start;
                 return false;
             };
-            // What positioning added to the advance travels as a character
-            // of its own, on the side the advance is on.
             const spacing: ?u21 = if (shaped.advance != 0) spacingName(@as(f32, @floatFromInt(shaped.advance)) / with.tables.units_per_em, with.joined) else null;
             if (with.joined) if (spacing) |space| try out.append(gpa, space);
-            // A mark a ligature was formed across says which part it is on.
-            // Marks typed after the whole ligature then say so too (255: its
-            // last part), so that they do not stack on the ones before.
             if (shaped.component != 0) {
                 try out.append(gpa, componentName(shaped.component, with.joined));
                 across = true;
@@ -621,10 +557,9 @@ pub const Font = struct {
         return true;
     }
 
-    /// The characters (see `glyph_codepoints`) of the glyphs that
-    /// `substitute` would need for `text` and that are not baked yet;
-    /// adding them with `extend` lets the substitutions show. Appended to
-    /// `missing`.
+    /// Appends to `missing` the `glyph_codepoints` characters `substitute`
+    /// needs
+    /// for `text` that are not baked; add them with `extend`.
     pub fn missingSubstitutes(self: *const Font, gpa: std.mem.Allocator, text: []const u21, shaping: Shaping, missing: *std.ArrayList(u21)) !void {
         var with = (try self.substitution(gpa, shaping)) orelse return;
         defer with.deinit(gpa);
@@ -635,7 +570,6 @@ pub const Font = struct {
         for (glyphs.items) |shaped| {
             if ((with.tables.glyphIndex(text[shaped.cluster]) catch 0) == shaped.id or shaped.id == 0) continue;
             if (codepointOf(current, shaped.id, with.nameOf(shaped.id)) != null) continue;
-            // About to be baked under a character of its own.
             var coming = false;
             for (missing.items) |other| {
                 if (other < glyph_codepoints_rtl_mark and (with.tables.glyphIndex(other) catch 0) == shaped.id) coming = true;
@@ -646,9 +580,7 @@ pub const Font = struct {
         }
     }
 
-    /// The font's own ligature for the start of `rest`, if it has one
-    /// among its baked glyphs: how many characters it stands for and the
-    /// character it is drawn as.
+    /// The baked ligature at the start of `rest`, if any.
     pub fn ligature(self: *const Font, rest: []const u21) ?LigatureMatch {
         for (self.baked().ligatures) |entry| {
             if (entry.len <= rest.len and std.mem.eql(u21, entry.sequence[0..entry.len], rest[0..entry.len]))
@@ -657,9 +589,8 @@ pub const Font = struct {
         return null;
     }
 
-    /// The characters (see `glyph_codepoints`) of the font's ligature
-    /// glyphs that are not baked yet although all their parts are; adding
-    /// them with `extend` makes those ligatures appear. Caller frees.
+    /// The `glyph_codepoints` characters of ligature glyphs not yet baked whose
+    /// parts all are. Caller frees.
     pub fn missingLigatures(self: *const Font, gpa: std.mem.Allocator) ![]u21 {
         var missing: std.ArrayList(u21) = .empty;
         errdefer missing.deinit(gpa);
@@ -684,26 +615,21 @@ pub const Font = struct {
         return missing.toOwnedSlice(gpa);
     }
 
-    /// Where a mark goes that follows `base` and, if any, a mark already
-    /// set on it (`below`, placed at `below_at`): on the mark below when
-    /// the font stacks the two, else on the base. Null when `mark` is not
-    /// a mark the font places there.
-    /// `component` is the part of a ligature the mark was typed after
-    /// (see `componentOf`), 0 when nothing said so.
+    /// Offset of `mark` following `base`: stacked on `below` (placed at
+    /// `below_at`) when the font stacks the two, else on the base. Null when
+    /// the
+    /// font does not place it. `component` is the ligature part the mark
+    /// follows
+    /// (see `componentOf`), 0 when unknown.
     pub fn markPlacement(self: *const Font, base: u21, component: u8, below: ?u21, below_at: [2]f32, mark: u21) ?[2]f32 {
         if (below) |under| if (self.markOffset(under, mark)) |offset| return .{ below_at[0] + offset[0], below_at[1] + offset[1] };
         if (self.baked().ligature_marks.get(ligatureMarkKey(base, mark, if (component == 255) 0 else component))) |offset| return offset;
         return self.markOffset(base, mark);
     }
 
-    /// How a glyph of a cursive script sits against the one drawn to its
-    /// left: the shift of its pen position and of its height, in ems.
-    /// Null when the two do not join. In a script written from right to
-    /// left the glyph on the left comes later in the text and its entry
-    /// is laid on the other's exit; written from left to right it comes
-    /// earlier and its exit is laid on the other's entry. The heights
-    /// add up along a word, which is what gives a script like Nastaliq
-    /// its descending line.
+    /// Pen and height shift, in ems, of a cursive glyph against the one drawn
+    /// to
+    /// its left; null when the two do not join.
     pub fn cursive(self: *const Font, left: u21, right: u21) ?[2]f32 {
         const current = self.baked();
         const on_left = current.cursive.get(left) orelse return null;
@@ -718,19 +644,18 @@ pub const Font = struct {
         return .{ exit[0] - entry[0] - current.glyph(left).advance, exit[1] - entry[1] };
     }
 
-    /// Kerning adjustment between two codepoints, in ems.
+    /// Kerning adjustment, in ems.
     pub fn kern(self: *const Font, left: u21, right: u21) f32 {
         return self.baked().kern(left, right);
     }
 
-    /// Width and height of `text` set at `size` (pixels or world units per
-    /// em). Newlines start a new line.
+    /// Width and height of `text` at `size` (pixels or world units per em).
+    /// Newlines start a new line.
     pub fn measure(self: *const Font, text: []const u8, size: f32) [2]f32 {
         var width: f32 = 0;
         var line_width: f32 = 0;
         var lines: f32 = 1;
         var previous: ?u21 = null;
-        // The mark last set on the letter before, for marks that stack.
         var mark_below: ?u21 = null;
         var iterator = Utf8Iterator{ .bytes = text };
         while (iterator.next()) |codepoint| {
@@ -741,7 +666,6 @@ pub const Font = struct {
                 previous = null;
                 continue;
             }
-            // A mark set on the letter before it takes no room.
             if (previous) |base| if (self.markPlacement(base, 0, mark_below, .{ 0, 0 }, codepoint) != null) {
                 mark_below = codepoint;
                 continue;
@@ -755,9 +679,7 @@ pub const Font = struct {
     }
 };
 
-/// Whether a character belongs to a script written from right to left,
-/// or names a glyph of one (`glyph_codepoints_rtl` and the range for
-/// its marks).
+/// Whether a character is of a right-to-left script or names a glyph of one.
 fn runsRightToLeft(codepoint: u21) bool {
     return switch (codepoint) {
         0x590...0x8ff, 0xfb1d...0xfdff, 0xfe70...0xfeff, 0xd0000...0xdffff, 0x100000...0x10ffff => true,
@@ -767,13 +689,13 @@ fn runsRightToLeft(codepoint: u21) bool {
 
 /// Lenient UTF-8 decoding: invalid bytes decode as U+FFFD.
 pub const Utf8Iterator = struct {
-    /// The text; must outlive the iterator.
+    /// Must outlive the iterator.
     bytes: []const u8,
     index: usize = 0,
 
-    /// The next codepoint, or null at the end of the text. A malformed
-    /// sequence gives U+FFFD and moves on one byte; one cut short by the end
-    /// of the text gives U+FFFD and ends there.
+    /// Null at the end. A malformed sequence gives U+FFFD and advances one
+    /// byte;
+    /// a truncated one gives U+FFFD and ends.
     pub fn next(self: *Utf8Iterator) ?u21 {
         if (self.index >= self.bytes.len) return null;
         const first = self.bytes[self.index];
@@ -793,8 +715,6 @@ pub const Utf8Iterator = struct {
         return codepoint;
     }
 };
-
-// ------------------------------------------------------------------ parsing
 
 const Reader = struct {
     bytes: []const u8,
@@ -828,7 +748,7 @@ const Tables = struct {
     glyf: usize = 0,
     loca: usize = 0,
     hmtx: usize = 0,
-    /// The font's metrics for text set downward, if it has them.
+    /// Null when the font has no vertical metrics.
     vmtx: ?usize = null,
     vertical_metric_count: u16 = 0,
     kern: ?usize = null,
@@ -883,7 +803,6 @@ const Tables = struct {
         self.metric_count = try reader.u16At(hhea + 34);
         if (self.metric_count == 0) return error.InvalidFont;
 
-        // Prefer a full Unicode table, then the BMP one.
         const cmap = (try findTable(reader, "cmap")) orelse return error.InvalidFont;
         const subtables = try reader.u16At(cmap + 2);
         var best_score: u32 = 0;
@@ -907,7 +826,6 @@ const Tables = struct {
     }
 
     fn glyphIndex(self: *const Tables, codepoint: u21) !u32 {
-        // Glyphs without a character of their own are named by number.
         if (codepoint >= glyph_codepoints_rtl) return codepoint - glyph_codepoints_rtl;
         if (codepoint >= glyph_codepoints_rtl_mark and codepoint < glyph_codepoints_rtl_mark + 0x10000) return codepoint - glyph_codepoints_rtl_mark;
         if (codepoint >= glyph_codepoints) return codepoint - glyph_codepoints;
@@ -951,8 +869,7 @@ const Tables = struct {
         return 0;
     }
 
-    /// How far down the pen moves after a glyph in text set downward, in
-    /// the font's units; 0 when the font has no such metrics.
+    /// Vertical advance in font units; 0 when the font has no vertical metrics.
     fn advanceDown(self: *const Tables, glyph_index: u32) !f32 {
         const vmtx = self.vmtx orelse return 0;
         const index: usize = @min(glyph_index, self.vertical_metric_count - 1);
@@ -964,7 +881,7 @@ const Tables = struct {
         return @floatFromInt(try self.reader.u16At(self.hmtx + index * 4));
     }
 
-    /// Byte range of a glyph inside `glyf`, or null for blank glyphs.
+    /// Offset of a glyph inside `glyf`, or null for blank glyphs.
     fn glyphData(self: *const Tables, glyph_index: u32) !?usize {
         if (glyph_index >= self.glyph_count) return null;
         const reader = self.reader;
@@ -982,7 +899,7 @@ const Tables = struct {
 
 const Segment = struct { a: [2]f32, b: [2]f32 };
 
-/// 2x2 linear transform plus translation, applied to composite components.
+/// 2x2 linear transform plus translation, for composite components.
 const Affine = struct {
     m: [4]f32 = .{ 1, 0, 0, 1 },
     t: [2]f32 = .{ 0, 0 },
@@ -1023,7 +940,7 @@ fn appendQuad(gpa: std.mem.Allocator, segments: *std.ArrayList(Segment), a: [2]f
     }
 }
 
-/// Appends the outline of a glyph, in font units, as line segments.
+/// Appends a glyph's outline, in font units, as line segments.
 fn appendOutline(
     gpa: std.mem.Allocator,
     tables: *const Tables,
@@ -1135,8 +1052,6 @@ fn appendOutline(
         const contour_points = points[first..][0..count];
         const contour_flags = flags[first..][0..count];
 
-        // Start on an on-curve point; if there is none, the midpoint of the
-        // first two control points is an implied one.
         var start_index: usize = 0;
         while (start_index < count and contour_flags[start_index] & 1 == 0) start_index += 1;
         var start: [2]f32 = undefined;
@@ -1151,7 +1066,6 @@ fn appendOutline(
         var pen = start;
         var control: ?[2]f32 = null;
         for (1..count + 1) |step| {
-            // When every point is off-curve the walk starts at point 0 itself.
             const point_index = (start_index + (if (all_off) step - 1 else step)) % count;
             const closing = !all_off and step == count;
             const point = if (closing) start else contour_points[point_index];
@@ -1181,11 +1095,7 @@ fn midpoint(a: [2]f32, b: [2]f32) [2]f32 {
     return .{ (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5 };
 }
 
-// ------------------------------------------------------------------- baking
-
-/// What the multi-channel field needs to know about a piece of outline:
-/// which of the three channels it is drawn in, and whether it begins or
-/// ends at a corner of the glyph.
+/// A segment's channel mask and whether it starts or ends at a corner.
 const EdgeInfo = struct {
     channels: u8 = 7,
     corner_at_start: bool = false,
@@ -1196,12 +1106,9 @@ fn samePoint(a: [2]f32, b: [2]f32) bool {
     return @abs(a[0] - b[0]) < 1e-3 and @abs(a[1] - b[1]) < 1e-3;
 }
 
-/// Colors the pieces of a glyph's outline for a multi-channel distance
-/// field (Chlumsky, "Shape Decomposition for Multi-channel Distance
-/// Fields"): the stretches between corners take turns among three pairs
-/// of channels, so that the two stretches meeting at a corner differ in
-/// two channels and the median of the three keeps the corner sharp.
-/// A contour without corners stays in all three and is a plain field.
+/// Colors a glyph's outline segments for a multi-channel distance field
+/// (Chlumsky, "Shape Decomposition for Multi-channel Distance Fields"). A
+/// contour without corners stays in all three channels.
 fn colorEdges(outline: []const Segment, info: []EdgeInfo) void {
     const pairs = [3]u8{ 0b101, 0b011, 0b110 };
     var start: usize = 0;
@@ -1209,7 +1116,6 @@ fn colorEdges(outline: []const Segment, info: []EdgeInfo) void {
         var end = start + 1;
         while (end < outline.len and samePoint(outline[end].a, outline[end - 1].b)) end += 1;
         const count = end - start;
-        // Is the joint before each piece a corner?
         var corners: usize = 0;
         var first_corner: usize = 0;
         for (0..count) |index| {
@@ -1228,7 +1134,6 @@ fn colorEdges(outline: []const Segment, info: []EdgeInfo) void {
         }
         for (0..count) |index| info[start + index].corner_at_end = info[start + (index + 1) % count].corner_at_start;
         if (corners == 1) {
-            // A teardrop: three stretches, the middle one in all channels.
             for (0..count) |step| {
                 const index = (first_corner + step) % count;
                 info[start + index].channels = if (step * 3 < count) pairs[0] else if (step * 3 < count * 2) 7 else pairs[1];
@@ -1241,7 +1146,6 @@ fn colorEdges(outline: []const Segment, info: []EdgeInfo) void {
                 if (step != 0 and info[start + index].corner_at_start) {
                     stretch += 1;
                     color = (color + 1) % 3;
-                    // The last stretch meets the first again: not its color.
                     if (stretch == corners - 1 and color == 0) color = if (corners % 3 == 1) 1 else 2;
                 }
                 info[start + index].channels = pairs[color];
@@ -1261,15 +1165,12 @@ fn distanceSquared(p: [2]f32, segment: Segment) f32 {
     return dx * dx + dy * dy;
 }
 
-/// Signed distance from `p` to the outline: positive inside (non-zero
-/// winding), negative outside.
+/// Positive inside (non-zero winding), negative outside.
 fn signedDistance(p: [2]f32, segments: []const Segment) f32 {
     var best = std.math.inf(f32);
     var winding: i32 = 0;
     for (segments) |segment| {
         best = @min(best, distanceSquared(p, segment));
-        // Horizontal ray toward +x; half-open rule avoids double counting
-        // shared vertices.
         const a = segment.a;
         const b = segment.b;
         if ((a[1] <= p[1]) != (b[1] <= p[1])) {
@@ -1281,8 +1182,7 @@ fn signedDistance(p: [2]f32, segments: []const Segment) f32 {
     return if (winding != 0) distance else -distance;
 }
 
-/// Where a glyph's outline crosses a row of pixels, and which way it is
-/// going there.
+/// Where the outline crosses a pixel row, and its winding direction there.
 const Crossing = struct { x: f32, direction: i32 };
 
 const Cell = struct {
@@ -1299,11 +1199,9 @@ const Cell = struct {
 
 var next_font_id: std.atomic.Value(u64) = .init(1);
 
-/// Parses a TrueType font and bakes an SDF atlas for the codepoints in
-/// `ranges`. The caller owns the result and frees it with `Font.deinit`.
-/// `bytes` is copied, so it need not outlive the call. Fonts without
-/// TrueType outlines (CFF) fail with `error.UnsupportedFont`, damaged ones
-/// with `error.InvalidFont`.
+/// Parses a TrueType font and bakes an SDF atlas for `ranges`. `bytes` is
+/// copied. Free the result with `Font.deinit`. `error.UnsupportedFont` for
+/// CFF outlines, `error.InvalidFont` for damaged files.
 pub fn load(gpa: std.mem.Allocator, bytes: []const u8, ranges: []const Range) !Font {
     const tables = try Tables.init(bytes);
     const first = try gpa.create(Baked);
@@ -1321,10 +1219,8 @@ pub fn load(gpa: std.mem.Allocator, bytes: []const u8, ranges: []const Range) !F
     };
 }
 
-/// Bakes the glyphs of `ranges`: outlines to a distance-field atlas, plus
-/// metrics and kerning. With `previous`, a bake of the first of those
-/// ranges, its glyphs are kept where they are in the atlas and only the
-/// rest is rasterized.
+/// Bakes the glyphs of `ranges`. `previous` must be a bake of the leading
+/// ranges; its glyphs keep their place in the atlas.
 fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, previous: ?*const Baked) !Baked {
     const scale = atlas_em / tables.units_per_em;
     const padding: u32 = @intFromFloat(@ceil(sdf_spread));
@@ -1338,8 +1234,6 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
     var cells: std.ArrayList(Cell) = .empty;
     defer cells.deinit(gpa);
 
-    // Glyphs of an earlier bake keep their place; only ranges past the
-    // ones it covered are new.
     var first_new: usize = 0;
     if (previous) |old| {
         try glyphs.appendSlice(gpa, old.glyphs);
@@ -1351,7 +1245,6 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
         while (codepoint <= range[1]) : (codepoint += 1) {
             if (previous) |old| if (old.find(codepoint) != null) continue;
             const glyph_index = try tables.glyphIndex(codepoint);
-            // Unmapped codepoints are skipped, except the space every font needs.
             if (glyph_index == 0 and codepoint != ' ') continue;
             const segment_start = segments.items.len;
             try appendOutline(gpa, tables, glyph_index, .{}, &segments, 0);
@@ -1383,8 +1276,6 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
     }
     if (glyphs.items.len == 0) return error.EmptyFont;
 
-    // Shelf packing in glyph order; a one-pixel gutter keeps bilinear
-    // filtering from bleeding between neighbours.
     const atlas_width: u32 = 1024;
     var pen_x: u32 = if (previous) |old| old.pen[0] else 1;
     var pen_y: u32 = if (previous) |old| old.pen[1] else 1;
@@ -1409,9 +1300,6 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
     errdefer gpa.free(msdf);
     @memset(msdf, 0);
     if (previous) |old| {
-        // The same width, and at least the same height: the old rows carry
-        // over as they are, and only their place as a share of the
-        // height may change.
         @memcpy(atlas[0..old.atlas.len], old.atlas);
         @memcpy(msdf[0..old.msdf.len], old.msdf);
         if (old.atlas_height != atlas_height) {
@@ -1423,8 +1311,6 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
         }
     }
 
-    // Scratch for the rows of a cell: the segments near the row, and where
-    // the outline crosses it.
     var near: std.ArrayList(u32) = .empty;
     defer near.deinit(gpa);
     var crossings: std.ArrayList(Crossing) = .empty;
@@ -1437,8 +1323,6 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
         try crossings.ensureTotalCapacity(gpa, outline.len);
         try edges.resize(gpa, outline.len);
         colorEdges(outline, edges.items);
-        // Which side of a piece of outline is inside: asked of the true
-        // field, just to the left of the longest piece.
         var inside_left: f32 = 1;
         {
             var longest: f32 = 0;
@@ -1453,12 +1337,7 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
             }
         }
         for (0..cell.height) |row| {
-            // Atlas rows run top to bottom; outline space is y up.
             const y = cell.min[1] + @as(f32, @floatFromInt(cell.height - 1 - row)) - @as(f32, @floatFromInt(padding)) + 0.5;
-            // A pixel's value only depends on outline within `sdf_spread`
-            // of it (further away it is fully in or fully out), so each
-            // row looks only at the segments that come that close, and
-            // works out once where the outline crosses it.
             near.clearRetainingCapacity();
             crossings.clearRetainingCapacity();
             for (outline, 0..) |segment, index| {
@@ -1466,8 +1345,6 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
                 const high = @max(segment.a[1], segment.b[1]);
                 if (y < low - sdf_spread or y > high + sdf_spread) continue;
                 near.appendAssumeCapacity(@intCast(index));
-                // Horizontal ray toward +x; the half-open rule avoids
-                // counting shared vertices twice.
                 const a = segment.a;
                 const b = segment.b;
                 if ((a[1] <= y) != (b[1] <= y)) crossings.appendAssumeCapacity(.{
@@ -1487,14 +1364,9 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
                 for (crossings.items) |crossing| {
                     if (crossing.x > x) winding += crossing.direction;
                 }
-                // Positive inside (non-zero winding), negative outside.
                 const distance = if (winding != 0) @sqrt(best) else -@sqrt(best);
                 const value = std.math.clamp(0.5 + distance / (2 * sdf_spread), 0, 1);
                 atlas[(cell.y + row) * atlas_width + cell.x + column] = @intFromFloat(@round(value * 255));
-                // The three channels: each the distance to the nearest
-                // piece of outline drawn in it, measured past a corner to
-                // the line the piece lies on, so that the two sides of a
-                // corner each keep their own straight edge.
                 var channel_value: [3]f32 = .{ value, value, value };
                 if (@abs(value - 0.5) < 0.45) {
                     var nearest: [3]f32 = @splat(std.math.inf(f32));
@@ -1514,11 +1386,8 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
                         const true_distance = @sqrt(dx * dx + dy * dy);
                         const perpendicular = (ab[0] * ap[1] - ab[1] * ap[0]) / length;
                         const edge = edges.items[index];
-                        // Past an end that is a corner: the distance to the line.
                         const beyond = (t < 0 and edge.corner_at_start) or (t > 1 and edge.corner_at_end);
                         const side_distance = if (beyond) perpendicular else if (perpendicular < 0) -true_distance else true_distance;
-                        // Of two pieces equally near (they share the point),
-                        // the one the texel is more squarely beside.
                         const squareness = @abs(perpendicular) / @max(true_distance, 1e-6);
                         inline for (0..3) |channel| {
                             if (edge.channels & (1 << channel) != 0) {
@@ -1533,8 +1402,6 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
                     inline for (0..3) |channel| {
                         if (nearest[channel] < sdf_spread) channel_value[channel] = std.math.clamp(0.5 + signed[channel] / (2 * sdf_spread), 0, 1);
                     }
-                    // Where the three disagree with the plain field about
-                    // inside and outside, the plain field is right.
                     const median = @max(@min(channel_value[0], channel_value[1]), @min(@max(channel_value[0], channel_value[1]), channel_value[2]));
                     if ((median > 0.5) != (value > 0.5) or @abs(median - value) > 0.2) channel_value = .{ value, value, value };
                 }
@@ -1571,14 +1438,11 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
         .ranges = &.{},
     };
     errdefer baked.kerning.deinit(gpa);
-    // The positioning table is the modern home of kerning; the old `kern`
-    // table is read only for fonts without it.
     if (!try loadGposKerning(gpa, tables, glyphs.items, glyph_indices.items, &baked.kerning))
         try loadKerning(gpa, tables, glyphs.items, glyph_indices.items, &baked.kerning);
     errdefer baked.marks.deinit(gpa);
     try loadGposMarks(gpa, tables, glyphs.items, glyph_indices.items, &baked.marks, "mark", 4);
     try loadGposMarks(gpa, tables, glyphs.items, glyph_indices.items, &baked.marks, "mkmk", 6);
-    // The same for scripts that name their marks by where they sit.
     try loadGposMarks(gpa, tables, glyphs.items, glyph_indices.items, &baked.marks, "abvm", 4);
     try loadGposMarks(gpa, tables, glyphs.items, glyph_indices.items, &baked.marks, "blwm", 4);
     try loadGposMarks(gpa, tables, glyphs.items, glyph_indices.items, &baked.marks, "abvm", 6);
@@ -1592,7 +1456,6 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
     baked.ranges = try gpa.dupe(Range, ranges);
     errdefer gpa.free(baked.ranges);
     baked.glyphs = try glyphs.toOwnedSlice(gpa);
-    // Ranges may be given in any order; lookups need sorted codepoints.
     std.mem.sort(Glyph, baked.glyphs, {}, struct {
         fn lessThan(_: void, a: Glyph, b: Glyph) bool {
             return a.codepoint < b.codepoint;
@@ -1601,25 +1464,20 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
     return baked;
 }
 
-/// A ligature of the font as the shaper uses it: these characters in a
-/// row are drawn as that one glyph.
 pub const Ligature = struct {
-    /// The first `len` entries are the characters, `result` the character
-    /// the glyph that replaces them is baked under.
+    /// The first `len` entries are the characters; `result` is the character
+    /// the
+    /// ligature glyph is baked under.
     sequence: [4]u21 = .{ 0, 0, 0, 0 },
     len: u8 = 0,
     result: u21 = 0,
 };
 
-/// Where glyphs that have no character of their own (most ligatures) are
-/// given one, so that the atlas, which is keyed by character, can hold
-/// them: this plus the font's glyph number. A private plane of Unicode.
+/// Base of the private range naming glyphs with no character of their own:
+/// this plus the glyph index.
 pub const glyph_codepoints: u21 = 0xf0000;
-/// Characters that stand for a change of spacing rather than a glyph: a
-/// font's positioning that depends on context is worked out while a run
-/// is shaped, and what it adds to a glyph's advance is handed on as one
-/// of these beside the glyph. The upper half of the range runs right to
-/// left. (A plane Unicode has assigned nothing in.)
+/// Base of the range of characters that add spacing instead of drawing a
+/// glyph. The upper half runs right to left.
 pub const spacing_codepoints: u21 = 0xc0000;
 const spacing_steps_per_em = 2048;
 
@@ -1636,23 +1494,17 @@ pub fn spacingOf(codepoint: u21) ?f32 {
     return @as(f32, @floatFromInt(steps)) / spacing_steps_per_em;
 }
 
-/// The same glyphs named a second time, for scripts written from right
-/// to left: text layout takes a character of this range to run that way,
-/// as the letters it stands for do.
+/// `glyph_codepoints` for right-to-left scripts.
 pub const glyph_codepoints_rtl: u21 = 0x100000;
-/// And a third time, for the marks of right-to-left scripts: text layout
-/// keeps a character of this range with the letter it follows, as it
-/// does a combining mark. (A plane Unicode has assigned nothing in.)
+/// `glyph_codepoints` for marks of right-to-left scripts.
 pub const glyph_codepoints_rtl_mark: u21 = 0xd0000;
 
-/// What `Font.ligature` found: the characters it replaces and with what.
 pub const LigatureMatch = struct { consumed: usize, codepoint: u21 };
 
 const RawLigature = struct { glyphs: [4]u16, len: u8, result: u16 };
 
-/// Reads the ligatures of the font's substitution table (GSUB): the
-/// ligature lookups of its `liga` and `rlig` features, of up to four
-/// glyphs each. Other kinds of substitution are not read.
+/// Reads GSUB ligature lookups of the `liga` and `rlig` features, up to four
+/// glyphs each.
 fn readGsubLigatures(gpa: std.mem.Allocator, tables: *const Tables, out: *std.ArrayList(RawLigature)) !void {
     const gsub = tables.gsub orelse return;
     const reader = tables.reader;
@@ -1680,14 +1532,12 @@ fn readGsubLigatures(gpa: std.mem.Allocator, tables: *const Tables, out: *std.Ar
                 var subtable = lookup + (reader.u16At(lookup + 6 + subtable_index * 2) catch return);
                 var kind = lookup_type;
                 if (kind == 7) {
-                    // An extension: the real subtable is further away.
                     kind = reader.u16At(subtable + 2) catch return;
                     subtable += reader.u32At(subtable + 4) catch return;
                 }
                 if (kind != 4) continue;
                 ligatureSubtable(gpa, reader, subtable, out) catch |err| switch (err) {
                     error.OutOfMemory => return err,
-                    // A table that runs off the end of the file: skip it.
                     else => {},
                 };
             }
@@ -1695,13 +1545,11 @@ fn readGsubLigatures(gpa: std.mem.Allocator, tables: *const Tables, out: *std.Ar
     }
 }
 
-/// One ligature subtable: for each first glyph it covers, the ligatures
-/// that begin with it.
+/// Reads one GSUB ligature substitution subtable.
 fn ligatureSubtable(gpa: std.mem.Allocator, reader: Reader, subtable: usize, out: *std.ArrayList(RawLigature)) !void {
     if (try reader.u16At(subtable) != 1) return;
     const coverage = subtable + try reader.u16At(subtable + 2);
     const set_count = try reader.u16At(subtable + 4);
-    // The coverage table lists the first glyphs in the order of the sets.
     const coverage_format = try reader.u16At(coverage);
     for (0..set_count) |set_index| {
         const first: u16 = blk: {
@@ -1709,7 +1557,6 @@ fn ligatureSubtable(gpa: std.mem.Allocator, reader: Reader, subtable: usize, out
                 if (set_index >= try reader.u16At(coverage + 2)) return;
                 break :blk try reader.u16At(coverage + 4 + set_index * 2);
             }
-            // Ranges of glyphs, each with the index its first glyph has.
             const range_count = try reader.u16At(coverage + 2);
             for (0..range_count) |range| {
                 const entry = coverage + 4 + range * 6;
@@ -1733,10 +1580,8 @@ fn ligatureSubtable(gpa: std.mem.Allocator, reader: Reader, subtable: usize, out
     }
 }
 
-/// Reads pair kerning from the font's GPOS table: the pair-adjustment
-/// lookups (formats 1 and 2, directly or through extension lookups) that
-/// its `kern` features use. Other positioning (marks, cursive joins,
-/// contextual rules) is not read. Returns whether the font had any.
+/// Reads GPOS pair adjustments (formats 1 and 2, also through extension
+/// lookups) of the `kern` features. Returns whether the font had any.
 fn loadGposKerning(
     gpa: std.mem.Allocator,
     tables: *const Tables,
@@ -1751,8 +1596,6 @@ fn loadGposKerning(
     const lookup_count = reader.u16At(lookup_list) catch return false;
     var found = false;
     const feature_count = reader.u16At(feature_list) catch return false;
-    // Many `kern` features (one per script and language) share the same
-    // lookups; each lookup is read once.
     const seen = try gpa.alloc(bool, lookup_count);
     defer gpa.free(seen);
     @memset(seen, false);
@@ -1772,7 +1615,6 @@ fn loadGposKerning(
                 var subtable = lookup + (reader.u16At(lookup + 6 + subtable_index * 2) catch return found);
                 var kind = lookup_type;
                 if (kind == 9) {
-                    // An extension: the real subtable is further away.
                     kind = reader.u16At(subtable + 2) catch return found;
                     subtable += reader.u32At(subtable + 4) catch return found;
                 }
@@ -1787,9 +1629,7 @@ fn loadGposKerning(
     return found;
 }
 
-/// Reads mark placement from the font's GPOS table: for every baked base
-/// glyph and combining mark the font has anchors for (mark-to-base
-/// lookups of its `mark` features), where the mark's origin goes relative
+/// Reads GPOS mark anchors for the baked glyphs: the mark's origin relative
 /// to the base's, in ems.
 fn loadGposMarks(
     gpa: std.mem.Allocator,
@@ -1797,9 +1637,9 @@ fn loadGposMarks(
     glyphs: []const Glyph,
     glyph_indices: []const u32,
     marks: *std.AutoHashMapUnmanaged(u64, [2]f32),
-    /// The feature to read and its lookup kind: "mark" with 4 (marks on
-    /// letters) or 5 (marks on the parts of ligatures, keyed as
-    /// `ligatureMarkKey` says), or "mkmk" with 6 (marks on marks).
+    /// "mark" with lookup type 4 (mark-to-base) or 5 (mark-to-ligature, keyed
+    /// by
+    /// `ligatureMarkKey`), or "mkmk" with 6 (mark-to-mark).
     tag: *const [4]u8,
     wanted_kind: u16,
 ) !void {
@@ -1837,7 +1677,6 @@ fn loadGposMarks(
                 else
                     markToBase(gpa, tables, subtable, glyphs, glyph_indices, marks)) catch |err| switch (err) {
                     error.OutOfMemory => return err,
-                    // A table that runs off the end of the file: skip it.
                     else => {},
                 };
             }
@@ -1845,17 +1684,15 @@ fn loadGposMarks(
     }
 }
 
-/// Where a glyph joins the one before it and the one after it in a
-/// script written as one flowing line (GPOS cursive attachment), in ems:
-/// the next glyph's `entry` is laid on this one's `exit`.
+/// GPOS cursive attachment, in ems: the next glyph's `entry` is laid on this
+/// one's `exit`.
 pub const Cursive = struct {
-    /// Offsets from the glyph's origin, y up; null where the font gives none.
+    /// Offsets from the glyph's origin, y up.
     entry: ?[2]f32 = null,
     exit: ?[2]f32 = null,
 };
 
-/// Reads the joining points of the baked glyphs from the font's `curs`
-/// feature.
+/// Reads cursive anchors of the baked glyphs from the `curs` feature.
 fn loadGposCursive(gpa: std.mem.Allocator, tables: *const Tables, glyphs: []const Glyph, glyph_indices: []const u32, cursive: *std.AutoHashMapUnmanaged(u21, Cursive)) !void {
     const gpos = tables.gpos orelse return;
     const reader = tables.reader;
@@ -1903,33 +1740,28 @@ fn loadGposCursive(gpa: std.mem.Allocator, tables: *const Tables, glyphs: []cons
     }
 }
 
-/// Key of `Baked.ligature_marks`: a ligature, a mark and the part of
-/// the ligature the mark belongs to, counting from 1; 0 stands for
-/// the last part, which is where a mark typed after the whole
-/// ligature goes.
+/// Key of `Baked.ligature_marks`. `component` counts from 1; 0 is the last
+/// part.
 fn ligatureMarkKey(base: u21, mark: u21, component: u8) u64 {
     return @as(u64, base) << 43 | @as(u64, mark) << 22 | component;
 }
 
-/// Characters that say which part of a ligature the mark after them
-/// belongs to, put there while a run is shaped; they are not drawn.
-/// The second half is for right-to-left text, where they travel with
-/// the mark. (Unassigned characters of plane 14.)
+/// Base of the range of undrawn characters naming the ligature part the next
+/// mark belongs to. The second half is for right-to-left text.
 pub const component_codepoints: u21 = 0xe1000;
 
 fn componentName(component: u8, rtl: bool) u21 {
     return component_codepoints + @as(u21, if (rtl) 0x100 else 0) + component;
 }
 
-/// The part of a ligature a component character names, counting from
-/// 1 (255: the last part); null for any other character.
+/// The 1-based ligature part a component character names (255: the last);
+/// null for any other character.
 pub fn componentOf(codepoint: u21) ?u8 {
     if (codepoint < component_codepoints or codepoint >= component_codepoints + 0x200) return null;
     return @intCast((codepoint - component_codepoints) & 0xff);
 }
 
-/// One mark-to-ligature subtable: like mark-to-base, with an anchor per
-/// mark class for every part of the ligature.
+/// Reads one GPOS mark-to-ligature subtable.
 fn markToLigature(
     gpa: std.mem.Allocator,
     tables: *const Tables,
@@ -1970,7 +1802,6 @@ fn markToLigature(
                 const offset = [2]f32{ (x - mark_x) / tables.units_per_em, (y - mark_y) / tables.units_per_em };
                 const key = ligatureMarkKey(base.codepoint, mark.codepoint, @intCast(component + 1));
                 if (!marks.contains(key)) try marks.put(gpa, key, offset);
-                // The last part also answers for marks that name none.
                 const last = ligatureMarkKey(base.codepoint, mark.codepoint, 0);
                 if (component + 1 == components and !marks.contains(last)) try marks.put(gpa, last, offset);
             }
@@ -2018,8 +1849,7 @@ fn markToBase(
     }
 }
 
-/// The font's ligatures whose parts and whose own glyph are all among the
-/// baked glyphs, as runs of characters, longest first.
+/// The font's ligatures whose parts and result are all baked, longest first.
 fn bakedLigatures(gpa: std.mem.Allocator, tables: *const Tables, glyphs: []const Glyph, glyph_indices: []const u32) ![]Ligature {
     var raw: std.ArrayList(RawLigature) = .empty;
     defer raw.deinit(gpa);
@@ -2028,8 +1858,6 @@ fn bakedLigatures(gpa: std.mem.Allocator, tables: *const Tables, glyphs: []const
     errdefer found.deinit(gpa);
     const Local = struct {
         fn codepointOf(all: []const Glyph, indices: []const u32, glyph: u16) ?u21 {
-            // A glyph may be baked under its own character and under its
-            // number; the character is the one text is typed in.
             var numbered: ?u21 = null;
             for (all, indices) |candidate, index| {
                 if (index != glyph) continue;
@@ -2058,7 +1886,7 @@ fn bakedLigatures(gpa: std.mem.Allocator, tables: *const Tables, glyphs: []const
     return found.toOwnedSlice(gpa);
 }
 
-/// Bytes of a GPOS value record, and where its horizontal advance sits.
+/// Size in bytes of a GPOS value record of this format.
 fn valueSize(format: u16) usize {
     return @as(usize, @popCount(format)) * 2;
 }
@@ -2068,7 +1896,7 @@ fn advanceOf(reader: Reader, record: usize, format: u16) !f32 {
     return @floatFromInt(try reader.i16At(record + @as(usize, @popCount(format & 0x0003)) * 2));
 }
 
-/// Position of a glyph in a coverage table, or null if it is not covered.
+/// Coverage index of a glyph, or null if not covered.
 fn coverageIndex(reader: Reader, coverage: usize, glyph: u32) !?usize {
     const count = try reader.u16At(coverage + 2);
     switch (try reader.u16At(coverage)) {
@@ -2121,7 +1949,6 @@ fn pairAdjustments(
     const record_size = valueSize(format1) + valueSize(format2);
     var found = false;
     if (format == 1) {
-        // Listed pairs: for each first glyph, a set of second glyphs.
         const set_count = try reader.u16At(subtable + 8);
         for (glyphs, glyph_indices) |left, left_index| {
             const covered = (try coverageIndex(reader, coverage, left_index)) orelse continue;
@@ -2136,15 +1963,12 @@ fn pairAdjustments(
                 for (glyphs, glyph_indices) |right, right_index| {
                     if (right_index != second) continue;
                     const key = @as(u64, left.codepoint) << 32 | right.codepoint;
-                    // The first subtable that names a pair decides it.
                     if (!kerning.contains(key)) try kerning.put(gpa, key, value / tables.units_per_em);
                     found = true;
                 }
             }
         }
     } else if (format == 2) {
-        // Classes: every glyph belongs to one on each side, and the table
-        // holds an adjustment per pair of classes.
         const class_def1 = subtable + try reader.u16At(subtable + 8);
         const class_def2 = subtable + try reader.u16At(subtable + 10);
         const class1_count = try reader.u16At(subtable + 12);
@@ -2170,8 +1994,7 @@ fn pairAdjustments(
     return found;
 }
 
-/// Reads format-0 `kern` pairs for the baked glyphs: the fallback for fonts
-/// whose GPOS table has no pair kerning.
+/// Reads format 0 `kern` table pairs for the baked glyphs.
 fn loadKerning(
     gpa: std.mem.Allocator,
     tables: *const Tables,
@@ -2191,7 +2014,6 @@ fn loadKerning(
     for (0..subtables) |_| {
         const length = reader.u16At(cursor + 2) catch return;
         const coverage = reader.u16At(cursor + 4) catch return;
-        // Horizontal, format 0, not cross-stream or minimum.
         if (coverage & 0xff07 == 0x0001) {
             const pairs = reader.u16At(cursor + 6) catch return;
             for (0..pairs) |pair| {
@@ -2217,12 +2039,10 @@ test "built-in font parses, bakes and measures" {
     try std.testing.expectEqual(@as(u21, 'A'), a.codepoint);
     try std.testing.expect(a.advance > 0.4 and a.advance < 0.9);
     try std.testing.expect(a.plane[3] > 0.6); // capital height
-    // The middle of the atlas cell for 'I' is inside the stem.
     const stem = font.glyph('I');
     const u: usize = @intFromFloat((stem.uv[0] + stem.uv[2]) * 0.5 * @as(f32, @floatFromInt(font.baked().atlas_width)));
     const v: usize = @intFromFloat((stem.uv[1] + stem.uv[3]) * 0.5 * @as(f32, @floatFromInt(font.baked().atlas_height)));
     try std.testing.expect(font.baked().atlas[v * font.baked().atlas_width + u] > 160);
-    // And its corner is outside.
     const corner_u: usize = @intFromFloat(stem.uv[0] * @as(f32, @floatFromInt(font.baked().atlas_width)));
     const corner_v: usize = @intFromFloat(stem.uv[1] * @as(f32, @floatFromInt(font.baked().atlas_height)));
     try std.testing.expect(font.baked().atlas[corner_v * font.baked().atlas_width + corner_u] < 96);
@@ -2245,10 +2065,8 @@ test "kerning is read from the font's positioning table" {
     var font = try load(std.testing.allocator, @embedFile("../render/fonts/DejaVuSans.ttf"), default_ranges);
     defer font.deinit();
     try std.testing.expect(font.baked().kerning.count() > 100);
-    // The classic pair: A and V tuck under each other.
     try std.testing.expect(font.kern('A', 'V') < -0.01);
     try std.testing.expect(font.kern('A', 'V') > -0.3);
-    // And letters that do not need it are left alone.
     try std.testing.expectEqual(@as(f32, 0), font.kern('H', 'H'));
 }
 
@@ -2259,7 +2077,6 @@ test "glyphs added later land where a full bake puts them" {
     defer grown.deinit();
     const added = [_]u21{ 'a', 'b', 'c', 0x05d0, 0x05d1, '!' };
     const next = (try grown.extend(&added)) orelse return error.NothingAdded;
-    // Nothing new the second time round.
     grown.adopt(next);
     try std.testing.expect((try grown.extend(&added)) == null);
 
@@ -2277,7 +2094,6 @@ test "glyphs added later land where a full bake puts them" {
     }
     try std.testing.expectEqualSlices(u8, b.atlas, a.atlas);
     try std.testing.expectEqual(b.kerning.count(), a.kerning.count());
-    // The bake that was replaced is still readable.
     try std.testing.expect(grown.retired.items.len == 1);
     try std.testing.expect(grown.retired.items[0].find('A') != null);
 }
@@ -2297,12 +2113,10 @@ test "adding enough glyphs to grow the atlas keeps the earlier ones intact" {
     const large = font.baked();
     try std.testing.expect(large.atlas_height > height_before);
     const after = large.glyph('C').*;
-    // The same pixels of the atlas, now a smaller share of its height.
     const scale = @as(f32, @floatFromInt(height_before)) / @as(f32, @floatFromInt(large.atlas_height));
     try std.testing.expectEqual(before.uv[0], after.uv[0]);
     try std.testing.expectApproxEqAbs(before.uv[1] * scale, after.uv[1], 1e-6);
     try std.testing.expectApproxEqAbs(before.uv[3] * scale, after.uv[3], 1e-6);
-    // And those pixels still hold the glyph: two of its rows are not empty.
     const top: usize = @intFromFloat(@round(after.uv[1] * @as(f32, @floatFromInt(large.atlas_height))));
     const left: usize = @intFromFloat(@round(after.uv[0] * @as(f32, @floatFromInt(large.atlas_width))));
     const width: usize = @intFromFloat(@round((after.uv[2] - after.uv[0]) * @as(f32, @floatFromInt(large.atlas_width))));
@@ -2313,22 +2127,17 @@ test "adding enough glyphs to grow the atlas keeps the earlier ones intact" {
 }
 
 test "combining marks are placed by the font's anchors" {
-    // Latin letters and the combining diacritics.
     var font = try load(std.testing.allocator, @embedFile("../render/fonts/DejaVuSans.ttf"), &.{ .{ 32, 126 }, .{ 0x300, 0x36f } });
     defer font.deinit();
-    // An acute accent over a lowercase and over a capital: both placed,
-    // and higher over the capital.
     const over_e = font.markOffset('e', 0x301) orelse return error.TestExpectedMark;
     const over_capital = font.markOffset('E', 0x301) orelse return error.TestExpectedMark;
     try std.testing.expect(over_capital[1] > over_e[1] + 0.05);
-    // A letter after a letter is not a mark.
     try std.testing.expectEqual(@as(?[2]f32, null), font.markOffset('e', 'a'));
 }
 
 test "a mark on a mark is placed by the font too" {
     var font = try load(std.testing.allocator, @embedFile("../render/fonts/DejaVuSans.ttf"), &.{ .{ 32, 126 }, .{ 0x300, 0x36f } });
     defer font.deinit();
-    // An acute accent over a diaeresis sits above it.
     const stacked = font.markOffset(0x308, 0x301) orelse return error.TestExpectedMark;
     try std.testing.expect(stacked[1] > 0.05);
 }
@@ -2336,7 +2145,6 @@ test "a mark on a mark is placed by the font too" {
 test "the font's own ligatures are read from its substitution table" {
     const gpa = std.testing.allocator;
     const bytes = @embedFile("../render/fonts/DejaVuSans.ttf");
-    // With the ligature characters baked, the table names them.
     var named = try load(gpa, bytes, &.{ .{ 32, 126 }, .{ 0xfb00, 0xfb04 } });
     defer named.deinit();
     const ffi = named.ligature(&.{ 'f', 'f', 'i', 'x' }) orelse return error.TestExpectedLigature;
@@ -2344,7 +2152,6 @@ test "the font's own ligatures are read from its substitution table" {
     try std.testing.expectEqual(@as(u21, 0xfb03), ffi.codepoint);
     try std.testing.expectEqual(@as(?LigatureMatch, null), named.ligature(&.{ 'a', 'b' }));
 
-    // Without them, the glyphs can be asked for by number and baked.
     var plain = try load(gpa, bytes, &.{.{ 32, 126 }});
     defer plain.deinit();
     try std.testing.expectEqual(@as(?LigatureMatch, null), plain.ligature(&.{ 'f', 'i' }));
@@ -2357,14 +2164,11 @@ test "the font's own ligatures are read from its substitution table" {
     const fi = plain.ligature(&.{ 'f', 'i' }) orelse return error.TestExpectedLigature;
     try std.testing.expectEqual(@as(usize, 2), fi.consumed);
     try std.testing.expect(fi.codepoint >= glyph_codepoints);
-    // The glyph it names is drawn: it has an outline in the atlas.
     const drawn = plain.glyph(fi.codepoint);
     try std.testing.expect(drawn.plane[2] > drawn.plane[0]);
     try std.testing.expect((try plain.missingLigatures(gpa)).len == 0);
 }
 
-/// The glyphs a run of characters comes out as once the font's
-/// substitutions for the given features have been applied.
 fn substitutedForTest(gpa: std.mem.Allocator, text: []const u21, script: opentype.Tag, language: ?opentype.Tag, features: []const opentype.Tag) ![]u16 {
     const tables = try Tables.init(@embedFile("../render/fonts/DejaVuSans.ttf"));
     const layout = try opentype.Layout.init(tables.reader.bytes, tables.gsub.?, tables.gdef);
@@ -2374,7 +2178,6 @@ fn substitutedForTest(gpa: std.mem.Allocator, text: []const u21, script: opentyp
     const lookups = try layout.lookups(gpa, script, language, features);
     defer gpa.free(lookups);
     try layout.substitute(gpa, &glyphs, lookups);
-    // The same through a plan.
     var planned: std.ArrayList(opentype.Glyph) = .empty;
     defer planned.deinit(gpa);
     for (text, 0..) |codepoint, index| try planned.append(gpa, .{ .id = @intCast(try tables.glyphIndex(codepoint)), .cluster = @intCast(index) });
@@ -2396,20 +2199,16 @@ test "the font's substitutions give the glyphs a full shaper gives" {
         script: opentype.Tag = "latn".*,
         language: ?opentype.Tag = null,
         features: []const opentype.Tag = &usual,
-        /// What HarfBuzz 13.2 shapes the same text to.
+        /// HarfBuzz 13.2 output for the same text.
         glyphs: []const u16,
     };
     const cases = [_]Case{
-        // Ligatures.
         .{ .text = &.{ 'f', 'i', ' ', 'f', 'f', 'l' }, .glyphs = &.{ 5042, 3, 5045 } },
-        // By what follows: i and j lose their dots under an accent.
         .{ .text = &.{ 'i', 0x30a, ' ', 'j', 0x303 }, .glyphs = &.{ 243, 699, 3, 505, 692 } },
-        // Forms that belong to a language.
         .{ .text = &.{0x431}, .script = "cyrl".*, .language = "SRB ".*, .glyphs = &.{5040} },
         .{ .text = &.{0x431}, .script = "cyrl".*, .glyphs = &.{966} },
         .{ .text = &.{0x14a}, .language = "NSM ".*, .glyphs = &.{5970} },
         .{ .text = &.{0x14a}, .glyphs = &.{268} },
-        // Features asked for by name.
         .{ .text = &.{'a'}, .features = &.{"salt".*}, .glyphs = &.{531} },
         .{ .text = &.{ 'a', 0xbf, '-' }, .features = &.{"case".*}, .glyphs = &.{ 68, 6214, 16 } },
         .{ .text = &.{0x1c6}, .features = &.{"aalt".*}, .glyphs = &.{392} },
@@ -2428,8 +2227,6 @@ test "text comes out as the characters of the glyphs the font puts in" {
     var out: std.ArrayList(u21) = .empty;
     defer out.deinit(gpa);
 
-    // A glyph that has a character of its own is named by it: the
-    // ligature, and the dotless i that an accent calls for.
     try std.testing.expect(try font.substitute(gpa, &.{ 'f', 'i', 'x' }, .{ .script = "latn".* }, &out));
     try std.testing.expectEqualSlices(u21, &.{ 0xfb01, 'x' }, out.items);
     out.clearRetainingCapacity();
@@ -2437,8 +2234,6 @@ test "text comes out as the characters of the glyphs the font puts in" {
     try std.testing.expectEqualSlices(u21, &.{ 0x131, 0x30a }, out.items);
     out.clearRetainingCapacity();
 
-    // The Serbian form of a letter has none, and is not baked: nothing is
-    // substituted until it has been added under its number.
     const serbian = Shaping{ .script = "cyrl".*, .language = "SRB ".* };
     try std.testing.expect(!try font.substitute(gpa, &.{ 0x430, 0x431 }, serbian, &out));
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
@@ -2451,20 +2246,17 @@ test "text comes out as the characters of the glyphs the font puts in" {
     try std.testing.expect(try font.substitute(gpa, &.{ 0x430, 0x431 }, serbian, &out));
     try std.testing.expectEqualSlices(u21, &.{ 0x430, glyph_codepoints + 5040 }, out.items);
     out.clearRetainingCapacity();
-    // In another language the letter stays as it is: nothing to put in.
     try std.testing.expect(!try font.substitute(gpa, &.{ 0x430, 0x431 }, .{ .script = "cyrl".* }, &out));
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
     out.clearRetainingCapacity();
 
-    // A feature asked for by name.
     missing.clearRetainingCapacity();
     const alternate = Shaping{ .script = "latn".*, .features = &.{"salt".*} };
     try font.missingSubstitutes(gpa, &.{'a'}, alternate, &missing);
     try std.testing.expectEqualSlices(u21, &.{glyph_codepoints + 531}, missing.items);
 }
 
-/// A font of this machine that has Devanagari, if there is one: the
-/// repository carries none.
+/// System fonts with Devanagari; the repository carries none.
 const devanagari_font_paths = [_][]const u8{
     "/nix/store/898jsdqfwknwsli5ajhns19gbi9faz4m-freefont-ttf-20120503/share/fonts/truetype/FreeSerif.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
@@ -2484,8 +2276,7 @@ test "devanagari comes out as the glyphs a full shaper gives" {
     try std.testing.expect(with.forms.?.reph);
     const Case = struct {
         text: []const u8,
-        /// What HarfBuzz 13.2 shapes the same text to with FreeSerif
-        /// (GNU FreeFont 20120503).
+        /// HarfBuzz 13.2 output with FreeSerif (GNU FreeFont 20120503).
         glyphs: []const u16,
     };
     const cases = [_]Case{
@@ -2554,8 +2345,7 @@ test "arabic comes out as the glyphs a full shaper gives" {
     defer with.deinit(gpa);
     const Case = struct {
         text: []const u8,
-        /// What HarfBuzz 13.2 shapes the same text to, in the order the
-        /// text is typed in.
+        /// HarfBuzz 13.2 output, in logical order.
         glyphs: []const u16,
     };
     const cases = [_]Case{
@@ -2606,8 +2396,7 @@ test "the sister scripts of devanagari come out as a full shaper gives them" {
     const Case = struct {
         script: opentype.Tag,
         text: []const u8,
-        /// What HarfBuzz 13.2 shapes the same text to with FreeSerif
-        /// (GNU FreeFont 20120503).
+        /// HarfBuzz 13.2 output with FreeSerif (GNU FreeFont 20120503).
         glyphs: []const u16,
     };
     const cases = [_]Case{
@@ -2692,7 +2481,7 @@ test "scripts tested with the repository's own fonts come out as a full shaper g
         font: []const u8,
         script: opentype.Tag,
         text: []const u8,
-        /// What HarfBuzz 13.2 shapes the same text to with that font.
+        /// HarfBuzz 13.2 output with that font.
         glyphs: []const u16,
     };
     const cases = [_]Case{
@@ -2868,12 +2657,13 @@ test "a cursive script is spaced and stepped as a full shaper does it" {
     defer font.deinit();
     const Case = struct {
         text: []const u8,
-        /// What the font's contextual positioning adds to each glyph's
-        /// advance, in the order the text is typed in, in font units:
-        /// HarfBuzz 13.2 with and without `kern` and `dist`.
+        /// Contextual advance per glyph, in logical order, in font units:
+        /// HarfBuzz
+        /// 13.2 with and without `kern` and `dist`.
         advances: []const i32,
-        /// How far above the baseline each letter (not mark) stands,
-        /// from left to right as drawn, in font units: HarfBuzz's.
+        /// Height above the baseline of each letter (not mark), left to right,
+        /// in
+        /// font units, from HarfBuzz.
         rises: []const f32,
     };
     const cases = [_]Case{
@@ -2890,7 +2680,6 @@ test "a cursive script is spaced and stepped as a full shaper does it" {
         var characters = Utf8Iterator{ .bytes = case.text };
         while (characters.next()) |codepoint| try text.append(gpa, codepoint);
 
-        // The advances, glyph by glyph.
         var with = (try font.substitution(gpa, shaping)) orelse return error.TestExpectedSubstitution;
         defer with.deinit(gpa);
         var glyphs: std.ArrayList(opentype.Glyph) = .empty;
@@ -2899,8 +2688,6 @@ test "a cursive script is spaced and stepped as a full shaper does it" {
         try std.testing.expectEqual(case.advances.len, glyphs.items.len);
         for (glyphs.items, case.advances) |shaped, expected| try std.testing.expectEqual(expected, shaped.advance);
 
-        // The heights, from the characters the text is drawn as once its
-        // glyphs are baked.
         var missing: std.ArrayList(u21) = .empty;
         defer missing.deinit(gpa);
         for (text.items) |codepoint| {
@@ -2918,7 +2705,6 @@ test "a cursive script is spaced and stepped as a full shaper does it" {
         while (index > 0) {
             index -= 1;
             const codepoint = drawn.items[index];
-            // Marks and changes of spacing are not letters.
             if (spacingOf(codepoint) != null or nameKind(codepoint) == .rtl_mark and codepoint >= glyph_codepoints_rtl_mark) continue;
             if (codepoint >= 0x610 and codepoint <= 0x65f) continue;
             if (left) |before| {
@@ -2939,8 +2725,6 @@ test "marks on a ligature go on the part they were typed after" {
     defer font.deinit();
     var with = (try font.substitution(gpa, .{ .script = "arab".* })) orelse return error.TestExpectedSubstitution;
     defer with.deinit(gpa);
-    // Lam, fatha, alef, fatha: the letters join into one glyph, with a
-    // mark for each of them.
     const text = [_]u21{ 0x644, 0x64e, 0x627, 0x64e };
     var glyphs: std.ArrayList(opentype.Glyph) = .empty;
     defer glyphs.deinit(gpa);
@@ -2951,13 +2735,10 @@ test "marks on a ligature go on the part they were typed after" {
     var shaped: std.ArrayList(u21) = .empty;
     defer shaped.deinit(gpa);
     try std.testing.expect(try font.substituteWith(gpa, &text, &with, &shaped));
-    // The ligature, then each mark behind the character that says which
-    // part it is on.
     try std.testing.expectEqual(@as(usize, 5), shaped.items.len);
     try std.testing.expectEqual(@as(?u8, 1), componentOf(shaped.items[1]));
     try std.testing.expectEqual(@as(?u8, 255), componentOf(shaped.items[3]));
     const ligature = shaped.items[0];
-    // Where HarfBuzz 13.2 puts the two marks, in the font's units.
     const on_lam = font.markPlacement(ligature, 1, null, .{ 0, 0 }, shaped.items[2]) orelse return error.TestExpectedMark;
     const on_alef = font.markPlacement(ligature, 255, null, .{ 0, 0 }, shaped.items[4]) orelse return error.TestExpectedMark;
     try std.testing.expectApproxEqAbs(@as(f32, 355.0 / 2048.0), on_lam[0], 1e-3);
