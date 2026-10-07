@@ -1,13 +1,10 @@
-//! A bounding volume hierarchy built on the CPU, for following rays in an
-//! ordinary shader on GPUs without ray tracing. The same tree is used at
-//! two levels: over the triangles of a mesh, built once, and over the
-//! instances of a scene, built each frame.
+//! CPU-built bounding volume hierarchy for ray traversal in ordinary
+//! shaders. Used over a mesh's triangles and over a scene's instances.
 const std = @import("std");
 
-/// One node (`BvhNode` in trace.glsl), 32 bytes. An inner node has
-/// `count` 0 and its two children at `first` and `first + 1`; a leaf
-/// holds `count` items, `first` being where they start in the order the
-/// build returns.
+/// Matches `BvhNode` in trace.glsl, 32 bytes. Inner node: `count` 0,
+/// children at `first` and `first + 1`. Leaf: `count` items starting at
+/// `first` in `Tree.order`.
 pub const Node = extern struct {
     min: [3]f32,
     first: u32,
@@ -15,16 +12,15 @@ pub const Node = extern struct {
     count: u32,
 };
 
-/// What `build` returns. Freed with `deinit`.
+/// Result of `build`. Freed with `deinit`.
 pub const Tree = struct {
-    /// The root is node 0. Never empty: a tree of nothing is one leaf
-    /// with no items and a box nothing can hit.
+    /// The root is node 0. Never empty: an empty tree is one leaf with no
+    /// items and a box nothing can hit.
     nodes: []Node,
-    /// The items in the order the leaves refer to them: `order[i]` is the
-    /// index, in what was passed to `build`, of the item at place `i`.
+    /// `order[i]` is the index, in `build`'s input, of the item at place `i`.
     order: []u32,
 
-    /// Frees the nodes and the order with the allocator `build` was given.
+    /// Must be given the allocator `build` was given.
     pub fn deinit(self: *Tree, gpa: std.mem.Allocator) void {
         gpa.free(self.nodes);
         gpa.free(self.order);
@@ -53,9 +49,8 @@ const Box = struct {
 
 const bins = 12;
 
-/// Builds a tree over items given by their boxes (`lo[i]` to `hi[i]`),
-/// splitting where the surface area heuristic says rays are saved most,
-/// until no leaf holds more than `leaf_size` items.
+/// Builds a tree over items given by their boxes (`lo[i]` to `hi[i]`)
+/// using the surface area heuristic. No leaf holds more than `leaf_size`.
 pub fn build(gpa: std.mem.Allocator, lo: []const [3]f32, hi: []const [3]f32, leaf_size: u32) !Tree {
     std.debug.assert(lo.len == hi.len);
     const count: u32 = @intCast(lo.len);
@@ -79,7 +74,6 @@ pub fn build(gpa: std.mem.Allocator, lo: []const [3]f32, hi: []const [3]f32, lea
         if (node.count <= leaf_size) continue;
         const items = order[node.first..][0..node.count];
 
-        // Where the middles of the items lie: the split is searched there.
         var middles = Box{};
         for (items) |item| {
             var middle: [3]f32 = undefined;
@@ -101,7 +95,6 @@ pub fn build(gpa: std.mem.Allocator, lo: []const [3]f32, hi: []const [3]f32, lea
                 boxes[bin].add(lo[item], hi[item]);
                 counts[bin] += 1;
             }
-            // Cost of every place to cut, from what lies to its right.
             var right_area: [bins]f32 = undefined;
             var right_count: [bins]u32 = undefined;
             var running = Box{};
@@ -133,7 +126,6 @@ pub fn build(gpa: std.mem.Allocator, lo: []const [3]f32, hi: []const [3]f32, lea
         if (best_cost < std.math.inf(f32)) {
             const extent = middles.max[best_axis] - middles.min[best_axis];
             const scale = bins / extent;
-            // Items left of the cut to the front.
             var back: usize = items.len;
             var front: usize = 0;
             while (front < back) {
@@ -149,7 +141,7 @@ pub fn build(gpa: std.mem.Allocator, lo: []const [3]f32, hi: []const [3]f32, lea
             }
             left_count = @intCast(front);
         }
-        // Items all in one place cannot be told apart: halve them.
+        // No cut separates the items: halve them.
         if (left_count == 0 or left_count == node.count) left_count = node.count / 2;
 
         var left = Box{};

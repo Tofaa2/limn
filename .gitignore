@@ -4,3 +4,4 @@ zig-pkg/
 .direnv/
 *.o
 /world.png
+examples/assets/hair/

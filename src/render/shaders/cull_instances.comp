@@ -1,0 +1,88 @@
+#version 460
+#include "common.glsl"
+#include "cull_view.glsl"
+#include "impostor.glsl"
+
+// Culls instance-group instances by bounding sphere against one view and lists
+// the meshlets of survivors for cull.comp. Same two phases as cull.comp.
+layout(local_size_x = 64) in;
+
+// Must match `gpu.StaticCull`.
+struct StaticCull {
+    vec4 sphere;
+    uint first_ref;
+    uint ref_count;
+    // Impostor index + 1, or 0.
+    uint impostor;
+    uint pad;
+};
+
+// Impostor draw (`gpu.DrawIndirect`); culling writes its instance count.
+layout(buffer_reference, scalar) buffer ImpostorDraw {
+    uint vertex_count;
+    uint instance_count;
+    uint first_vertex;
+    uint first_instance;
+};
+layout(buffer_reference, scalar) writeonly buffer ImpostorList { uint data[]; };
+
+layout(buffer_reference, scalar) readonly buffer StaticCulls { StaticCull data[]; };
+layout(buffer_reference, scalar) writeonly buffer Candidates { uint data[]; };
+
+layout(push_constant, scalar) uniform Push {
+    FrameConstants frame;
+    CullView view;
+    StaticCulls instances;
+    Candidates candidates;
+    CullDispatch dispatch;
+    InstanceVisibility visibility;
+    uint instance_count;
+    uint phase;
+    uint hiz_texture;
+    // Entity pairs cull.comp tests before the listed ones.
+    uint entity_refs;
+    vec2 hiz_size;
+    Impostors impostors;
+    ImpostorList impostor_list;
+    ImpostorDraw impostor_draw;
+    uint impostor_view;
+    uint push_pad;
+} push;
+
+#include "cull_occlusion.glsl"
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= push.instance_count) return;
+    StaticCull instance = push.instances.data[index];
+    bool was_visible = push.phase != PHASE_SINGLE && (push.visibility.data[index] & 1u) != 0u;
+    if (push.phase == PHASE_EARLY && !was_visible) return;
+
+    vec3 center = instance.sphere.xyz;
+    float radius = instance.sphere.w;
+    // Impostors are emitted once, not in the early phase.
+    bool as_impostor = false;
+    if (push.impostor_view != 0u && instance.impostor != 0u) {
+        float across = radius * abs(push.view.p11) * push.frame.resolution.y / max(distance(push.view.camera_position, center), push.view.near);
+        as_impostor = across < push.impostors.data[instance.impostor - 1u].pixels;
+        if (as_impostor && push.phase == PHASE_EARLY) return;
+    }
+    bool visible = radius >= push.view.min_radius;
+    for (uint i = 0u; i < push.view.plane_count; i++) {
+        vec4 plane = push.view.planes[i];
+        if (dot(plane.xyz, center) + plane.w < -radius) visible = false;
+    }
+    if (push.phase == PHASE_LATE) {
+        if (visible && occluded(center, radius)) visible = false;
+        push.visibility.data[index] = (was_visible ? 2u : 0u) | (visible ? 1u : 0u);
+    }
+    if (!visible || instance.ref_count == 0u) return;
+    if (as_impostor) {
+        push.impostor_list.data[atomicAdd(push.impostor_draw.instance_count, 1u)] = index;
+        return;
+    }
+
+    uint first = atomicAdd(push.dispatch.count, instance.ref_count);
+    for (uint i = 0u; i < instance.ref_count; i++) push.candidates.data[first + i] = instance.first_ref + i;
+    atomicMax(push.dispatch.x, (push.entity_refs + first + instance.ref_count + 63u) / 64u);
+}

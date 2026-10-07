@@ -1,5 +1,4 @@
-//! The volumes between the camera and the scene: clouds, smoke and fire,
-//! and fog.
+//! Volumes between the camera and the scene: clouds, smoke, fire and fog.
 //! Internal to the renderer.
 const std = @import("std");
 const rhi = @import("../../rhi/rhi.zig");
@@ -16,9 +15,8 @@ const max_fluids = render.max_fluids;
 const ScenePass = scene_pass.ScenePass;
 const Lighting = scene_pass.Lighting;
 
-/// Describes the scene's cloud layer for this view and returns the
-/// address of that description, or 0 when no clouds are drawn. Makes
-/// the noise the clouds are shaped by the first time it is needed.
+/// Uploads the cloud layer's parameters for this view and returns their
+/// address, or 0 without clouds. Creates the noise volume on first use.
 pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -32,7 +30,6 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
     if (view.clouds) |*targets| clouds: {
         const layer = scene.clouds orelse break :clouds;
         if (renderer.cloud_noise == null) {
-            // The noise volume, as a sheet of slices; made once.
             const noise = try device.createTexture(.{
                 .name = "cloud noise",
                 .width = cloud_noise_size[0] * cloud_noise_tiles,
@@ -48,8 +45,6 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             cmd.endRendering();
             cmd.transition(noise, .shader_read);
         }
-        // The noise drifts with the wind, and stays put in the world
-        // when the scene is shifted.
         const period = 9000 * @max(layer.scale, 0.01);
         if (scene.cloud_time != renderer.time) {
             const elapsed = renderer.time - scene.cloud_time;
@@ -61,8 +56,6 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
         std.mem.swap(rhi.Texture, &targets.current, &targets.history);
         const bottom = @max(layer.bottom, 0);
         const bottom_altitude: f64 = bottom;
-        // Lightning: now and then a flash starts somewhere in the
-        // layer; it is a few quick strokes that die away.
         if (layer.lightning > 0 and renderer.time - scene.flash_start > 0.6 and renderer.time != scene.flash_checked) {
             var random = std.Random.DefaultPrng.init(renderer.frame_index *% 0x9e3779b97f4a7c15 +% 0x51ed);
             const draw = random.random();
@@ -117,16 +110,13 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             .flash = flash,
         };
         cloud_address = params.address;
-        // Every so often the layer is also baked into the sky's
-        // lighting, so ambient light and sky reflections follow it.
         if (scene.environment) |handle_value| if (renderer.environments.get(handle_value)) |sky_entry| {
             if ((sky_entry.sky_desc != null or sky_entry.state == .ready) and layer.environment_interval > 0 and
                 (sky_entry.clouds == null or renderer.time - sky_entry.cloud_bake_time >= layer.environment_interval))
             {
                 sky_entry.clouds = params.items[0];
                 sky_entry.cloud_bake_time = renderer.time;
-                // A loaded environment has no sun of its own: its
-                // clouds are lit by the scene's.
+                // A loaded environment has no sun: its clouds use the scene's.
                 sky_entry.cloud_to_sun = math.scale(math.normalize(scene.sun.direction), -1);
                 sky_entry.cloud_sunlight = math.scale(scene.sun.color, scene.sun.intensity);
                 sky_entry.sky_dirty = true;
@@ -134,7 +124,6 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             }
         };
     }
-    // A layer that was taken away leaves the sky's lighting too.
     if (scene.clouds == null) if (scene.environment) |handle_value| if (renderer.environments.get(handle_value)) |sky_entry| {
         if (sky_entry.clouds != null) {
             sky_entry.clouds = null;
@@ -145,7 +134,7 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
     return cloud_address;
 }
 
-/// Marches the cloud layer and lays it over the scene.
+/// Ray-marches the cloud layer and composites it.
 pub fn drawClouds(renderer: *Renderer, p: *const ScenePass, cloud_address: u64) !void {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -170,8 +159,7 @@ pub fn drawClouds(renderer: *Renderer, p: *const ScenePass, cloud_address: u64) 
     cmd.endScope();
 }
 
-/// The fluids stepped this frame that cast shadows, as shading reads
-/// them.
+/// The fluids stepped this frame that cast shadows.
 pub fn shadowingFluids(renderer: *Renderer, p: *const ScenePass) gpu.FluidList {
     const scene = p.scene;
     var list = gpu.FluidList{};
@@ -181,15 +169,14 @@ pub fn shadowingFluids(renderer: *Renderer, p: *const ScenePass) gpu.FluidList {
         list.fluids[list.count] = state.params;
         list.count += 1;
     }
-    // As for the march: no slot is left null.
     if (list.count != 0) {
         for (list.fluids[list.count..]) |*slot| slot.* = list.fluids[0];
     }
     return list;
 }
 
-/// Works out the light that the scene's fires give off, into the light
-/// records that follow the scene's own.
+/// Writes the lights of the scene's fires into the light records after the
+/// scene's own.
 pub fn lightFluids(renderer: *Renderer, p: *const ScenePass, lighting: *const Lighting) void {
     const cmd = p.cmd;
     const scene = p.scene;
@@ -210,7 +197,7 @@ pub fn lightFluids(renderer: *Renderer, p: *const ScenePass, lighting: *const Li
     }
 }
 
-/// Marches the scene's smoke and fire and lays them over the scene.
+/// Ray-marches the scene's smoke and fire and composites them.
 pub fn drawFluids(renderer: *Renderer, p: *const ScenePass) !void {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -237,8 +224,8 @@ pub fn drawFluids(renderer: *Renderer, p: *const ScenePass) !void {
             push.count += 1;
         }
         if (push.count == 0) break :fluids;
-        // Slots past the count still hold a real fluid: a driver may
-        // follow these pointers for pixels that are not using them.
+        // Unused slots hold a valid fluid: helper invocations may dereference
+        // them.
         for (push.fluids[push.count..]) |*slot| slot.* = push.fluids[0];
         cmd.beginScope("fluids");
         const fluid_motion = view.fluid_motion.?;
@@ -257,7 +244,6 @@ pub fn drawFluids(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.endRendering();
             cmd.transition(view.motion, .shader_read);
         }
-        // Laid over the scene the way fog is: a depth-aware upsample.
         try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
         cmd.bindPipeline(renderer.pipelines.fog_composite);
         cmd.pushConstants(extern struct { frame: u64, fog: u32, depth: u32 }{
@@ -272,7 +258,7 @@ pub fn drawFluids(renderer: *Renderer, p: *const ScenePass) !void {
     }
 }
 
-/// Marches the fog between the camera and the scene and lays it over.
+/// Ray-marches the fog and composites it.
 pub fn drawFog(renderer: *Renderer, p: *const ScenePass) !void {
     const device = renderer.device;
     const cmd = p.cmd;

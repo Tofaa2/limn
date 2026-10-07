@@ -1,37 +1,32 @@
 //! Block suballocator for device memory. Buffers and images never share a
-//! block, which sidesteps bufferImageGranularity entirely.
+//! block, which avoids bufferImageGranularity.
 const std = @import("std");
 const vk = @import("vulkan");
 const Device = @import("dispatch.zig").Device;
 
-/// How the CPU accesses an allocation. Selects the memory type and whether
-/// the memory is mapped.
+/// How the CPU accesses an allocation.
 pub const Class = enum {
     /// Device-local, not mapped.
     gpu,
-    /// Host-visible and persistently mapped; written by the CPU every frame.
+    /// Host-visible, persistently mapped.
     cpu_to_gpu,
-    /// Host-visible, cached when available; read back by the CPU.
+    /// Host-visible, cached when available; for readback.
     gpu_to_cpu,
 };
 
 /// What an allocation backs. A block only ever holds one kind.
 pub const Kind = enum { buffer, image };
 
-/// A range of device memory handed out by `Allocator.allocate`. Pass it
-/// back unchanged to `Allocator.free`.
+/// A range of device memory from `Allocator.allocate`.
 pub const Allocation = struct {
-    /// Memory object to bind the resource to, at `offset`.
     memory: vk.DeviceMemory,
-    /// Byte offset of the range inside `memory`.
+    /// Byte offset inside `memory`.
     offset: u64,
-    /// Size that was asked for, in bytes.
+    /// Requested size in bytes.
     size: u64,
-    /// First byte of the range for host-visible classes; null for `gpu`.
-    /// Stays valid until the allocation is freed.
+    /// Start of the range for host-visible classes; null for `gpu`.
     mapped: ?[*]u8,
-    /// Block the range was cut from, or null when the allocation has a
-    /// memory object of its own.
+    /// Null when the allocation has a memory object of its own.
     block_index: ?u32,
 };
 
@@ -46,23 +41,19 @@ const Block = struct {
     mapped: ?[*]u8,
     live_allocations: u32 = 0,
     active: bool = true,
-    /// Always has room for one more range per live allocation, so that
-    /// freeing never has to allocate: `allocate` reserves it, for the
-    /// allocation it makes and for the range or two that cutting it out
-    /// of a free range leaves behind.
+    /// Has room for one more range per live allocation (reserved by
+    /// `allocate`), so freeing never allocates.
     free_ranges: std.ArrayList(Range) = .empty,
 };
 
-/// Totals reported by `Allocator.stats`.
 pub const Stats = struct {
-    /// Shared blocks currently allocated from the driver.
+    /// Shared blocks held from the driver.
     block_count: usize = 0,
     /// Bytes held from the driver: whole blocks plus dedicated allocations.
     reserved_bytes: u64 = 0,
     /// Bytes of live allocations, as requested (excluding alignment padding).
     used_bytes: u64 = 0,
-    /// For tests: allocations still to succeed before one fails as if the
-    /// device had run out of memory; null never fails.
+    /// For tests: allocations to succeed before one fails; null never fails.
     fail_after: ?u32 = null,
     /// Live allocations that have a memory object of their own.
     dedicated_allocations: usize = 0,
@@ -71,12 +62,11 @@ pub const Stats = struct {
 const block_size_gpu = 128 * 1024 * 1024;
 const block_size_host = 32 * 1024 * 1024;
 
-/// Suballocates buffers and images from large blocks: 128 MiB for
-/// device-local memory, 32 MiB for host-visible memory. Requests of a
-/// quarter block or more get a dedicated memory object instead. Not
+/// Suballocates from 128 MiB (device-local) or 32 MiB (host-visible) blocks;
+/// requests of a quarter block or more get a dedicated memory object. Not
 /// thread-safe.
 pub const Allocator = struct {
-    /// For bookkeeping (block and free lists), not for device memory.
+    /// For bookkeeping, not device memory.
     allocator: std.mem.Allocator,
     device: Device,
     properties: vk.PhysicalDeviceMemoryProperties,
@@ -84,18 +74,15 @@ pub const Allocator = struct {
     dedicated_allocations: usize = 0,
     dedicated_bytes: u64 = 0,
     used_bytes: u64 = 0,
-    /// For tests: allocations still to succeed before one fails as if the
-    /// device had run out of memory; null never fails.
+    /// For tests: allocations to succeed before one fails; null never fails.
     fail_after: ?u32 = null,
 
-    /// Makes an empty allocator. No device memory is reserved until the first
-    /// `allocate`. `properties` are the adapter's memory types.
+    /// No device memory is reserved until the first `allocate`.
     pub fn init(allocator: std.mem.Allocator, device: Device, properties: vk.PhysicalDeviceMemoryProperties) Allocator {
         return .{ .allocator = allocator, .device = device, .properties = properties };
     }
 
-    /// Returns every block to the driver. Dedicated allocations are not
-    /// tracked individually, so they must have been freed before this.
+    /// Frees every block. Dedicated allocations must already be freed.
     pub fn deinit(self: *Allocator) void {
         for (self.blocks.items) |*block| {
             if (!block.active) continue;
@@ -107,11 +94,9 @@ pub const Allocator = struct {
         self.* = undefined;
     }
 
-    /// Reserves memory for a buffer or image with the given requirements. The
-    /// caller binds the resource at `memory` + `offset`. Host-visible classes
-    /// come back mapped. Fails with `error.MemoryTypeUnavailable` when no
-    /// memory type fits the class, `error.MapMemoryFailed`, or the driver's
-    /// out-of-memory errors when a new block or dedicated allocation is needed.
+    /// Host-visible classes come back mapped. Fails with
+    /// `error.MemoryTypeUnavailable`, `error.MapMemoryFailed` or the driver's
+    /// out-of-memory errors.
     pub fn allocate(self: *Allocator, requirements: vk.MemoryRequirements, class: Class, kind: Kind) !Allocation {
         if (self.fail_after) |*remaining| {
             if (remaining.* == 0) {
@@ -176,9 +161,8 @@ pub const Allocator = struct {
         return blockAllocation(&self.blocks.items[index], index, 0, requirements.size);
     }
 
-    /// Releases an allocation. The resource bound to it must already be
-    /// destroyed. A block is returned to the driver as soon as its last
-    /// allocation is freed; otherwise the range becomes reusable at once.
+    /// The bound resource must already be destroyed. An emptied block is
+    /// returned to the driver at once.
     pub fn free(self: *Allocator, allocation: Allocation) void {
         self.used_bytes -= allocation.size;
         if (allocation.block_index) |index| {
@@ -203,7 +187,6 @@ pub const Allocator = struct {
         self.dedicated_bytes -= allocation.size;
     }
 
-    /// Current totals, computed by walking the block list.
     pub fn stats(self: *const Allocator) Stats {
         var result: Stats = .{
             .reserved_bytes = self.dedicated_bytes,
@@ -233,8 +216,7 @@ pub const Allocator = struct {
         }
         const offset = std.mem.alignForward(u64, block.cursor, requirements.alignment);
         if (offset + requirements.size > block.size) return null;
-        // Alignment padding is recorded so it can be reused and so that
-        // freeing every allocation leaves the block fully coalesced.
+        // Record alignment padding as free so the block coalesces fully.
         if (offset != block.cursor)
             block.free_ranges.appendAssumeCapacity(.{ .offset = block.cursor, .size = offset - block.cursor });
         block.cursor = offset + requirements.size;

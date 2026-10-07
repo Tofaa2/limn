@@ -3,7 +3,6 @@ const gfx = @import("limn");
 const math = gfx.math;
 const canvas_scene = @import("canvas_scene");
 
-/// Reads the flags, builds the scene they ask for, renders it and reports.
 pub fn main(init: std.process.Init) !void {
     var output: []const u8 = "world.png";
     var width: u32 = 1920;
@@ -16,8 +15,6 @@ pub fn main(init: std.process.Init) !void {
     var sun_direction: math.Vec3 = .{ -0.42, -1.0, 0.18 };
     var sun_intensity: f32 = 28;
     var environment_intensity: f32 = 1.0;
-    // Stress modes: move the camera and character every frame, and churn
-    // through load/spawn/despawn/destroy cycles while rendering.
     var motion = false;
     var soak_cycles: u32 = 0;
     var compact_test = false;
@@ -26,13 +23,16 @@ pub fn main(init: std.process.Init) !void {
     var helmet = false;
     var lights = false;
     var glass = false;
-    // Optional sub-rectangle {x, y, width, height} of the frame to write.
+    // {x, y, width, height} of the frame to write.
     var crop: ?[4]u32 = null;
-    // Draw-list coverage: a HUD and world-space labels over the scene, or
-    // the 2D demo with no scene at all.
     var overlay = false;
     var canvas = false;
     var multi_view = false;
+    var stereo = false;
+    var hair = false;
+    var mesh_shaders = true;
+    // 0 none, 1 a box lit by the probes, 2 the same with a baked lightmap.
+    var lightmap_box: u32 = 0;
     var custom_pass = false;
     var sky = false;
     var sky_sweep = false;
@@ -125,10 +125,7 @@ pub fn main(init: std.process.Init) !void {
     var cache_dir: ?[]const u8 = null;
     var pick_pixel: ?[2]u32 = null;
     var picked: ?gfx.PickResult = null;
-    // Worker tasks hammering the renderer API while frames are rendered.
     var thread_count: u32 = 0;
-    // Fixed workload for measuring: a camera orbit, a warm-up, then per-pass
-    // medians over `frames` frames.
     var bench = false;
     var max_quality = false;
 
@@ -180,32 +177,26 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--no-compress")) {
             compression = .none;
         } else if (std.mem.eql(u8, arg, "--stream")) {
-            // Texture streaming with a budget in MiB; 0 means no limit.
+            // Budget in MiB; 0 means no limit.
             const megabytes = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArgument, 10);
             streaming = .{ .budget_bytes = megabytes * 1024 * 1024, .evict_delay_frames = 8 };
         } else if (std.mem.eql(u8, arg, "--stream-visible")) {
-            // After --stream: only what the camera can see asks for detail.
             if (streaming) |*value| value.visible_only = true;
         } else if (std.mem.eql(u8, arg, "--stream-skip-occluded")) {
-            // After --stream: only what the camera drew asks for detail.
             if (streaming) |*value| value.skip_occluded = true;
         } else if (std.mem.eql(u8, arg, "--stream-from-cache")) {
-            // After --stream: large levels are read from the asset cache.
             if (streaming) |*value| value.from_cache = true;
         } else if (std.mem.eql(u8, arg, "--shift-frame")) {
-            // Shifts the whole scene far away on this frame; nothing should show.
             shift_frame = try std.fmt.parseInt(usize, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--cloud-coverage")) {
             cloud_coverage = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--no-cloud-lighting")) {
-            // The clouds are drawn but left out of the sky's lighting.
             cloud_lighting = false;
         } else if (std.mem.eql(u8, arg, "--clouds")) {
             clouds = true;
         } else if (std.mem.eql(u8, arg, "--fluid")) {
             fluid = true;
         } else if (std.mem.eql(u8, arg, "--cache-limit")) {
-            // Megabytes the asset cache is trimmed to at startup.
             cache_limit = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArgument, 10) * 1024 * 1024;
         } else if (std.mem.eql(u8, arg, "--cache")) {
             cache_dir = args.next() orelse return error.MissingArgument;
@@ -234,26 +225,18 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--particles")) {
             particles = true;
         } else if (std.mem.eql(u8, arg, "--ktx2")) {
-            // Stores the decal picture as a KTX2 file at this path and loads it back.
             decal_ktx2 = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--ktx2-model")) {
-            // Writes a panel model whose texture is a BC1 KTX2 file into
-            // this directory, loads it and stands it in the scene.
             ktx2_model = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--cube-env")) {
-            // Writes a half-float cube map to this KTX2 file and uses it
-            // as the environment.
             cube_env = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--morph-row")) {
-            // Writes a model of twelve tiles with a morph target each into
-            // this directory and raises four of them by their weights.
             morph_row = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--ktx2-bc1")) {
-            // With --decals: the decal picture is a BC1 checkerboard written to
-            // this KTX2 file and loaded back.
+            // With --decals.
             decal_bc1 = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--decal-count")) {
-            // Scatters this many small marks over the floor (with --decals).
+            // With --decals.
             decal_count = try std.fmt.parseInt(usize, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--decals")) {
             decals = true;
@@ -277,20 +260,26 @@ pub fn main(init: std.process.Init) !void {
             custom_pass = true;
         } else if (std.mem.eql(u8, arg, "--views")) {
             multi_view = true;
+        } else if (std.mem.eql(u8, arg, "--stereo")) {
+            stereo = true;
+        } else if (std.mem.eql(u8, arg, "--no-mesh-shaders")) {
+            mesh_shaders = false;
+        } else if (std.mem.eql(u8, arg, "--hair")) {
+            hair = true;
+        } else if (std.mem.eql(u8, arg, "--lightmap-box")) {
+            lightmap_box = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--pane-row")) {
-            // With --glass: a row of tinted panes, as one instance group
-            // ("group") or as separate entities ("entities").
+            // With --glass: "group" or "entities".
             const how = args.next() orelse return error.MissingValue;
             pane_row = if (std.mem.eql(u8, how, "group")) .group else if (std.mem.eql(u8, how, "entities")) .entities else return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--lens-pane")) {
-            // With --glass: a tinted pane behind the lens.
+            // With --glass.
             lens_pane = true;
         } else if (std.mem.eql(u8, arg, "--layered-refraction")) {
             settings.layered_refraction = true;
         } else if (std.mem.eql(u8, arg, "--glass")) {
             glass = true;
         } else if (std.mem.eql(u8, arg, "--many-lights")) {
-            // This many small colored lights in rows along the hall.
             many_lights = try std.fmt.parseInt(usize, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--bounce-lights")) {
             settings.gi_bounce_lights = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
@@ -301,16 +290,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--motion")) {
             motion = true;
         } else if (std.mem.eql(u8, arg, "--coarse-test")) {
-            // A detailed ball far down the hall: with
-            // `--geometry-coarse` it keeps only its coarser levels.
             coarse_test = true;
         } else if (std.mem.eql(u8, arg, "--coarse-near")) {
-            // Then brought up close, where it must be whole again.
             coarse_near = true;
         } else if (std.mem.eql(u8, arg, "--compact-test")) {
-            // A large model made and dropped again while a later one
-            // stays: the gap it leaves in the geometry pools must be
-            // closed.
             compact_test = true;
         } else if (std.mem.eql(u8, arg, "--soak")) {
             soak_cycles = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
@@ -327,7 +310,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--gi-interval")) {
             settings.gi_update_interval = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--max-quality")) {
-            // Everything at its most expensive setting.
             settings.ao_resolution = .full;
             settings.fog_resolution = .full;
             settings.gi_resolution = .full;
@@ -357,7 +339,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--no-gi-follow")) {
             settings.gi_follow_camera = false;
         } else if (std.mem.eql(u8, arg, "--grade")) {
-            // A stylized look, to exercise every grading control.
             settings.vignette = 0.45;
             settings.film_grain = 0.5;
             settings.saturation = 1.2;
@@ -369,7 +350,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--quality")) {
             settings = gfx.Settings.preset(std.meta.stringToEnum(gfx.Quality, args.next() orelse return error.MissingArgument) orelse return error.InvalidArgument);
         } else if (std.mem.eql(u8, arg, "--lut")) {
-            // "identity" must change nothing; "warm" is a visible grade.
+            // "identity" or "warm".
             lut = args.next() orelse return error.MissingArgument;
         } else if (std.mem.eql(u8, arg, "--autofocus")) {
             settings.dof_aperture = 1;
@@ -381,36 +362,30 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--gi-coarse-interval")) {
             settings.gi_coarse_interval = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--sheen")) {
-            // With --coat: the three spheres are velvet instead of lacquer.
+            // With --coat.
             sheen = true;
         } else if (std.mem.eql(u8, arg, "--contact-shadows")) {
             settings.contact_shadows = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--panel")) {
-            // A glowing panel on the arcade wall, facing across the corridor.
             panel = true;
         } else if (std.mem.eql(u8, arg, "--tube")) {
-            // A strip light lying just above the floor of the arcade.
             tube = true;
         } else if (std.mem.eql(u8, arg, "--aniso")) {
-            // With --coat: the three spheres are brushed metal.
+            // With --coat.
             aniso = true;
         } else if (std.mem.eql(u8, arg, "--bc7-normals")) {
             bc7_normals = true;
         } else if (std.mem.eql(u8, arg, "--morph")) {
-            // The character pulls a face: its morph targets set by hand.
             morph = true;
         } else if (std.mem.eql(u8, arg, "--static-gi")) {
-            // Leave skinned and morphed meshes out of the ray-tracing structure.
             static_gi = true;
         } else if (std.mem.eql(u8, arg, "--no-player")) {
-            // Hides the animated character: nothing in the scene moves.
             no_player = true;
         } else if (std.mem.eql(u8, arg, "--shadow-lod-light")) {
             settings.shadow_lod = .light;
         } else if (std.mem.eql(u8, arg, "--no-reflect-transparent")) {
             settings.reflect_transparent = false;
         } else if (std.mem.eql(u8, arg, "--soft-text")) {
-            // Text from the plain distance field: rounded corners when large.
             settings.sharp_text = false;
         } else if (std.mem.eql(u8, arg, "--terrain")) {
             terrain = true;
@@ -419,13 +394,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--lod-uv-weight")) {
             lod_uv_weight = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--panel-basis")) {
-            // The tiled panel with its texture in one of Basis Universal's
-            // formats: etc1s or uastc.
+            // etc1s or uastc.
             transform_panel = true;
             const kind = args.next() orelse return error.MissingArgument;
             panel_model = if (std.mem.eql(u8, kind, "etc1s")) "examples/assets/panel/panel_etc1s.gltf" else "examples/assets/panel/panel_uastc.gltf";
         } else if (std.mem.eql(u8, arg, "--cluster-lods")) {
-            // Levels of detail chosen cluster by cluster.
             cluster_lods = true;
         } else if (std.mem.eql(u8, arg, "--lod-fade")) {
             settings.lod_cross_fade = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
@@ -436,75 +409,55 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--shadow-small")) {
             settings.shadow_small_feature_texels = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--aerial-sky")) {
-            // The simple haze: one grey, fading to the sky behind.
             settings.aerial_model = .sky;
         } else if (std.mem.eql(u8, arg, "--aerial")) {
             settings.aerial_perspective = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--wax")) {
-            // With --coat: the three spheres are wax.
+            // With --coat.
             wax = true;
         } else if (std.mem.eql(u8, arg, "--sort-test")) {
-            // A sorted emitter, whose drawing order is read back and checked.
             sort_test = true;
         } else if (std.mem.eql(u8, arg, "--meshlet-bounds")) {
-            // Animated meshes are culled meshlet by meshlet.
             meshlet_bounds = true;
         } else if (std.mem.eql(u8, arg, "--no-shader-variants")) {
-            // Always shade with the full pass, whatever the view uses.
             shader_variants = false;
         } else if (std.mem.eql(u8, arg, "--instance-params")) {
-            // With --material: a second lava block, cooled through its own
-            // entity parameters.
+            // With --material.
             instance_params = true;
         } else if (std.mem.eql(u8, arg, "--refits")) {
-            // Ray-tracing structures of animated meshes brought up to date per frame.
             gi_dynamic_refits = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--crowd-sync")) {
-            // The crowd walks in step with the player.
             crowd_sync = true;
         } else if (std.mem.eql(u8, arg, "--crowd-group")) {
-            // The crowd is one instance group that takes the player's pose,
-            // instead of an entity per character.
             crowd_group = true;
         } else if (std.mem.eql(u8, arg, "--crowd")) {
-            // This many more walking characters, each at its own point of the walk.
             crowd = try std.fmt.parseInt(usize, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--transform-panel")) {
-            // A panel whose glow texture is tiled four times while its base
-            // color is not (examples/assets/panel/panel.gltf).
             transform_panel = true;
         } else if (std.mem.eql(u8, arg, "--coat-maps")) {
-            // With --coat: a checker on the first sphere, a rippled coat on
-            // the second, a coat in stripes on the third.
+            // With --coat.
             coat_maps = true;
         } else if (std.mem.eql(u8, arg, "--geometry-distance")) {
-            // Geometry streaming: models farther than this leave GPU memory.
             geometry_distance = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--geometry-coarse")) {
-            // Beyond this, models keep only their coarser levels in GPU memory.
             geometry_coarse = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--teleport")) {
-            // At this frame the camera jumps to a position and target.
             teleport_frame = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
             for (&teleport_to) |*value| value.* = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--shape-font")) {
-            // A font file and a line of text to set large with it, for
-            // looking at how a script is shaped.
             shape_font = args.next() orelse return error.MissingArgument;
             shape_text = args.next() orelse return error.MissingArgument;
         } else if (std.mem.eql(u8, arg, "--text-fallback")) {
             text_fallback = true;
         } else if (std.mem.eql(u8, arg, "--light-size")) {
-            // With --lights: the radius of the two shadow-casting lamps.
+            // With --lights.
             light_size = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--fire-size")) {
-            // Width of the fire's light as a share of its box: soft shadows.
             fire_size = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--tube-shadows")) {
-            // With --tube: the tube casts shadows.
+            // With --tube.
             tube_shadows = true;
         } else if (std.mem.eql(u8, arg, "--fluid-lamp")) {
-            // A spot light shining through the fluid onto the floor beyond.
             fluid_lamp = true;
         } else if (std.mem.eql(u8, arg, "--relocate")) {
             settings.gi_probe_relocation = true;
@@ -517,22 +470,20 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--no-fluid-shadows")) {
             settings.fluid_shadows = false;
         } else if (std.mem.eql(u8, arg, "--fluid-sharp")) {
-            // Error-corrected advection of the flow itself, in both fluids.
             fluid_sharp = true;
         } else if (std.mem.eql(u8, arg, "--fluid-flipbook")) {
-            // With --fluid: records the flat fluid as a 4x4 sheet and saves it here.
+            // With --fluid.
             fluid_flipbook = args.next() orelse return error.MissingArgument;
         } else if (std.mem.eql(u8, arg, "--fluid-frame")) {
-            // With --fluid: saves the 2D fluid's picture as a PNG at the end.
+            // With --fluid.
             fluid_frame = args.next() orelse return error.MissingArgument;
         } else if (std.mem.eql(u8, arg, "--compress-images")) {
-            // With --decals: the decal picture is stored block-compressed.
+            // With --decals.
             compress_images = true;
         } else if (std.mem.eql(u8, arg, "--bumps")) {
-            // With --decals: the stain carries a ripple normal map.
+            // With --decals.
             bumps = true;
         } else if (std.mem.eql(u8, arg, "--tints")) {
-            // Colors per instance (with --instances) and on the character.
             tints = true;
         } else if (std.mem.eql(u8, arg, "--sharp-reflections")) {
             settings.reflection_blur_samples = 0;
@@ -544,10 +495,20 @@ pub fn main(init: std.process.Init) !void {
             settings.light_shadow_filter = false;
         } else if (std.mem.eql(u8, arg, "--dof-blades")) {
             settings.dof_blades = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
+        } else if (std.mem.eql(u8, arg, "--vsm")) {
+            settings.virtual_shadow_maps = true;
+        } else if (std.mem.eql(u8, arg, "--vrs")) {
+            settings.variable_rate_shading = true;
+        } else if (std.mem.eql(u8, arg, "--fsr2")) {
+            settings.upscaling = .fsr2;
+        } else if (std.mem.eql(u8, arg, "--fsr3")) {
+            settings.upscaling = .fsr3;
+        } else if (std.mem.eql(u8, arg, "--fsr")) {
+            settings.upscaling = .fsr;
         } else if (std.mem.eql(u8, arg, "--spatial-upscaling")) {
             settings.upscaling = .spatial;
         } else if (std.mem.eql(u8, arg, "--sky-spread")) {
-            // With --sky-sweep: frames each sky rebuild is spread over.
+            // With --sky-sweep.
             sky_spread = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--flat-panes")) {
             flat_panes = true;
@@ -563,16 +524,12 @@ pub fn main(init: std.process.Init) !void {
             mirror_panel = true;
             mirror_far = true;
         } else if (std.mem.eql(u8, arg, "--bc7-test")) {
-            // Draws a picture of all 64 two-group block shapes, compressed
-            // (with --compress-images) or not, large on the screen.
             bc7_test = true;
         } else if (std.mem.eql(u8, arg, "--mirror-panel")) {
             mirror_panel = true;
         } else if (std.mem.eql(u8, arg, "--probe-settle")) {
-            // Frames the probe waits before its pictures are taken.
             probe_settle = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--probe")) {
-            // A local reflection probe in the middle of the hall.
             reflection_probe = true;
         } else if (std.mem.eql(u8, arg, "--no-traced-reflections")) {
             settings.reflection_ray_tracing = false;
@@ -590,11 +547,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--render-scale")) {
             settings.render_scale = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--hdr10")) {
-            // Encode as for an HDR10 display; in an 8-bit file this looks
-            // flat, it only checks that the path runs.
             settings.output_encoding = .hdr10;
         } else if (std.mem.eql(u8, arg, "--low-quality")) {
-            // Every quality knob at its cheapest.
             settings.shadow_cascades = 2;
             settings.shadow_samples = 4;
             settings.bloom_levels = 3;
@@ -617,13 +571,10 @@ pub fn main(init: std.process.Init) !void {
             settings.bloom = 0;
         } else return error.InvalidArgument;
     }
-    // A benchmark needs enough frames for stable percentiles.
     const frames: u32 = frame_argument orelse if (bench) 900 else 64;
     if (width == 0 or height == 0 or frames == 0) return error.InvalidArgument;
 
     const start = std.Io.Clock.Timestamp.now(init.io, .awake);
-    // With --oom the renderer allocates through a wrapper that can be told
-    // to fail a chosen allocation.
     var failing = FailingAllocator{ .backing = init.gpa };
     const renderer_start = std.Io.Clock.Timestamp.now(init.io, .awake);
     const renderer = try gfx.Renderer.init(if (oom_rounds != 0) failing.allocator() else init.gpa, init.io, .{
@@ -635,6 +586,7 @@ pub fn main(init: std.process.Init) !void {
         .lod_uv_weight = lod_uv_weight orelse std.meta.fieldInfo(gfx.Options, .lod_uv_weight).defaultValue().?,
         .gi_dynamic_refits = gi_dynamic_refits,
         .job_allocator = if (oom_rounds != 0) failing.allocator() else null,
+        .mesh_shaders = mesh_shaders,
         .application_name = "limn verify",
         .validation = validation,
         .debug_names = debug_names,
@@ -684,8 +636,6 @@ pub fn main(init: std.process.Init) !void {
     var sky_environment: ?gfx.Environment = null;
     defer if (sky_environment) |handle| renderer.destroyEnvironment(handle);
     if (sky) {
-        // A computed clear sky and the sun that belongs to it, in place of
-        // the photographed environment.
         const sky_desc = gfx.SkyDesc{ .sun_direction = if (stars) .{ -0.4, 0.25, -0.3 } else sun_direction, .turbidity = sky_turbidity, .stars = if (stars) 1 else 0, .moon = if (stars) 1 else 0, .moon_direction = .{ -0.3, -0.9, 0.05 } };
         sky_environment = try renderer.createSky(sky_desc);
         renderer.setEnvironment(scene, sky_environment, 1);
@@ -694,8 +644,6 @@ pub fn main(init: std.process.Init) !void {
     var cube_environment: ?gfx.Environment = null;
     defer if (cube_environment) |handle| renderer.destroyEnvironment(handle);
     if (cube_env) |path| {
-        // Each face its own color, two levels, and one very bright texel
-        // on the +X face that the loader has to find.
         const size = 32;
         const face_colors = [6][3]f32{ .{ 1.6, 0.5, 0.4 }, .{ 0.4, 1.4, 0.5 }, .{ 0.9, 1.3, 2.4 }, .{ 0.25, 0.2, 0.15 }, .{ 1.5, 1.4, 0.4 }, .{ 1.2, 0.4, 1.5 } };
         const texels = try init.gpa.alloc(u8, 6 * (size * size + (size / 2) * (size / 2)) * 8);
@@ -745,16 +693,11 @@ pub fn main(init: std.process.Init) !void {
         const info = renderer.modelInfo(tiles).?;
         if (info.morph_targets != morph_row_tiles) return error.MorphRowTargetsMissing;
         const row = try renderer.spawn(scene, .{ .model = tiles, .transform = math.mul(math.translation(.{ 3.0, 0.2, -0.4 }), math.rotationY(std.math.pi * 0.5)) });
-        // Tiles 1, 9, 10 and 11 rise; the last three are past the eight
-        // targets a mesh used to be limited to.
         var weights: [morph_row_tiles]f32 = @splat(0);
         for ([_]usize{ 1, 9, 10, 11 }) |tile| weights[tile] = 1;
         renderer.setMorphWeights(row, &weights);
     }
     if (terrain) {
-        // One large, finely tessellated landscape beside the building:
-        // near and far at once, which is what choosing levels of detail
-        // cluster by cluster is for.
         const cells = 512;
         const size: f32 = 200;
         const positions = try init.gpa.alloc([3]f32, (cells + 1) * (cells + 1));
@@ -778,8 +721,6 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("terrain: {d} triangles, {d} meshlets", .{ land_info.triangle_count, land_info.meshlet_count });
     }
     if (mirror_panel) {
-        // A polished metal panel facing the camera: it shows whatever
-        // answers for reflections of what is behind the camera.
         const corners = [_][3]f32{ .{ -0.9, 0, 0 }, .{ 0.9, 0, 0 }, .{ 0.9, 1.9, 0 }, .{ -0.9, 1.9, 0 } };
         const two_triangles = [_]u32{ 0, 1, 2, 0, 2, 3 };
         const mirror = try renderer.createModel(&.{.{ .positions = &corners, .indices = &two_triangles, .material = .{
@@ -788,7 +729,6 @@ pub fn main(init: std.process.Init) !void {
             .roughness = 0.03,
             .double_sided = true,
         } }});
-        // Near the camera, or (--mirror-far) at the far side of the fire.
         _ = try renderer.spawn(scene, .{ .model = mirror, .transform = math.mul(math.translation(.{ if (mirror_far) -4.5 else 4.2, 0.1, 0.9 }), math.rotationY(std.math.pi * 0.5)) });
     }
     if (reflection_probe) _ = try renderer.createReflectionProbe(scene, .{ .position = .{ 1.0, 1.6, -0.2 }, .extent = .{ 14, 6, 3 }, .settle_frames = probe_settle });
@@ -847,12 +787,9 @@ pub fn main(init: std.process.Init) !void {
         try renderer.setLights(scene, row);
     }
     if (lights) try renderer.setLights(scene, &.{
-        // Unshadowed fill lights under the arcades.
         .{ .position = .{ 4.0, 1.2, -3.6 }, .color = .{ 1.0, 0.45, 0.15 }, .intensity = 12, .range = 6 },
         .{ .position = .{ -4.0, 1.2, 3.4 }, .color = .{ 0.3, 1.0, 0.4 }, .intensity = 12, .range = 6 },
-        // A shadow-casting point light near the character...
         .{ .position = .{ 3.2, 1.0, -1.5 }, .color = .{ 0.4, 0.6, 1.0 }, .intensity = 25, .range = 9, .cast_shadows = true, .source_radius = light_size },
-        // ...and a shadow-casting spot light aimed down the nave.
         .{
             .kind = .spot,
             .position = .{ 7.0, 3.5, 0.6 },
@@ -867,8 +804,6 @@ pub fn main(init: std.process.Init) !void {
         },
     });
     if (glass) {
-        // Blended materials built from in-memory geometry: two tinted
-        // panes and a frosted block.
         const pane = [_][3]f32{ .{ -0.9, 0, 0 }, .{ 0.9, 0, 0 }, .{ 0.9, 1.9, 0 }, .{ -0.9, 1.9, 0 } };
         const quad = [_]u32{ 0, 1, 2, 0, 2, 3 };
         const panes = try renderer.createModel(&.{
@@ -892,7 +827,6 @@ pub fn main(init: std.process.Init) !void {
         _ = try renderer.spawn(scene, .{ .model = panes, .transform = math.mul(math.translation(.{ 3.6, 0, 0.5 }), math.rotationY(1.25)) });
         _ = try renderer.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 4.6, 0, -1.3 }), math.rotationY(1.75)) });
         if (pane_row != .none) {
-            // The same five panes either way; the pictures must match.
             var row: [5]math.Mat4 = undefined;
             for (&row, 0..) |*transform, index| {
                 const step: f32 = @floatFromInt(index);
@@ -904,12 +838,10 @@ pub fn main(init: std.process.Init) !void {
                 _ = try renderer.spawn(scene, .{ .model = amber, .transform = transform });
             }
         }
-        // Two more panes held flat above the sunlit floor, for their shadows.
         if (flat_panes) {
             _ = try renderer.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 2.4, 1.2, 0.2 }), math.rotationX(-std.math.pi * 0.5)) });
             _ = try renderer.spawn(scene, .{ .model = panes, .transform = math.mul(math.translation(.{ 0.2, 1.2, 0.2 }), math.rotationX(-std.math.pi * 0.5)) });
         }
-        // A thick pane that bends what is seen through it.
         const lens = try renderer.createModel(&.{
             .{ .positions = &pane, .indices = &quad, .material = .{
                 .base_color = .{ 0.85, 1.0, 0.9, 1 },
@@ -923,14 +855,12 @@ pub fn main(init: std.process.Init) !void {
         });
         _ = try renderer.spawn(scene, .{ .model = lens, .transform = math.mul(math.translation(.{ 2.6, 0, -1.9 }), math.rotationY(1.45)) });
         if (lens_pane) _ = try renderer.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 3.8, 0, -2.0 }), math.rotationY(1.45)) });
-        // With the mirror panel: a pane behind the camera, seen only in the mirror.
         if (mirror_panel) _ = try renderer.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 9.8, 0.2, 1.2 }), math.rotationY(std.math.pi * 0.5)) });
         try renderer.waitUntilLoaded();
     }
     var lava_shader: ?gfx.MaterialShader = null;
     defer if (lava_shader) |shader| renderer.destroyMaterialShader(shader);
     if (custom_material) {
-        // A block shaded by application code (examples/shaders/lava.frag).
         lava_shader = try renderer.createMaterialShader(@embedFile("lava.frag.spv"));
         var positions: [24][3]f32 = undefined;
         var indices: [36]u32 = undefined;
@@ -960,7 +890,6 @@ pub fn main(init: std.process.Init) !void {
         try renderer.waitUntilLoaded();
     }
     if (particles) {
-        // A fire with sparks and a column of smoke lit by the scene.
         const base = math.Vec3{ 3.4, 0.1, -1.5 };
         _ = try renderer.createEmitter(scene, .{
             .position = base,
@@ -1010,7 +939,6 @@ pub fn main(init: std.process.Init) !void {
         });
     }
     if (clouds) try renderer.setClouds(scene, .{ .coverage = cloud_coverage, .environment_interval = if (cloud_lighting) 4 else 0 });
-    // A fire in the middle of the courtyard, and a 2D one as a picture.
     var fluid_picture: ?gfx.Image = null;
     var flat_fluid: ?gfx.Fluid = null;
     if (fluid) {
@@ -1020,7 +948,6 @@ pub fn main(init: std.process.Init) !void {
             .vorticity = if (fluid_sharp) 4 else 12,
             .light_size = fire_size,
             .transform = math.mul(math.translation(.{ -1.5, 1.8, 0.9 }), math.scaling(.{ 2.4, 3.6, 2.4 })),
-            // With the lamp: plain smoke, so the lamp is what lights it.
             .sources = if (fluid_lamp) &.{.{ .smoke = 6, .temperature = 3 }} else &.{.{ .fuel = 7, .temperature = 7 }},
             .obstacles = &.{.{ .sphere = .{ .center = .{ 0.5, 0.45, 0.5 }, .radius = 0.08 } }},
         });
@@ -1067,7 +994,6 @@ pub fn main(init: std.process.Init) !void {
     defer if (bump_image) |image| renderer.destroyImage(image);
     defer if (decal_image) |image| renderer.destroyImage(image);
     if (decals) {
-        // A painted ring with an arrow, generated here, and a plain stain.
         const size = 128;
         const pixels = try init.gpa.alloc(u8, size * size * 4);
         defer init.gpa.free(pixels);
@@ -1081,8 +1007,6 @@ pub fn main(init: std.process.Init) !void {
             pixels[(y * size + x) * 4 ..][0..4].* = .{ 250, 200, 40, alpha };
         };
         if (decal_bc1) |path| {
-            // 64x64 in 4x4 blocks: yellow and dark blue squares of 8 pixels,
-            // each block one flat color (both end points the same).
             var blocks: [16 * 16 * 8]u8 = undefined;
             for (0..16) |by| for (0..16) |bx| {
                 const yellow = (bx / 2 + by / 2) % 2 == 0;
@@ -1102,7 +1026,6 @@ pub fn main(init: std.process.Init) !void {
             decal_image = try renderer.loadImage(path);
         } else decal_image = if (compress_images) try renderer.createImageCompressed(size, size, pixels, true) else try renderer.createImage(size, size, pixels, true);
         if (bumps) {
-            // Concentric ripples, as a tangent-space normal map.
             const bump_size = 64;
             var bump_pixels: [bump_size * bump_size * 4]u8 = undefined;
             for (0..bump_size) |y| for (0..bump_size) |x| {
@@ -1120,13 +1043,11 @@ pub fn main(init: std.process.Init) !void {
         var list: std.ArrayList(gfx.DecalDesc) = .empty;
         defer list.deinit(init.gpa);
         try list.appendSlice(init.gpa, &.{
-            // On the floor: the box looks straight down.
             .{
                 .transform = math.mul(math.translation(.{ 1.0, 0, -0.4 }), math.mul(math.rotationX(-std.math.pi * 0.5), math.scaling(.{ 1.6, 1.6, 0.6 }))),
                 .image = decal_image,
                 .roughness = 0.35,
             },
-            // A dark wet stain further along.
             .{
                 .transform = math.mul(math.translation(.{ 4.6, 0, 0.3 }), math.mul(math.rotationX(-std.math.pi * 0.5), math.scaling(.{ 2.2, 1.4, 0.6 }))),
                 .color = .{ 0.12, 0.02, 0.02, 0.8 },
@@ -1135,7 +1056,6 @@ pub fn main(init: std.process.Init) !void {
                 .roughness = 0.1,
             },
         });
-        // Extra small marks in a grid, to measure cost against count.
         for (0..decal_count) |index| {
             const column: f32 = @floatFromInt(index % 16);
             const row: f32 = @floatFromInt(index / 16);
@@ -1146,8 +1066,6 @@ pub fn main(init: std.process.Init) !void {
         }
         try renderer.setDecals(scene, list.items);
     }
-    // Images for --coat-maps: a checker, stripes (coat strength in red,
-    // coat roughness in green) and ripples as a normal map.
     var coat_images: [3]?gfx.Image = .{ null, null, null };
     defer for (coat_images) |maybe| if (maybe) |image| renderer.destroyImage(image);
     if (coat and coat_maps) {
@@ -1176,7 +1094,6 @@ pub fn main(init: std.process.Init) !void {
         coat_images[2] = try renderer.createImage(n, n, &pixels, false);
     }
     if (coat) {
-        // The same red paint three times: bare, half coated, fully coated.
         const rings = 24;
         const segments = 48;
         var positions: [(rings + 1) * (segments + 1)][3]f32 = undefined;
@@ -1190,7 +1107,6 @@ pub fn main(init: std.process.Init) !void {
                 const phi = std.math.tau * @as(f32, @floatFromInt(segment)) / segments;
                 const n = [3]f32{ @sin(theta) * @cos(phi), @cos(theta), @sin(theta) * @sin(phi) };
                 normals[ring * (segments + 1) + segment] = n;
-                // With --tints: bands of color painted on the vertices.
                 colors[ring * (segments + 1) + segment] = if (tints and ring % 6 < 3) .{ 0.15, 0.15, 0.15, 1 } else .{ 1, 1, 1, 1 };
                 uvs[ring * (segments + 1) + segment] = .{ @as(f32, @floatFromInt(segment)) / segments, @as(f32, @floatFromInt(ring)) / rings };
                 positions[ring * (segments + 1) + segment] = .{ n[0] * 0.4, n[1] * 0.4, n[2] * 0.4 };
@@ -1209,13 +1125,10 @@ pub fn main(init: std.process.Init) !void {
                 .colors = &colors,
                 .indices = &sphere_indices,
                 .material = if (wax)
-                    // Candle wax: no light under the surface, some, a lot.
                     .{ .base_color = .{ 0.9, 0.82, 0.6, 1 }, .metallic = 0, .roughness = 0.6, .subsurface = amount }
                 else if (aniso)
-                    // Brushed steel: round highlight, half stretched, fully stretched.
                     .{ .base_color = .{ 0.8, 0.8, 0.82, 1 }, .metallic = 1, .roughness = 0.35, .anisotropy = amount }
                 else if (sheen)
-                    // Dark velvet: no sheen, half, full.
                     .{ .base_color = .{ 0.08, 0.02, 0.12, 1 }, .metallic = 0, .roughness = 0.9, .sheen_color = .{ amount, amount * 0.85, amount }, .sheen_roughness = 0.35 }
                 else
                     .{ .base_color = .{ 0.55, 0.03, 0.03, 1 }, .metallic = 0, .roughness = 0.65, .clearcoat = amount, .clearcoat_roughness = 0.04 },
@@ -1225,15 +1138,12 @@ pub fn main(init: std.process.Init) !void {
                 1 => .{ .clearcoat_normal = coat_images[2] },
                 else => .{ .clearcoat = coat_images[1], .clearcoat_roughness = coat_images[1] },
             });
-            // The wax spheres stand in the sun, where the effect shows.
             const place: math.Vec3 = if (wax) .{ 4.2 + 0.95 * @as(f32, @floatFromInt(index)), 0.45, 1.3 } else .{ 3.0, 0.45, -1.3 + 1.0 * @as(f32, @floatFromInt(index)) };
             _ = try renderer.spawn(scene, .{ .model = sphere, .transform = math.translation(place) });
         }
         try renderer.waitUntilLoaded();
     }
     if (instance_count != 0) {
-        // A cloud of small blocks above the courtyard, either as one
-        // instance group or (for comparison) as that many entities.
         var positions: [24][3]f32 = undefined;
         var indices: [36]u32 = undefined;
         const half = [3]f32{ 0.06, 0.06, 0.06 };
@@ -1282,7 +1192,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (helmet) {
-        // A metal/emissive material reference next to the character.
         const model = try renderer.loadModel("examples/assets/DamagedHelmet.glb");
         try renderer.waitUntilLoaded();
         _ = try renderer.spawn(scene, .{
@@ -1307,9 +1216,6 @@ pub fn main(init: std.process.Init) !void {
     var worker_state = WorkerState{ .renderer = renderer, .scene = scene, .model = robot, .io = init.io };
     for (0..thread_count) |index| try workers.concurrent(init.io, worker, .{ &worker_state, @as(u32, @intCast(index)) });
     var cpu_ns: u64 = 0;
-    // Every way BC7 can split a block in two, one per block, in two
-    // colors: if the encoder's table of splits matches the hardware's, the
-    // compressed picture decodes to the same thing as the plain one.
     var bc7_picture: ?gfx.Image = null;
     if (bc7_test) {
         var shapes: [32 * 32 * 4]u8 = undefined;
@@ -1317,8 +1223,6 @@ pub fn main(init: std.process.Init) !void {
             const x = shape % 8 * 4 + texel % 4;
             const y = shape / 8 * 4 + texel / 4;
             const second = (gfx.bc7_partitions[shape] >> @intCast(texel)) & 1 != 0;
-            // Each group shades along a line of its own, so that no one
-            // line through color space fits the block.
             const step: u8 = @intCast(texel);
             shapes[(y * 32 + x) * 4 ..][0..4].* = if (second) .{ 240, 230 - step * 10, 40, 255 } else .{ 20, 40 + step * 8, 170, 255 };
         };
@@ -1327,20 +1231,81 @@ pub fn main(init: std.process.Init) !void {
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
     const font = renderer.defaultFont();
-    // A font holding capitals only, to show world-space text falling back
-    // to another font for the rest (`--text-fallback`).
     const capitals: ?*const gfx.Font = if (text_fallback) try renderer.loadFont("src/render/fonts/DejaVuSans.ttf", &.{.{ 'A', 'Z' }}) else null;
     defer if (capitals) |loaded| renderer.destroyFont(loaded);
     const shaped_font: ?*const gfx.Font = if (shape_font) |path| try renderer.loadFont(path, &.{.{ 32, 126 }}) else null;
     defer if (shaped_font) |loaded| renderer.destroyFont(loaded);
     if (shaped_font) |loaded| try renderer.prepareText(loaded, shape_text);
-    // And the forms the font keeps for text set downward.
     if (shaped_font) |loaded| try renderer.prepareTextWith(loaded, shape_text, null, &.{"vert".*});
     var inset = gfx.DrawList.init(init.gpa);
     defer inset.deinit();
     var banner = gfx.DrawList.init(init.gpa);
     defer banner.deinit();
     const views = [2]gfx.View{ try renderer.createView(), try renderer.createView() };
+    if (lightmap_box != 0) {
+        var positions: [24][3]f32 = undefined;
+        var patches: [24][2]f32 = undefined;
+        var box_indices: [36]u32 = undefined;
+        const half = 0.45;
+        for (0..6) |face| {
+            const axis = face / 2;
+            const sign: f32 = if (face % 2 == 0) 1 else -1;
+            const u = (axis + 1) % 3;
+            const w = (axis + 2) % 3;
+            for (0..4) |corner| {
+                var position: [3]f32 = undefined;
+                position[axis] = sign * half;
+                position[u] = (if (corner == 1 or corner == 2) @as(f32, half) else -half) * sign;
+                position[w] = if (corner >= 2) half else -half;
+                positions[face * 4 + corner] = position;
+                const column: f32 = @floatFromInt(face % 3);
+                const row: f32 = @floatFromInt(face / 3);
+                const x: f32 = if (corner == 1 or corner == 2) 0.9 else 0.1;
+                const y: f32 = if (corner >= 2) 0.9 else 0.1;
+                patches[face * 4 + corner] = .{ (column + x) / 3, (row + y) / 2 };
+            }
+            const base: u32 = @intCast(face * 4);
+            box_indices[face * 6 ..][0..6].* = .{ base, base + 1, base + 2, base, base + 2, base + 3 };
+        }
+        const box = try renderer.createModel(&.{.{
+            .positions = &positions,
+            .uvs1 = &patches,
+            .indices = &box_indices,
+            .material = .{ .base_color = .{ 0.9, 0.9, 0.9, 1 }, .metallic = 0, .roughness = 0.9 },
+        }});
+        try renderer.waitUntilLoaded();
+        const toward = math.normalize(math.sub(camera_target, camera_position));
+        const place = math.add(camera_position, math.scale(toward, 2.6));
+        const stands = try renderer.spawn(scene, .{ .model = box, .transform = math.translation(.{ place[0], 0.45, place[2] }) });
+        if (lightmap_box == 2) try renderer.bakeLightmap(stands, .{ .resolution = 192, .frames = 48, .rays = 16 });
+    }
+    if (hair) {
+        const strands = 24000;
+        const per_strand = 8;
+        const points = try init.gpa.alloc([3]f32, strands * per_strand);
+        defer init.gpa.free(points);
+        var random = std.Random.DefaultPrng.init(7);
+        const rng = random.random();
+        for (0..strands) |strand| {
+            const z = rng.float(f32) * 2 - 1;
+            const turn = rng.float(f32) * std.math.tau;
+            const ring = @sqrt(1 - z * z);
+            const out = math.Vec3{ ring * @cos(turn), z, ring * @sin(turn) };
+            const length = 0.16 + rng.float(f32) * 0.1;
+            for (0..per_strand) |index| {
+                const along = @as(f32, @floatFromInt(index)) / (per_strand - 1);
+                var point = math.scale(out, 0.3 + along * length);
+                point[1] -= along * along * 0.12;
+                points[strand * per_strand + index] = point;
+            }
+        }
+        _ = try renderer.createHair(scene, .{
+            .points = points,
+            .points_per_strand = per_strand,
+            .transform = math.translation(math.add(camera_position, math.scale(math.normalize(math.sub(camera_target, camera_position)), 1.6))),
+            .width = 0.004,
+        });
+    }
     defer for (views) |view| renderer.destroyView(view);
     var outline = Outline{};
     defer if (outline.pipeline) |pipeline| renderer.device.destroyPipeline(pipeline);
@@ -1354,14 +1319,12 @@ pub fn main(init: std.process.Init) !void {
         const frame_start = std.Io.Clock.Timestamp.now(init.io, .awake);
         const t = @as(f32, @floatFromInt(index)) / 60.0;
         if (sky_sweep) {
-            // The sun sinks toward the horizon; the sky is rebuilt as it moves.
             const elevation = 1.0 - t * 0.5;
             const desc = gfx.SkyDesc{ .sun_direction = .{ -@cos(elevation) * 0.6, -@sin(elevation), -@cos(elevation) * 0.8 }, .turbidity = sky_turbidity, .rebuild_frames = sky_spread };
             renderer.setSky(sky_environment.?, desc);
             renderer.setSun(scene, gfx.skySun(desc));
         }
         var player_pose = gfx.Pose{ .animation = walk, .time = t };
-        // Upper body waves while the legs keep walking.
         if (wave) player_pose.layers[0] = .{
             .animation = renderer.findAnimation(robot, "Wave") orelse walk,
             .time = t,
@@ -1384,7 +1347,6 @@ pub fn main(init: std.process.Init) !void {
         }
         var player_position = math.add(.{ 2.0, 0, -0.4 }, world_shift);
         if (motion) {
-            // Strafe the camera and walk the character across the view.
             const offset = math.Vec3{ 0, 0, 1.5 * t };
             camera = gfx.Camera.lookAt(math.add(camera_position, offset), math.add(camera_target, offset));
             player_position = math.add(.{ 2.0, 0, -1.4 + 1.2 * t }, world_shift);
@@ -1399,25 +1361,20 @@ pub fn main(init: std.process.Init) !void {
         if (shaped_font) |loaded| {
             try list.rect(.{ .x = 20, .y = 20, .width = size[0] - 40, .height = 230 }, gfx.Color.rgba(10, 12, 20, 255));
             try list.text(loaded, shape_text, .{ 40, 70 }, .{ .size = 72 });
-            // The same in a column, at the right.
             try list.textVertical(loaded, shape_text, .{ @as(f32, @floatFromInt(width)) - 60, 20 }, .{ .size = 40 });
         }
         if (capitals) |narrow| {
-            // Capitals from the narrow font, everything else from the fallback.
             try list.text3d(narrow, "Fallback OK: lower case, 123", .{ 3.0, 2.6, -0.6 }, .{ .size = 0.3, .fallback = &.{font} });
         }
         if (overlay) {
-            // World-space: a name tag, a wireframe box and text on the floor.
             try list.text3d(font, "RobotExpressive\nwalking", math.add(player_position, .{ 0, 2.25, 0 }), .{ .size = 0.2 });
             try list.box3d(math.add(player_position, .{ -0.55, 0, -0.55 }), math.add(player_position, .{ 0.55, 1.95, 0.55 }), 2, gfx.Color.hex(0x3ddc97));
             try list.text3d(font, "SPONZA", .{ 0, 0, 0 }, .{
                 .size = 0.9,
                 .color = gfx.Color.rgba(255, 255, 255, 200),
                 .billboard = false,
-                // Lying flat on the floor, readable from +X.
                 .transform = math.mul(math.translation(.{ 4.5, 0.02, -0.2 }), math.mul(math.rotationY(std.math.pi * 0.5), math.rotationX(-std.math.pi * 0.5))),
             });
-            // Screen-space HUD.
             var buffer: [96]u8 = undefined;
             try list.rect(.{ .x = 12, .y = 12, .width = 300, .height = 64 }, gfx.Color.rgba(10, 12, 20, 190));
             try list.text(font, "verify scene", .{ 24, 18 }, .{ .size = 22 });
@@ -1427,23 +1384,27 @@ pub fn main(init: std.process.Init) !void {
             });
         }
         if (reload_frame != null and reload_frame.? == index) {
-            // Recompile every shader from source and rebuild the pipelines
-            // in the middle of the run; the picture must not change.
             const count = try renderer.reloadShaders();
             std.log.info("frame {d}: reloaded {d} shaders", .{ index, count });
         }
         if (pick_pixel) |pixel| renderer.requestPick(null, pixel);
         if (renderer.takePick()) |result| picked = result;
         if (fail_frame != null and fail_frame.? == index) {
-            // A pass that fails after the scene is half recorded; the
-            // renderer must report it and carry on with the next frame.
             const broken: []const gfx.Pass = &.{.{ .stage = .after_opaque, .run = failingPass }};
             const outcome = renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings, .passes = broken }} });
             if (outcome != error.InjectedFailure) return error.FailureNotReported;
             std.log.info("frame {d}: injected failure reported, continuing", .{index});
+        } else if (stereo) {
+            const half = width / 2;
+            const eyes = camera.stereo(0.065, math.length(math.sub(camera_target, camera.position)));
+            _ = try renderer.render(.{
+                .views = &.{
+                    .{ .scene = scene, .camera = eyes[0], .target = .{ .texture = target }, .region = .{ .x = 0, .y = 0, .width = half, .height = height }, .settings = settings },
+                    .{ .view = views[1], .scene = scene, .camera = eyes[1], .target = .{ .texture = target }, .region = .{ .x = half, .y = 0, .width = width - half, .height = height }, .settings = settings },
+                },
+                .delta_time = 1.0 / 60.0,
+            });
         } else if (multi_view) {
-            // A camera drawn into a texture, two cameras side by side, and
-            // a 2D layer across both.
             const half = width / 2;
             const monitor_camera = gfx.Camera.lookAt(math.add(player_position, .{ -2.5, 2.2, 2.0 }), math.add(player_position, .{ 0, 1, 0 }));
             const reverse = gfx.Camera.lookAt(math.add(camera_target, .{ 3, 0.5, 0 }), camera.position);
@@ -1491,11 +1452,9 @@ pub fn main(init: std.process.Init) !void {
             }},
             .delta_time = 1.0 / 60.0,
         });
-        // Shading variants compile in the background; wait for them so that
-        // what is measured and photographed does not depend on timing. The
-        // first frame of each new feature set still uses the stand-in.
+        // Variants compile in the background; wait so timing cannot matter.
         try renderer.waitForShaderVariants();
-        // Skip warm-up frames (pipeline first use, allocations).
+        // Skip warm-up frames.
         if (index >= frames / 2) cpu_ns += @intCast(frame_start.untilNow(init.io).raw.nanoseconds);
     }
     worker_state.stop.store(true, .release);
@@ -1589,9 +1548,8 @@ fn elapsedMs(io: std.Io, start: std.Io.Clock.Timestamp) i64 {
     return @intCast(@divTrunc(start.untilNow(io).raw.nanoseconds, std.time.ns_per_ms));
 }
 
-/// A finely made ball placed far away, for `GeometryStreaming.coarse_distance`:
-/// with it set, the ball must be down to its coarse levels after a few
-/// frames and still be drawn; brought near, it must be whole again.
+/// Checks `GeometryStreaming.coarse_distance`: a distant ball must drop to
+/// its coarse levels and still draw; brought near, it must be whole again.
 fn coarseLevels(gpa: std.mem.Allocator, renderer: *gfx.Renderer, scene: gfx.Scene, target: gfx.rhi.Texture, settings: gfx.Settings, expect_coarse: bool, near: bool) !void {
     const rings = 220;
     const positions = try gpa.alloc([3]f32, (rings + 1) * (rings + 1));
@@ -1601,7 +1559,6 @@ fn coarseLevels(gpa: std.mem.Allocator, renderer: *gfx.Renderer, scene: gfx.Scen
     for (0..rings + 1) |ring| for (0..rings + 1) |segment| {
         const v = @as(f32, @floatFromInt(ring)) / rings * std.math.pi;
         const u = @as(f32, @floatFromInt(segment)) / rings * std.math.tau;
-        // Dimpled, so that its levels of detail differ.
         const radius = 1.2 + 0.05 * @sin(u * 9) * @sin(v * 7);
         positions[ring * (rings + 1) + segment] = .{ radius * @sin(v) * @cos(u), radius * @cos(v), radius * @sin(v) * @sin(u) };
     };
@@ -1629,9 +1586,8 @@ fn coarseLevels(gpa: std.mem.Allocator, renderer: *gfx.Renderer, scene: gfx.Scen
     }
 }
 
-/// Makes a gap in the geometry pools and checks that it is closed: a
-/// large mesh, then a small one after it, then the large one dropped.
-/// The small one has to be moved down for the pools to draw back.
+/// Checks that a gap in the geometry pools is closed: a large mesh is
+/// dropped and the small one after it must move down.
 fn compaction(gpa: std.mem.Allocator, renderer: *gfx.Renderer, scene: gfx.Scene, target: gfx.rhi.Texture, settings: gfx.Settings) !void {
     const side = 500;
     const positions = try gpa.alloc([3]f32, side * side);
@@ -1654,7 +1610,6 @@ fn compaction(gpa: std.mem.Allocator, renderer: *gfx.Renderer, scene: gfx.Scene,
     const group = try renderer.createInstances(scene, small, &.{ math.translation(.{ 1.5, 4.0, -0.2 }), math.translation(.{ 1.5, 3.6, 0.5 }) });
     try renderer.waitUntilLoaded();
     for (0..40) |_| _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings }} });
-    // The picture with everything where it was put.
     const pixels_before = try renderer.device.readTexture(gpa, target);
     defer gpa.free(pixels_before);
     const before = renderer.getStats();
@@ -1663,8 +1618,6 @@ fn compaction(gpa: std.mem.Allocator, renderer: *gfx.Renderer, scene: gfx.Scene,
     const after = renderer.getStats();
     std.log.info("compaction: {d} KiB moved, gpu memory {d} -> {d} KiB", .{ (after.geometry_bytes_compacted - before.geometry_bytes_compacted) / 1024, before.gpu_memory_bytes / 1024, after.gpu_memory_bytes / 1024 });
     if (after.geometry_bytes_compacted == before.geometry_bytes_compacted) return error.GeometryNotCompacted;
-    // And with the small model moved: it must look the same (the large
-    // one lay under the floor, unseen).
     const pixels_after = try renderer.device.readTexture(gpa, target);
     defer gpa.free(pixels_after);
     var difference: u64 = 0;
@@ -1672,14 +1625,12 @@ fn compaction(gpa: std.mem.Allocator, renderer: *gfx.Renderer, scene: gfx.Scene,
     const mean = @as(f32, @floatFromInt(difference)) / @as(f32, @floatFromInt(pixels_before.len));
     std.log.info("compaction: picture differs by {d:.2} levels", .{mean});
     if (mean > 3) return error.CompactedGeometryDrawnWrong;
-    // Both stay, so the picture shows them drawn from where they now lie.
     _ = entity;
     _ = group;
 }
 
-/// Exercises asset and entity lifetimes: every cycle streams a model in,
-/// spawns animated entities, renders, then tears it all down again. Run
-/// with `--validation` to catch use-after-free and synchronization errors.
+/// Each cycle streams a model in, spawns animated entities, renders and
+/// tears it all down.
 fn soak(renderer: *gfx.Renderer, scene: gfx.Scene, target: gfx.rhi.Texture, settings: gfx.Settings, cycles: u32) !void {
     const camera = gfx.Camera.lookAt(.{ 6, 2, 3 }, .{ 0, 1, 0 });
     // Measured after the first cycle, once render targets and pools exist.
@@ -1687,7 +1638,6 @@ fn soak(renderer: *gfx.Renderer, scene: gfx.Scene, target: gfx.rhi.Texture, sett
     for (0..cycles) |cycle| {
         const fox = try renderer.loadModel("examples/assets/world/Fox.glb");
         var entities: [4]gfx.Entity = undefined;
-        // Spawned while still loading; they appear once the model is ready.
         for (&entities, 0..) |*entity, index| {
             entity.* = try renderer.spawn(scene, .{
                 .model = fox,
@@ -1695,7 +1645,6 @@ fn soak(renderer: *gfx.Renderer, scene: gfx.Scene, target: gfx.rhi.Texture, sett
             });
         }
         for (0..6) |frame| {
-            // Half the cycles render while the model is still streaming.
             if (frame == 1 and cycle % 2 == 0) try renderer.waitUntilLoaded();
             for (entities, 0..) |entity, index|
                 renderer.setPose(entity, .{ .animation = @intCast(index % 3), .time = @as(f32, @floatFromInt(frame)) * 0.1 });
@@ -1726,9 +1675,8 @@ const WorkerState = struct {
     calls: std.atomic.Value(u64) = .init(0),
 };
 
-/// Uses the renderer from a second thread the way game code would: spawn
-/// and move entities, change poses, create and destroy images and fonts,
-/// and record a private draw list, all while the main thread renders.
+/// Drives the renderer API from a second thread while the main thread
+/// renders.
 fn worker(state: *WorkerState, index: u32) std.Io.Cancelable!void {
     workerLoop(state, index) catch |err| {
         if (err == error.Canceled) return error.Canceled;
@@ -1756,7 +1704,6 @@ fn workerLoop(state: *WorkerState, index: u32) !void {
             if (step == 8) renderer.setVisible(entity, iteration % 2 == 0);
             _ = renderer.modelInfo(state.model);
             _ = renderer.getStats();
-            // Recording is lock-free and private to this thread.
             list.clear();
             try list.text(renderer.defaultFont(), "worker", .{ 0, 0 }, .{});
             try list.text3d(renderer.defaultFont(), "worker", .{ x, 1, 1.2 }, .{});
@@ -1786,10 +1733,8 @@ fn percentile(samples: []f32, fraction: f32) f32 {
     return samples[index];
 }
 
-/// A repeatable workload: the camera orbits the courtyard while the
-/// character walks, so shadows, culling and temporal passes all do real
-/// work. Reports median and 95th-percentile GPU time per pass and the CPU
-/// time spent recording frames.
+/// Orbits the camera and reports median and p95 GPU time per pass and the
+/// CPU time spent recording frames.
 fn benchmark(
     init: std.process.Init,
     renderer: *gfx.Renderer,
@@ -1840,8 +1785,6 @@ fn benchmark(
 
     const info = renderer.device.textureInfo(target);
     std.log.info("benchmark: {d}x{d}, {d} frames after {d} warm-up", .{ info.width, info.height, frames, warmup });
-    // Other programs sharing the GPU can only add time, so the low
-    // percentile is the best estimate of a pass's own cost.
     std.log.info("{s:<26} {s:>9} {s:>9} {s:>9}", .{ "pass (ms)", "p5", "median", "p95" });
     var floor_total: f32 = 0;
     for (passes.items) |*pass| {
@@ -1862,8 +1805,8 @@ fn benchmark(
     if (renderer.device.validationErrorCount() != 0) return error.ValidationFailed;
 }
 
-/// A pass written against the renderer's public interface: it owns its
-/// pipeline and draws depth-edge outlines over the tone-mapped picture.
+/// A pass using only the public interface: depth-edge outlines over the
+/// tone-mapped picture.
 const Outline = struct {
     pipeline: ?gfx.rhi.Pipeline = null,
     format: gfx.rhi.Format = undefined,
@@ -1895,15 +1838,11 @@ const Outline = struct {
 };
 
 fn failingPass(_: ?*anyopaque, pass: gfx.PassContext) anyerror!void {
-    // Fail in the worst place: inside an open render pass.
     try pass.cmd.beginRendering(.{ .color = &.{.{ .texture = pass.color, .load = .load }} });
     return error.InjectedFailure;
 }
 
-/// An allocator that can be told to fail one chosen allocation, counted
-/// from the start. Safe to use from several threads at once, which the
-/// standard library's testing one is not: asset loading allocates on
-/// worker threads.
+/// Fails one chosen allocation, counted from the start. Thread-safe.
 const FailingAllocator = struct {
     backing: std.mem.Allocator,
     alloc_index: std.atomic.Value(usize) = .init(0),
@@ -1935,9 +1874,9 @@ const FailingAllocator = struct {
     }
 };
 
-/// Fails one allocation at a time, further into the same sequence of
-/// operations each round. Every operation must either succeed or return
-/// `error.OutOfMemory`, and the renderer must draw a normal frame afterwards.
+/// Fails one allocation per round, each further into the same operations.
+/// Each must succeed or return `error.OutOfMemory`, and the next frame
+/// must draw.
 fn outOfMemory(
     renderer: *gfx.Renderer,
     failing: *FailingAllocator,
@@ -1970,15 +1909,11 @@ fn outOfMemory(
             if (err != error.OutOfMemory) return err;
             failures += 1;
         }
-        // Whatever happened, the next frame must work.
         _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings }} });
     }
     try renderer.setLights(scene, &.{});
     std.log.info("out of memory: {d} of {d} rounds hit an injected failure, all recovered", .{ failures, rounds });
 
-    // The same for a model loaded from a file, whose decoding runs on
-    // worker threads: one clean load counts its allocations, then each
-    // round fails one of them, spread evenly over the whole load.
     const path = "examples/assets/world/Fox.glb";
     const before = failing.alloc_index.load(.monotonic);
     {
@@ -1998,7 +1933,7 @@ fn outOfMemory(
         if (loaded) |model| {
             renderer.waitUntilLoaded() catch |err| if (err != error.OutOfMemory) return err;
             failing.fail_index.store(std.math.maxInt(usize), .monotonic);
-            // A wait cut short leaves the load unfinished; let it finish.
+            // A wait cut short leaves the load unfinished.
             try renderer.waitUntilLoaded();
             switch (renderer.modelState(model)) {
                 .ready => {},
@@ -2017,10 +1952,8 @@ fn outOfMemory(
     std.log.info("out of memory while loading: {d} allocations per load, {d} of {d} rounds failed the load, all recovered", .{ allocations, load_failures, rounds });
 }
 
-/// Fails one GPU memory allocation at a time while a view with render
-/// targets of its own, an image, a model and an entity are created and a
-/// frame is drawn with them. Whatever fails, the next frame must work, and
-/// validation must find nothing left behind.
+/// Fails one GPU memory allocation per round while resources are created
+/// and a frame is drawn; the next frame must work.
 fn outOfGpuMemory(
     renderer: *gfx.Renderer,
     scene: gfx.Scene,
@@ -2056,8 +1989,7 @@ fn outOfGpuMemory(
             defer renderer.despawn(entity);
             _ = renderer.render(.{ .views = &.{.{ .view = view, .scene = scene, .camera = camera, .target = .{ .texture = small }, .settings = settings }} }) catch |err| break :blk err;
         };
-        // Some failures are absorbed (a model that fails to upload is
-        // reported and skipped), so count the ones that were injected.
+        // Some failures are absorbed, so count the ones that were injected.
         if (!device.gpuAllocationFailurePending()) failures += 1;
         device.failGpuAllocation(null);
         if (outcome) |_| {} else |err| {
@@ -2068,9 +2000,8 @@ fn outOfGpuMemory(
     std.log.info("out of GPU memory: {d} of {d} rounds hit an injected failure, all recovered", .{ failures, rounds });
 }
 
-/// Renders a scene in which nothing moves and measures how much the
-/// picture still changes from frame to frame. Returns a heat map: black is
-/// stable, white changes by 8 or more 8-bit levels per frame on average.
+/// Heat map of frame-to-frame change in a static scene: black is stable,
+/// white changes by 8 or more 8-bit levels per frame on average.
 fn measureFlicker(
     init: std.process.Init,
     renderer: *gfx.Renderer,
@@ -2082,7 +2013,6 @@ fn measureFlicker(
 ) ![]u8 {
     const device = renderer.device;
     const view = gfx.ViewDesc{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings };
-    // Let temporal effects settle on the now static scene first.
     for (0..48) |_| _ = try renderer.render(.{ .views = &.{view} });
     var previous = try device.readTexture(init.gpa, target);
     defer init.gpa.free(previous);
@@ -2099,7 +2029,7 @@ fn measureFlicker(
                 const b: i32 = previous[pixel * 4 + channel];
                 difference = @max(difference, @abs(a - b));
             }
-            // A change of one level is the output dither, not flicker.
+            // A change of one level is the output dither.
             if (difference >= 2) sum.* += @floatFromInt(difference);
         }
         init.gpa.free(previous);
@@ -2128,10 +2058,8 @@ fn measureFlicker(
     return heat;
 }
 
-/// Compares the frame with a stored picture of what it should look like.
-/// Small differences (other GPUs round and filter slightly differently) are
-/// allowed; the test fails when the average difference per channel exceeds
-/// `tolerance` 8-bit levels or more than 2% of the pixels are clearly off.
+/// Fails when the average difference per channel from the stored picture
+/// exceeds `tolerance` 8-bit levels or over 2% of pixels are clearly off.
 fn compareReference(
     init: std.process.Init,
     renderer: *gfx.Renderer,
@@ -2142,10 +2070,7 @@ fn compareReference(
     tolerance: f32,
     update: bool,
 ) !void {
-    // The stored pictures were made on one particular GPU. Another one
-    // filters textures and rounds a little differently, so the comparison
-    // is strict on the same device and loose on any other: there it only
-    // catches a picture that is plainly wrong.
+    // Strict on the GPU the references were made on, loose on any other.
     const device_name = renderer.device.name();
     var device_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const device_path = try std.fmt.bufPrint(&device_path_buffer, "{s}/device.txt", .{std.fs.path.dirname(path) orelse "."});
@@ -2156,8 +2081,7 @@ fn compareReference(
             same_device = std.mem.eql(u8, std.mem.trim(u8, recorded, " \n"), device_name);
         } else |_| {}
     }
-    // Ray-traced global illumination is in the pictures; without it the
-    // lit views are legitimately different.
+    // The references include ray-traced global illumination.
     if (!renderer.device.ray_tracing and !update) {
         std.log.info("reference {s}: skipped, this device has no ray tracing", .{path});
         return;
@@ -2199,8 +2123,7 @@ fn compareReference(
     if (mean > allowed_mean or off_percent > allowed_off) return error.ReferenceMismatch;
 }
 
-/// A minimal profiler behind the renderer's hooks: total time and call
-/// count per zone name. A real one (Tracy) plugs in the same way.
+/// Total time and call count per zone name, behind the renderer's hooks.
 const ZoneLog = struct {
     io: std.Io,
     names: [16][:0]const u8 = undefined,
@@ -2238,9 +2161,8 @@ const ZoneLog = struct {
     }
 };
 
-/// Writes a two-triangle panel as a glTF model whose only texture is a
-/// KTX2 file of BC1 blocks (a yellow and blue checkerboard), and returns
-/// the model's path.
+/// Writes a glTF panel textured with a BC1 KTX2 checkerboard; returns its
+/// path.
 fn writeKtx2Panel(gpa: std.mem.Allocator, io: std.Io, directory: []const u8) ![]u8 {
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, directory, .{});
     defer dir.close(io);
@@ -2296,8 +2218,8 @@ fn writeKtx2Panel(gpa: std.mem.Allocator, io: std.Io, directory: []const u8) ![]
 
 const morph_row_tiles = 12;
 
-/// Writes a glTF model of twelve square tiles in a row, each with a morph
-/// target of its own that lifts it, and returns the model's path.
+/// Writes a glTF row of twelve tiles, each with its own morph target;
+/// returns its path.
 fn writeMorphRow(gpa: std.mem.Allocator, io: std.Io, directory: []const u8) ![]u8 {
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, directory, .{});
     defer dir.close(io);

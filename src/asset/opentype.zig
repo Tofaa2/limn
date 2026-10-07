@@ -1,51 +1,35 @@
-//! OpenType layout: applies a font's glyph substitutions (the GSUB table)
-//! to a run of glyphs. Single, multiple, alternate and ligature
-//! substitution, and the contextual and chained contextual lookups that
-//! call on them, in all their formats; reverse chaining substitution is
-//! not read. Glyphs a lookup is told to pass over (marks, for the most
-//! part) are passed over by the font's own glyph classes (GDEF).
-//!
-//! Which lookups to apply is the caller's choice: `lookups` gathers those
-//! of a set of features for a script and language, in the order the font
-//! lists them, which is the order they are applied in.
+//! OpenType layout: applies GSUB substitutions (single, multiple, alternate,
+//! ligature, contextual and chained contextual; not reverse chaining) and
+//! advance-adjusting GPOS lookups to a glyph run, honouring GDEF classes.
 const std = @import("std");
 
-/// An OpenType tag: the four-character name of a script, language, feature
-/// or table, padded with spaces (`"latn"`, `"ROM "`, `"liga"`).
+/// Four-character tag, space padded (`"latn"`, `"ROM "`, `"liga"`).
 pub const Tag = [4]u8;
 
-/// A glyph of a run being shaped.
 pub const Glyph = struct {
-    /// The glyph's number in the font file.
+    /// Glyph index in the font.
     id: u16,
-    /// Where in the shaped text the first character this glyph stands for
-    /// is.
+    /// Index in the shaped text of the first character this glyph stands for.
     cluster: u32 = 0,
-    /// The parts this glyph plays, as bits: a stage of a plan is applied
-    /// at it only if the two have a bit in common.
+    /// A plan stage applies here only if its mask shares a bit with this.
     mask: u32 = std.math.maxInt(u32),
-    /// For a mark that a ligature was formed across: which of the
-    /// ligature's parts it was typed after, counting from 1. 0 for
-    /// every other glyph; a mark after the whole ligature belongs to its
-    /// last part.
+    /// For a mark a ligature was formed across: the 1-based ligature component
+    /// it follows. 0 for every other glyph.
     component: u8 = 0,
-    /// What positioning lookups have added to the glyph's advance, in the
-    /// font's units.
+    /// Advance added by positioning lookups, in font units.
     advance: i32 = 0,
 };
 
-/// Contexts nest; a font that nests deeper than this is cut short.
+/// Maximum nesting of contextual lookups; deeper nesting is cut short.
 const max_depth = 6;
 /// Most glyphs one rule's input may span.
 const max_input = 32;
 
-/// Bounds-checked reads from a font file, whose numbers are big-endian.
-/// `bytes` is borrowed.
+/// Bounds-checked big-endian reads from a font file. `bytes` is borrowed.
 pub const Reader = struct {
     bytes: []const u8,
 
-    /// The 16-bit number at `offset`; `error.InvalidFont` when that is past
-    /// the end of the file.
+    /// `error.InvalidFont` when `offset` is past the end.
     pub fn u16At(self: Reader, offset: usize) !u16 {
         if (offset > self.bytes.len or self.bytes.len - offset < 2) return error.InvalidFont;
         return std.mem.readInt(u16, self.bytes[offset..][0..2], .big);
@@ -66,37 +50,35 @@ pub const Reader = struct {
     }
 };
 
-/// How one place of a rule is compared with a glyph.
+/// How a rule value is compared with a glyph.
 const Match = union(enum) {
-    /// The value is the glyph.
+    /// The value is the glyph id.
     glyph,
-    /// The value is the glyph's class in this class definition.
+    /// The value is the glyph's class in the class definition at this offset.
     class: usize,
-    /// The value is the offset, from this base, of a coverage table the
-    /// glyph must be in.
+    /// The value is the offset, from this base, of a coverage table the glyph
+    /// must be in.
     coverage: usize,
 };
 
-/// Features applied together, and the glyphs they are for.
+/// Features applied together, and the glyphs they apply to.
 pub const Stage = struct {
     features: []const Tag,
-    /// The stage is applied at glyphs whose `Glyph.mask` shares a bit with
-    /// this. The default is every glyph.
+    /// Applied at glyphs whose `Glyph.mask` shares a bit with this.
     mask: u32 = std.math.maxInt(u32),
 };
 
-/// Lookups chosen for a script, language and set of features, and for
-/// each the glyphs it can start at.
+/// Lookups chosen for a script, language and feature set.
 pub const Plan = struct {
-    /// Indices into the font's lookup list, in the order they are applied.
+    /// Lookup list indices, in application order.
     lookups: []u16,
-    /// Per lookup, a bit per glyph of the font, set if the lookup can start
-    /// at that glyph (all set when that could not be worked out).
+    /// Per lookup, one bit per glyph: set if the lookup can start at that glyph
+    /// (all set when unknown).
     starts: []std.DynamicBitSetUnmanaged,
-    /// Per lookup, the glyphs it is for (see `Glyph.mask`).
+    /// Per lookup, the `Glyph.mask` bits it applies to.
     masks: []u32,
 
-    /// Frees the plan; `gpa` is the allocator it was made with.
+    /// `gpa` must be the allocator the plan was made with.
     pub fn deinit(self: *Plan, gpa: std.mem.Allocator) void {
         for (self.starts) |*set| set.deinit(gpa);
         gpa.free(self.starts);
@@ -106,28 +88,24 @@ pub const Plan = struct {
     }
 };
 
-/// A font's GSUB or GPOS table, found in the file and ready to apply.
-/// It holds offsets into the file's bytes, which it borrows and which
-/// must outlive it; it owns no memory itself.
+/// A font's GSUB or GPOS table. Holds offsets into the borrowed file bytes,
+/// which must outlive it; owns no memory.
 pub const Layout = struct {
     reader: Reader,
-    /// Whether this is the font's table of substitutions or of positions:
-    /// the two are laid out alike and their lookups differ.
+    /// True for GPOS, false for GSUB.
     positions: bool = false,
-    /// Where the table's script, feature and lookup lists start in the file.
+    /// File offsets of the script, feature and lookup lists.
     script_list: usize,
     feature_list: usize,
     lookup_list: usize,
-    /// The font's glyph classes (base, ligature, mark), if it has them.
+    /// GDEF glyph class definition (base, ligature, mark).
     glyph_classes: ?usize = null,
-    /// The classes its marks fall in, for lookups that pass over all
-    /// marks but one kind.
+    /// GDEF mark attachment class definition.
     mark_classes: ?usize = null,
-    /// Sets of marks that lookups can name as the only ones they see.
+    /// GDEF mark glyph sets.
     mark_sets: ?usize = null,
 
-    /// `table` is where the GSUB table starts in the font file `bytes`,
-    /// `gdef` where its GDEF table does, if it has one.
+    /// `table` is the file offset of GSUB, `gdef` that of GDEF if present.
     pub fn init(bytes: []const u8, table: usize, gdef: ?usize) !Layout {
         const reader = Reader{ .bytes = bytes };
         if (try reader.u16At(table) != 1) return error.UnsupportedFont;
@@ -142,7 +120,6 @@ pub const Layout = struct {
             if (classes != 0) self.glyph_classes = start + classes;
             const marks = try reader.u16At(start + 10);
             if (marks != 0) self.mark_classes = start + marks;
-            // From the table's version 1.2 on.
             if (try reader.u16At(start + 2) >= 2) {
                 const sets = try reader.u16At(start + 12);
                 if (sets != 0) self.mark_sets = start + sets;
@@ -151,20 +128,19 @@ pub const Layout = struct {
         return self;
     }
 
-    /// The same for the font's table of positions (GPOS), of which the
-    /// lookups that adjust advances are applied: single adjustments, and
-    /// contexts with the single and pair adjustments they call on. (Plain
-    /// pairs, marks and cursive joins are read when a font is baked.)
+    /// As `init`, for GPOS. Only advance adjustments are applied: single
+    /// adjustments, and contexts with the single and pair adjustments they
+    /// call.
     pub fn initPositions(bytes: []const u8, table: usize, gdef: ?usize) !Layout {
         var self = try init(bytes, table, gdef);
         self.positions = true;
         return self;
     }
 
-    /// The lookups of `features` for a script and language, in the order
-    /// they are to be applied, each once. A script the font does not name
-    /// falls back to its default script, a language it does not name to
-    /// the script's default. Owned by the caller.
+    /// Lookups of `features` for a script and language, in application order,
+    /// each once. Unknown scripts and languages fall back to the defaults.
+    /// Owned
+    /// by the caller.
     pub fn lookups(self: Layout, gpa: std.mem.Allocator, script: Tag, language: ?Tag, features: []const Tag) ![]u16 {
         var found: std.ArrayList(u16) = .empty;
         errdefer found.deinit(gpa);
@@ -174,7 +150,6 @@ pub const Layout = struct {
         const count = try reader.u16At(system + 4);
         const feature_count = try reader.u16At(self.feature_list);
         for (0..@as(usize, count) + 1) |entry| {
-            // The feature a language insists on comes after the rest.
             const index = if (entry == count) required else try reader.u16At(system + 6 + entry * 2);
             if (index >= feature_count) continue;
             const record = self.feature_list + 2 + @as(usize, index) * 6;
@@ -195,16 +170,14 @@ pub const Layout = struct {
         return found.toOwnedSlice(gpa);
     }
 
-    /// The lookups of `features` for a script and language, with what
-    /// each can start at worked out once, so that applying them to text
-    /// they do not touch costs next to nothing. Owned by the caller.
+    /// As `lookups`, with each lookup's start glyphs precomputed. Owned by the
+    /// caller.
     pub fn plan(self: Layout, gpa: std.mem.Allocator, script: Tag, language: ?Tag, features: []const Tag, glyph_count: u32) !Plan {
         return self.planStages(gpa, script, language, &.{.{ .features = features }}, glyph_count);
     }
 
-    /// A plan made of stages applied one after another: the lookups of
-    /// the first stage's features, then those of the second's, and so
-    /// on, each stage only at glyphs that carry one of its mask's bits.
+    /// A plan of stages applied in order, each only at glyphs sharing a bit
+    /// with its mask.
     pub fn planStages(self: Layout, gpa: std.mem.Allocator, script: Tag, language: ?Tag, stages: []const Stage, glyph_count: u32) !Plan {
         var indices: std.ArrayList(u16) = .empty;
         defer indices.deinit(gpa);
@@ -245,10 +218,7 @@ pub const Layout = struct {
                 actual = try reader.u16At(subtable + 2);
                 subtable += try reader.u32At(subtable + 4);
             }
-            // A positioning table numbers its kinds differently; for
-            // finding where a lookup starts, they pair off like this.
             if (self.positions) actual = switch (actual) {
-                // Plain pairs are not applied from here: they start nowhere.
                 1 => 1,
                 7 => 5,
                 8 => 6,
@@ -263,7 +233,6 @@ pub const Layout = struct {
                     if (try reader.u16At(input_at) == 0) continue;
                     break :first subtable + try reader.u16At(input_at + 2);
                 } else subtable + try reader.u16At(subtable + 2),
-                // Nothing this engine applies.
                 else => continue,
             };
             const count = try reader.u16At(coverage + 2);
@@ -283,8 +252,8 @@ pub const Layout = struct {
         }
     }
 
-    /// Applies a plan's lookups to a run of glyphs. Returns whether any
-    /// of them found something to do.
+    /// Applies a plan's lookups to a glyph run. Returns whether anything
+    /// changed.
     pub fn substitutePlanned(self: Layout, gpa: std.mem.Allocator, glyphs: *std.ArrayList(Glyph), planned: Plan) !bool {
         var changed = false;
         for (planned.lookups, planned.starts, planned.masks) |index, starts, mask| {
@@ -338,7 +307,7 @@ pub const Layout = struct {
         return if (default == 0) null else table + default;
     }
 
-    /// Applies lookups, in the order given, to a run of glyphs.
+    /// Applies lookups, in the order given, to a glyph run.
     pub fn substitute(self: Layout, gpa: std.mem.Allocator, glyphs: *std.ArrayList(Glyph), lookup_indices: []const u16) !void {
         for (lookup_indices) |index| {
             const lookup = (try self.lookupAt(index)) orelse continue;
@@ -354,15 +323,14 @@ pub const Layout = struct {
         }
     }
 
-    /// Where lookup `index` of the lookup list starts in the file, or null
-    /// when the font has no lookup of that number.
+    /// File offset of lookup `index`, or null when out of range.
     pub fn lookupAt(self: Layout, index: u16) !?usize {
         if (index >= try self.reader.u16At(self.lookup_list)) return null;
         return self.lookup_list + try self.reader.u16At(self.lookup_list + 2 + @as(usize, index) * 2);
     }
 
-    /// A lookup's flags, with the number of its mark filtering set (if
-    /// it names one) in the upper half.
+    /// A lookup's flags, with its mark filtering set index in the upper 16
+    /// bits.
     fn flagsOf(self: Layout, lookup: usize) !u32 {
         const flag: u32 = try self.reader.u16At(lookup + 2);
         if (flag & 0x10 == 0) return flag;
@@ -370,13 +338,12 @@ pub const Layout = struct {
         return flag | (@as(u32, try self.reader.u16At(lookup + 6 + @as(usize, count) * 2)) << 16);
     }
 
-    /// Whether the font classes the glyph as a mark.
     pub fn isMark(self: Layout, glyph: u16) bool {
         const classes = self.glyph_classes orelse return false;
         return (self.classOf(classes, glyph) catch 0) == 3;
     }
 
-    /// Whether a lookup with these flags treats the glyph as not there.
+    /// Whether a lookup with these flags skips the glyph.
     fn passedOver(self: Layout, flag: u32, glyph: u16) !bool {
         if (flag & 0xff1e == 0) return false;
         const classes = self.glyph_classes orelse return false;
@@ -385,7 +352,6 @@ pub const Layout = struct {
         if (class == 2 and flag & 4 != 0) return true;
         if (class != 3) return false;
         if (flag & 8 != 0) return true;
-        // Marks outside the set the lookup works with.
         if (flag & 0x10 != 0) if (self.mark_sets) |sets| {
             const set = flag >> 16;
             if (set < try self.reader.u16At(sets + 2)) {
@@ -393,7 +359,6 @@ pub const Layout = struct {
                 if ((try self.coverageIndex(coverage, glyph)) == null) return true;
             }
         };
-        // Marks of every kind but the one the lookup works with.
         const kind = (flag >> 8) & 0xff;
         if (kind == 0) return false;
         const marks = self.mark_classes orelse return false;
@@ -417,8 +382,8 @@ pub const Layout = struct {
         return null;
     }
 
-    /// Tries the lookup's subtables on the glyph at `at`. Null when none
-    /// applies, else how many glyphs to move on by.
+    /// Tries the lookup's subtables at `at`. Null when none applies, else how
+    /// many glyphs to advance by.
     fn applyAt(self: Layout, gpa: std.mem.Allocator, glyphs: *std.ArrayList(Glyph), lookup: usize, at: usize, depth: u32) anyerror!?usize {
         const reader = self.reader;
         const kind = try reader.u16At(lookup);
@@ -427,7 +392,6 @@ pub const Layout = struct {
         for (0..count) |index| {
             var subtable = lookup + try reader.u16At(lookup + 6 + index * 2);
             var actual = kind;
-            // An extension: the real subtable is further off.
             const extension: u16 = if (self.positions) 9 else 7;
             if (kind == extension) {
                 actual = try reader.u16At(subtable + 2);
@@ -436,8 +400,7 @@ pub const Layout = struct {
             if (self.positions) {
                 const placed = switch (actual) {
                     1 => try self.adjustOne(glyphs, subtable, at),
-                    // Plain pairs are read when the font is baked; here
-                    // only as part of a context.
+                    // Pair adjustments are applied only inside a context.
                     2 => if (depth == 0) null else try self.adjustPair(glyphs, subtable, flag, at),
                     7 => try self.context(gpa, glyphs, subtable, flag, at, depth),
                     8 => try self.chained(gpa, glyphs, subtable, flag, at, depth),
@@ -460,19 +423,18 @@ pub const Layout = struct {
         return null;
     }
 
-    /// Size in bytes of a value record of this format.
+    /// Size in bytes of a GPOS value record of this format.
     fn valueSize(format: u16) usize {
         return @as(usize, @popCount(format & 0xff)) * 2;
     }
 
-    /// What a value record adds to a glyph's advance.
+    /// The advance a GPOS value record adds.
     fn valueAdvance(self: Layout, record: usize, format: u16) !i32 {
         if (format & 4 == 0) return 0;
-        // The advance follows the two placements, where they are present.
         return try self.reader.i16At(record + @as(usize, @popCount(format & 3)) * 2);
     }
 
-    /// Positioning: an adjustment to one glyph.
+    /// GPOS single adjustment.
     fn adjustOne(self: Layout, glyphs: *std.ArrayList(Glyph), subtable: usize, at: usize) !?usize {
         const reader = self.reader;
         const covered = (try self.coverageIndex(subtable + try reader.u16At(subtable + 2), glyphs.items[at].id)) orelse return null;
@@ -486,7 +448,7 @@ pub const Layout = struct {
         return 1;
     }
 
-    /// Positioning: an adjustment to a glyph by the one after it.
+    /// GPOS pair adjustment.
     fn adjustPair(self: Layout, glyphs: *std.ArrayList(Glyph), subtable: usize, flag: u32, at: usize) !?usize {
         const reader = self.reader;
         const first = glyphs.items[at].id;
@@ -559,7 +521,6 @@ pub const Layout = struct {
         if (covered >= try reader.u16At(subtable + 4)) return null;
         const set = subtable + try reader.u16At(subtable + 6 + covered * 2);
         if (try reader.u16At(set) == 0) return null;
-        // The first of the alternates; there is no asking for another.
         glyphs.items[at].id = try reader.u16At(set + 2);
         return 1;
     }
@@ -581,13 +542,10 @@ pub const Layout = struct {
                 if (glyphs.items[place].id != try reader.u16At(entry + 4 + (part - 1) * 2)) continue :candidates;
                 places[part] = place;
             }
-            // Marks the ligature was formed across remember the part they
-            // follow, so that they can be set on it.
             for (1..parts) |part| {
                 for (places[part - 1] + 1..places[part]) |between| glyphs.items[between].component = @intCast(part);
             }
             glyphs.items[at].id = try reader.u16At(entry);
-            // What was passed over stays, now after the ligature.
             var part = parts;
             while (part > 1) : (part -= 1) _ = glyphs.orderedRemove(places[part - 1]);
             return 1;
@@ -688,8 +646,8 @@ pub const Layout = struct {
         };
     }
 
-    /// The glyphs of a rule after its first, whose values start at
-    /// `values`; where each was found goes into `places`.
+    /// Matches a rule's input glyphs after the first, whose values start at
+    /// `values`; writes where each was found to `places`.
     fn matchInput(self: Layout, glyphs: []const Glyph, flag: u32, at: usize, values: usize, count: u16, match: Match, places: *[max_input]usize) !bool {
         if (count > max_input) return false;
         places[0] = at;
@@ -701,7 +659,7 @@ pub const Layout = struct {
         return true;
     }
 
-    /// What must come before a rule's input, nearest first.
+    /// Matches a rule's backtrack sequence, nearest first.
     fn matchBefore(self: Layout, glyphs: []const Glyph, flag: u32, at: usize, values: usize, count: u16, match: Match) !bool {
         var place = at;
         for (0..count) |index| {
@@ -711,7 +669,7 @@ pub const Layout = struct {
         return true;
     }
 
-    /// What must come after a rule's input.
+    /// Matches a rule's lookahead sequence.
     fn matchAfter(self: Layout, glyphs: []const Glyph, flag: u32, last: usize, values: usize, count: u16, match: Match) !bool {
         var place = last;
         for (0..count) |index| {
@@ -721,8 +679,8 @@ pub const Layout = struct {
         return true;
     }
 
-    /// Carries out what a matched rule asks for: other lookups, each at
-    /// one of the places its input was found.
+    /// Applies a matched rule's nested lookups at the places its input was
+    /// found.
     fn applyRecords(self: Layout, gpa: std.mem.Allocator, glyphs: *std.ArrayList(Glyph), records: usize, record_count: u16, places: *[max_input]usize, count: u16, depth: u32) !?usize {
         const first = places[0];
         var end = places[count - 1] + 1;
@@ -734,7 +692,6 @@ pub const Layout = struct {
             if (place >= glyphs.items.len) continue;
             const before = glyphs.items.len;
             _ = try self.applyAt(gpa, glyphs, lookup, place, depth + 1);
-            // Glyphs came or went: what lies after has moved.
             const after = glyphs.items.len;
             for (places[0..count]) |*other| {
                 if (other.* > place) other.* = other.* + after -| before;

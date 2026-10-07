@@ -2,8 +2,7 @@
 #include "common.glsl"
 #include "liquid.glsl"
 
-// How much liquid a ray through each pixel passes: every particle adds
-// the length of the ray inside its sphere.
+// Liquid thickness per pixel: each particle adds its sphere's chord length.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     LiquidRef liquid;
@@ -23,7 +22,6 @@ void main() {
     vec4 clip = push.frame.proj * vec4(in_sphere.xyz, 1.0);
     float scene = texelFetch(TEX(push.depth_texture, push.frame.sampler_nearest_clamp), ivec2(gl_FragCoord.xy), 0).r;
     if (clip.z / clip.w < scene) discard;
-    // Spheres overlap a good deal; counted in full they would add up to
-    // more liquid than there is.
+    // Scaled down because spheres overlap.
     out_thickness = 2.0 * in_sphere.w * sqrt(1.0 - off_center) * 0.24;
 }

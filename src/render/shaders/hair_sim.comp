@@ -1,0 +1,189 @@
+#version 460
+#include "common.glsl"
+#include "hair.glsl"
+
+// Hair simulation, one strand per invocation: Verlet integration with gravity,
+// wind, density repulsion and a pull toward the rest pose, then collision and
+// root-to-tip length constraints.
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, scalar) buffer HairPointsOut { HairPoint data[]; };
+// Points per cell of a grid around the hair.
+layout(buffer_reference, scalar) buffer HairDensity { uint data[]; };
+
+// Must match `SimulationParams` in passes/hair.zig.
+layout(buffer_reference, scalar) readonly buffer Params {
+    // Rest pose, in hair space.
+    HairPoints rest;
+    // World-space points now and one step ago. This step is written over the
+    // older buffer.
+    HairPointsOut current;
+    HairPointsOut next;
+    // Density of the previous step, and the one being counted.
+    HairDensity density_before;
+    HairDensity density_now;
+    mat4 transform;
+    // World to collision field space.
+    mat4 world_to_field;
+    vec3 gravity;
+    float damping;
+    vec3 wind;
+    float gustiness;
+    // Distance field: grid corner and cell size, in field units.
+    vec3 field_low;
+    float field_cell;
+    // Bounds of the two density grids.
+    vec3 density_low_before;
+    float density_cell_before;
+    vec3 density_low_now;
+    float density_cell_now;
+    float time;
+    float dt;
+    float previous_dt;
+    // Pull toward the rest pose per 1/60 s, along the strand and at the root.
+    float stiffness;
+    float root_stiffness;
+    // World units per field unit.
+    float field_scale;
+    // Distance kept from the collision shape.
+    float margin;
+    // Strength of strand-strand repulsion.
+    float volume;
+    uint strand_count;
+    uint points_per_strand;
+    uint collider_count;
+    // Nonzero to reset to the rest pose.
+    uint reset;
+    // Field texture (INVALID_ID for none) and cells per side.
+    uint field_texture;
+    uint field_size;
+    uint density_size;
+    uint pad;
+    // Sphere colliders: world-space centre and radius.
+    vec4 colliders[6];
+};
+
+layout(push_constant, scalar) uniform Push {
+    FrameConstants frame;
+    Params params;
+} push;
+
+// Maximum points per strand.
+const uint most_points = 64u;
+
+// Signed distance at `place` in field space, negative inside; large outside the
+// grid.
+float fieldAt(Params params, vec3 place) {
+    vec3 cells = (place - params.field_low) / params.field_cell;
+    float size = float(params.field_size);
+    if (any(lessThan(cells, vec3(0.5))) || any(greaterThan(cells, vec3(size - 0.5)))) return 1.0e9;
+    float layer = cells.z - 0.5;
+    float below = floor(layer);
+    uint linear = push.frame.sampler_linear_clamp;
+    float a = textureLod(sampler2DArray(textures_2d_array[nonuniformEXT(params.field_texture)], samplers[nonuniformEXT(linear)]), vec3(cells.xy / size, below), 0.0).r;
+    float b = textureLod(sampler2DArray(textures_2d_array[nonuniformEXT(params.field_texture)], samplers[nonuniformEXT(linear)]), vec3(cells.xy / size, min(below + 1.0, size - 1.0)), 0.0).r;
+    return mix(a, b, layer - below);
+}
+
+// Pushes a world-space point out of the collision shape to the margin.
+vec3 outsideShape(Params params, vec3 point) {
+    if (params.field_texture == INVALID_ID) return point;
+    vec3 place = (params.world_to_field * vec4(point, 1.0)).xyz;
+    float distance_out = fieldAt(params, place);
+    float wanted = params.margin / params.field_scale;
+    if (distance_out >= wanted) return point;
+    float h = params.field_cell;
+    vec3 slope = vec3(
+        fieldAt(params, place + vec3(h, 0.0, 0.0)) - fieldAt(params, place - vec3(h, 0.0, 0.0)),
+        fieldAt(params, place + vec3(0.0, h, 0.0)) - fieldAt(params, place - vec3(0.0, h, 0.0)),
+        fieldAt(params, place + vec3(0.0, 0.0, h)) - fieldAt(params, place - vec3(0.0, 0.0, h)));
+    float steep = length(slope);
+    if (steep < 1.0e-6 || steep > 1.0e8) return point;
+    vec3 way = normalize(transpose(mat3(params.world_to_field)) * (slope / steep));
+    return point + way * (wanted - distance_out) * params.field_scale;
+}
+
+uint densityAt(Params params, ivec3 cell) {
+    int size = int(params.density_size);
+    if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, ivec3(size)))) return 0u;
+    return params.density_before.data[uint(cell.x + (cell.y + cell.z * size) * size)];
+}
+
+// Displacement down the density gradient, in cells per 1/60 s.
+vec3 awayFromCrowd(Params params, vec3 point) {
+    if (params.volume <= 0.0) return vec3(0.0);
+    ivec3 cell = ivec3(floor((point - params.density_low_before) / params.density_cell_before));
+    float here = float(densityAt(params, cell));
+    vec3 slope = vec3(
+        float(densityAt(params, cell + ivec3(1, 0, 0))) - float(densityAt(params, cell - ivec3(1, 0, 0))),
+        float(densityAt(params, cell + ivec3(0, 1, 0))) - float(densityAt(params, cell - ivec3(0, 1, 0))),
+        float(densityAt(params, cell + ivec3(0, 0, 1))) - float(densityAt(params, cell - ivec3(0, 0, 1))));
+    vec3 push_away = -slope / (2.0 * (here + 4.0));
+    float size = length(push_away);
+    if (size > 1.0) push_away /= size;
+    return push_away * params.volume * 0.06 * params.density_cell_before;
+}
+
+void main() {
+    Params params = push.params;
+    uint strand = gl_GlobalInvocationID.x;
+    if (strand >= params.strand_count) return;
+    uint first = strand * params.points_per_strand;
+    uint count = min(params.points_per_strand, most_points);
+    vec3 above = (params.transform * vec4(params.rest.data[first].position, 1.0)).xyz;
+    vec3 combed_above = above;
+    params.next.data[first] = HairPoint(above, 0.0);
+    params.current.data[first] = HairPoint(above, 0.0);
+    // Final positions and length-constraint corrections.
+    vec3 placed[most_points];
+    vec3 pulled[most_points];
+    placed[0] = above;
+    pulled[0] = vec3(0.0);
+    for (uint index = 1u; index < count; index++) {
+        HairPoint combed = params.rest.data[first + index];
+        vec3 target = (params.transform * vec4(combed.position, 1.0)).xyz;
+        float reach = distance(target, combed_above);
+        vec3 point = target;
+        if (params.reset == 0u) {
+            vec3 here = params.current.data[first + index].position;
+            vec3 before = params.next.data[first + index].position;
+            vec3 travel = (here - before) * (params.dt / max(params.previous_dt, 1.0e-4)) * (1.0 - params.damping);
+            float gust = 1.0 + params.gustiness * sin(params.time * 2.3 + dot(here, vec3(1.7, 0.6, 1.1)));
+            point = here + travel + (params.gravity + params.wind * gust) * params.dt * params.dt;
+            point += awayFromCrowd(params, here) * params.dt * 60.0;
+            // Root stiffness blends out over the first 35% of the strand.
+            float hold = mix(params.root_stiffness, params.stiffness, smoothstep(0.0, 0.35, combed.along));
+            point = mix(point, target, 1.0 - pow(1.0 - clamp(hold, 0.0, 1.0), params.dt * 60.0));
+        }
+        for (uint collider = 0u; collider < params.collider_count; collider++) {
+            vec3 from = point - params.colliders[collider].xyz;
+            float distance_in = length(from);
+            if (distance_in < params.colliders[collider].w) point = params.colliders[collider].xyz + from / max(distance_in, 1.0e-6) * params.colliders[collider].w;
+        }
+        point = outsideShape(params, point);
+        vec3 along = point - above;
+        float stretched = length(along);
+        vec3 kept = above + (stretched > 1.0e-6 ? along / stretched : normalize(target - combed_above + vec3(0.0, -1.0e-6, 0.0))) * reach;
+        // Collide again after the length constraint.
+        kept = outsideShape(params, kept);
+        pulled[index] = kept - point;
+        placed[index] = kept;
+        params.next.data[first + index] = HairPoint(kept, combed.along);
+        ivec3 cell = ivec3(floor((kept - params.density_low_now) / params.density_cell_now));
+        int size = int(params.density_size);
+        if (all(greaterThanEqual(cell, ivec3(0))) && all(lessThan(cell, ivec3(size))))
+            atomicAdd(params.density_now.data[uint(cell.x + (cell.y + cell.z * size) * size)], 1u);
+        above = kept;
+        combed_above = target;
+    }
+    // Velocity correction from the next point's constraint ("Fast Simulation of
+    // Inextensible Hair and Fur", Müller et al. 2012), written into the
+    // previous position.
+    const float handed_back = 0.9;
+    for (uint index = 1u; index < count; index++) {
+        vec3 here = params.reset == 0u ? params.current.data[first + index].position : placed[index];
+        vec3 travel = placed[index] - here;
+        if (index + 1u < count) travel -= handed_back * pulled[index + 1u];
+        params.current.data[first + index] = HairPoint(placed[index] - travel, params.rest.data[first + index].along);
+    }
+}

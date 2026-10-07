@@ -1,5 +1,4 @@
-//! A scene's particle emitters: stepping them and drawing them.
-//! Internal to the renderer.
+//! Particle emitters: simulation and drawing. Internal to the renderer.
 const std = @import("std");
 const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
@@ -26,8 +25,6 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
     for (scene.emitters.items) |handle_value| {
         const emitter = renderer.emitters.get(handle_value) orelse continue;
         const desc = emitter.desc;
-        // A new emitter with `prewarm` is stepped as many frames as that
-        // takes before it is first seen.
         const steps: u32 = if (emitter.warmed or desc.prewarm <= 0 or delta_time <= 0) 1 else @min(@as(u32, @intFromFloat(desc.prewarm / delta_time)) + 1, 600);
         emitter.warmed = true;
         var step: u32 = 0;
@@ -35,9 +32,8 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
             emitter.pending += @max(desc.rate, 0) * delta_time;
             const births: u32 = @min(@as(u32, @intFromFloat(@min(emitter.pending, 1e9))), emitter.capacity);
             emitter.pending -= @floatFromInt(births);
-            // The fluid's description for this frame; fluids are stepped first.
+            // Fluids are stepped first.
             const carrier: u64 = if (desc.fluid) |fluid| (if (renderer.fluids.get(fluid)) |state| (if (state.params_frame == renderer.frame_index) state.params else 0) else 0) else 0;
-            // Time to remember another trail point?
             var trail_record = false;
             const trail_interval = @max(desc.trail_seconds, 1e-3) / @as(f32, @floatFromInt(@max(emitter.trail_points, 1)));
             if (emitter.trail_points != 0) {
@@ -104,8 +100,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
     cmd.sync(.compute_to_all);
 }
 
-/// The mesh an emitter's particles are drawn as, once its model is
-/// ready; null for sprites.
+/// The mesh an emitter's particles are drawn as, once loaded; null for sprites.
 pub fn emitterMesh(renderer: *Renderer, emitter: *const EmitterData) ?ModelMesh {
     const model = emitter.desc.mesh orelse return null;
     const entry = renderer.models.get(model) orelse return null;
@@ -113,20 +108,16 @@ pub fn emitterMesh(renderer: *Renderer, emitter: *const EmitterData) ?ModelMesh 
     entry.geometry_pinned = true;
     if (!entry.geometry_resident) return null;
     const mesh = entry.meshes[0];
-    // Skinned and morphed meshes have no fixed shape to copy.
     if (mesh.skin_offset != null or mesh.lod0_index_count == 0) return null;
     return mesh;
 }
 
-/// Draws the scene's particles over the picture, as sprites, trails or
-/// copies of a mesh.
+/// Draws the scene's particles as sprites, trails or mesh instances.
 pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, view: *ViewState, frame_address: u64, camera_position: Vec3) !void {
     if (scene.emitters.items.len == 0) return;
     const device = renderer.device;
     cmd.beginScope("particles");
     defer cmd.endScope();
-    // Emitters that asked for it are sorted for this camera first:
-    // alpha-blended particles only look right drawn farthest first.
     for (scene.emitters.items) |handle_value| {
         const emitter = renderer.emitters.get(handle_value) orelse continue;
         const order = emitter.order orelse continue;
@@ -143,7 +134,7 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         });
         cmd.dispatch((count + 63) / 64, 1, 1);
         cmd.sync(.compute_to_all);
-        // A bitonic sort: log2(n) * (log2(n) + 1) / 2 rounds.
+        // Bitonic sort: log2(n) * (log2(n) + 1) / 2 rounds.
         cmd.bindPipeline(renderer.pipelines.particle_sort);
         var run: u32 = 2;
         while (run <= count) : (run *= 2) {
@@ -155,9 +146,6 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             }
         }
     }
-    // Whole emitters are drawn farthest first too, by where they sit,
-    // so that one effect in front of another blends over it.
-    // A scene's worth of emitters fits on the stack; more spill over.
     var fallback = std.heap.stackFallback(64 * @sizeOf(Emitter), renderer.gpa);
     const ordering = fallback.get();
     const ordered = try ordering.alloc(Emitter, scene.emitters.items.len);
@@ -179,8 +167,7 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     };
     std.mem.sort(Emitter, ordered, Farther{ .renderer = renderer, .camera = camera_position }, Farther.lessThan);
     var mesh_total: u32 = 0;
-    // Mesh particles first: they are solid, so they go through the
-    // depth buffer, and the sprites after them are hidden by them.
+    // Mesh particles first: they write depth.
     var mesh_pass = false;
     for (scene.emitters.items) |handle_value| {
         const emitter = renderer.emitters.get(handle_value) orelse continue;
@@ -216,7 +203,6 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         const emitter = renderer.emitters.get(handle_value) orelse continue;
         if (emitter.frame_params == 0) continue;
         if (emitter.trail) |trail| {
-            // The ribbons first, then the particles at their heads.
             cmd.bindPipeline(renderer.pipelines.particle_trails);
             cmd.pushConstants(extern struct { frame: u64, emitter: u64, particles: u64, depth: u32, pad: u32 = 0, order: u64 = 0, trail: u64 }{
                 .frame = frame_address,

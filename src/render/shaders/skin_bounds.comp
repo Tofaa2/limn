@@ -1,20 +1,18 @@
 #version 460
 #include "common.glsl"
 
-// After skinning: the bounds of every meshlet of the deformed meshes, so
-// that animated characters are culled piece by piece like everything else
-// instead of as one sphere each. All of a frame's meshes go through one
-// dispatch, laid out as in skin.comp.
+// Per-meshlet bounds of skinned meshes, for culling. One dispatch for all
+// meshes, laid out as in skin.comp.
 layout(local_size_x = 64) in;
 
 struct BoundsJob {
-    // Where the mesh's deformed vertices are.
+    // First skinned vertex of the mesh.
     uint vertex_offset;
     uint meshlet_offset;
     uint meshlet_count;
-    // Where this mesh's bounds go, one per meshlet.
+    // First output bound, one per meshlet.
     uint bounds_offset;
-    // The first work group that belongs to this job.
+    // First work group of this job.
     uint first_group;
     uint job_pad0;
     uint job_pad1;
@@ -22,7 +20,7 @@ struct BoundsJob {
 };
 layout(buffer_reference, scalar) readonly buffer BoundsJobs { BoundsJob data[]; };
 layout(buffer_reference, scalar) readonly buffer BoundsGroups { uint data[]; };
-// Center and radius, in the space the deformed vertices are in.
+// Center and radius, in skinned vertex space.
 layout(buffer_reference, scalar) writeonly buffer MeshletBounds { vec4 data[]; };
 
 const uint GROUPS_PER_ROW = 1024u;
@@ -51,7 +49,6 @@ void main() {
         low = min(low, position);
         high = max(high, position);
     }
-    // A sphere about the middle of the box, as small as the vertices allow.
     vec3 center = (low + high) * 0.5;
     float reach = 0.0;
     for (uint corner = 0u; corner < meshlet.index_count; corner++) {

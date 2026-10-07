@@ -6,12 +6,12 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Marks the cells that are solid to the fluid: those inside one of its
-// obstacles and, when asked, those the scene's geometry passes through.
+// Marks solid cells: inside an obstacle or, optionally, crossed by scene
+// geometry.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
 #ifdef RAY_TRACED
-    // The scene's acceleration structure, or zero to leave the scene out.
+    // TLAS address, or zero to ignore the scene.
     uint64_t tlas;
 #endif
 } push;
@@ -36,9 +36,7 @@ void main() {
     }
 #ifdef RAY_TRACED
     if (solid == 0.0 && push.tlas != 0ul && cell.z < fluid.data.size.z) {
-        // A surface crosses this cell if a ray from its middle to one of
-        // its faces hits something. Six short rays find most of them, and
-        // a shell of solid cells one cell thick is all the flow needs.
+        // Six short rays from the cell center to its faces.
         mat4 box_to_world = fluid.data.box_to_world;
         vec3 origin = (box_to_world * vec4(center / vec3(fluid.data.size), 1.0)).xyz;
         for (int axis = 0; axis < 3 && solid == 0.0; axis++) {

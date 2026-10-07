@@ -2,15 +2,14 @@
 #include "common.glsl"
 #include "liquid.glsl"
 
-// A liquid's particles into a shadow cascade: a square facing the light
-// for each, which the fragment stage trims to a disc.
+// Liquid particles into a shadow cascade: one light-facing quad each.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     LiquidRef liquid;
     LiquidParticles particles;
     mat4 view_proj;
-    // Drawn radius as a multiple of the particle's own, and how much of
-    // the light the liquid stops.
+    // Drawn radius as a multiple of the particle radius, and the liquid's
+    // opacity to light.
     float swell;
     float strength;
 } push;
@@ -30,8 +29,7 @@ void main() {
         return;
     }
     vec3 world = (liquid.from_box * vec4(push.particles.data[slot].position, 1.0)).xyz;
-    // The light looks along parallel lines, so the rows of its matrix
-    // point across and up its picture.
+    // Orthographic light: right and up are the matrix rows.
     vec3 across = normalize(vec3(push.view_proj[0][0], push.view_proj[1][0], push.view_proj[2][0]));
     vec3 up = normalize(vec3(push.view_proj[0][1], push.view_proj[1][1], push.view_proj[2][1]));
     float radius = liquid.radius * push.swell;

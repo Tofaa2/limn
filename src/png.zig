@@ -8,15 +8,9 @@ pub const Image = struct {
     pixels: []const u8,
 };
 
-/// Writes `image` as an 8-bit RGBA PNG at `path` (relative to the current
-/// directory), replacing any file already there. The pixels are stored
-/// uncompressed, so the file is slightly larger than the raw data.
-///
-/// `allocator` is used for scratch buffers about three times the size of
-/// the image, all freed before returning; `image.pixels` is only read. Fails
-/// with `error.InvalidImageData` when `pixels.len` is not
-/// `width * height * 4`, or with whatever creating or writing the file
-/// reports.
+/// Writes `image` as an uncompressed 8-bit RGBA PNG at `path`, replacing any
+/// existing file. Fails with `error.InvalidImageData` when `pixels.len` is
+/// not `width * height * 4`.
 pub fn write(
     allocator: std.mem.Allocator,
     io: std.Io,

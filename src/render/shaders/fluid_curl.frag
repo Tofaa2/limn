@@ -2,7 +2,7 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// How much the flow spins around each cell.
+// Curl of the velocity field.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;

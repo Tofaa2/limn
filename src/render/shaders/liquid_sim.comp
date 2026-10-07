@@ -2,17 +2,14 @@
 #include "common.glsl"
 #include "liquid.glsl"
 
-// One stage of a liquid's step, chosen by `mode`:
-//   0  move every particle by its velocity and gravity (a first guess at
-//      where it ends up) and give birth to this step's new ones;
-//   1  sort the guesses into a grid, so neighbours can be found;
-//   2  measure how crowded each particle is and how hard it must push;
-//   3  push: move each guess apart from its neighbours, and keep it in
-//      the box and out of obstacles;
-//   4  work out the velocity that got each particle to its guess, drawn
-//      a little toward its neighbours';
-//   5  take the guess as the new position.
-// Stages 2 and 3 are run a few times over.
+// One stage of a liquid step, by `mode`:
+//   0 predict positions from velocity and gravity; spawn new particles
+//   1 bin predictions into the grid
+//   2 density and lambda
+//   3 position correction; box and obstacle collision
+//   4 velocity from the position change, with viscosity
+//   5 commit predictions as positions
+// Stages 2 and 3 are iterated.
 layout(local_size_x = 64) in;
 
 layout(push_constant, scalar) uniform Push {
@@ -21,14 +18,13 @@ layout(push_constant, scalar) uniform Push {
     LiquidCells counts;
     LiquidCells cells;
     uint mode;
-    // Which of the two guesses is the one to read.
+    // Which predicted-position buffer to read.
     uint flip;
 } push;
 
 const float PI_ = 3.14159265;
 
-// The liquid's record, read a field at a time: copying all of it for
-// every particle costs more than the step itself.
+// Fields are read individually; copying the whole record per particle is slow.
 #define LIQUID push.liquid.data
 
 uint hash(uint value) {
@@ -57,7 +53,7 @@ vec3 guessOf(LiquidParticle particle, uint flip) {
     return flip == 0u ? particle.guess_a : particle.guess_b;
 }
 
-// Keeps a point inside the box and outside the obstacles.
+// Clamps a point into the box and out of the obstacles.
 vec3 contained(vec3 position) {
     for (uint i = 0u; i < LIQUID.sphere_count; i++) {
         vec3 away = position - LIQUID.spheres[i].xyz;
@@ -79,17 +75,14 @@ void main() {
             uint state = hash(index * 0x9e3779b9u + LIQUID.seed);
             particle.velocity = vec3(0.0);
             if (index < LIQUID.block_count) {
-                // Part of the block the liquid starts as.
                 uint column = index % LIQUID.block_nx;
                 uint row = (index / LIQUID.block_nx) % LIQUID.block_nz;
                 uint layer = index / (LIQUID.block_nx * LIQUID.block_nz);
                 vec3 jitter = (vec3(random(state), random(state), random(state)) - 0.5) * 0.05;
                 particle.position = LIQUID.block_origin + (vec3(column, layer, row) + 0.5 + jitter) * LIQUID.spacing;
             } else {
-                // Poured from a source, a layer at a time: each layer a
-                // disc of evenly spread particles across the jet, the
-                // layers a particle's width apart, so that the jet
-                // leaves its mouth as a solid stream.
+                // Sources emit layers of evenly spread discs, one particle
+                // width apart.
                 LiquidSource source = LIQUID.sources[0];
                 uint which = 0u;
                 for (uint i = 1u; i < LIQUID.source_count; i++) {
@@ -113,8 +106,7 @@ void main() {
             particle.position = contained(particle.position);
         }
         particle.velocity += LIQUID.gravity * LIQUID.dt;
-        // A breath of disorder: without it particles pressed flat against
-        // a wall can stand there as a film, each resting on the one below.
+        // Jitter, so particles do not stack into a film on walls.
         uint shake = hash(index * 0x85ebca6bu + LIQUID.seed);
         vec3 nudge = (vec3(random(shake), random(shake), random(shake)) - 0.5) * LIQUID.h * 0.004;
         particle.guess_a = contained(particle.position + particle.velocity * LIQUID.dt + nudge);
@@ -132,15 +124,11 @@ void main() {
     }
 
     if (push.mode == 5u) {
-        // The guess becomes the position.
         push.particles.data[index].position = push.flip == 0u ? push.particles.data[index].guess_a : push.particles.data[index].guess_b;
         return;
     }
 
-    // The other stages look at every neighbour within reach. Lengths are
-    // in units of that reach from here on.
-    // Of each particle only what the stage needs is read: its guess, and
-    // for some stages one thing more.
+    // Neighbour stages: lengths are in units of h from here on.
     vec3 own = push.flip == 0u ? push.particles.data[index].guess_a : push.particles.data[index].guess_b;
     float own_lambda = push.particles.data[index].lambda;
     vec3 own_position = push.particles.data[index].position;
@@ -151,9 +139,7 @@ void main() {
     vec3 correction = vec3(0.0);
     vec3 own_velocity = (own - own_position) / LIQUID.dt;
     vec3 drift = vec3(0.0);
-    // Read once: the loop below runs for every neighbour, and what it
-    // would read again each time cannot be assumed unchanged while the
-    // stage also writes.
+    // Read once: the stage writes the buffer it loops over.
     float inverse_h = 1.0 / LIQUID.h;
     float inverse_dt = 1.0 / LIQUID.dt;
     float inverse_rest = 1.0 / LIQUID.rest_density;
@@ -175,8 +161,7 @@ void main() {
             float q = sqrt(q2);
             float w = 1.0 - q2;
             float weight = (315.0 / (64.0 * PI_)) * w * w * w;
-            // The spiky kernel's slope: steep up close, so that crowded
-            // particles are pushed apart firmly.
+            // Spiky kernel gradient.
             vec3 slope = q > 1.0e-5 ? apart * (-(45.0 / PI_) * (1.0 - q) * (1.0 - q) / q) : vec3(0.0);
             if (mode == 2u) {
                 density += weight;
@@ -188,15 +173,12 @@ void main() {
             } else if (mode == 3u) {
                 if (other != index) correction += (own_lambda + push.particles.data[other].lambda) * slope;
             } else if (other != index) {
-                // Neighbours pull each other's speed together a little:
-                // the liquid moves as a body, not as a swarm.
+                // XSPH viscosity.
                 drift += ((there - push.particles.data[other].position) * inverse_dt - own_velocity) * weight;
             }
         }
     }
-    // A wall stands in for the liquid that would be behind it: without
-    // that, particles beside a wall seem to have room, and the rest
-    // squeezes them against it and up it.
+    // Walls count as liquid: ghost density at the boundary.
     for (int axis = 0; axis < 3; axis++) for (int side = 0; side < 2; side++) {
         float gap = (side == 0 ? own[axis] : LIQUID.extent[axis] - own[axis]) / LIQUID.h;
         if (gap >= 1.0) continue;
@@ -212,8 +194,7 @@ void main() {
         }
     }
     if (push.mode == 2u) {
-        // Only crowding counts: liquid with room to spare is left alone,
-        // so its surface does not cling together.
+        // Only compression is corrected, so the surface does not clump.
         float crowding = max(density / LIQUID.rest_density - 1.0, 0.0);
         push.particles.data[index].lambda = -crowding / (gradient_squares + dot(gradient_sum, gradient_sum) + 0.05);
     } else if (push.mode == 3u) {
@@ -221,9 +202,8 @@ void main() {
         if (push.flip == 0u) push.particles.data[index].guess_b = moved;
         else push.particles.data[index].guess_a = moved;
     } else {
-        // Stage 4: the velocity is what got the particle to its guess.
         vec3 velocity = own_velocity + drift * (LIQUID.viscosity / LIQUID.rest_density);
-        // Nothing crosses more than a cell in a step.
+        // Clamp speed to one cell per step.
         float speed = length(velocity);
         float limit = LIQUID.h / LIQUID.dt;
         if (speed > limit) velocity *= limit / speed;

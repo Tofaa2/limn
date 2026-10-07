@@ -2,9 +2,8 @@
 #include "common.glsl"
 #include "gi.glsl"
 
-// Blends this frame's probe rays into the irradiance atlas (default) or the
-// visibility atlas (VISIBILITY). One fragment per atlas texel; the output
-// alpha is the blend weight, so hysteresis is ordinary alpha blending.
+// Blends probe rays into the irradiance atlas, or the visibility atlas with
+// VISIBILITY. One fragment per texel; output alpha is the blend weight.
 layout(buffer_reference, scalar) readonly buffer Rays { vec4 data[]; };
 
 layout(push_constant, scalar) uniform Push {
@@ -16,11 +15,11 @@ layout(push_constant, scalar) uniform Push {
     float max_distance;
     uint probe_stride;
     uint probe_phase;
-    // Blend rate of the second, quick-to-react irradiance atlas.
+    // Blend rate of the fast irradiance atlas.
     float fast_hysteresis;
-    // Cells the grid moved by this frame.
+    // Cells the grid moved this frame.
     ivec3 shift;
-    // Which grid is being updated: 0 main, 1 coarse.
+    // Grid updated: 0 main, 1 coarse.
     uint grid_index;
 } push;
 
@@ -43,8 +42,7 @@ vec3 sphericalFibonacci(float i, float n) {
     return vec3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
 }
 
-// Border texels duplicate interior texels so bilinear filtering wraps
-// correctly across the octahedral map's edges.
+// Border texels copy interior ones for bilinear wrap across octahedral edges.
 ivec2 interiorTexel(ivec2 t) {
     int last = texels - 1;
     bool border_x = t.x == 0 || t.x == last;
@@ -62,10 +60,8 @@ void main() {
     GiGrid probe_grid = giGrid(frame, push.grid_index);
     ivec3 counts = probe_grid.counts;
     int probe = tile.x % counts.x + tile.y * counts.x + (tile.x / counts.x) * counts.x * counts.y;
-    // Probes are refreshed in rotation; the rest keep their contents.
     if (uint(probe) % push.probe_stride != push.probe_phase) discard;
-    // A probe that came into the grid this frame holds what a probe on the
-    // far side used to; it starts over rather than blending with that.
+    // Probes that scrolled in this frame start over.
     ivec3 grid = giGridCoord(probe_grid, ivec3(tile.x % counts.x, tile.y, tile.x / counts.x));
     bool fresh = false;
     for (int axis = 0; axis < 3; axis++) {
@@ -85,7 +81,7 @@ void main() {
         vec3 ray_direction = rotation * sphericalFibonacci(float(i), float(push.rays_per_probe));
         float weight = max(dot(direction, ray_direction), 0.0);
 #ifdef VISIBILITY
-        // A sharp lobe keeps depth edges crisp enough for the Chebyshev test.
+        // Sharp lobe for the Chebyshev test.
         weight = pow(weight, 50.0);
         float distance = min(abs(ray.a), push.max_distance);
         total.rg += vec2(distance, distance * distance) * weight;

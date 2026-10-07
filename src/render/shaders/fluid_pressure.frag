@@ -2,8 +2,7 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// One Jacobi iteration toward the pressure that cancels the divergence.
-// The second channel carries on whether the cell is solid.
+// One Jacobi pressure iteration. The second channel flags solid cells.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint pressure_texture;

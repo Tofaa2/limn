@@ -3,9 +3,8 @@
 #include "shading.glsl"
 #include "water.glsl"
 
-// The view from under a water surface: everything takes on the water's
-// color with the distance looked through it, and what lies under the
-// water shows the light pattern of the waves above.
+// Underwater view: absorption by distance through the water, and caustics on
+// submerged surfaces.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     WaterRef water;
@@ -27,7 +26,6 @@ void main() {
     vec3 direction = normalize(world - frame.camera_position);
     float reach = depth > 0.0 ? distance(world, frame.camera_position) : 1e5;
 
-    // How far the ray runs before it leaves through the surface.
     vec3 up = normalize(water.data.transform[1].xyz);
     float below = dot(water.data.transform[3].xyz - frame.camera_position, up);
     float rise = dot(direction, up);
@@ -35,7 +33,6 @@ void main() {
     bool in_water = reach < to_surface;
     float through = min(reach, to_surface);
 
-    // The wave pattern, only where the sun reaches.
     if (in_water) scene *= mix(1.0, waterCaustic(water, world, frame.sun_direction, frame.time), sunShadow(frame, world, up, 1.0, reach, 0.5));
     vec3 ambient = vec3(0.0);
     if ((frame.flags & FRAME_ENVIRONMENT) != 0u)

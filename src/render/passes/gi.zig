@@ -1,6 +1,5 @@
-//! Bounce light: the grids of irradiance probes around the camera and the
-//! rays that keep them up to date.
-//! Internal to the renderer.
+//! Irradiance probe grids and the rays that update them. Internal to the
+//! renderer.
 const std = @import("std");
 const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
@@ -18,25 +17,19 @@ const gi_visibility_texels = render.gi_visibility_texels;
 const hdr_format = render.hdr_format;
 const SceneFrame = scene_pass.SceneFrame;
 
-/// Returns the volume in `slot` moved to `cell`, or a new one if the
-/// grid's shape, spacing or ray count changed.
+/// Returns the volume in `slot` moved to `cell`, or a new one if the grid's
+/// shape, spacing or ray count changed.
 pub fn ensureGiVolume(renderer: *Renderer, slot: *?GiVolume, scene_origin: [3]f64, cell: [3]i32, counts: [3]u32, spacing: f32, rays_per_probe: u32) !*GiVolume {
     const device = renderer.device;
-    // Cells are counted from the application's world zero in 64 bits,
-    // so the grid stays put however far the scene has been shifted.
     var origin: Vec3 = undefined;
     inline for (0..3) |axis| origin[axis] = @floatCast(@as(f64, @floatFromInt(cell[axis])) * spacing - scene_origin[axis]);
     if (slot.*) |*volume| {
         const same = std.mem.eql(u32, &volume.counts, &counts) and volume.rays_per_probe == rays_per_probe and
             @abs(volume.spacing - spacing) < 1e-4;
         if (same) {
-            // Probes are stored by their world cell modulo the grid
-            // size, so moving the grid keeps every probe that is still
-            // inside it; only the cells that wrapped around are new.
+            // Probes are stored by world cell modulo the grid size; only cells
+            // that wrapped are new.
             inline for (0..3) |axis| volume.shift[axis] = cell[axis] - volume.cell[axis];
-            // A jump that brings in more new probes than it keeps (a
-            // teleport, a cut): the grid settles again at the quick
-            // rate a new one starts with, instead of the steady one.
             var kept: u64 = 1;
             var total: u64 = 1;
             inline for (0..3) |axis| {
@@ -96,9 +89,8 @@ pub fn ensureGiVolume(renderer: *Renderer, slot: *?GiVolume, scene_origin: [3]f6
     return &slot.*.?;
 }
 
-/// Sizes the probe volume and the top-level acceleration structure for
-/// this frame. Returns null when global illumination is off, unsupported
-/// or there is nothing to trace against.
+/// Sizes the probe volume and the TLAS for this frame. Returns null when global
+/// illumination is off, unsupported or there is nothing to trace.
 pub fn prepareGi(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame, settings: Settings, camera_position: Vec3) !?*GiVolume {
     const device = renderer.device;
     const pipelines = renderer.gi_pipelines orelse return null;
@@ -119,18 +111,12 @@ pub fn prepareGi(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame
     const wanted = @max(settings.gi_probe_spacing, 0.25);
     var spacing = wanted;
     inline for (0..3) |axis| spacing = @max(spacing, extent[axis] / @as(f32, @floatFromInt(gi_max_counts[axis] - 1)));
-    // A scene too large for the probe budget at the wanted spacing
-    // either gets its probes stretched apart, or keeps the spacing and
-    // a grid that moves with the camera.
     const stretched = spacing;
-    // Only worth a second grid when stretching would cost real detail.
     const follow = settings.gi_follow_camera and scene.gi_bounds == null and spacing > wanted * settings.gi_follow_threshold;
     if (follow) spacing = wanted;
     var cell: [3]i32 = undefined;
     var counts: [3]u32 = undefined;
     inline for (0..3) |axis| {
-        // The grid sits on multiples of the spacing, so probes stay in
-        // place in the world when the bounds or the camera move.
         const first: i32 = @intFromFloat(@floor((bounds[0][axis] + scene.origin[axis]) / spacing));
         const needed: f32 = @floatCast(@ceil((bounds[1][axis] + scene.origin[axis]) / spacing) - @as(f64, @floatFromInt(first)) + 1);
         counts[axis] = std.math.clamp(@as(u32, @intFromFloat(@max(needed, 2))), 2, gi_max_counts[axis]);
@@ -142,8 +128,6 @@ pub fn prepareGi(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame
     const rays_per_probe = std.math.clamp(settings.gi_rays, 16, 256);
     const main = try ensureGiVolume(renderer, &scene.gi, scene.origin, cell, counts, spacing, rays_per_probe);
     if (follow) {
-        // Behind the grid that follows the camera, a coarse one over
-        // the whole scene, so nothing falls back to plain sky light.
         var coarse_cell: [3]i32 = undefined;
         var coarse_counts: [3]u32 = undefined;
         inline for (0..3) |axis| {
@@ -153,8 +137,6 @@ pub fn prepareGi(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame
             coarse_cell[axis] = first;
         }
         _ = try ensureGiVolume(renderer, &scene.gi_coarse, scene.origin, coarse_cell, coarse_counts, stretched, rays_per_probe);
-        // Very far apart from the main grid's spacing: a grid between
-        // the two, around the camera.
         const ratio = stretched / wanted;
         if (settings.gi_middle_ratio > 0 and ratio > settings.gi_middle_ratio) {
             const middle_spacing = wanted * @sqrt(ratio);
@@ -201,18 +183,11 @@ pub fn updateGi(
     cmd.beginScope("global illumination");
     defer cmd.endScope();
     const tlas = scene.tlas.?;
-    // Static geometry rarely changes; rebuild only when the instance
-    // list (transforms, meshes) differs from the last build.
     if (scene.tlas_hash != scene_frame.tlas_hash) {
         cmd.buildTlas(tlas, scene_frame.tlas_instances, scene_frame.tlas_count);
         scene.tlas_hash = scene_frame.tlas_hash;
     }
 
-    // A new rotation every frame turns a small fixed ray set into
-    // full coverage of the sphere over time. The rotations follow a
-    // sequence that fills the space of rotations evenly rather than
-    // at random, so that what the probes average over a second
-    // or two has fewer gaps and clumps and wanders less.
     const turn: f64 = @floatFromInt(renderer.frame_index + 1);
     const first: f32 = @floatCast(@mod(turn * 0.8191725133961645, 1.0));
     const second: f32 = @floatCast(@mod(turn * 0.6710436067037893, 1.0));
@@ -224,13 +199,10 @@ pub fn updateGi(
         @sqrt(first) * @cos(std.math.tau * third),
     });
     const rotation_columns = [3][4]f32{ rotation[0..4].*, rotation[4..8].*, rotation[8..12].* };
-    // Distances beyond the neighbouring probes do not matter to the
-    // visibility test; clamping keeps the moments well conditioned.
+    // Clamp distances just beyond the neighbouring probes, to keep the moments
+    // well conditioned.
     const max_distance = volume.spacing * 1.75 * 1.5;
     const probe_count = volume.probeCount();
-    // Once converged, a quarter of the probes are refreshed per frame.
-    // When the grid moved, every probe is traced this frame so the ones
-    // that just came into range have data at once.
     const moved = volume.shift[0] != 0 or volume.shift[1] != 0 or volume.shift[2] != 0;
     const stride: u32 = if (volume.frames < 200 or moved) 1 else std.math.clamp(settings.gi_update_interval, 1, 16);
     const phase: u32 = @intCast(renderer.frame_index % stride);
@@ -256,8 +228,7 @@ pub fn updateGi(
         .rotation = rotation_columns,
         .rays_per_probe = volume.rays_per_probe,
         .probe_count = probe_count,
-        // Bounce light comes from the probes themselves, which is only
-        // valid once every grid in use has been written at least once.
+        // Multibounce needs every grid in use written at least once.
         .multibounce = @intFromBool(volume.frames != 0 and
             (if (scene.gi) |other| other.frames != 0 else true) and
             (if (scene.gi_coarse) |other| other.frames != 0 else true) and
@@ -271,13 +242,8 @@ pub fn updateGi(
     cmd.dispatch((((probe_count + stride - 1) / stride) * volume.rays_per_probe + 63) / 64, 1, 1);
     cmd.sync(.compute_to_all);
 
-    // Converge quickly at first, then favour stability.
-    // A probe refreshed every `stride` frames blends correspondingly more
-    // per update, so the response over time stays the same.
-    // Each update counts for less as more have been gathered, twice
-    // what an even average would give it (the early ones saw probes
-    // that had not yet caught any bounced light), until the steady
-    // rate is reached.
+    // Hysteresis: probes traced every `stride` frames blend more per update;
+    // early updates weigh twice an even average until the steady rate.
     const settled = std.math.pow(f32, std.math.clamp(settings.gi_hysteresis, 0, 0.999), @floatFromInt(stride));
     const gathered: f32 = @floatFromInt(volume.frames);
     const hysteresis: f32 = if (volume.frames == 0) 0 else @min(settled, @max(0.8, 1 - 2 / (gathered + 2)));
@@ -291,8 +257,7 @@ pub fn updateGi(
         probe_stride: u32,
         probe_phase: u32,
         fast_hysteresis: f32,
-        /// Grid cells the volume moved by; probes that wrapped around
-        /// start over instead of blending with stale data.
+        /// Grid cells the volume moved by; probes that wrapped start over.
         shift: [3]i32,
         grid: u32,
     };
@@ -310,8 +275,6 @@ pub fn updateGi(
         .shift = volume.shift,
         .grid = grid_index,
     };
-    // The first update overwrites; clearing avoids blending with
-    // whatever the fresh texture happened to contain.
     const load: rhi.LoadOp = if (volume.frames == 0) .clear else .load;
     try cmd.beginRendering(.{ .color = &.{
         .{ .texture = volume.irradiance, .load = load },
@@ -322,9 +285,6 @@ pub fn updateGi(
     cmd.drawFullscreen();
     cmd.endRendering();
     cmd.transition(volume.irradiance_fast, .shader_read);
-    // The steady average may not drift further from the fast one than
-    // sampling noise explains; beyond that the light really changed
-    // and it is pulled along at once.
     const tolerance = std.math.clamp(settings.gi_change_tolerance, 0, 4);
     if (tolerance > 0 and volume.frames != 0) {
         const ClampPush = extern struct { frame: u64, fast: u32, scale: f32, offset: f32, pad: u32 = 0 };
@@ -349,8 +309,7 @@ pub fn updateGi(
     cmd.endRendering();
     cmd.transition(volume.visibility, .shader_read);
     if (settings.gi_probe_relocation) {
-        // The rays just traced say where each probe stands; the
-        // offsets take effect from the next frame's trace on.
+        // Relocation takes effect from the next frame's trace.
         const read = volume.offsets[volume.offset_turn];
         const write = volume.offsets[1 - volume.offset_turn];
         if (!volume.offsets_valid) {

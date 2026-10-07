@@ -1,42 +1,83 @@
 #version 460
 #include "common.glsl"
 
-// Clears the grain of a path-traced picture that has not gathered many
-// frames yet. What is smoothed is the light arriving at each surface, not
-// the surface's own color: each pixel is divided by the color of what it
-// shows before its neighbours are averaged in and multiplied by it after,
-// so textures stay sharp. Neighbours count by how nearly they lie in the
-// same plane and how like their light is, and the likeness asked for
-// grows with the frames gathered: a picture left alone is filtered less
-// and less. Run twice, the second time with a wider step.
+// Edge-avoiding a-trous filter for the path tracer's noisy light. The light is
+// demodulated by albedo, filtered with plane, normal and variance-guided
+// luminance weights over several passes of growing step, then remodulated and
+// added to the steady light.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
-    // The picture (first run: light as gathered; second: already divided).
+    // Demodulated noisy light. First pass: a = second moment of luminance;
+    // later passes: a = variance.
     uint color_texture;
-    // The color of what each pixel shows; black where nothing is to be
-    // smoothed (the sky, mirrors, what glows).
+    // Albedo (black where nothing is denoised) and distance, negative via a
+    // mirror.
     uint guide_texture;
-    uint depth_texture;
-    // Pixels between samples.
+    // Pixels between taps.
     int step_size;
     uint gathered;
-    // 0 for the first run, 1 for the second; 2 for a single run that
-    // smooths nothing.
-    uint last;
+    // 0: first pass, 3: middle, 1: last, 2: single pass without filtering.
+    uint mode;
+    // Steady light, a = accumulated frame count.
+    uint steady_texture;
+    // Accumulated normal (rgb, unnormalized) and distance (a, negative via a
+    // mirror).
+    uint facing_texture;
+    // Glossy reflections added by the last pass: denoised, and accumulated
+    // while the camera is still (a = frame count).
+    uint gloss_texture;
+    uint gloss_gathered_texture;
 } push;
+
+// Frame counts over which accumulated reflections replace denoised ones.
+const vec2 gathered_takes_over = vec2(128.0, 1024.0);
+
+const uint mode_first = 0u;
+const uint mode_last = 1u;
+const uint mode_none = 2u;
 
 layout(location = 0) out vec4 out_color;
 
-vec3 positionAt(FrameConstants frame, ivec2 pixel, out float depth) {
-    depth = texelFetch(TEX(push.depth_texture, frame.sampler_nearest_clamp), pixel, 0).r;
-    vec2 uv = (vec2(pixel) + 0.5) * frame.inv_resolution;
-    return worldPositionFromDepth(uv, max(depth, 1e-6), frame.inv_view_proj);
+bool mirroredAt(FrameConstants frame, ivec2 pixel) {
+    return texelFetch(TEX(push.facing_texture, frame.sampler_nearest_clamp), pixel, 0).a < 0.0;
 }
 
-vec3 lightAt(FrameConstants frame, ivec2 pixel, vec3 guide) {
-    vec3 value = texelFetch(TEX(push.color_texture, frame.sampler_nearest_clamp), pixel, 0).rgb;
-    // Already divided by the color of what it shows (pathtrace.frag).
-    return value;
+// World position of a pixel's hit; `reach` is its distance, 0 for none.
+vec3 positionAt(FrameConstants frame, ivec2 pixel, out float reach) {
+    reach = abs(texelFetch(TEX(push.facing_texture, frame.sampler_nearest_clamp), pixel, 0).a);
+    vec2 uv = (vec2(pixel) + 0.5) * frame.inv_resolution;
+    vec3 toward = normalize(worldPositionFromDepth(uv, 0.5, frame.inv_view_proj) - frame.camera_position);
+    return frame.camera_position + toward * reach;
+}
+
+vec3 facingAt(FrameConstants frame, ivec2 pixel) {
+    vec3 facing = texelFetch(TEX(push.facing_texture, frame.sampler_nearest_clamp), pixel, 0).rgb;
+    float size = length(facing);
+    return size > 1e-4 ? facing / size : vec3(0.0, 1.0, 0.0);
+}
+
+// Normal similarity weight.
+float facingWeight(vec3 facing, vec3 other) {
+    return pow(max(dot(facing, other), 0.0), 48.0);
+}
+
+// Albedo floor for demodulation.
+vec3 divisor(vec3 guide) {
+    return max(guide, vec3(0.03));
+}
+
+vec3 lightAt(FrameConstants frame, ivec2 pixel) {
+    return texelFetch(TEX(push.color_texture, frame.sampler_nearest_clamp), pixel, 0).rgb;
+}
+
+// Relative standard deviation of a pixel's light. The first pass derives it
+// from the temporal moments.
+float doubtAt(FrameConstants frame, ivec2 pixel, float frames) {
+    vec4 texel = texelFetch(TEX(push.color_texture, frame.sampler_nearest_clamp), pixel, 0);
+    if (push.mode != mode_first) return texel.a;
+    float average = luminance(texel.rgb);
+    float spread = max(texel.a - average * average, 0.0);
+    return sqrt(spread / frames) / (average + 1e-3);
 }
 
 void main() {
@@ -44,55 +85,83 @@ void main() {
     uint nearest = frame.sampler_nearest_clamp;
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     ivec2 last_pixel = ivec2(frame.resolution) - 1;
-    vec3 guide = texelFetch(TEX(push.guide_texture, nearest), pixel, 0).rgb;
-    vec4 own_texel = texelFetch(TEX(push.color_texture, nearest), pixel, 0);
-    vec3 own_color = own_texel.rgb;
-    // How many frames this pixel has gathered; carried in alpha.
-    float frames = max(own_texel.a, 1.0);
-    float depth;
-    vec3 position = positionAt(frame, pixel, depth);
+    vec4 guide_texel = texelFetch(TEX(push.guide_texture, nearest), pixel, 0);
+    vec3 guide = guide_texel.rgb;
+    vec4 steady_texel = texelFetch(TEX(push.steady_texture, nearest), pixel, 0);
+    float frames = max(steady_texel.a, 1.0);
+    vec3 grainy = texelFetch(TEX(push.color_texture, nearest), pixel, 0).rgb;
+    vec3 gloss = vec3(0.0);
+    if (push.mode == mode_last || push.mode == mode_none) {
+        vec4 gathered = texelFetch(TEX(push.gloss_gathered_texture, nearest), pixel, 0);
+        vec3 denoised = texelFetch(TEX(push.gloss_texture, nearest), pixel, 0).rgb;
+        gloss = push.mode == mode_none ? gathered.rgb : mix(denoised, gathered.rgb, smoothstep(gathered_takes_over.x, gathered_takes_over.y, gathered.a));
+    }
     bool colored = dot(guide, vec3(1.0)) > 0.0;
-    if (!colored || depth <= 0.0 || push.last == 2u) {
-        // Not smoothed (or, with 2 for `last`, nothing is): only the
-        // color divided out when the light was gathered is put back,
-        // once, by the run that ends the pass.
-        out_color = vec4(colored && push.last != 0u ? own_color * max(guide, vec3(0.03)) : own_color, frames);
+    if (push.mode == mode_none) {
+        out_color = vec4(steady_texel.rgb + grainy * (colored ? divisor(guide) : vec3(1.0)) + gloss, 1.0);
         return;
     }
-    // The plane the pixel lies in, from its nearer neighbour each way.
-    float depth_a;
-    float depth_b;
-    vec3 left = positionAt(frame, clamp(pixel - ivec2(1, 0), ivec2(0), last_pixel), depth_a);
-    vec3 right = positionAt(frame, clamp(pixel + ivec2(1, 0), ivec2(0), last_pixel), depth_b);
-    vec3 along_x = abs(depth_a - depth) < abs(depth_b - depth) ? position - left : right - position;
-    vec3 up = positionAt(frame, clamp(pixel - ivec2(0, 1), ivec2(0), last_pixel), depth_a);
-    vec3 down = positionAt(frame, clamp(pixel + ivec2(0, 1), ivec2(0), last_pixel), depth_b);
-    vec3 along_y = abs(depth_a - depth) < abs(depth_b - depth) ? position - up : down - position;
+    float reach;
+    vec3 position = positionAt(frame, pixel, reach);
+    if (!colored || reach <= 0.0) {
+        out_color = push.mode == mode_last ? vec4(steady_texel.rgb + grainy * (colored ? divisor(guide) : vec3(1.0)) + gloss, 1.0) : vec4(grainy, 0.0);
+        return;
+    }
+    // Plane from the nearer neighbour on each axis.
+    float reach_a;
+    float reach_b;
+    vec3 left = positionAt(frame, clamp(pixel - ivec2(1, 0), ivec2(0), last_pixel), reach_a);
+    vec3 right = positionAt(frame, clamp(pixel + ivec2(1, 0), ivec2(0), last_pixel), reach_b);
+    vec3 along_x = abs(reach_a - reach) < abs(reach_b - reach) ? position - left : right - position;
+    vec3 up = positionAt(frame, clamp(pixel - ivec2(0, 1), ivec2(0), last_pixel), reach_a);
+    vec3 down = positionAt(frame, clamp(pixel + ivec2(0, 1), ivec2(0), last_pixel), reach_b);
+    vec3 along_y = abs(reach_a - reach) < abs(reach_b - reach) ? position - up : down - position;
     vec3 normal = normalize(cross(along_x, along_y));
-    float distance_here = distance(position, frame.camera_position);
+    bool mirrored = mirroredAt(frame, pixel);
+    vec3 facing = facingAt(frame, pixel);
 
-    vec3 own = lightAt(frame, pixel, guide);
-    // What the light here is about, from the pixel and its ring: one
-    // bright grain must not be the measure of its neighbours.
-    vec3 around = own;
-    float around_count = 1.0;
+    vec3 own = lightAt(frame, pixel);
+    vec3 traced = own;
+    vec3 around = vec3(0.0);
+    float around_squared = 0.0;
+    float around_count = 0.0;
+    float brightest_around = 0.0;
+    float doubt = doubtAt(frame, pixel, frames);
+    float doubt_count = 1.0;
     for (int index = 0; index < 8; index++) {
         ivec2 offset = ivec2(index < 3 ? index - 1 : (index < 5 ? (index == 3 ? -1 : 1) : index - 6), index < 3 ? -1 : (index < 5 ? 0 : 1));
         ivec2 tap = clamp(pixel + offset * push.step_size, ivec2(0), last_pixel);
-        vec3 tap_guide = texelFetch(TEX(push.guide_texture, nearest), tap, 0).rgb;
-        if (dot(tap_guide, vec3(1.0)) <= 0.0) continue;
-        around += lightAt(frame, tap, tap_guide);
+        vec4 tap_guide = texelFetch(TEX(push.guide_texture, nearest), tap, 0);
+        if (dot(tap_guide.rgb, vec3(1.0)) <= 0.0 || mirroredAt(frame, tap) != mirrored) continue;
+        if (facingWeight(facing, facingAt(frame, tap)) < 0.5) continue;
+        vec3 tap_light = lightAt(frame, tap);
+        float tap_brightness = luminance(tap_light);
+        around += tap_light;
+        around_squared += tap_brightness * tap_brightness;
         around_count += 1.0;
+        brightest_around = max(brightest_around, tap_brightness);
+        doubt += doubtAt(frame, tap, max(texelFetch(TEX(push.steady_texture, nearest), tap, 0).a, 1.0));
+        doubt_count += 1.0;
     }
-    // A first frame's pixel says little about itself, so it is measured
-    // by its ring; as frames are gathered it comes to be trusted, and
-    // what differs from it (a highlight, a shadow's edge) is left out.
-    float trust = 1.0 / pow(frames, 0.7);
-    float reference = mix(luminance(own), luminance(around / around_count), trust);
-    // How unlike a neighbour's light may be: wide for a first frame,
-    // narrowing a little faster than the grain itself falls with the
-    // frames gathered, so that shadows sharpen early.
-    float allowed = (3.0 / pow(frames, 0.7)) * (reference + 0.02);
+    doubt /= doubt_count;
+    float own_brightness = luminance(own);
+    float around_brightness = around_count > 0.0 ? luminance(around) / around_count : own_brightness;
+    if (push.mode == mode_first) {
+        // Firefly clamp to the neighbourhood maximum, looser with more frames.
+        float most = brightest_around * (1.0 + frames / 256.0);
+        if (around_count > 0.0 && own_brightness > most) {
+            own *= most / own_brightness;
+            own_brightness = most;
+        }
+        // With few frames, spatial variance stands in for temporal.
+        float around_spread = around_count > 1.0 ? sqrt(max(around_squared / around_count - around_brightness * around_brightness, 0.0)) : 0.0;
+        float by_neighbours = around_spread / (around_brightness + 1e-3);
+        doubt = mix(by_neighbours, doubt, clamp((frames - 1.0) / 6.0, 0.0, 1.0));
+        doubt = min(doubt, 4.0);
+    }
+    float reference = mix(own_brightness, around_brightness, clamp(doubt * 2.0, 0.0, 1.0));
+    float remaining = doubt / sqrt(float(push.step_size));
+    float allowed = 4.0 * remaining * (reference + 0.02) + 1e-4;
 
     vec3 total = vec3(0.0);
     float weight_total = 0.0;
@@ -101,24 +170,26 @@ void main() {
         for (int x = -2; x <= 2; x++) {
             ivec2 tap = pixel + ivec2(x, y) * push.step_size;
             if (any(lessThan(tap, ivec2(0))) || any(greaterThan(tap, last_pixel))) continue;
-            vec3 tap_guide = texelFetch(TEX(push.guide_texture, nearest), tap, 0).rgb;
-            if (dot(tap_guide, vec3(1.0)) <= 0.0) continue;
-            float tap_depth;
-            vec3 tap_position = positionAt(frame, tap, tap_depth);
-            if (tap_depth <= 0.0) continue;
-            vec3 light = lightAt(frame, tap, tap_guide);
+            vec4 tap_guide = texelFetch(TEX(push.guide_texture, nearest), tap, 0);
+            if (dot(tap_guide.rgb, vec3(1.0)) <= 0.0 || mirroredAt(frame, tap) != mirrored) continue;
+            float tap_reach;
+            vec3 tap_position = positionAt(frame, tap, tap_reach);
+            if (tap_reach <= 0.0) continue;
+            vec3 light = tap == pixel ? own : lightAt(frame, tap);
             float off_plane = abs(dot(normal, tap_position - position));
             float weight = kernel[abs(x)] * kernel[abs(y)];
-            weight *= exp(-off_plane / (0.01 * distance_here + 1e-4));
+            weight *= exp(-off_plane / (0.01 * reach + 1e-4));
+            weight *= facingWeight(facing, facingAt(frame, tap));
             weight *= exp(-abs(luminance(light) - reference) / allowed);
+            // In mirrors, also weight by distance.
+            if (mirrored) weight *= exp(-abs(tap_reach - reach) / (0.05 * reach + 0.02));
             total += light * weight;
             weight_total += weight;
         }
     }
     vec3 smoothed = weight_total > 1e-6 ? total / weight_total : own;
-    // A picture gathered for long is shown as it was traced.
-    smoothed = mix(smoothed, own, clamp(frames / 4096.0, 0.0, 1.0));
-    // A number that is not one must not leave this pass.
-    if (any(isnan(smoothed)) || any(isinf(smoothed))) smoothed = any(isnan(own)) || any(isinf(own)) ? vec3(0.0) : own;
-    out_color = vec4(push.last != 0u ? smoothed * max(guide, vec3(0.03)) : smoothed, frames);
+    // Fade the filter out as frames accumulate.
+    smoothed = mix(smoothed, traced, clamp(frames / 4096.0, 0.0, 1.0));
+    if (any(isnan(smoothed)) || any(isinf(smoothed))) smoothed = any(isnan(traced)) || any(isinf(traced)) ? vec3(0.0) : traced;
+    out_color = push.mode == mode_last ? vec4(steady_texel.rgb + smoothed * divisor(guide) + gloss, 1.0) : vec4(smoothed, doubt);
 }

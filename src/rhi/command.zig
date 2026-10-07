@@ -1,35 +1,27 @@
-//! Command recording for one frame.
-//!
-//! The encoder tracks texture state per mip so callers only say what they are
-//! about to do with a texture; layout transitions and their stage/access masks
-//! are derived. `beginRendering` transitions its attachments itself.
+//! Command recording for one frame. The encoder tracks texture state per
+//! mip and derives layout transitions; `beginRendering` transitions its
+//! attachments itself.
 const std = @import("std");
 const vk = @import("vulkan");
 const types = @import("types.zig");
 const device_module = @import("device.zig");
 const Device = device_module.Device;
 
-const all_shader_stages = vk.ShaderStageFlags{ .vertex_bit = true, .fragment_bit = true, .compute_bit = true };
-
-/// Records commands into one command buffer: the frame's (`Frame.cmd`) or
-/// a one-off from `Device.beginImmediate`. Recording only queues work; the
-/// GPU runs it after `Device.submitFrame` / `endImmediate`. A resource may
-/// be destroyed once the commands that use it are recorded; deferred
-/// destruction keeps it alive until the GPU is done. Not thread-safe:
-/// record from the thread that owns the frame.
+/// Records into one command buffer: a frame's (`Frame.cmd`) or one from
+/// `Device.beginImmediate`. A resource may be destroyed once the commands
+/// using it are recorded. Not thread-safe.
 pub const CommandEncoder = struct {
-    /// The device that created the encoder.
     device: *Device,
-    /// Command buffer being recorded, for Vulkan calls the encoder lacks.
     command: vk.CommandBuffer,
-    /// Null for immediate (blocking) command buffers, which carry no timings.
+    /// Null for immediate command buffers, which carry no timings.
     frame: ?*device_module.FrameData,
     /// Timing slot of each open `beginScope`, innermost last.
     scope_stack: [8]u32 = undefined,
-    /// Number of scopes currently open; at most 8.
     scope_depth: u8 = 0,
     /// True between `beginRendering` and `endRendering`.
     rendering: bool = false,
+    /// Number of `drawIndexedIndirectCount` draws recorded.
+    indirect_draws: u32 = 0,
 
     /// Binds the global descriptor table for both bind points.
     pub fn bindGlobals(self: *CommandEncoder) void {
@@ -45,7 +37,6 @@ pub const CommandEncoder = struct {
         const resource = self.device.textureResource(texture);
         var barriers: [device_module.max_mip_levels]vk.ImageMemoryBarrier2 = undefined;
         var count: u32 = 0;
-        // Coalesce runs of mips that share a source state into one barrier.
         var mip: u32 = 0;
         while (mip < resource.info.mip_levels) {
             const from = resource.states[mip];
@@ -86,8 +77,7 @@ pub const CommandEncoder = struct {
             .compute_shader_bit = true,
             .draw_indirect_bit = true,
             .vertex_input_bit = true,
-            // Acceleration-structure builds read vertex, index and instance
-            // buffers as shader reads at their own stage.
+            // Acceleration-structure builds read buffers at their own stage.
             .acceleration_structure_build_bit_khr = self.device.ray_tracing,
         };
         const shader_access = vk.AccessFlags2{
@@ -125,8 +115,8 @@ pub const CommandEncoder = struct {
 
     // -------------------------------------------------------------- rendering
 
-    /// Begins a render pass over the given attachments, transitioning them
-    /// and setting a full-size viewport and scissor.
+    /// Begins a render pass, transitioning the attachments and setting a
+    /// full-size viewport and scissor.
     pub fn beginRendering(self: *CommandEncoder, desc: types.RenderingDesc) !void {
         std.debug.assert(!self.rendering);
         var colors: [8]vk.RenderingAttachmentInfo = undefined;
@@ -142,7 +132,7 @@ pub const CommandEncoder = struct {
                 .resolve_image_layout = .undefined,
                 .load_op = loadOp(attachment.load),
                 .store_op = .store,
-                .clear_value = if (resource.info.format == .r32_uint)
+                .clear_value = if (resource.info.format == .r32_uint or resource.info.format == .r8_uint)
                     .{ .color = .{ .uint_32 = attachment.clear_uint } }
                 else
                     .{ .color = .{ .float_32 = attachment.clear } },
@@ -163,7 +153,18 @@ pub const CommandEncoder = struct {
                 .clear_value = .{ .depth_stencil = .{ .depth = attachment.clear, .stencil = 0 } },
             };
         }
+        var rate: vk.RenderingFragmentShadingRateAttachmentInfoKHR = undefined;
+        if (desc.shading_rate) |texture| {
+            self.transition(texture, .shading_rate);
+            const tile = self.device.shading_rate_tile;
+            rate = .{
+                .image_view = self.device.textureResource(texture).view,
+                .image_layout = .fragment_shading_rate_attachment_optimal_khr,
+                .shading_rate_attachment_texel_size = .{ .width = tile, .height = tile },
+            };
+        }
         self.device.vkd.cmdBeginRendering(self.command, &.{
+            .p_next = if (desc.shading_rate != null) &rate else null,
             .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = extent },
             .layer_count = 1,
             .view_mask = 0,
@@ -175,17 +176,16 @@ pub const CommandEncoder = struct {
         self.setViewport(0, 0, extent.width, extent.height);
     }
 
-    /// Ends the pass started by `beginRendering`. The attachments stay in
-    /// their attachment state; `transition` them before sampling or copying.
+    /// Attachments stay in their attachment state; `transition` them before
+    /// sampling or copying.
     pub fn endRendering(self: *CommandEncoder) void {
         std.debug.assert(self.rendering);
         self.device.vkd.cmdEndRendering(self.command);
         self.rendering = false;
     }
 
-    /// Sets the viewport and the scissor to the same rectangle, in pixels
-    /// from the top-left corner, with depth range 0..1. `beginRendering`
-    /// already selects the whole attachment.
+    /// Sets viewport and scissor to the same rectangle, in pixels from the
+    /// top-left corner; depth range 0..1.
     pub fn setViewport(self: *CommandEncoder, x: u32, y: u32, width: u32, height: u32) void {
         self.device.vkd.cmdSetViewport(self.command, 0, &.{.{
             .x = @floatFromInt(x),
@@ -209,9 +209,8 @@ pub const CommandEncoder = struct {
         }});
     }
 
-    /// Binds a graphics or compute pipeline, to the bind point it was created
-    /// for. All pipelines share one layout, so the global descriptor table
-    /// and push constants stay valid across binds.
+    /// Binds to the bind point the pipeline was created for. Globals and push
+    /// constants stay valid across binds.
     pub fn bindPipeline(self: *CommandEncoder, pipeline: types.Pipeline) void {
         const resource = self.device.pipelineResource(pipeline);
         self.device.vkd.cmdBindPipeline(self.command, resource.bind_point, resource.handle);
@@ -222,11 +221,10 @@ pub const CommandEncoder = struct {
         const T = @TypeOf(value);
         comptime std.debug.assert(@sizeOf(T) <= device_module.push_constant_size);
         comptime std.debug.assert(@sizeOf(T) % 4 == 0);
-        self.device.vkd.cmdPushConstants(self.command, self.device.pipeline_layout, all_shader_stages, 0, @sizeOf(T), @ptrCast(&value));
+        self.device.vkd.cmdPushConstants(self.command, self.device.pipeline_layout, self.device.shaderStages(), 0, @sizeOf(T), @ptrCast(&value));
     }
 
-    /// Binds `buffer`, from byte `offset`, as the vertex buffer of pipelines
-    /// that have a `VertexLayout`.
+    /// Binds `buffer` from byte `offset` for pipelines with a `VertexLayout`.
     pub fn bindVertexBuffer(self: *CommandEncoder, buffer: types.Buffer, offset: u64) void {
         self.device.vkd.cmdBindVertexBuffers(self.command, 0, &.{self.device.bufferResource(buffer).handle}, &.{offset});
     }
@@ -244,8 +242,7 @@ pub const CommandEncoder = struct {
         }});
     }
 
-    /// Binds `buffer`, from byte `offset`, as the index buffer for
-    /// `drawIndexed` and indexed indirect draws.
+    /// Binds `buffer` from byte `offset` as the index buffer.
     pub fn bindIndexBuffer(self: *CommandEncoder, buffer: types.Buffer, offset: u64, index_type: types.IndexType) void {
         self.device.vkd.cmdBindIndexBuffer(self.command, self.device.bufferResource(buffer).handle, offset, switch (index_type) {
             .uint16 => .uint16,
@@ -253,22 +250,27 @@ pub const CommandEncoder = struct {
         });
     }
 
-    /// Draws `vertex_count` vertices, without an index buffer, with the bound
-    /// graphics pipeline. Must be inside a render pass. `first_instance` is
-    /// the base of `gl_InstanceIndex`.
+    /// Non-indexed draw; inside a render pass. `first_instance` is the base of
+    /// `gl_InstanceIndex`.
     pub fn draw(self: *CommandEncoder, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) void {
         self.device.vkd.cmdDraw(self.command, vertex_count, instance_count, first_vertex, first_instance);
     }
 
-    /// Draws one triangle covering the viewport; pair with a vertex shader
-    /// that derives positions from `gl_VertexIndex`.
+    /// `draw` with its four arguments read from `buffer` at `offset`. Needs
+    /// `BufferUsage.indirect`.
+    pub fn drawIndirect(self: *CommandEncoder, buffer: types.Buffer, offset: u64) void {
+        self.indirect_draws += 1;
+        self.device.vkd.cmdDrawIndirect(self.command, self.device.bufferResource(buffer).handle, offset, 1, 4 * @sizeOf(u32));
+    }
+
+    /// Draws one triangle covering the viewport; the vertex shader derives
+    /// positions from `gl_VertexIndex`.
     pub fn drawFullscreen(self: *CommandEncoder) void {
         self.device.vkd.cmdDraw(self.command, 3, 1, 0, 0);
     }
 
-    /// Draws `index_count` indices from the bound index buffer, starting at
-    /// `first_index`. `vertex_offset` is added to every index. Must be
-    /// inside a render pass.
+    /// Indexed draw; inside a render pass. `vertex_offset` is added to every
+    /// index.
     pub fn drawIndexed(
         self: *CommandEncoder,
         index_count: u32,
@@ -280,6 +282,13 @@ pub const CommandEncoder = struct {
         self.device.vkd.cmdDrawIndexed(self.command, index_count, instance_count, first_index, vertex_offset, first_instance);
     }
 
+    /// Mesh shader draw with its three 32-bit task group counts read from
+    /// `buffer` at `offset`. Needs `BufferUsage.indirect`.
+    pub fn drawMeshTasksIndirect(self: *CommandEncoder, buffer: types.Buffer, offset: u64) void {
+        self.indirect_draws += 1;
+        self.device.vkd.cmdDrawMeshTasksIndirectEXT(self.command, self.device.bufferResource(buffer).handle, offset, 1, 3 * @sizeOf(u32));
+    }
+
     /// Multi-draw of `VkDrawIndexedIndirectCommand`s with a GPU-written count.
     pub fn drawIndexedIndirectCount(
         self: *CommandEncoder,
@@ -289,6 +298,7 @@ pub const CommandEncoder = struct {
         count_offset: u64,
         max_draws: u32,
     ) void {
+        self.indirect_draws += 1;
         self.device.vkd.cmdDrawIndexedIndirectCount(
             self.command,
             self.device.bufferResource(commands).handle,
@@ -300,25 +310,29 @@ pub const CommandEncoder = struct {
         );
     }
 
-    /// Runs the bound compute pipeline over `x` * `y` * `z` workgroups. Must
-    /// be outside a render pass. Buffer writes are not visible to later
-    /// passes until `sync(.compute_to_all)`.
+    /// Runs the bound compute pipeline; outside a render pass. Buffer writes
+    /// are not visible to later passes until `sync(.compute_to_all)`.
     pub fn dispatch(self: *CommandEncoder, x: u32, y: u32, z: u32) void {
         self.device.vkd.cmdDispatch(self.command, x, y, z);
     }
 
+    /// `dispatch` with its three 32-bit workgroup counts read from `buffer` at
+    /// `offset`. Needs `BufferUsage.indirect`.
+    pub fn dispatchIndirect(self: *CommandEncoder, buffer: types.Buffer, offset: u64) void {
+        self.device.vkd.cmdDispatchIndirect(self.command, self.device.bufferResource(buffer).handle, offset);
+    }
+
     // ---------------------------------------------------------------- copies
 
-    /// Fills `size` bytes from `offset` with the repeated 32-bit `value`.
-    /// Both must be multiples of 4. Must be outside a render pass; follow
-    /// with `sync(.transfer_to_all)` before the buffer is read.
+    /// Fills with the repeated 32-bit `value`; `offset` and `size` must be
+    /// multiples of 4. Outside a render pass; `sync(.transfer_to_all)` before
+    /// the buffer is read.
     pub fn fillBuffer(self: *CommandEncoder, buffer: types.Buffer, offset: u64, size: u64, value: u32) void {
         self.device.vkd.cmdFillBuffer(self.command, self.device.bufferResource(buffer).handle, offset, size, value);
     }
 
-    /// Copies `size` bytes between two buffers. `source` needs `copy_src`
-    /// usage and the ranges must not overlap. Must be outside a render pass;
-    /// follow with `sync(.transfer_to_all)` before the destination is read.
+    /// `source` needs `copy_src`; the ranges must not overlap. Outside a render
+    /// pass; `sync(.transfer_to_all)` before the destination is read.
     pub fn copyBuffer(self: *CommandEncoder, source: types.Buffer, destination: types.Buffer, source_offset: u64, destination_offset: u64, size: u64) void {
         self.device.vkd.cmdCopyBuffer(
             self.command,
@@ -328,8 +342,8 @@ pub const CommandEncoder = struct {
         );
     }
 
-    /// Records every staged upload and mip-generation request. Must be called
-    /// outside a render pass. Uploaded textures end in `shader_read`.
+    /// Records every staged upload and mip-generation request; outside a
+    /// render pass. Uploaded textures end in `shader_read`.
     pub fn flushUploads(self: *CommandEncoder) !void {
         std.debug.assert(!self.rendering);
         const device = self.device;
@@ -402,9 +416,8 @@ pub const CommandEncoder = struct {
         try self.device.buildBlasCommand(self.command, blas, desc);
     }
 
-    /// Rebuilds a top-level structure from `instance_count`
-    /// `AccelerationInstance` records at `instances_address`. Bottom-level
-    /// builds recorded earlier in this command buffer are synchronized.
+    /// Rebuilds from `instance_count` `AccelerationInstance` records at
+    /// `instances_address`.
     pub fn buildTlas(self: *CommandEncoder, tlas: types.AccelerationStructure, instances_address: u64, instance_count: u32) void {
         std.debug.assert(!self.rendering);
         self.accelerationBarrier();
@@ -412,8 +425,7 @@ pub const CommandEncoder = struct {
         self.accelerationBarrier();
     }
 
-    /// Makes acceleration-structure builds visible to later builds and to
-    /// ray queries in any shader stage.
+    /// Makes builds visible to later builds and to ray queries.
     fn accelerationBarrier(self: *CommandEncoder) void {
         const barrier = vk.MemoryBarrier2{
             .src_stage_mask = .{ .acceleration_structure_build_bit_khr = true },
@@ -449,7 +461,7 @@ pub const CommandEncoder = struct {
         self.scope_depth += 1;
     }
 
-    /// Closes the innermost `beginScope`. Every scope must be closed before
+    /// Closes the innermost `beginScope`. All scopes must be closed before
     /// the frame is submitted.
     pub fn endScope(self: *CommandEncoder) void {
         if (self.device.debug_labels) self.device.vkd.cmdEndDebugUtilsLabelEXT(self.command);
@@ -515,6 +527,16 @@ fn stateInfo(state: types.TextureState) StateInfo {
             .layout = .transfer_dst_optimal,
             .stage = .{ .all_transfer_bit = true },
             .access = .{ .transfer_write_bit = true },
+        },
+        .storage => .{
+            .layout = .general,
+            .stage = .{ .compute_shader_bit = true },
+            .access = .{ .shader_storage_read_bit = true, .shader_storage_write_bit = true },
+        },
+        .shading_rate => .{
+            .layout = .fragment_shading_rate_attachment_optimal_khr,
+            .stage = .{ .fragment_shading_rate_attachment_bit_khr = true },
+            .access = .{ .fragment_shading_rate_attachment_read_bit_khr = true },
         },
         .present => .{ .layout = .present_src_khr, .stage = .{}, .access = .{} },
     };

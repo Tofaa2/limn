@@ -1,30 +1,23 @@
-//! Arabic, and Mongolian after it: which of its four forms each letter takes (alone, first,
-//! middle or last of a joined group), from the letters either side. A
-//! font's lookups for the forms are then applied each to its own letters.
+//! Arabic and Mongolian joining: picks each letter's form (isolated, initial,
+//! medial, final) from its neighbours.
 const std = @import("std");
 
-/// Set on every glyph.
 pub const mask_all: u32 = 1;
-/// A letter joined to neither neighbour; the font's `isol` feature.
+/// `isol` feature: joined to neither neighbour.
 pub const mask_isolated: u32 = 2;
-/// A letter joined only to the one before it, ending a joined group; the
-/// font's `fina` feature.
+/// `fina` feature: joined only to the letter before.
 pub const mask_final: u32 = 4;
-/// A letter joined on both sides; the font's `medi` feature.
+/// `medi` feature: joined on both sides.
 pub const mask_medial: u32 = 8;
-/// A letter joined only to the one after it, beginning a joined group;
-/// the font's `init` feature.
+/// `init` feature: joined only to the letter after.
 pub const mask_initial: u32 = 16;
 
 const Joining = enum {
-    /// Joins to nothing.
     none,
-    /// Joins to the letter before it only (alef, dal, ra, waw...).
+    /// Joins to the letter before only (alef, dal, ra, waw...).
     right,
-    /// Joins on both sides.
     dual,
-    /// Makes its neighbours join without having forms of its own (the
-    /// stretching stroke, the joiner).
+    /// Makes neighbours join but has no forms itself (tatweel, ZWJ).
     causing,
     /// A mark: letters join across it.
     transparent,
@@ -40,14 +33,12 @@ fn joiningOf(c: u21) Joining {
     };
 }
 
-/// The part each character of `text` plays: `masks` gets one entry a
-/// character.
+/// Writes one feature mask per character of `text` into `masks`.
 pub fn forms(text: []const u21, masks: []u32) void {
     for (text, masks, 0..) |c, *mask, index| {
         mask.* = mask_all;
         const own = joiningOf(c);
         if (own != .right and own != .dual) continue;
-        // The letters either side, past any marks.
         var before: Joining = .none;
         var at = index;
         while (at > 0) {
@@ -70,15 +61,11 @@ pub fn forms(text: []const u21, masks: []u32) void {
 }
 
 test "arabic letters take their forms from their neighbours" {
-    // seen, lam, alef, meem: first, middle, last, alone (alef does not
-    // join onward).
     var masks: [6]u32 = undefined;
     forms(&.{ 0x633, 0x644, 0x627, 0x645 }, masks[0..4]);
     try std.testing.expectEqualSlices(u32, &.{ mask_all | mask_initial, mask_all | mask_medial, mask_all | mask_final, mask_all | mask_isolated }, masks[0..4]);
-    // Letters join across a mark, which has no form itself.
     forms(&.{ 0x628, 0x650, 0x633 }, masks[0..3]);
     try std.testing.expectEqualSlices(u32, &.{ mask_all | mask_initial, mask_all, mask_all | mask_final }, masks[0..3]);
-    // A space parts them.
     forms(&.{ 0x628, ' ', 0x628 }, masks[0..3]);
     try std.testing.expectEqualSlices(u32, &.{ mask_all | mask_isolated, mask_all, mask_all | mask_isolated }, masks[0..3]);
 }

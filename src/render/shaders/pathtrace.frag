@@ -5,42 +5,49 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #include "common.glsl"
 #include "brdf.glsl"
+#include "ffx_reflections.glsl"
 
-// Path tracing: for every pixel a ray from the camera is followed from
-// surface to surface, gathering the light of the sun, the lamps, the sky
-// and whatever glows, the way light itself travels, only backwards. One
-// frame's answer is noisy; the pass blends each new one into the average
-// of those before it, so a picture left alone sharpens by the second.
+// Progressive path tracer. Outputs are split into steady, noisy and glossy
+// light for pathtrace_denoise.frag and the ffx_reflections passes.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
-    // The acceleration structure (ray tracing hardware), or the scene's
-    // tree of boxes (without).
+    // TLAS address (hardware ray tracing) or the scene BVH.
     uint64_t scene;
     uint64_t scene_instances;
     uint64_t mesh_nodes;
     uint64_t mesh_items;
-    // How many frames have gone into the average so far.
+    // Frames accumulated so far.
     uint gathered;
     uint bounces;
     uint samples;
-    // Most light one path may bring back, against sparkle.
+    // Radiance clamp per path, against fireflies.
     float clamp_radiance;
-    // Angular radius of the sun, for the softness of its shadows.
+    // Angular radius of the sun.
     float sun_radius;
     uint light_count;
-    // The instances that glow evenly, to aim at, and how many.
+    // Emissive instances to sample as lights, and their count.
     uint64_t glowing;
     uint glowing_count;
-    // Last frame's gathered picture (rgb, and in alpha how many frames
-    // each pixel has gathered) and guide (rgb, and in alpha how far
-    // away what the pixel showed was).
+    // History: steady light (rgb, a = frame count), guide (rgb, a = distance)
+    // and noisy light (rgb, a = second moment of luminance).
     uint history_color;
     uint history_guide;
-    // The camera has moved since, and where it was.
+    uint history_soft;
+    // Glossy reflections accumulated while the camera is still (rgb, a = frame
+    // count).
+    uint history_gloss;
+    // Camera moved since last frame, and its previous position.
     uint moved;
     vec3 previous_camera;
     // 1 to start over.
     uint reset;
+    // 1: rays go through pixel centers (jitter comes from the projection, for
+    // TAA). 0: rays are jittered within the pixel.
+    uint centered;
+    // History of out_facing.
+    uint history_facing;
+    // History of out_surface.
+    uint history_surface;
 } push;
 
 #ifdef RAY_TRACED
@@ -62,16 +69,43 @@ struct Glowing {
 };
 layout(buffer_reference, scalar) readonly buffer GlowingList { Glowing data[]; };
 
+// Steady light: sun and sky on primary hits, emission, mirror images.
 layout(location = 0) out vec4 out_color;
-// The color of the first thing each path meets, for the pass that clears
-// the grain (pathtrace_denoise.frag); black where it is to keep its hands
-// off: the sky, mirrors and what glows.
+// Albedo of the first non-mirror hit, for pathtrace_denoise.frag; black for sky
+// and emitters, which are not denoised.
 layout(location = 1) out vec4 out_guide;
+// Noisy light: lamps, emissive lights and diffuse bounces.
+layout(location = 2) out vec4 out_soft;
+// Accumulated normal of the first non-mirror hit (rgb, unnormalized) and path
+// distance to it (a, negative via a mirror).
+layout(location = 3) out vec4 out_facing;
+// Glossy reflection radiance (rgb) and reflected ray length (a), for the
+// ffx_reflections passes. Accumulated when the camera is still.
+layout(location = 4) out vec4 out_gloss;
+// Glossy reflections accumulated while the camera is still (rgb) and the frame
+// count (a).
+layout(location = 5) out vec4 out_gloss_gathered;
+// Primary hit for the reflection denoiser (FfxSurface): normal, roughness,
+// distance. Mirrors are not looked through.
+layout(location = 6) out vec4 out_surface;
 
 vec3 first_color;
 bool first_met;
-// How far from the camera that first thing is.
+// Path distance to the first non-mirror hit, and whether via a mirror.
 float first_distance;
+bool first_mirrored;
+vec3 first_facing;
+// Primary hit: found, normal, roughness, distance.
+bool primary_met;
+vec3 primary_facing;
+float primary_roughness;
+float primary_distance;
+// Primary hit is a mirror.
+bool primary_mirror;
+// Length of the ray reflected off a glossy surface.
+float gloss_reach;
+// Path reached a glossy surface that is traced both ways (see tracePath).
+bool split_met;
 
 uint random_state;
 
@@ -86,25 +120,31 @@ float random() {
     return float(random_state >> 8) / 16777216.0;
 }
 
-// What a ray met, ready to be lit.
+// Shading data of a hit.
 struct Surface {
     vec3 position;
-    // The triangle's own normal and the smoothed one, both toward where
-    // the ray came from.
+    // Geometric and interpolated normals, both facing the ray origin.
     vec3 flat_normal;
     vec3 normal;
     vec3 albedo;
     vec3 emissive;
-    // It is one of the glowing things paths aim at (see directLight).
+    // Sampled as a light (see directLight).
     bool even_glow;
     float metallic;
     float roughness;
-    // How much of the light passes straight through (see-through
-    // materials and cut-outs).
+    // Fraction of light passing straight through (blend, cut-outs).
     float through;
 };
 
-Surface surfaceAt(FrameConstants frame, TraceHit hit, vec3 origin, vec3 direction, float lod) {
+// Texture LOD for a ray footprint covering `spread` of the texture, biased one
+// level finer.
+float detailLevel(uint texture_index, uint sampler_index, float spread) {
+    vec2 size = vec2(textureSize(TEX(texture_index, sampler_index), 0));
+    return max(log2(spread * max(size.x, size.y)) - 1.0, 0.0);
+}
+
+// `footprint`: ray width at the hit, in world units.
+Surface surfaceAt(FrameConstants frame, TraceHit hit, vec3 origin, vec3 direction, float footprint) {
     Surface surface;
     Instance instance = frame.instances.data[hit.instance];
     Mesh mesh = frame.meshes.data[instance.mesh];
@@ -124,16 +164,23 @@ Surface surfaceAt(FrameConstants frame, TraceHit hit, vec3 origin, vec3 directio
 
     vec2 uv = v0.uv * lambda.x + v1.uv * lambda.y + v2.uv * lambda.z;
     vec2 uvb = v0.uv1 * lambda.x + v1.uv1 * lambda.y + v2.uv1 * lambda.z;
+    // Footprint in UV space, from the triangle's shorter UV-to-world scale.
+    vec3 world_edge_a = mat3(instance.transform) * (v1.position - v0.position);
+    vec3 world_edge_b = mat3(instance.transform) * (v2.position - v0.position);
+    vec2 uv_edge_a = v1.uv - v0.uv;
+    vec2 uv_edge_b = v2.uv - v0.uv;
+    float texture_per_world = sqrt(abs(uv_edge_a.x * uv_edge_b.y - uv_edge_a.y * uv_edge_b.x) / max(length(cross(world_edge_a, world_edge_b)), 1e-12));
+    float spread = footprint * texture_per_world;
     vec4 base_color = material.base_color;
     if (material.base_color_texture != INVALID_ID)
-        base_color *= textureLod(TEX(material.base_color_texture, material.sampler_index), materialUv(material, (material.uv_sets & 1u) != 0u ? uvb : uv), lod);
+        base_color *= textureLod(TEX(material.base_color_texture, material.sampler_index), materialUv(material, (material.uv_sets & 1u) != 0u ? uvb : uv), detailLevel(material.base_color_texture, material.sampler_index, spread));
     base_color *= unpackUnorm4x8(v0.color) * lambda.x + unpackUnorm4x8(v1.color) * lambda.y + unpackUnorm4x8(v2.color) * lambda.z;
     base_color.rgb *= unpackUnorm4x8(instance.tint).rgb;
     surface.albedo = base_color.rgb;
     surface.metallic = material.metallic;
     surface.roughness = material.roughness;
     if (material.metallic_roughness_texture != INVALID_ID) {
-        vec4 packed = textureLod(TEX(material.metallic_roughness_texture, material.sampler_index), materialUv(material, uv), lod);
+        vec4 packed = textureLod(TEX(material.metallic_roughness_texture, material.sampler_index), materialUv(material, uv), detailLevel(material.metallic_roughness_texture, material.sampler_index, spread));
         surface.metallic *= packed.b;
         surface.roughness *= packed.g;
     }
@@ -141,17 +188,36 @@ Surface surfaceAt(FrameConstants frame, TraceHit hit, vec3 origin, vec3 directio
     surface.emissive = material.emissive;
     surface.even_glow = (instance.flags & INSTANCE_AIMED) != 0u;
     if (material.emissive_texture != INVALID_ID)
-        surface.emissive *= textureLod(TEX(material.emissive_texture, material.sampler_index), materialUv(material, uv), lod).rgb;
+        surface.emissive *= textureLod(TEX(material.emissive_texture, material.sampler_index), materialUv(material, uv), detailLevel(material.emissive_texture, material.sampler_index, spread)).rgb;
     surface.through = 0.0;
     if ((material.flags & MATERIAL_ALPHA_TEST) != 0u && base_color.a < material.alpha_cutoff) surface.through = 1.0;
     else if ((material.flags & MATERIAL_BLEND) != 0u) surface.through = clamp(1.0 - base_color.a * (1.0 - material.transmission), 0.0, 1.0);
-    // Stand-ins are for reflections and the like; a path sees past them.
     if ((instance.flags & INSTANCE_PROXY) != 0u) surface.through = 1.0;
     return surface;
 }
 
-// The light a surface sends toward `view` of what reaches it from
-// `light`, the angle of arrival included.
+// Below this roughness a surface is a mirror: no light sampling.
+const float mirror_roughness = 0.08;
+
+// Below this roughness reflections go to the reflection denoiser.
+const float glossy_roughness = FFX_GLOSSY_ROUGHNESS;
+
+// Roughness floor for mirrors seen after a rough bounce.
+const float softened_mirror = 0.3;
+
+// Emission luminance above which a surface counts as an emitter.
+const float lit_by_itself = 0.5;
+
+// Minimum blend weight of steady light while the camera moves.
+const float moving_steady_weight = 1.0 / 3.0;
+const float moving_mirror_weight = 0.5;
+
+bool mirrorLike(Surface surface) {
+    return surface.roughness <= mirror_roughness;
+}
+
+// BSDF times cosine toward `view` for `light`, without the mirror lobe of
+// mirror-like surfaces.
 vec3 surfaceResponse(Surface surface, vec3 view, vec3 light) {
     float n_dot_l = dot(surface.normal, light);
     float n_dot_v = max(dot(surface.normal, view), 1e-4);
@@ -160,24 +226,119 @@ vec3 surfaceResponse(Surface surface, vec3 view, vec3 light) {
     float alpha = surface.roughness * surface.roughness;
     vec3 f0 = mix(vec3(0.04), surface.albedo, surface.metallic);
     vec3 fresnel = fresnelSchlick(max(dot(view, half_vector), 0.0), f0);
-    vec3 specular = fresnel * distributionGgx(max(dot(surface.normal, half_vector), 0.0), alpha) * visibilitySmithGgx(n_dot_l, n_dot_v, alpha);
+    vec3 specular = mirrorLike(surface) ? vec3(0.0) : fresnel * distributionGgx(max(dot(surface.normal, half_vector), 0.0), alpha) * visibilitySmithGgx(n_dot_l, n_dot_v, alpha);
     vec3 diffuse = surface.albedo * (1.0 - surface.metallic) * (1.0 - fresnel) / PI;
     return (diffuse + specular) * n_dot_l;
 }
 
-vec3 skyLight(FrameConstants frame, vec3 direction, float lod) {
+// Sky radiance. `with_sun` false removes the sun disc, which directLight
+// samples separately.
+vec3 skyLight(FrameConstants frame, vec3 direction, bool with_sun) {
     if ((frame.flags & FRAME_ENVIRONMENT) == 0u) return vec3(0.0);
-    return textureLod(TEX_CUBE(frame.env_specular, frame.sampler_linear_clamp), direction, lod).rgb * frame.env_intensity;
+    if (!with_sun) {
+        // Sun disc as drawn by env_sky.frag, plus its filtered surroundings.
+        const float disc_angle = 0.0175;
+        float texel_angle = 1.6 / float(textureSize(TEX_CUBE(frame.env_sky, frame.sampler_linear_clamp), 0).x);
+        float kept_clear = disc_angle + 2.5 * texel_angle;
+        float toward_sun = dot(direction, frame.sun_direction);
+        if (toward_sun > cos(kept_clear)) {
+            vec3 away = direction - frame.sun_direction * toward_sun;
+            float away_length = length(away);
+            away = away_length > 1e-6 ? away / away_length : tangentBasis(frame.sun_direction)[0];
+            float beside = kept_clear + texel_angle;
+            direction = frame.sun_direction * cos(beside) + away * sin(beside);
+        }
+    }
+    return textureLod(TEX_CUBE(frame.env_sky, frame.sampler_linear_clamp), direction, 0.0).rgb * frame.env_intensity;
 }
 
-// Light arriving straight from the sun and the lamps, each asked with a
-// ray of its own whether anything stands in the way.
-vec3 directLight(FrameConstants frame, Surface surface, vec3 view) {
+// Unshadowed contribution of one random lamp, with its RIS weight; outputs the
+// shadow ray.
+vec3 lampCandidate(FrameConstants frame, Surface surface, vec3 view, uint light_count, out vec3 toward, out float reach) {
+    uint pick = min(uint(random() * float(light_count)), light_count - 1u);
+    Light light = frame.lights.data[pick];
+    float attenuation = 1.0;
+    reach = 1e4;
+    if ((light.flags & LIGHT_DIRECTIONAL) != 0u) {
+        toward = -light.direction;
+    } else {
+        vec3 target = light.position;
+        if (light.source_radius > 0.0) target += (vec3(random(), random(), random()) * 2.0 - 1.0) * light.source_radius * 0.57;
+        vec3 to_light = target - surface.position;
+        float distance_squared = dot(to_light, to_light);
+        float range_squared = light.range * light.range;
+        if (distance_squared >= range_squared) return vec3(0.0);
+        float window = clamp(1.0 - (distance_squared * distance_squared) / (range_squared * range_squared), 0.0, 1.0);
+        attenuation = window * window / max(distance_squared, 0.01);
+        reach = sqrt(distance_squared);
+        toward = to_light / max(reach, 1e-5);
+        if ((light.flags & LIGHT_SPOT) != 0u) {
+            float cone = clamp(dot(-toward, light.direction) * light.cone_scale + light.cone_offset, 0.0, 1.0);
+            attenuation *= cone * cone;
+        }
+        if ((light.flags & LIGHT_RECTANGLE) != 0u) attenuation *= clamp(dot(-toward, light.direction), 0.0, 1.0);
+        reach -= 0.004;
+    }
+    if (attenuation <= 1e-5 || dot(surface.flat_normal, toward) <= 0.0) return vec3(0.0);
+    return surfaceResponse(surface, view, toward) * light.color * (attenuation * float(light_count));
+}
+
+// Same for a random point on a random emissive triangle.
+vec3 glowCandidate(FrameConstants frame, Surface surface, vec3 view, out vec3 toward, out float reach) {
+    GlowingList list = GlowingList(push.glowing);
+    Glowing chosen = list.data[min(uint(random() * float(push.glowing_count)), push.glowing_count - 1u)];
+    uint triangle = min(uint(random() * float(chosen.triangles)), chosen.triangles - 1u);
+    Instance instance = frame.instances.data[chosen.instance];
+    Mesh mesh = frame.meshes.data[instance.mesh];
+    uint base = mesh.index_offset + triangle * 3u;
+    vec3 p0 = (instance.transform * vec4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base]].position, 1.0)).xyz;
+    vec3 p1 = (instance.transform * vec4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 1u]].position, 1.0)).xyz;
+    vec3 p2 = (instance.transform * vec4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 2u]].position, 1.0)).xyz;
+    float side = sqrt(random());
+    float along = random();
+    vec2 weights = vec2(side * (1.0 - along), side * along);
+    vec3 point = p0 + (p1 - p0) * weights.x + (p2 - p0) * weights.y;
+    vec3 across = cross(p1 - p0, p2 - p0);
+    float area = 0.5 * length(across);
+    vec3 to_point = point - surface.position;
+    float distance_squared = dot(to_point, to_point);
+    if (area <= 0.0 || distance_squared <= 1e-8) return vec3(0.0);
+    reach = sqrt(distance_squared);
+    toward = to_point / reach;
+    reach -= 0.004;
+    // Two-sided emitter.
+    float facing = abs(dot(across, toward)) / (2.0 * area);
+    if (facing <= 1e-4 || dot(surface.flat_normal, toward) <= 0.0) return vec3(0.0);
+    Material material = frame.materials.data[instance.material];
+    float spread = facing * area / max(distance_squared, 0.01);
+    return surfaceResponse(surface, view, toward) * material.emissive * (spread * float(chosen.triangles) * float(push.glowing_count));
+}
+
+// Resampled importance sampling: keeps one candidate with probability
+// proportional to its luminance. `kept`, `kept_weight`: reservoir;
+// `weight_sum`: total weight.
+void considerCandidate(vec3 candidate, vec3 toward, float reach, inout vec3 kept, inout vec3 kept_toward, inout float kept_reach, inout float kept_weight, inout float weight_sum) {
+    float weight = luminance(candidate);
+    if (weight <= 0.0) return;
+    weight_sum += weight;
+    if (random() * weight_sum < weight) {
+        kept = candidate;
+        kept_toward = toward;
+        kept_reach = reach;
+        kept_weight = weight;
+    }
+}
+
+const uint lamp_candidates = 2u;
+const uint glow_candidates = 3u;
+
+// Direct light: returns the sun's; `lamps` receives lamps and emissive lights.
+// One shadow ray each.
+vec3 directLight(FrameConstants frame, Surface surface, vec3 view, out vec3 lamps) {
     vec3 total = vec3(0.0);
-    vec3 guide = vec3(0.0);
+    lamps = vec3(0.0);
     vec3 start = surface.position + surface.flat_normal * 0.002;
     if (dot(frame.sun_radiance, vec3(1.0)) > 0.0) {
-        // A point on the sun's disc, so its shadows soften with distance.
         mat3 basis = tangentBasis(frame.sun_direction);
         float turn = 2.0 * PI * random();
         float reach = push.sun_radius * sqrt(random());
@@ -186,161 +347,197 @@ vec3 directLight(FrameConstants frame, Surface surface, vec3 view) {
         if (dot(response, vec3(1.0)) > 0.0 && dot(surface.flat_normal, toward) > 0.0 && !traceAny(start, toward, 1e4))
             total += response * frame.sun_radiance;
     }
-    // One lamp a path's step, picked at random and weighed up for the
-    // ones passed over: many lamps then cost no more than one.
     uint light_count = min(frame.light_count, push.light_count);
     if (light_count != 0u) {
-        uint pick = min(uint(random() * float(light_count)), light_count - 1u);
-        Light light = frame.lights.data[pick];
-        vec3 toward;
-        float attenuation = 1.0;
-        float reach = 1e4;
-        if ((light.flags & LIGHT_DIRECTIONAL) != 0u) {
-            toward = -light.direction;
-        } else {
-            vec3 target = light.position;
-            // A lamp with a size is lit from a point within it.
-            if (light.source_radius > 0.0) target += (vec3(random(), random(), random()) * 2.0 - 1.0) * light.source_radius * 0.57;
-            vec3 to_light = target - surface.position;
-            float distance_squared = dot(to_light, to_light);
-            float range_squared = light.range * light.range;
-            if (distance_squared < range_squared) {
-                float window = clamp(1.0 - (distance_squared * distance_squared) / (range_squared * range_squared), 0.0, 1.0);
-                attenuation = window * window / max(distance_squared, 0.01);
-                reach = sqrt(distance_squared);
-                toward = to_light / max(reach, 1e-5);
-                if ((light.flags & LIGHT_SPOT) != 0u) {
-                    float cone = clamp(dot(-toward, light.direction) * light.cone_scale + light.cone_offset, 0.0, 1.0);
-                    attenuation *= cone * cone;
-                }
-                if ((light.flags & LIGHT_RECTANGLE) != 0u) attenuation *= clamp(dot(-toward, light.direction), 0.0, 1.0);
-            } else attenuation = 0.0;
+        vec3 kept = vec3(0.0);
+        vec3 kept_toward = vec3(0.0);
+        float kept_reach = 0.0;
+        float kept_weight = 0.0;
+        float weight_sum = 0.0;
+        uint candidates = min(light_count, lamp_candidates);
+        for (uint index = 0u; index < candidates; index++) {
+            vec3 toward;
+            float reach;
+            vec3 candidate = lampCandidate(frame, surface, view, light_count, toward, reach);
+            considerCandidate(candidate, toward, reach, kept, kept_toward, kept_reach, kept_weight, weight_sum);
         }
-        if (attenuation > 1e-5) {
-            vec3 response = surfaceResponse(surface, view, toward);
-            if (dot(response, vec3(1.0)) > 0.0 && dot(surface.flat_normal, toward) > 0.0 && !traceAny(start, toward, reach - 0.004))
-                total += response * light.color * attenuation * float(light_count);
-        }
+        if (kept_weight > 0.0 && !traceAny(start, kept_toward, kept_reach))
+            lamps += kept * (weight_sum / (float(candidates) * kept_weight));
     }
-    // And one glowing surface: a point on one of its triangles, weighed
-    // up for all the points and surfaces passed over. A small bright
-    // thing lights a room this way from the first frame, where chance
-    // would take thousands.
     if (push.glowing_count != 0u) {
-        GlowingList list = GlowingList(push.glowing);
-        Glowing chosen = list.data[min(uint(random() * float(push.glowing_count)), push.glowing_count - 1u)];
-        uint triangle = min(uint(random() * float(chosen.triangles)), chosen.triangles - 1u);
-        Instance instance = frame.instances.data[chosen.instance];
-        Mesh mesh = frame.meshes.data[instance.mesh];
-        uint base = mesh.index_offset + triangle * 3u;
-        vec3 p0 = (instance.transform * vec4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base]].position, 1.0)).xyz;
-        vec3 p1 = (instance.transform * vec4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 1u]].position, 1.0)).xyz;
-        vec3 p2 = (instance.transform * vec4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 2u]].position, 1.0)).xyz;
-        float side = sqrt(random());
-        float along = random();
-        vec2 weights = vec2(side * (1.0 - along), side * along);
-        vec3 point = p0 + (p1 - p0) * weights.x + (p2 - p0) * weights.y;
-        vec3 across = cross(p1 - p0, p2 - p0);
-        float area = 0.5 * length(across);
-        vec3 to_point = point - surface.position;
-        float distance_squared = dot(to_point, to_point);
-        if (area > 0.0 && distance_squared > 1e-8) {
-            float reach = sqrt(distance_squared);
-            vec3 toward = to_point / reach;
-            // How squarely the triangle faces here; it glows from both sides.
-            float facing = abs(dot(across, toward)) / (2.0 * area);
-            vec3 response = surfaceResponse(surface, view, toward);
-            if (facing > 1e-4 && dot(response, vec3(1.0)) > 0.0 && dot(surface.flat_normal, toward) > 0.0 && !traceAny(start, toward, reach - 0.004)) {
-                Material material = frame.materials.data[instance.material];
-                // Never more than if the point were a hand's breadth away.
-                float spread = facing * area / max(distance_squared, 0.01);
-                total += response * material.emissive * (spread * float(chosen.triangles) * float(push.glowing_count));
-            }
+        vec3 kept = vec3(0.0);
+        vec3 kept_toward = vec3(0.0);
+        float kept_reach = 0.0;
+        float kept_weight = 0.0;
+        float weight_sum = 0.0;
+        for (uint index = 0u; index < glow_candidates; index++) {
+            vec3 toward;
+            float reach;
+            vec3 candidate = glowCandidate(frame, surface, view, toward, reach);
+            considerCandidate(candidate, toward, reach, kept, kept_toward, kept_reach, kept_weight, weight_sum);
         }
+        if (kept_weight > 0.0 && !traceAny(start, kept_toward, kept_reach))
+            lamps += kept * (weight_sum / (float(glow_candidates) * kept_weight));
     }
     return total;
 }
 
-// Follows one path. What it gathers comes back in two parts: the light
-// seen directly or in a mirror, which is the same from frame to frame,
-// and in `indirect` the light that arrived by way of a rough bounce,
-// where a rare lucky path can bring back far more than its share.
-vec3 tracePath(FrameConstants frame, vec3 origin, vec3 direction, out vec3 indirect) {
+// GGX visible normal sampling ("Sampling the GGX Distribution of Visible
+// Normals", Heitz 2018). `view` is in tangent space, z along the normal.
+vec3 visibleFacet(vec3 view, float alpha, vec2 xi) {
+    vec3 stretched = normalize(vec3(alpha * view.xy, view.z));
+    float across = dot(stretched.xy, stretched.xy);
+    vec3 side = across > 0.0 ? vec3(-stretched.y, stretched.x, 0.0) * inversesqrt(across) : vec3(1.0, 0.0, 0.0);
+    vec3 other = cross(stretched, side);
+    float radius = sqrt(xi.x);
+    float turn = 2.0 * PI * xi.y;
+    float a = radius * cos(turn);
+    float b = radius * sin(turn);
+    float lean = 0.5 * (1.0 + stretched.z);
+    b = (1.0 - lean) * sqrt(max(1.0 - a * a, 0.0)) + lean * b;
+    vec3 facet = a * side + b * other + sqrt(max(1.0 - a * a - b * b, 0.0)) * stretched;
+    return normalize(vec3(alpha * facet.xy, max(facet.z, 1e-6)));
+}
+
+// Weight of a visibleFacet sample, before Fresnel: G2 / G1.
+float reflectedShare(float n_dot_l, float n_dot_v, float alpha) {
+    float a2 = alpha * alpha;
+    float seen_out = sqrt(a2 + (1.0 - a2) * n_dot_l * n_dot_l);
+    float seen_in = sqrt(a2 + (1.0 - a2) * n_dot_v * n_dot_v);
+    return n_dot_l * (n_dot_v + seen_in) / max(n_dot_v * seen_out + n_dot_l * seen_in, 1e-6);
+}
+
+// Traces one path. Returns steady light (direct view and mirrors); `soft`:
+// sampled lights on visible surfaces; `indirect`: light after a rough bounce;
+// `gloss`: the same where the first rough bounce was a glossy reflection.
+//
+// The first glossy surface with a diffuse part is traced both ways, in two
+// calls: `scattering` takes the diffuse side and returns only what follows.
+// Sampled lights are excluded from rays leaving a rough surface.
+vec3 tracePath(FrameConstants frame, vec3 origin, vec3 direction, bool scattering, out vec3 soft, out vec3 indirect, out vec3 gloss) {
+    soft = vec3(0.0);
     indirect = vec3(0.0);
+    gloss = vec3(0.0);
+    bool glossy_first = false;
+    bool awaiting_reach = false;
+    float travelled = 0.0;
     bool rough_bounce = false;
+    bool split = false;
+    // No light sampling preceded this ray.
+    bool unaimed = true;
     vec3 gathered = vec3(0.0);
     vec3 carried = vec3(1.0);
-    // How blurred the sky is read for a ray: sharp for the eye, softer
-    // after a rough bounce, against sparkle from a small bright sun.
-    float sky_lod = 0.0;
-    float texture_lod = 0.0;
+    // Ray cone, for texture LOD.
+    float cone_width = 0.0;
+    float cone_angle = 2.0 / (abs(frame.proj[1][1]) * frame.resolution.y);
     for (uint bounce = 0u; bounce <= push.bounces; bounce++) {
         TraceHit hit;
-        if (!traceClosest(origin, direction, 1e5, hit)) {
-            vec3 sky = carried * skyLight(frame, direction, sky_lod);
-            if (rough_bounce) indirect += sky;
-            else gathered += sky;
+        bool met = traceClosest(origin, direction, 1e5, hit);
+        if (awaiting_reach) {
+            gloss_reach = met ? hit.t : 1000.0;
+            awaiting_reach = false;
+        }
+        if (!met) {
+            vec3 sky = carried * skyLight(frame, direction, unaimed);
+            if (glossy_first) gloss += sky;
+            else if (!rough_bounce) gathered += sky;
+            else indirect += sky;
             break;
         }
-        Surface surface = surfaceAt(frame, hit, origin, direction, texture_lod);
-        // A see-through surface lets that share of the paths straight on.
+        cone_width += cone_angle * hit.t;
+        Surface surface = surfaceAt(frame, hit, origin, direction, cone_width);
+        travelled += hit.t;
+        // Path regularization: mirrors after a rough bounce are roughened.
+        if (rough_bounce) surface.roughness = max(surface.roughness, softened_mirror);
         if (surface.through > 0.0 && random() < surface.through) {
             origin = surface.position + direction * 0.002;
             continue;
         }
-        if (!first_met) {
-            first_met = true;
-            first_distance = distance(surface.position, frame.camera_position);
-            bool keep = surface.roughness < 0.1 || dot(surface.emissive, vec3(1.0)) > 0.0;
-            first_color = keep ? vec3(0.0) : max(surface.albedo, vec3(0.03));
+        bool glows = luminance(surface.emissive) > lit_by_itself;
+        bool pure_mirror = mirrorLike(surface) && surface.metallic > 0.5 && !glows;
+        if (!primary_met) {
+            primary_met = true;
+            primary_facing = surface.normal;
+            primary_roughness = surface.roughness;
+            primary_distance = travelled;
+            primary_mirror = pure_mirror;
         }
-        // What glows evenly was aimed at from the surface before; a
-        // path that then runs into it as well would count it twice.
-        if (rough_bounce) {
-            if (!surface.even_glow) indirect += carried * surface.emissive;
-        } else gathered += carried * surface.emissive;
+        if (!first_met && !pure_mirror) {
+            first_met = true;
+            first_distance = travelled;
+            first_mirrored = bounce > 0u;
+            first_color = glows ? vec3(0.0) : max(surface.albedo, vec3(0.03));
+            first_facing = surface.normal;
+        }
+        // Emissive lights were already sampled from rough surfaces.
+        if (unaimed || !surface.even_glow) {
+            if (glossy_first) gloss += carried * surface.emissive;
+            else if (!rough_bounce) gathered += carried * surface.emissive;
+            else indirect += carried * surface.emissive;
+        }
         if (bounce == push.bounces) break;
         vec3 view = -direction;
-        vec3 lit = carried * directLight(frame, surface, view);
-        if (rough_bounce) indirect += lit;
-        else gathered += lit;
+        vec3 lamps;
+        vec3 sun = carried * directLight(frame, surface, view, lamps);
+        lamps *= carried;
+        if (glossy_first) gloss += sun + lamps;
+        else if (rough_bounce) indirect += sun + lamps;
+        else {
+            gathered += sun;
+            soft += lamps;
+        }
 
-        // Where the path goes next: off the surface as a mirror would
-        // send it, or scattered, in the share each has in the material.
         vec3 f0 = mix(vec3(0.04), surface.albedo, surface.metallic);
         float n_dot_v = max(dot(surface.normal, view), 1e-4);
         vec3 fresnel_view = fresnelSchlick(n_dot_v, f0);
         vec3 scattered = surface.albedo * (1.0 - surface.metallic);
-        float mirror_share = clamp(luminance(fresnel_view) / max(luminance(fresnel_view) + luminance(scattered), 1e-4), 0.1, 0.9);
+        float mirror_share = luminance(scattered) > 1e-4 ? clamp(luminance(fresnel_view) / (luminance(fresnel_view) + luminance(scattered)), 0.1, 0.9) : 1.0;
+        // Glossy reflections are sampled at least half the time.
+        if (!rough_bounce && !mirrorLike(surface) && surface.roughness < glossy_roughness) mirror_share = max(mirror_share, 0.5);
+        bool reflects;
+        if (!split && !rough_bounce && !glossy_first && mirrorLike(surface) && mirror_share < 1.0) {
+            split = true;
+            split_met = true;
+            reflects = !scattering;
+            mirror_share = reflects ? 1.0 : 0.0;
+            if (scattering) {
+                gathered = vec3(0.0);
+                soft = vec3(0.0);
+                indirect = vec3(0.0);
+                gloss = vec3(0.0);
+            }
+        } else {
+            reflects = random() < mirror_share;
+        }
         mat3 basis = tangentBasis(surface.normal);
         vec3 next;
-        if (random() < mirror_share) {
+        if (reflects) {
             float alpha = surface.roughness * surface.roughness;
-            vec3 half_vector = basis * importanceSampleGgx(vec2(random(), random()), alpha);
+            vec3 view_local = view * basis;
+            vec3 half_vector = basis * visibleFacet(vec3(view_local.xy, max(view_local.z, 1e-3)), alpha, vec2(random(), random()));
             next = reflect(direction, half_vector);
             float n_dot_l = dot(surface.normal, next);
             if (n_dot_l <= 0.0 || dot(surface.flat_normal, next) <= 0.0) break;
-            float v_dot_h = max(dot(view, half_vector), 1e-4);
-            float n_dot_h = max(dot(surface.normal, half_vector), 1e-4);
-            // The response over the chance of having picked this way.
-            vec3 fresnel = fresnelSchlick(v_dot_h, f0);
-            carried *= fresnel * visibilitySmithGgx(n_dot_l, n_dot_v, alpha) * 4.0 * n_dot_l * v_dot_h / n_dot_h / mirror_share;
-            sky_lod = max(sky_lod, surface.roughness * 4.0);
-            // At a grazing angle the weight of one direction can run away.
-            carried = min(carried, vec3(4.0));
-            if (surface.roughness > 0.08) rough_bounce = true;
+            vec3 fresnel = fresnelSchlick(max(dot(view, half_vector), 1e-4), f0);
+            carried *= fresnel * reflectedShare(n_dot_l, n_dot_v, alpha) / mirror_share;
+            unaimed = mirrorLike(surface);
+            // Stochastically chosen reflections go to the reflection denoiser.
+            if (!rough_bounce && !glossy_first && (unaimed ? mirror_share < 1.0 : surface.roughness < glossy_roughness)) {
+                glossy_first = true;
+                awaiting_reach = true;
+            }
+            if (!unaimed) rough_bounce = true;
         } else {
             float turn = 2.0 * PI * random();
             float radius = sqrt(random());
             next = normalize(basis * vec3(cos(turn) * radius, sin(turn) * radius, sqrt(max(1.0 - radius * radius, 0.0))));
             if (dot(surface.flat_normal, next) <= 0.0) break;
             carried *= scattered * (1.0 - fresnel_view) / (1.0 - mirror_share);
-            sky_lod = max(sky_lod, 3.0);
+            unaimed = false;
             rough_bounce = true;
         }
-        texture_lod = 2.0;
-        // Paths that carry little are ended by lot, the rest made up for
-        // the ones ended.
+        cone_angle = max(cone_angle, unaimed ? cone_angle : 0.05 + 0.25 * surface.roughness);
+        // Russian roulette.
         if (bounce >= 2u) {
             float keep = clamp(max(carried.r, max(carried.g, carried.b)), 0.05, 1.0);
             if (random() > keep) break;
@@ -352,11 +549,7 @@ vec3 tracePath(FrameConstants frame, vec3 origin, vec3 direction, out vec3 indir
     return gathered;
 }
 
-// Last frame's picture at a place between its pixels, by a curve through
-// the pixels around rather than a straight blend of the nearest four:
-// looked up afresh every frame, a straight blend would soften the
-// picture a little more each time. (Catmull-Rom, gathered in five
-// lookups.)
+// Catmull-Rom history sample in five bilinear taps.
 vec3 historySharp(uint texture_index, uint sampler_index, vec2 uv, vec2 size) {
     vec2 place = uv * size;
     vec2 base = floor(place - 0.5) + 0.5;
@@ -375,9 +568,7 @@ vec3 historySharp(uint texture_index, uint sampler_index, vec2 uv, vec2 size) {
     total += textureLod(TEX(texture_index, sampler_index), vec2(after.x, near.y), 0.0).rgb * (w3.x * w12.y);
     total += textureLod(TEX(texture_index, sampler_index), vec2(near.x, after.y), 0.0).rgb * (w12.x * w3.y);
     float weight = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
-    // The curve swings a little past what it passes through, most at a
-    // bright speck; swung again every frame, that would grow without
-    // end. It is held to what the four nearest pixels span.
+    // Clamped to the four nearest texels against ringing.
     ivec2 corner = ivec2(base - 0.5);
     ivec2 last = ivec2(size) - 1;
     vec3 a = texelFetch(TEX(texture_index, sampler_index), clamp(corner, ivec2(0), last), 0).rgb;
@@ -392,94 +583,126 @@ void main() {
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     random_state = pcg(uint(pixel.x) + pcg(uint(pixel.y) + pcg(push.gathered * 7919u + frame.frame_index)));
     vec3 total = vec3(0.0);
+    vec3 total_soft = vec3(0.0);
+    vec3 total_gloss = vec3(0.0);
     vec3 guide = vec3(0.0);
     uint samples = max(push.samples, 1u);
     for (uint index = 0u; index < samples; index++) {
-        // Somewhere within the pixel: the average over frames smooths
-        // edges as it clears the noise.
-        vec2 uv = (vec2(pixel) + vec2(random(), random())) * frame.inv_resolution;
+        vec2 uv = (vec2(pixel) + (push.centered != 0u ? vec2(0.5) : vec2(random(), random()))) * frame.inv_resolution;
         vec3 through = worldPositionFromDepth(uv, 0.5, frame.inv_view_proj);
         vec3 direction = normalize(through - frame.camera_position);
         first_met = false;
         first_distance = 60000.0;
+        first_mirrored = false;
         first_color = vec3(0.0);
+        first_facing = vec3(0.0, 1.0, 0.0);
+        primary_met = false;
+        primary_facing = vec3(0.0, 1.0, 0.0);
+        primary_roughness = 1.0;
+        primary_distance = 60000.0;
+        primary_mirror = false;
+        gloss_reach = 0.0;
+        vec3 soft;
         vec3 indirect;
-        vec3 light = tracePath(frame, frame.camera_position, direction, indirect);
-        // A number that is not one would poison the average for good.
+        vec3 gloss;
+        split_met = false;
+        vec3 light = tracePath(frame, frame.camera_position, direction, false, soft, indirect, gloss);
+        if (split_met) {
+            split_met = false;
+            vec3 scattered_soft;
+            vec3 scattered_indirect;
+            vec3 scattered_gloss;
+            vec3 scattered_light = tracePath(frame, frame.camera_position, direction, true, scattered_soft, scattered_indirect, scattered_gloss);
+            if (split_met) {
+                light += scattered_light;
+                soft += scattered_soft;
+                indirect += scattered_indirect;
+                gloss += scattered_gloss;
+            }
+        }
         if (any(isnan(light)) || any(isinf(light))) light = vec3(0.0);
+        if (any(isnan(soft)) || any(isinf(soft))) soft = vec3(0.0);
         if (any(isnan(indirect)) || any(isinf(indirect))) indirect = vec3(0.0);
-        // One lucky path may not outshine its neighbours: what came by
-        // a rough bounce is held to the limit, which trades a little of
-        // the light of small bright things for a picture that clears.
+        if (any(isnan(gloss)) || any(isinf(gloss))) gloss = vec3(0.0);
+        float gloss_brightness = luminance(gloss);
+        if (gloss_brightness > push.clamp_radiance) gloss *= push.clamp_radiance / gloss_brightness;
         float brightness = luminance(indirect);
         if (brightness > push.clamp_radiance) indirect *= push.clamp_radiance / brightness;
-        // What is gathered is the light arriving at the surface, with the
-        // surface's own color divided out: the color is put back at
-        // the end from this frame's sharp picture of it, so a texture
-        // is not blurred by being carried from frame to frame or by
-        // the pass that clears the grain. Where there is no such color
-        // (the sky, mirrors, what glows) the light is kept as it is.
-        vec3 arriving = light + indirect;
-        if (dot(first_color, vec3(1.0)) > 0.0) arriving /= first_color;
-        total += arriving;
+        // Noisy light is demodulated by albedo; pathtrace_denoise.frag
+        // remodulates.
+        total += light;
+        total_soft += (soft + indirect) / (dot(first_color, vec3(1.0)) > 0.0 ? first_color : vec3(1.0));
+        total_gloss += gloss;
         guide += first_color;
     }
     vec3 light = total / float(samples);
+    vec3 grainy = total_soft / float(samples);
     vec3 shown = guide / float(samples);
-    // What this pixel gathered before. With the camera still, that is
-    // the same pixel of the last frame. With the camera moving, it is
-    // wherever the surface seen here was on screen then, if it was on
-    // screen and not behind something: the distance kept with the
-    // guide tells. A surface newly come into view starts from nothing.
+    // History: the same pixel when still, else reprojected and validated by
+    // distance.
     float count = 0.0;
     vec3 light_before = vec3(0.0);
+    vec4 grainy_before = vec4(0.0);
     vec3 shown_before = vec3(0.0);
+    vec4 facing_before = vec4(0.0);
     if (push.reset == 0u) {
         if (push.moved == 0u) {
             vec4 before = texelFetch(TEX(push.history_color, frame.sampler_nearest_clamp), pixel, 0);
             count = before.a;
             light_before = before.rgb;
+            grainy_before = texelFetch(TEX(push.history_soft, frame.sampler_nearest_clamp), pixel, 0);
             shown_before = texelFetch(TEX(push.history_guide, frame.sampler_nearest_clamp), pixel, 0).rgb;
+            facing_before = texelFetch(TEX(push.history_facing, frame.sampler_nearest_clamp), pixel, 0);
         } else {
             vec2 center = (vec2(pixel) + 0.5) * frame.inv_resolution;
             vec3 toward = normalize(worldPositionFromDepth(center, 0.5, frame.inv_view_proj) - frame.camera_position);
             vec3 point = frame.camera_position + toward * first_distance;
             vec4 clip = frame.prev_view_proj_unjittered * vec4(point, 1.0);
-            vec2 was_at = clip.xy / clip.w * 0.5 + 0.5;
+            vec2 was_at = clip.xy / clip.w * 0.5 + 0.5 + frame.prev_jitter;
             if (clip.w > 0.0 && all(greaterThan(was_at, vec2(0.0))) && all(lessThan(was_at, vec2(1.0)))) {
                 vec4 guide_before = textureLod(TEX(push.history_guide, frame.sampler_linear_clamp), was_at, 0.0);
                 float expected = distance(push.previous_camera, point);
-                // The same surface, by how far it was and by its color: a
-                // floor's light is not carried onto the wall that slid
-                // in front of it.
+                bool was_mirrored = guide_before.a < 0.0;
                 vec3 unlike = abs(guide_before.rgb - shown);
-                if (abs(guide_before.a - expected) <= 0.03 * expected + 0.02 && max(unlike.r, max(unlike.g, unlike.b)) < 0.2) {
+                if (was_mirrored == first_mirrored && abs(abs(guide_before.a) - expected) <= 0.03 * expected + 0.02 && max(unlike.r, max(unlike.g, unlike.b)) < 0.2) {
                     count = textureLod(TEX(push.history_color, frame.sampler_linear_clamp), was_at, 0.0).a;
                     light_before = historySharp(push.history_color, frame.sampler_linear_clamp, was_at, frame.resolution);
+                    grainy_before = textureLod(TEX(push.history_soft, frame.sampler_linear_clamp), was_at, 0.0);
                     shown_before = guide_before.rgb;
+                    facing_before = textureLod(TEX(push.history_facing, frame.sampler_linear_clamp), was_at, 0.0);
                 }
             }
-            // What a moving camera carries along goes stale: highlights
-            // and reflections belong to where it was seen from. So less
-            // of it is trusted, and of mirrors hardly any.
-            count = min(count, dot(shown, vec3(1.0)) > 0.0 ? 32.0 : 4.0);
+            // Cap history while moving, harder for mirrors.
+            count = min(count, dot(shown, vec3(1.0)) > 0.0 && !first_mirrored ? 64.0 : 6.0);
         }
     }
-    // One number that is not one, carried from frame to frame and looked
-    // up by its neighbours, would spread until the whole picture is
-    // lost: such history is dropped here.
-    if (any(isnan(light_before)) || any(isinf(light_before)) || any(isnan(shown_before)) || any(isinf(shown_before)) || isnan(count) || isinf(count)) {
+    if (any(isnan(light_before)) || any(isinf(light_before)) || any(isnan(grainy_before)) || any(isinf(grainy_before)) || any(isnan(shown_before)) || any(isinf(shown_before)) || any(isnan(facing_before)) || any(isinf(facing_before)) || isnan(count) || isinf(count)) {
         count = 0.0;
         light_before = vec3(0.0);
+        grainy_before = vec4(0.0);
         shown_before = vec3(0.0);
+        facing_before = vec4(0.0);
     }
     if (any(isnan(shown)) || any(isinf(shown))) shown = vec3(0.0);
     if (isnan(first_distance) || isinf(first_distance)) first_distance = 60000.0;
     count = min(count, 8192.0);
     float weight = 1.0 / (count + 1.0);
-    out_color = vec4(mix(light_before, light, weight), count + 1.0);
-    // The color of what is shown is steady, so while the camera moves
-    // this frame's own counts for most of it and it stays sharp.
+    // Steady light keeps only a few frames while moving, mirrors fewer.
+    float steady_weight = push.moved != 0u ? max(weight, primary_mirror ? moving_mirror_weight : moving_steady_weight) : weight;
+    out_color = vec4(mix(light_before, light, steady_weight), count + 1.0);
+    float brightness = min(luminance(grainy), 240.0);
+    out_soft = mix(grainy_before, vec4(grainy, brightness * brightness), weight);
     float shown_weight = push.moved != 0u ? max(weight, 0.7) : weight;
-    out_guide = vec4(mix(shown_before, shown, shown_weight), min(first_distance, 60000.0));
+    float shown_distance = min(first_distance, 60000.0);
+    out_facing = mix(facing_before, vec4(first_facing, first_mirrored ? -shown_distance : shown_distance), shown_weight);
+    vec4 surface_now = vec4(unpackSnorm2x16(packDirection(primary_facing)), primary_roughness, min(primary_distance, 60000.0));
+    vec4 surface_before = push.reset == 0u && push.moved == 0u ? texelFetch(TEX(push.history_surface, frame.sampler_nearest_clamp), pixel, 0) : surface_now;
+    if (any(isnan(surface_before)) || any(isinf(surface_before))) surface_before = surface_now;
+    out_surface = mix(surface_before, surface_now, weight);
+    vec3 gloss_now = min(total_gloss / float(samples), vec3(60000.0));
+    vec4 gloss_before = push.reset == 0u && push.moved == 0u ? texelFetch(TEX(push.history_gloss, frame.sampler_nearest_clamp), pixel, 0) : vec4(0.0);
+    if (any(isnan(gloss_before)) || any(isinf(gloss_before))) gloss_before = vec4(0.0);
+    out_gloss_gathered = vec4(mix(gloss_before.rgb, gloss_now, 1.0 / (gloss_before.a + 1.0)), min(gloss_before.a + 1.0, 8192.0));
+    out_gloss = vec4(out_gloss_gathered.rgb, gloss_reach);
+    out_guide = vec4(mix(shown_before, shown, shown_weight), first_mirrored ? -shown_distance : shown_distance);
 }

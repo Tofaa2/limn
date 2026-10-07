@@ -2,14 +2,14 @@
 #include "common.glsl"
 #include "water.glsl"
 
-// The water surface as a grid of quads generated from the vertex index and
-// lifted by the simulated height.
+// Water surface grid generated from the vertex index, displaced by the
+// simulated height.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     WaterRef water;
     uint depth_texture;
     uint scene_texture;
-    // Quads along each side of the grid.
+    // Quads per grid side.
     uint quads;
 } push;
 

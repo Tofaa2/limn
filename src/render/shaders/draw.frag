@@ -12,13 +12,13 @@ layout(push_constant, scalar) uniform Push {
     vec2 viewport;
     uint sampler_linear;
     uint sampler_nearest;
-    // Scene depth for world-space items, or INVALID_ID; and the view'"'"'s
-    // corner in the target.
+    // Scene depth for world-space items, or INVALID_ID, and the view's origin
+    // in the target.
     uint depth_texture;
-    // HDR10 targets: brightness of white in nits.
+    // HDR10 targets: white level in nits.
     float hdr_paper_white;
     vec2 origin;
-    // 1 to read text from the three-channel field (sharp corners).
+    // 1 to sample text from the multi-channel distance field.
     uint sharp_text;
 } push;
 
@@ -35,7 +35,6 @@ vec3 linearToSrgb(vec3 c) {
 
 void main() {
     if (push.depth_texture != INVALID_ID) {
-        // Hidden behind the scene? (Reverse depth: nearer is larger.)
         vec2 uv = (gl_FragCoord.xy - push.origin) / push.viewport;
         float scene = textureLod(TEX(push.depth_texture, push.sampler_nearest), uv, 0.0).r;
         if (gl_FragCoord.z < scene) discard;
@@ -51,10 +50,7 @@ void main() {
         color *= texture(TEX(texture_index, push.sampler_nearest), in_uv);
         break;
     case 2u: {
-        // Signed distance field text: scale the stored distance to screen
-        // pixels using how fast the atlas coordinate changes per pixel.
-        // The atlas holds the distance in alpha, and in red, green and
-        // blue a field per channel whose median keeps corners sharp.
+        // Signed distance field text: distance in alpha, MSDF in rgb.
         vec4 field = texture(TEX(texture_index, push.sampler_linear), in_uv);
         float distance = (push.sharp_text != 0u ? max(min(field.r, field.g), min(max(field.r, field.g), field.b)) : field.a) - 0.5;
         vec2 atlas_size = vec2(textureSize(textures_2d[nonuniformEXT(texture_index)], 0));
@@ -74,14 +70,11 @@ void main() {
         break;
     }
     case 7u: {
-        // Rounded rectangle: signed distance to the outline, in the
-        // shape's own units, turned into coverage by how fast it changes
-        // across a pixel.
         float radius = float(texture_index & 0xfffu) * 0.25;
         float stroke = float((texture_index >> 12) & 0xfffu) * 0.25;
         vec2 q = abs(in_uv) - in_extra + radius;
         float distance = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
-        // An outline is the band between the edge and `stroke` inside it.
+        // Outline: the band `stroke` wide inside the edge.
         if (stroke > 0.0) distance = max(distance, -(distance + stroke));
         color.a *= clamp(0.5 - distance / max(fwidth(distance), 1e-6), 0.0, 1.0);
         break;

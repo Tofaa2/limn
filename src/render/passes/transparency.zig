@@ -1,6 +1,5 @@
-//! The surfaces that are seen through, drawn over the opaque picture:
-//! liquids, water and transparent meshes.
-//! Internal to the renderer.
+//! Transparent surfaces drawn over the opaque scene: liquids, water and blended
+//! meshes. Internal to the renderer.
 const std = @import("std");
 const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
@@ -15,8 +14,7 @@ const hdr_format = render.hdr_format;
 const shaderCode = render.shaderCode;
 const ScenePass = scene_pass.ScenePass;
 
-/// Copies the picture so far into `copy`, for a pass that reads what is
-/// behind the surfaces it draws.
+/// Copies the scene color into `copy`, for passes that refract it.
 pub fn copyScene(renderer: *Renderer, p: *const ScenePass, copy: rhi.Texture) !void {
     const cmd = p.cmd;
     try cmd.beginRendering(.{ .color = &.{.{ .texture = copy, .load = .discard }} });
@@ -27,8 +25,7 @@ pub fn copyScene(renderer: *Renderer, p: *const ScenePass, copy: rhi.Texture) !v
     cmd.transition(copy, .shader_read);
 }
 
-/// Draws the scene's liquids: their particles as one smoothed surface
-/// that bends what is behind it.
+/// Draws the scene's liquids as smoothed, refracting surfaces.
 pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -53,22 +50,18 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
                 .depth = device.textureIndex(view.depth),
                 .swell = 1.7,
             };
-            // The nearest surface of the particles, as spheres.
             try cmd.beginRendering(.{ .depth = .{ .texture = targets.depth, .clear = 0 } });
             cmd.bindPipeline(renderer.pipelines.liquid_depth);
             cmd.pushConstants(particle_push);
             cmd.draw(state.live * 6, 1, 0, 0);
             cmd.endRendering();
             cmd.transition(targets.depth, .shader_read);
-            // How much liquid each pixel looks through.
             try cmd.beginRendering(.{ .color = &.{.{ .texture = targets.thickness, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
             cmd.bindPipeline(renderer.pipelines.liquid_thickness);
             cmd.pushConstants(particle_push);
             cmd.draw(state.live * 6, 1, 0, 0);
             cmd.endRendering();
             cmd.transition(targets.thickness, .shader_read);
-            // The spheres smoothed into one surface, across and down,
-            // once each.
             const BlurPush = extern struct { frame: u64, source: u32, raw: u32, direction: [2]f32, width: f32, edge: f32 };
             cmd.bindPipeline(renderer.pipelines.liquid_blur);
             var source = targets.depth;
@@ -90,8 +83,6 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
                 source = smoothed;
                 raw = 0;
             }
-            // What is behind it is read from a copy of the picture so
-            // far, bent by the surface.
             try copyScene(renderer, p, copy);
             try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
             cmd.bindPipeline(renderer.pipelines.liquid);
@@ -107,8 +98,7 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.endRendering();
             cmd.transition(view.hdr, .shader_read);
             if (state.desc.write_depth) {
-                // Not in the same pass: the liquid reads the depth
-                // of what is behind it while it is drawn.
+                // A separate pass: the liquid pass reads depth.
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = view.motion, .load = .load }}, .depth = .{ .texture = view.depth, .load = .load } });
                 cmd.bindPipeline(renderer.pipelines.liquid_surface);
                 cmd.pushConstants(extern struct { frame: u64, distance: u32, pad: u32 = 0 }{ .frame = frame_address, .distance = device.textureIndex(targets.smooth[1]) });
@@ -121,7 +111,7 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
     }
 }
 
-/// Draws the scene's water surfaces, and the view from under one.
+/// Draws the scene's water surfaces and the underwater view.
 pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -133,8 +123,6 @@ pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
     if (scene.waters.items.len != 0 and !debugging) water: {
         const copy = view.scene_copy orelse break :water;
         cmd.beginScope("water");
-        // What is under the surface is read from a copy of the picture
-        // so far, bent by the waves.
         try copyScene(renderer, p, copy);
         try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
         cmd.bindPipeline(renderer.pipelines.water);
@@ -152,9 +140,7 @@ pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
         }
         cmd.endRendering();
         cmd.transition(view.hdr, .shader_read);
-        // Then into the depth buffer, for the passes that follow. Not
-        // in the same pass: the water reads the depth of what is under
-        // it while it is drawn.
+        // Depth is written in a separate pass: the water pass reads it.
         var any_depth = false;
         for (scene.waters.items) |item| {
             const state = renderer.waters.get(item) orelse continue;
@@ -178,7 +164,6 @@ pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.endRendering();
             cmd.transition(view.depth, .shader_read);
         }
-        // From under a surface, the whole view is seen through water.
         for (scene.waters.items) |item| {
             const state = renderer.waters.get(item) orelse continue;
             if (state.params_frame != renderer.frame_index or !state.desc.underwater) continue;
@@ -202,8 +187,7 @@ pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
     }
 }
 
-/// The pipeline that accumulates see-through surfaces without sorting
-/// them, made the first time it is needed.
+/// The weighted blended OIT pipeline, created on first use.
 pub fn forwardWeightedPipeline(renderer: *Renderer) !rhi.Pipeline {
     if (renderer.pipelines.forward_weighted) |made| return made;
     const made = try renderer.device.createGraphicsPipeline(.{
@@ -218,8 +202,7 @@ pub fn forwardWeightedPipeline(renderer: *Renderer) !rhi.Pipeline {
     return made;
 }
 
-/// The pipeline that draws one depth-peeled layer of see-through
-/// surfaces, made the first time it is needed.
+/// The depth peeling pipeline, created on first use.
 pub fn forwardPeelPipeline(renderer: *Renderer) !rhi.Pipeline {
     if (renderer.pipelines.forward_peel) |made| return made;
     const made = try renderer.device.createGraphicsPipeline(.{
@@ -234,8 +217,7 @@ pub fn forwardPeelPipeline(renderer: *Renderer) !rhi.Pipeline {
     return made;
 }
 
-/// Draws the scene's see-through surfaces over the opaque picture, the
-/// way `Settings.transparency` asks.
+/// Draws the scene's blended surfaces as `Settings.transparency` selects.
 pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -247,8 +229,6 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
     const frame_address = p.frame_address;
     if (scene.transparent.items.len != 0 and !debugging) {
         cmd.beginScope("transparency");
-        // Refraction looks through surfaces at the scene behind them,
-        // so that scene is set aside before anything is drawn over it.
         var behind: u32 = gpu.invalid_id;
         if (view.scene_copy) |copy| {
             try copyScene(renderer, p, copy);
@@ -256,10 +236,6 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
         }
         const ForwardPush = extern struct { frame: u64, instance: u32, mode: u32, scene: u32, opaque_depth: u32 = gpu.invalid_id, peel_depth: u32 = gpu.invalid_id, pad: u32 = 0 };
         if (view.peel) |peel| {
-            // Exact layering: the nearest transparent surface at every
-            // pixel is drawn into a layer of its own, then the nearest
-            // behind that, and so on; each layer goes under the ones
-            // before it. Surfaces past the last layer are left out.
             try cmd.beginRendering(.{ .color = &.{.{ .texture = peel.accumulation, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
             cmd.endRendering();
             const layers = std.math.clamp(settings.transparency_layers, 1, 16);
@@ -299,8 +275,6 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.drawFullscreen();
             cmd.endRendering();
         } else if (view.oit) |oit| {
-            // Order-independent: every surface is accumulated with a
-            // weight, then the result is laid over the scene at once.
             try cmd.beginRendering(.{
                 .color = &.{
                     .{ .texture = oit.accumulation, .load = .clear, .clear = .{ 0, 0, 0, 0 } },
@@ -328,7 +302,6 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.drawFullscreen();
             cmd.endRendering();
         } else {
-            // Back to front along the view axis.
             renderer.transparent_order.clearRetainingCapacity();
             try renderer.transparent_order.appendSlice(renderer.gpa, scene.transparent.items);
             for (renderer.transparent_order.items) |*draw| draw.depth = -math.transformPoint(view_matrix, draw.center)[2];
@@ -346,9 +319,6 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.bindIndexBuffer(renderer.indices.buffer, 0, .uint32);
             var drawn_any = false;
             for (renderer.transparent_order.items) |draw| {
-                // A surface that bends light is given the picture as it
-                // is now, with the see-through surfaces behind it in
-                // it, instead of the one from before any were drawn.
                 if (settings.layered_refraction and draw.transmissive and drawn_any) if (view.scene_copy) |copy| {
                     cmd.endRendering();
                     cmd.transition(view.hdr, .shader_read);

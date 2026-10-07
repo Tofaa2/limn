@@ -7,7 +7,7 @@ layout(buffer_reference, scalar) buffer SkinnedVertices { Vertex data[]; };
 layout(buffer_reference, scalar) readonly buffer SkinVertices { SkinVertex data[]; };
 layout(buffer_reference, scalar) readonly buffer Joints { mat4 data[]; };
 
-// How far one morph target moves a vertex and turns its normal and tangent.
+// Morph target delta for position, normal and tangent.
 struct MorphDelta {
     vec3 position;
     vec3 normal;
@@ -15,8 +15,8 @@ struct MorphDelta {
 };
 layout(buffer_reference, scalar) readonly buffer MorphDeltas { MorphDelta data[]; };
 
-// One mesh to deform. All of a frame's jobs are done by one dispatch: each
-// work group of 64 vertices looks up which job it belongs to.
+// One mesh to deform. One dispatch handles all jobs: each work group of 64
+// vertices looks up its job.
 struct SkinJob {
     uint source_offset;
     uint destination_offset;
@@ -26,9 +26,9 @@ struct SkinJob {
     // Morph targets: runs of vertex_count deltas from morph_offset.
     uint morph_offset;
     uint target_count;
-    // The first work group that belongs to this job.
+    // First work group of this job.
     uint first_group;
-    // Where this job's target weights start in the weights list.
+    // Offset of this job's target weights.
     uint weights_offset;
     uint job_pad0;
     uint job_pad1;
@@ -38,7 +38,7 @@ layout(buffer_reference, scalar) readonly buffer SkinJobs { SkinJob data[]; };
 layout(buffer_reference, scalar) readonly buffer GroupJobs { uint data[]; };
 layout(buffer_reference, scalar) readonly buffer MorphWeights { float data[]; };
 
-// Work groups are laid out in rows of this many.
+// Work groups per dispatch row.
 const uint GROUPS_PER_ROW = 1024u;
 
 layout(push_constant, scalar) uniform Push {
@@ -47,9 +47,9 @@ layout(push_constant, scalar) uniform Push {
     Joints joints;
     MorphDeltas morph;
     SkinJobs jobs;
-    // Which job each work group belongs to.
+    // Job index per work group.
     GroupJobs group_jobs;
-    // Morph target weights of every job, back to back.
+    // Morph weights of all jobs.
     MorphWeights weights;
     uint group_count;
 } push;
@@ -63,7 +63,7 @@ void main() {
     Vertex vertex = push.vertices.data[job.source_offset + index];
     vec3 normal = vertexNormal(vertex);
     vec4 tangent = vertexTangent(vertex);
-    // Morph first, in the mesh's own space, then bend with the skeleton.
+    // Morph in mesh space, then skin.
     for (uint target = 0u; target < job.target_count; target++) {
         float weight = push.weights.data[job.weights_offset + target];
         if (weight == 0.0) continue;

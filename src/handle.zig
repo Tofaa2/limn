@@ -1,29 +1,22 @@
 const std = @import("std");
 
-/// A 32-bit generational handle: a slot index and the generation the slot
-/// had when the handle was issued. `Tag` takes no part in the layout; it
-/// only makes handles to different kinds of resource distinct types, so
-/// one cannot be passed where another is expected. A plain value, safe to
-/// copy and to keep after the resource is gone: a `HandleTable` rejects it
-/// once its slot has been reused.
+/// 32-bit generational handle: a slot index plus the slot's generation at
+/// issue. `Tag` only makes handles of different resources distinct types.
 pub fn Handle(comptime Tag: type) type {
     return packed struct(u32) {
-        /// Slot in the table that issued the handle (the low 24 bits).
+        /// Low 24 bits.
         index: u24,
-        /// Generation of that slot at the time (the high 8 bits). Live
-        /// handles never have generation 0.
+        /// High 8 bits; never 0 for a live handle.
         generation: u8,
 
-        /// The handle that refers to nothing; no table ever issues it.
+        /// Refers to nothing; never issued.
         pub const invalid: @This() = .{
             .index = std.math.maxInt(u24),
             .generation = 0,
         };
 
-        /// Whether the handle could have been issued by a table at all:
-        /// false for `invalid` and for a zeroed handle. It does not look
-        /// in any table, so a handle whose resource has since been removed
-        /// still reports true; `HandleTable.get` is the test for that.
+        /// False for `invalid` and a zeroed handle. Consults no table, so a
+        /// stale handle still reports true; `HandleTable.get` tests that.
         pub fn isValid(self: @This()) bool {
             _ = Tag;
             return self.index != std.math.maxInt(u24) and self.generation != 0;
@@ -31,17 +24,12 @@ pub fn Handle(comptime Tag: type) type {
     };
 }
 
-/// A growable table of `T` addressed by `Handle(Tag)`. Slots of removed
-/// values are reused, most recently freed first, and each reuse gets a new
-/// generation, so handles to the old value stop resolving instead of
-/// reaching the new one. The generation is 8 bits and wraps (skipping 0):
-/// a handle kept across 255 reuses of its slot would resolve again.
-///
-/// Holds up to 2^24 - 1 values. Not thread safe; callers serialize access.
+/// Growable table of `T` addressed by `Handle(Tag)`. Freed slots are reused
+/// with a new generation, so stale handles stop resolving; the generation is
+/// 8 bits and wraps, skipping 0. Up to 2^24 - 1 values. Not thread safe.
 pub fn HandleTable(comptime T: type, comptime Tag: type) type {
     return struct {
         const Self = @This();
-        /// The handle type this table issues and accepts.
         pub const Id = Handle(Tag);
         const Slot = struct {
             generation: u8 = 1,
@@ -54,25 +42,19 @@ pub fn HandleTable(comptime T: type, comptime Tag: type) type {
         slots: std.ArrayList(Slot) = .empty,
         free_head: u24 = none,
 
-        /// An empty table. Nothing is allocated until the first `insert`;
-        /// `allocator` is kept and used for the slot array.
+        /// Allocates nothing until the first `insert`.
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{ .allocator = allocator };
         }
 
-        /// Frees the slot array. Values still in the table are dropped
-        /// without being cleaned up: drain it with `popAny` first if they
-        /// own anything.
+        /// Values still stored are dropped without cleanup.
         pub fn deinit(self: *Self) void {
             self.slots.deinit(self.allocator);
             self.* = undefined;
         }
 
-        /// Stores `value` and returns the handle to it, reusing a free
-        /// slot when there is one. May grow the slot array, which
-        /// invalidates pointers returned by `get`. Fails with
-        /// `error.HandleTableFull` when every index is taken, or
-        /// `error.OutOfMemory`.
+        /// May grow the slot array, invalidating pointers from `get`. Fails
+        /// with `error.HandleTableFull` or `error.OutOfMemory`.
         pub fn insert(self: *Self, value: T) !Id {
             if (self.free_head != none) {
                 const index = self.free_head;
@@ -88,10 +70,8 @@ pub fn HandleTable(comptime T: type, comptime Tag: type) type {
             return .{ .index = index, .generation = 1 };
         }
 
-        /// The value `id` refers to, or null if `id` is invalid, stale
-        /// (its value was removed) or out of range. The pointer is into
-        /// the table: valid until the next `insert`, or until the value is
-        /// removed.
+        /// Null if `id` is invalid, stale or out of range. The pointer is
+        /// valid until the next `insert` or the value's removal.
         pub fn get(self: *Self, id: Id) ?*T {
             if (id.index >= self.slots.items.len) return null;
             const slot = &self.slots.items[id.index];
@@ -99,10 +79,7 @@ pub fn HandleTable(comptime T: type, comptime Tag: type) type {
             return if (slot.value) |*value| value else null;
         }
 
-        /// Takes the value `id` refers to out of the table and returns it
-        /// for the caller to clean up, or null if `id` does not resolve
-        /// (so removing twice is harmless). Every copy of `id` is stale
-        /// from then on and the slot is free for reuse.
+        /// Removes and returns the value, or null if `id` does not resolve.
         pub fn remove(self: *Self, id: Id) ?T {
             if (id.index >= self.slots.items.len) return null;
             const slot = &self.slots.items[id.index];
@@ -116,10 +93,8 @@ pub fn HandleTable(comptime T: type, comptime Tag: type) type {
             return value;
         }
 
-        /// Removes and returns one live value (the one in the lowest
-        /// slot), or null when the table is empty. For draining a table at
-        /// shutdown: `while (table.popAny()) |value| destroy(value);`.
-        /// Each call scans from the first slot.
+        /// Removes and returns the live value in the lowest slot, or null
+        /// when empty. Scans from the first slot on every call.
         pub fn popAny(self: *Self) ?T {
             for (self.slots.items, 0..) |slot, index| {
                 if (slot.value != null) return self.remove(.{
@@ -130,9 +105,7 @@ pub fn HandleTable(comptime T: type, comptime Tag: type) type {
             return null;
         }
 
-        /// Handles of every live value, in slot order, as a new slice the
-        /// caller frees with `allocator`. A snapshot: it does not follow
-        /// later inserts and removals.
+        /// Snapshot of every live handle, in slot order. Caller frees.
         pub fn handlesAlloc(self: *const Self, allocator: std.mem.Allocator) ![]Id {
             var result: std.ArrayList(Id) = .empty;
             errdefer result.deinit(allocator);

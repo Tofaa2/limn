@@ -3,8 +3,8 @@
 #include "shading.glsl"
 #include "particles.glsl"
 
-// Camera-facing quads pulled straight from the particle buffer: six
-// vertices per particle, no vertex or index buffers.
+// Camera-facing particle quads, six vertices each, pulled from the particle
+// buffer.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     EmitterRef emitter;
@@ -17,7 +17,7 @@ layout(push_constant, scalar) uniform Push {
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec2 out_uv;
 layout(location = 2) out float out_view_depth;
-// Where this corner is on screen now and where it was a frame ago.
+// Clip position now and last frame.
 layout(location = 3) out vec4 out_clip;
 layout(location = 4) out vec4 out_previous_clip;
 
@@ -27,14 +27,13 @@ void main() {
     uint slot = uint(gl_VertexIndex) / 6u;
     bool listed = true;
     if ((emitter.flags & EMITTER_SORTED) != 0u) {
-        // Drawn in the order the sort left: farthest first.
         slot = push.order.data[slot].index;
         listed = slot != 0xffffffffu;
         if (!listed) slot = 0u;
     }
     Particle particle = push.particles.data[slot];
     if (!listed || particle.age >= particle.lifetime) {
-        // Dead: collapse the quad.
+        // Dead: degenerate quad.
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         out_color = vec4(0.0);
         out_uv = vec2(0.0);
@@ -58,7 +57,6 @@ void main() {
     vec3 up = frame.inv_view[1].xyz;
     vec2 half_size = vec2(size * 0.5);
     if (emitter.stretch > 0.0) {
-        // Drawn as a streak along its motion, as seen from the camera.
         vec3 toward = normalize(particle.position - frame.camera_position);
         vec3 along = particle.velocity - toward * dot(particle.velocity, toward);
         float speed = length(along);
@@ -78,12 +76,9 @@ void main() {
         uint key = min(uint(at), emitter.curve_counts.x - 2u);
         color = mix(emitter.curve_colors[key], emitter.curve_colors[key + 1u], at - float(key));
     }
-    // Ease in over the first moments so births do not pop.
     color.a *= smoothstep(0.0, 0.08, t);
     float view_depth = -(frame.view * vec4(particle.position, 1.0)).z;
     if ((emitter.flags & EMITTER_LIT) != 0u) {
-        // Lit like a puff of smoke: light from the sun (if it reaches the
-        // particle) and from the surroundings, scattered evenly.
         vec3 light = vec3(0.0);
         if ((frame.flags & FRAME_GI) != 0u) {
             light += giAmbient(frame, particle.position) * frame.gi_intensity;
@@ -97,7 +92,6 @@ void main() {
     out_color = color;
     out_uv = corner * 0.5 + 0.5;
     if (emitter.image != INVALID_ID) {
-        // Step through the sprite sheet once over the particle's life.
         uint frames = max(emitter.sheet.x * emitter.sheet.y, 1u);
         uint shown = min(uint(t * float(frames)), frames - 1u);
         vec2 cell = vec2(shown % max(emitter.sheet.x, 1u), shown / max(emitter.sheet.x, 1u));
@@ -106,6 +100,5 @@ void main() {
     out_view_depth = -(frame.view * vec4(world, 1.0)).z;
     gl_Position = frame.view_proj * vec4(world, 1.0);
     out_clip = frame.view_proj_unjittered * vec4(world, 1.0);
-    // A frame ago the particle was where its velocity says it came from.
     out_previous_clip = frame.prev_view_proj_unjittered * vec4(world - particle.velocity * frame.delta_time, 1.0);
 }

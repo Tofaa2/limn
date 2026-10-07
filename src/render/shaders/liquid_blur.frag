@@ -1,16 +1,14 @@
 #version 460
 #include "common.glsl"
 
-// Smooths the depth of a liquid's spheres into one surface, along one
-// axis at a time: a blur that does not reach across a jump in depth, so
-// drops in front of a far sheet stay drops.
+// Separable bilateral blur of the liquid's sphere depths into one surface.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;
-    // The source is a depth buffer (first pass) or distances (second).
+    // Source is a depth buffer (first pass) or view distance (second).
     uint raw;
     vec2 direction;
-    // Width of the blur in world units, and the depth jump it stops at.
+    // Blur width in world units and depth rejection threshold.
     float width;
     float edge;
 } push;
@@ -31,8 +29,6 @@ void main() {
         out_distance = 0.0;
         return;
     }
-    // The blur covers the same stretch of the liquid near and far, and
-    // looks at every pixel of it: skipping any shows as a pattern.
     float pixels = clamp(push.width * abs(frame.proj[1][1]) * frame.resolution.y * 0.5 / center, 1.0, 28.0);
     int reach = int(ceil(pixels));
     float sum = center;

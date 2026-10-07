@@ -3,7 +3,7 @@
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
-    // 1 for a pass whose see-through casters go into the tint instead.
+    // 1 when translucent casters go into the tint pass instead.
     uint tinted;
 } push;
 
@@ -17,16 +17,10 @@ void main() {
     if (material.base_color_texture != INVALID_ID)
         alpha *= texture(TEX(material.base_color_texture, material.sampler_index), materialUv(material, in_uv)).a;
     if ((material.flags & MATERIAL_BLEND) != 0u) {
-        // With tinted shadows these casters are drawn into the tint
-        // instead, and leave the depth to what is solid.
         if (push.tinted != 0u) discard;
-        // A see-through surface casts a partial shadow: it writes depth in
-        // a fixed pattern of texels, as dense as the surface is opaque,
-        // and the shadow filter averages the pattern into a tone.
+        // Translucent casters write a dither pattern as dense as their opacity.
         float opacity = alpha * (1.0 - material.transmission * 0.85);
-        // The pattern is shifted per material, so that two surfaces one
-        // behind the other darken the shadow together instead of
-        // punching the same holes.
+        // Pattern offset per material, so stacked surfaces darken together.
         if (opacity <= interleavedGradientNoise(gl_FragCoord.xy + vec2(float(in_material % 61u) * 5.0, float(in_material % 37u) * 3.0), 0u)) discard;
     } else if (alpha < material.alpha_cutoff) {
         discard;

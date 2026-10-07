@@ -2,9 +2,8 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Forces on the flow: hot gas rises, smoke weighs it down, wind pushes,
-// and small swirls that the grid would smear away are put back (vorticity
-// confinement, Fedkiw et al. 2001).
+// Forces: buoyancy, smoke weight, wind and vorticity confinement (Fedkiw et al.
+// 2001).
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;

@@ -1,6 +1,5 @@
-//! Binary form of a processed model, for the asset cache. Everything a
-//! `gltf.Model` holds except texture pixels is written field by field;
-//! textures are referenced by their key in the texture cache.
+//! Binary form of a processed `gltf.Model` for the asset cache. Texture
+//! pixels are not stored; textures are referenced by texture-cache key.
 const std = @import("std");
 
 /// Bump when any serialized type changes.
@@ -20,13 +19,9 @@ fn isPlain(comptime T: type) bool {
     };
 }
 
-/// Appends `value` to `out` in the cache's binary form. Numbers and extern
-/// structs of numbers are copied as they lie in memory (native byte
-/// order), bools and enums take one byte, an optional a presence byte and
-/// then its value, a slice a 64-bit length and then its items, and a
-/// struct its fields in declaration order. Other types, enums wider than
-/// a byte among them, do not compile. The only error is running out of
-/// memory.
+/// Appends `value` in the cache's binary form: plain types as raw native-endian
+/// bytes, bool/enum as one byte, optional as presence byte + value, slice as
+/// u64 length + items, struct as fields in declaration order.
 pub fn put(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: anytype) !void {
     const T = @TypeOf(value);
     if (comptime isPlain(T)) return out.appendSlice(gpa, std.mem.asBytes(&value));
@@ -50,7 +45,7 @@ pub fn put(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: anytype) !voi
     }
 }
 
-/// Reads back what `put` wrote, in the same order and with the same types.
+/// Reads back what `put` wrote, in the same order with the same types.
 /// `bytes` is an unsealed payload (see `unseal`) and is borrowed.
 pub const Reader = struct {
     bytes: []const u8,
@@ -62,10 +57,9 @@ pub const Reader = struct {
         return self.bytes[self.cursor..][0..count];
     }
 
-    /// The next value, read as a `T`. Slices in it are allocated from `arena`
-    /// and are not freed one by one, so hand in an arena that is dropped with
-    /// the model. Data that runs out early or holds an enum value `T` does
-    /// not have gives `error.CorruptCache`.
+    /// Reads the next value as `T`. Slices are allocated from `arena` and never
+    /// freed individually. Truncated data or an unknown enum value gives
+    /// `error.CorruptCache`.
     pub fn get(self: *Reader, arena: std.mem.Allocator, comptime T: type) !T {
         if (comptime isPlain(T)) {
             var value: T = undefined;
@@ -113,8 +107,7 @@ pub fn seal(gpa: std.mem.Allocator, payload: []const u8) ![]u8 {
     return out;
 }
 
-/// Returns the payload of a sealed file, or null if it is not one of ours
-/// or is damaged.
+/// Returns the payload of a sealed file, or null if foreign or damaged.
 pub fn unseal(bytes: []const u8) ?[]const u8 {
     if (bytes.len < 16 or !std.mem.eql(u8, bytes[0..4], &magic)) return null;
     if (std.mem.readInt(u32, bytes[4..8], .little) != version) return null;

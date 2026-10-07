@@ -2,10 +2,8 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Turns a fluid's fire into a light: adds up the glow of the hot gas over
-// a coarse grid of samples and writes its color and where it is centered
-// into one of the frame's light records, so the scene around a fire is lit
-// by it without anyone placing a lamp there.
+// Sums a fluid's fire emission over a coarse grid and writes its color and
+// centroid into one of the frame's light records.
 layout(local_size_x = 1) in;
 
 layout(buffer_reference, scalar) buffer LightsOut { Light data[]; };
@@ -14,9 +12,9 @@ layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     LightsOut lights;
     uint index;
-    // Brightness of the light per unit of glow per cubic world unit.
+    // Light intensity per unit of emission per cubic world unit.
     float scale;
-    // 1 makes the light as tall as the flames, 0 keeps it a point.
+    // 1 makes the light as tall as the flames, 0 a point.
     float tall;
 } push;
 
@@ -27,8 +25,6 @@ void main() {
     vec3 total = vec3(0.0);
     vec3 center = vec3(0.0);
     float weight = 0.0;
-    // For how tall the fire is: the spread of the glow along the box's
-    // height.
     float height_sum = 0.0;
     float height_squared = 0.0;
     for (int z = 0; z < samples.z; z++)
@@ -49,8 +45,7 @@ void main() {
     vec3 mean_glow = total / float(samples.x * samples.y * samples.z);
     vec3 where = weight > 1e-6 ? center / weight : vec3(0.5);
     push.lights.data[push.index].position = (box_to_world * vec4(where, 1.0)).xyz;
-    // A tube standing along the box: two standard deviations either side
-    // of the middle hold most of the glow.
+    // Tube along the box, two standard deviations to each side.
     float mean_height = weight > 1e-6 ? height_sum / weight : 0.5;
     float spread = weight > 1e-6 ? sqrt(max(height_squared / weight - mean_height * mean_height, 0.0)) : 0.0;
     push.lights.data[push.index].direction = normalize(box_to_world[1].xyz);

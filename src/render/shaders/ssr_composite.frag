@@ -2,8 +2,8 @@
 #include "common.glsl"
 #include "shading.glsl"
 
-// Adds each surface's mirror reflection to the lit picture: what the
-// screen-space trace found where it is confident, the sky elsewhere.
+// Adds reflections to the lit image: the traced result where confident, the sky
+// elsewhere.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint depth_texture;
@@ -11,10 +11,9 @@ layout(push_constant, scalar) uniform Push {
     uint surface_texture;
     uint traced_texture;
     float max_roughness;
-    // Taps of the blur that widens with roughness; 0 for none.
+    // Roughness blur taps; 0 for none.
     int blur_taps;
-    // 1 when the trace is coarser than the picture and has to be joined
-    // back up.
+    // 1 when the trace is at reduced resolution.
     uint reduced;
 } push;
 
@@ -33,8 +32,6 @@ void main() {
     if (push.reduced == 0u) {
         traced = texelFetch(TEX(push.traced_texture, nearest), pixel, 0);
     } else {
-        // Of the four traced pixels around this one, those at a similar
-        // depth, weighted as bilinear filtering would weight them.
         vec2 traced_size = vec2(textureSize(TEX(push.traced_texture, nearest), 0));
         vec2 at = in_uv * traced_size - 0.5;
         ivec2 base = ivec2(floor(at));
@@ -45,7 +42,6 @@ void main() {
         for (int i = 0; i < 4; i++) {
             ivec2 offset = ivec2(i & 1, i >> 1);
             ivec2 texel = clamp(base + offset, ivec2(0), ivec2(traced_size) - 1);
-            // The full-resolution pixel that traced pixel answered for.
             ivec2 source = min(ivec2((vec2(texel) + 0.5) / traced_size * frame.resolution), ivec2(frame.resolution) - 1);
             float tap_depth = linearDepth(texelFetch(TEX(push.depth_texture, nearest), source, 0).r, frame.near);
             float weight = (offset.x == 1 ? f.x : 1.0 - f.x) * (offset.y == 1 ? f.y : 1.0 - f.y);
@@ -56,16 +52,11 @@ void main() {
         }
         traced = weight_total > 1e-4 ? vec4(total.a > 1e-4 ? total.rgb / total.a : vec3(0.0), total.a / weight_total) : vec4(0.0);
     }
-    // Surfaces past the roughness limit were never traced: there is nothing
-    // to blur, and they are most of a typical scene.
     if (push.blur_taps > 0 && mirror.a > 0.02 && mirror.a < push.max_roughness) {
-        // A rough surface mirrors a cone of directions, not one: average
-        // the neighbours' answers over a disc that grows with roughness.
-        // Only neighbours of similar depth, so edges stay clean.
         float radius = mirror.a * mirror.a * 0.09 * frame.resolution.y;
         float spin = interleavedGradientNoise(gl_FragCoord.xy, frame.frame_index) * 6.2831853;
         float center_depth = linearDepth(depth, frame.near);
-        // Premultiplied by confidence, so misses do not darken the result.
+        // Premultiplied by confidence.
         vec4 total = vec4(traced.rgb * traced.a, traced.a);
         float weight_total = 1.0;
         for (int i = 0; i < push.blur_taps; i++) {

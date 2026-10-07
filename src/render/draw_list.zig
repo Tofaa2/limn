@@ -1,47 +1,30 @@
-//! Immediate-mode drawing: shapes, images and text, on screen and in the
-//! world.
-//!
-//! A `DrawList` is plain CPU data owned by whoever records into it. Recording
-//! takes no locks and touches no renderer state, so each thread can fill its
-//! own list; the lists are handed to `Renderer.render`, which draws them in
-//! order after the scene.
-//!
-//! Screen-space calls take pixels with the origin at the top-left corner.
-//! World-space calls (`*3d`) take world units and are depth-tested against
-//! the scene. Colors are 8-bit sRGB.
+//! Immediate-mode drawing of shapes, images and text. Screen-space calls
+//! take pixels from the top-left; `*3d` calls take world units and are
+//! depth-tested. A `DrawList` is plain CPU data, one per recording thread.
 const std = @import("std");
 const math = @import("../math.zig");
 const font_module = @import("font_baker").font;
 const text_layout = @import("text_layout.zig");
 
-/// A loaded font (`font_baker.font.Font`), re-exported so text calls can
-/// be written against this module alone. The draw list only borrows fonts:
-/// one must outlive every list drawn with it.
+/// Borrowed by the draw list: a font must outlive every list drawn with it.
 pub const Font = font_module.Font;
 
-/// An 8-bit color as it is written in an image editor or in CSS: red,
-/// green and blue are sRGB-encoded (the renderer converts them to linear
-/// light itself) and `a` is opacity, 0 clear to 255 opaque. Four bytes in
-/// r, g, b, a order; stored in each `Vertex` as is.
+/// 8-bit sRGB color with opacity `a`, 0 clear to 255 opaque. Stored in
+/// each `Vertex` as is, in r, g, b, a order.
 pub const Color = extern struct {
     r: u8,
     g: u8,
     b: u8,
     a: u8 = 255,
 
-    /// Opaque white. As an image tint it leaves the image unchanged.
     pub const white: Color = .{ .r = 255, .g = 255, .b = 255 };
-    /// Opaque black.
     pub const black: Color = .{ .r = 0, .g = 0, .b = 0 };
-    /// Fully clear; draws nothing.
     pub const transparent: Color = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
 
-    /// Opaque color from sRGB components, 0..255 each.
     pub fn rgb(r: u8, g: u8, b: u8) Color {
         return .{ .r = r, .g = g, .b = b };
     }
 
-    /// Color from sRGB components and an opacity, 0..255 each.
     pub fn rgba(r: u8, g: u8, b: u8, a: u8) Color {
         return .{ .r = r, .g = g, .b = b, .a = a };
     }
@@ -51,15 +34,13 @@ pub const Color = extern struct {
         return .{ .r = @truncate(value >> 16), .g = @truncate(value >> 8), .b = @truncate(value) };
     }
 
-    /// The same color with its opacity replaced (not multiplied) by
-    /// `alpha`.
+    /// Replaces (does not multiply) the opacity.
     pub fn withAlpha(self: Color, alpha: u8) Color {
         return .{ .r = self.r, .g = self.g, .b = self.b, .a = alpha };
     }
 };
 
-/// A texture usable by draw lists. A plain value: safe to copy and to use
-/// from any thread until the image is destroyed.
+/// A texture usable by draw lists. Valid until the image is destroyed.
 pub const Image = struct {
     /// Index in the renderer's bindless texture table.
     index: u32,
@@ -68,9 +49,7 @@ pub const Image = struct {
     height: u32,
 };
 
-/// An axis-aligned rectangle: `x`, `y` is its top-left corner, with y
-/// growing downward. In pixels of the current transform for screen-space
-/// calls and clips, and in image pixels for `ImageOptions.source`.
+/// Axis-aligned rectangle; `x`, `y` is the top-left corner, y down.
 pub const Rect = struct {
     x: f32,
     y: f32,
@@ -87,15 +66,12 @@ pub const Transform2D = struct {
     tx: f32 = 0,
     ty: f32 = 0,
 
-    /// Leaves points where they are; what a cleared draw list starts with.
     pub const identity: Transform2D = .{};
 
-    /// Moves points by `x`, `y` pixels.
     pub fn translation(x: f32, y: f32) Transform2D {
         return .{ .tx = x, .ty = y };
     }
 
-    /// Scales about the origin by `x` horizontally and `y` vertically.
     pub fn scaling(x: f32, y: f32) Transform2D {
         return .{ .a = x, .d = y };
     }
@@ -119,7 +95,6 @@ pub const Transform2D = struct {
         };
     }
 
-    /// Where the transform puts the point `p`.
     pub fn apply(self: Transform2D, p: [2]f32) [2]f32 {
         return .{ self.a * p[0] + self.c * p[1] + self.tx, self.b * p[0] + self.d * p[1] + self.ty };
     }
@@ -138,37 +113,30 @@ pub const Transform2D = struct {
     }
 };
 
-/// Where each line of text sits relative to the position it is drawn at:
-/// `left` starts there, `center` is centered on it and `right` ends
-/// there. Lines are aligned one by one, each by its own width.
+/// Where each line of text sits relative to its draw position. Lines are
+/// aligned individually.
 pub const Alignment = enum { left, center, right };
 
-/// How `DrawList.text` draws a string. The slices are only read during
-/// the call.
+/// Options for `DrawList.text`. Slices are only read during the call.
 pub const TextOptions = struct {
     /// Pixels per em.
     size: f32 = 16,
     color: Color = .white,
     alignment: Alignment = .left,
-    /// Draws a one-pixel-offset copy underneath, for legibility over scenes.
+    /// Draws a one-pixel-offset copy underneath.
     shadow: ?Color = null,
-    /// Fonts to take glyphs from when the main font lacks them (another
-    /// script, symbols, emoji outlines), tried in order.
+    /// Fonts tried in order for glyphs the main font lacks.
     fallback: []const *const Font = &.{},
-    /// Ligatures, Arabic letter forms and right-to-left runs. Costs nothing
-    /// for text that has none of them.
+    /// Ligatures, Arabic letter forms and right-to-left runs.
     shaping: bool = true,
-    /// The language of the text, as OpenType names it (`"ROM "`,
-    /// `"SRB "`, ...), for letters a font draws differently in it.
+    /// OpenType language tag (`"ROM "`, `"SRB "`, ...).
     language: ?[4]u8 = null,
-    /// Font features to apply besides the usual ligatures and contextual
-    /// forms, by their OpenType names (`"smcp"`, `"salt"`, `"case"`,
-    /// `"dlig"`, ...). The glyphs they bring in must be in the atlas:
-    /// see `Renderer.prepareTextWith`.
+    /// Extra OpenType features (`"smcp"`, `"salt"`, ...). Their glyphs must be
+    /// in the atlas: see `Renderer.prepareTextWith`.
     features: []const [4]u8 = &.{},
 };
 
-/// How `DrawList.text3d` draws a string in the world.
+/// Options for `DrawList.text3d`.
 pub const Text3dOptions = struct {
     /// World units per em.
     size: f32 = 0.25,
@@ -177,14 +145,13 @@ pub const Text3dOptions = struct {
     /// Face the camera, anchored at `position`. When false the text lies in
     /// the XY plane of `transform`, reading along +X with +Y up.
     billboard: bool = true,
-    /// Local-to-world matrix of the text's plane. Used only when
-    /// `billboard` is false.
+    /// Local-to-world matrix; used only when `billboard` is false.
     transform: math.Mat4 = math.identity,
-    /// Fonts to take a glyph from when the main one lacks it, in order.
+    /// Fonts tried in order for glyphs the main font lacks.
     fallback: []const *const Font = &.{},
 };
 
-/// Shared with `shaders/draw.vert`.
+/// Layout shared with `shaders/draw.vert`.
 pub const Vertex = extern struct {
     position: [3]f32,
     /// Camera-facing offset in world units (billboards), else zero.
@@ -203,7 +170,7 @@ const Mode = enum(u32) {
     circle = 3,
     /// uv spans [-1, 1]; antialiased box edges.
     smooth = 4,
-    /// A world-space segment expanded to a pixel width in the vertex shader.
+    /// World-space segment expanded to a pixel width in the vertex shader.
     line3d = 5,
     image_nearest = 6,
     /// uv is the pixel offset from the center, `offset` half the size;
@@ -220,36 +187,29 @@ fn cross2(a: [2]f32, b: [2]f32, c: [2]f32) f32 {
     return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
 }
 
-/// An outline built from lines and curves, for `DrawList.fillPath` and
-/// `strokePath`. Curves are flattened into short segments as they are
-/// added; `tolerance` is how far, in the path's own units, a segment may
-/// stray from the true curve.
+/// An outline of lines and curves for `DrawList.fillPath` and `strokePath`.
+/// Curves are flattened as they are added.
 pub const Path = struct {
     gpa: std.mem.Allocator,
-    /// The flattened outline so far, in order.
+    /// The flattened outline, in order.
     points: std.ArrayList([2]f32) = .empty,
-    /// Set by `close`: a stroke joins the last point back to the first.
+    /// A stroke joins the last point back to the first.
     closed: bool = false,
     /// Largest distance a flattened curve may stray from the true one, in
-    /// the path's units. Set it before adding curves; smaller is smoother
-    /// and costs more points.
+    /// the path's units. Set before adding curves.
     tolerance: f32 = 0.25,
 
-    /// An empty path. Nothing is allocated until points are added; `gpa`
-    /// is kept for the point list.
     pub fn init(gpa: std.mem.Allocator) Path {
         return .{ .gpa = gpa };
     }
 
-    /// Frees the points. Draw lists copy what they need when the path is
-    /// filled or stroked, so it may be freed right after.
+    /// Draw lists copy what they need, so a path may be freed right after use.
     pub fn deinit(self: *Path) void {
         self.points.deinit(self.gpa);
         self.* = undefined;
     }
 
-    /// Removes every point and reopens the path, keeping its memory and
-    /// `tolerance` for the next outline.
+    /// Removes every point and reopens the path, keeping memory and `tolerance`.
     pub fn clear(self: *Path) void {
         self.points.clearRetainingCapacity();
         self.closed = false;
@@ -261,15 +221,12 @@ pub const Path = struct {
         try self.points.append(self.gpa, p);
     }
 
-    /// Straight line from the current end of the outline to `p`.
     pub fn lineTo(self: *Path, p: [2]f32) !void {
         try self.points.append(self.gpa, p);
     }
 
-    /// Quadratic curve to `end`, pulled toward `control`.
     pub fn quadTo(self: *Path, control: [2]f32, end: [2]f32) !void {
         const start = self.points.items[self.points.items.len - 1];
-        // Raise to a cubic with the same shape.
         try self.cubicTo(
             .{ start[0] + (control[0] - start[0]) * 2 / 3, start[1] + (control[1] - start[1]) * 2 / 3 },
             .{ end[0] + (control[0] - end[0]) * 2 / 3, end[1] + (control[1] - end[1]) * 2 / 3 },
@@ -277,11 +234,8 @@ pub const Path = struct {
         );
     }
 
-    /// Cubic Bezier curve to `end` with two control points.
     pub fn cubicTo(self: *Path, control_a: [2]f32, control_b: [2]f32, end: [2]f32) !void {
         const start = self.points.items[self.points.items.len - 1];
-        // Enough segments that none strays further than the tolerance,
-        // estimated from how far the control points are from the chord.
         const deviation = @max(
             @abs(cross2(start, end, control_a)),
             @abs(cross2(start, end, control_b)),
@@ -296,8 +250,8 @@ pub const Path = struct {
         }
     }
 
-    /// Arc of a circle around `center`, from `start_angle` to `end_angle`
-    /// in radians (clockwise on screen), joined to the outline by a line.
+    /// Arc around `center` from `start_angle` to `end_angle` in radians
+    /// (clockwise on screen), joined to the outline by a line.
     pub fn arc(self: *Path, center: [2]f32, radius: f32, start_angle: f32, end_angle: f32) !void {
         const sweep = end_angle - start_angle;
         const step = 2 * std.math.acos(1 - @min(self.tolerance / @max(radius, 1e-3), 1));
@@ -314,15 +268,13 @@ pub const Path = struct {
     }
 };
 
-/// A grid of equally sized frames in one image, for animated sprites and
-/// tile sets.
+/// A grid of equally sized frames in one image.
 pub const SpriteSheet = struct {
     image: Image,
     columns: u32,
     rows: u32,
 
-    /// Source rectangle of frame `index`, counting left to right, top to
-    /// bottom. Pass it as `ImageOptions.source`.
+    /// Source rectangle of frame `index`, counted left to right, top to bottom.
     pub fn frame(self: SpriteSheet, index: u32) Rect {
         const width = @as(f32, @floatFromInt(self.image.width)) / @as(f32, @floatFromInt(self.columns));
         const height = @as(f32, @floatFromInt(self.image.height)) / @as(f32, @floatFromInt(self.rows));
@@ -335,9 +287,8 @@ pub const SpriteSheet = struct {
         };
     }
 };
-/// The substitutions of fonts (see `Font.substitution`) for the scripts,
-/// languages and features text has been drawn with, worked out once and
-/// kept by a draw list for as long as it lives.
+/// Per-list cache of font substitutions (see `Font.substitution`) by
+/// script, language and features.
 const SubstitutionCache = struct {
     const Entry = struct {
         font: u64,
@@ -347,8 +298,7 @@ const SubstitutionCache = struct {
         /// Null when the font has nothing for these.
         with: ?font_module.Substitution,
     };
-    /// More than this many and the oldest go: fonts come and go, and a
-    /// program may draw with any number of feature sets.
+    /// Entries kept; the oldest are evicted beyond this.
     const limit = 32;
 
     entries: std.ArrayList(Entry) = .empty,
@@ -383,15 +333,13 @@ fn isMarkName(codepoint: u21) bool {
     return codepoint >= font_module.glyph_codepoints_rtl_mark and codepoint < font_module.glyph_codepoints_rtl_mark + 0x10000;
 }
 
-/// A font and the ones that stand in for what it lacks.
+/// A font and its fallbacks.
 const FontSet = struct {
     primary: *const Font,
     fallback: []const *const Font,
     /// See `TextOptions.language` and `TextOptions.features`.
     language: ?[4]u8 = null,
     features: []const [4]u8 = &.{},
-    /// Where substitutions worked out for a font are kept, when there is
-    /// such a place.
     cache: ?*SubstitutionCache = null,
 
     fn pick(self: FontSet, codepoint: u21) *const Font {
@@ -400,9 +348,8 @@ const FontSet = struct {
         return self.primary;
     }
 
-    /// Each font's own substitutions, run by run: a run is what one font
-    /// draws of one script, with what has no script of its own going
-    /// along.
+    /// Applies each font's substitutions run by run; a run is what one font
+    /// draws of one script.
     fn substitute(context: *const anyopaque, gpa: std.mem.Allocator, line: []const u21, out: *std.ArrayList(u21)) anyerror!void {
         const self: *const FontSet = @ptrCast(@alignCast(context));
         var start: usize = 0;
@@ -423,9 +370,6 @@ const FontSet = struct {
             start = end;
             const tag = script orelse "DFLT".*;
             const shaping = font_module.Shaping{ .script = tag, .language = self.language, .features = self.features };
-            // Where the font has nothing for a script (or a glyph is not
-            // baked), the run stays as typed; Arabic is then joined
-            // through its presentation forms further on.
             const done = if (self.cache) |cache|
                 if (try cache.get(gpa, font, shaping)) |with| try font.substituteWith(gpa, run, with, out) else false
             else
@@ -450,21 +394,16 @@ const FontSet = struct {
     }
 };
 
-/// The geometry recorded for one space of a draw list (screen or world):
-/// an indexed triangle list in draw order, which the renderer uploads and
-/// draws as is. Owned by its `DrawList`.
+/// Geometry for one space of a draw list (screen or world): an indexed
+/// triangle list in draw order. Owned by its `DrawList`.
 pub const Batch = struct {
     vertices: std.ArrayList(Vertex) = .empty,
-    /// Three per triangle, each an index into `vertices`.
     indices: std.ArrayList(u32) = .empty,
-    /// Where the clip rectangle changes, in index order. Empty means the
-    /// whole batch is unclipped.
+    /// Clip changes in index order. Empty means the batch is unclipped.
     clips: std.ArrayList(ClipRange) = .empty,
 
-    /// A clip rectangle and where it takes effect: indices from
-    /// `first_index` up to the next range's (or the end of the batch) are
-    /// drawn clipped to `rect`, in untransformed screen pixels; null is
-    /// unclipped.
+    /// Indices from `first_index` to the next range are clipped to `rect`, in
+    /// untransformed screen pixels; null is unclipped.
     pub const ClipRange = struct { first_index: u32, rect: ?Rect };
 
     fn quad(self: *Batch, gpa: std.mem.Allocator, corners: [4]Vertex) !void {
@@ -474,48 +413,34 @@ pub const Batch = struct {
     }
 };
 
-/// One frame's worth of 2D and world-space drawing, recorded on the CPU
-/// and handed to `Renderer.render`. Things are drawn in the order they
-/// were recorded, later over earlier. Typical use: `clear` at the start of
-/// a frame, record, render, and keep the list for the next frame.
-///
-/// A list is not thread safe, but separate lists share nothing, so each
-/// thread can record into its own. Drawing calls return an error when an
-/// allocation fails; what was recorded before stays valid.
+/// One frame of 2D and world-space drawing, handed to `Renderer.render`
+/// and drawn in recording order. Not thread safe; use one list per thread.
+/// A failed drawing call leaves what was recorded before valid.
 pub const DrawList = struct {
     gpa: std.mem.Allocator,
     /// Screen-space geometry, in pixels from the top-left corner.
     screen: Batch = .{},
-    /// World-space geometry from the `*3d` calls, depth-tested against
-    /// the scene.
+    /// World-space geometry from the `*3d` calls, depth-tested.
     world: Batch = .{},
-    /// The current 2D transform, applied to screen-space calls as they
-    /// are recorded. Change it with `pushTransform` and `popTransform`.
+    /// Current 2D transform, applied to screen-space calls as recorded.
     transform: Transform2D = .identity,
     /// Soften the edges of filled polygons, convex shapes and triangles
-    /// over one pixel, as lines and circles are. Off draws them with the
-    /// hard edges of plain triangles (and without the extra vertices).
+    /// over one pixel, at the cost of extra vertices.
     antialias_fills: bool = true,
     transform_stack: [16]Transform2D = undefined,
     transform_depth: u8 = 0,
-    /// The current clip rectangle in screen pixels, or null for none.
-    /// Change it with `pushClip` and `popClip`.
+    /// Current clip rectangle in screen pixels, or null for none.
     clip: ?Rect = null,
     clip_stack: [16]?Rect = undefined,
     clip_depth: u8 = 0,
     glyph_scratch: std.ArrayList(u21) = .empty,
-    /// The fonts' substitutions for what text has been drawn with.
     substitutions: SubstitutionCache = .{},
 
-    /// An empty list. Nothing is allocated until something is drawn;
-    /// `gpa` is kept and used for all of the list's memory.
     pub fn init(gpa: std.mem.Allocator) DrawList {
         return .{ .gpa = gpa };
     }
 
-    /// Frees everything the list holds. It must not be in use by a
-    /// `Renderer.render` call. Fonts and images it drew with are not
-    /// touched.
+    /// The list must not be in use by a `Renderer.render` call.
     pub fn deinit(self: *DrawList) void {
         self.screen.vertices.deinit(self.gpa);
         self.screen.indices.deinit(self.gpa);
@@ -527,7 +452,7 @@ pub const DrawList = struct {
         self.* = undefined;
     }
 
-    /// Empties the list, keeping its memory for the next frame.
+    /// Empties the list, keeping its memory.
     pub fn clear(self: *DrawList) void {
         self.screen.vertices.clearRetainingCapacity();
         self.screen.indices.clearRetainingCapacity();
@@ -540,17 +465,14 @@ pub const DrawList = struct {
         self.transform_depth = 0;
     }
 
-    /// Whether nothing has been recorded since the last `clear`, on
-    /// screen or in the world.
     pub fn isEmpty(self: *const DrawList) bool {
         return self.screen.indices.items.len == 0 and self.world.indices.items.len == 0;
     }
 
     // ---------------------------------------------------------- transforms
 
-    /// Composes `transform` onto the current 2D transform until the
-    /// matching `popTransform`. Affects screen-space calls only. Pushes
-    /// nest up to 16 deep.
+    /// Composes `transform` onto the current 2D transform until the matching
+    /// `popTransform`. Screen-space only. Nests up to 16 deep.
     pub fn pushTransform(self: *DrawList, transform: Transform2D) void {
         std.debug.assert(self.transform_depth < self.transform_stack.len);
         self.transform_stack[self.transform_depth] = self.transform;
@@ -558,9 +480,6 @@ pub const DrawList = struct {
         self.transform = self.transform.mul(transform);
     }
 
-    /// Restores the transform that was current before the matching
-    /// `pushTransform`. What was already drawn keeps the transform it was
-    /// drawn with.
     pub fn popTransform(self: *DrawList) void {
         std.debug.assert(self.transform_depth > 0);
         self.transform_depth -= 1;
@@ -571,8 +490,7 @@ pub const DrawList = struct {
 
     /// Restricts screen-space drawing to `r` (in the current transform's
     /// coordinates) until the matching `popClip`. Nested clips intersect.
-    /// The clip is an axis-aligned rectangle on screen: under a rotation it
-    /// is the bounding box of `r`. Pushes nest up to 16 deep.
+    /// Under a rotation the clip is the bounding box of `r`. Nests 16 deep.
     pub fn pushClip(self: *DrawList, r: Rect) !void {
         std.debug.assert(self.clip_depth < self.clip_stack.len);
         var low = [2]f32{ std.math.inf(f32), std.math.inf(f32) };
@@ -593,9 +511,6 @@ pub const DrawList = struct {
         try self.setClip(.{ .x = low[0], .y = low[1], .width = @max(high[0] - low[0], 0), .height = @max(high[1] - low[1], 0) });
     }
 
-    /// Restores the clip that was current before the matching `pushClip`
-    /// (none, for the outermost). Can fail only by running out of memory
-    /// while recording the change.
     pub fn popClip(self: *DrawList) !void {
         std.debug.assert(self.clip_depth > 0);
         self.clip_depth -= 1;
@@ -615,8 +530,7 @@ pub const DrawList = struct {
 
     // -------------------------------------------------------------- shapes
 
-    /// A rectangle with a different color at each corner (top-left,
-    /// top-right, bottom-right, bottom-left), blended across it.
+    /// Corner colors in order top-left, top-right, bottom-right, bottom-left.
     pub fn rectGradient(self: *DrawList, r: Rect, colors: [4]Color) !void {
         const mode = pack(.solid, 0);
         try self.screen.quad(self.gpa, .{
@@ -627,23 +541,20 @@ pub const DrawList = struct {
         });
     }
 
-    /// Top-to-bottom gradient.
     pub fn rectGradientVertical(self: *DrawList, r: Rect, top: Color, bottom: Color) !void {
         try self.rectGradient(r, .{ top, top, bottom, bottom });
     }
 
-    /// Left-to-right gradient.
     pub fn rectGradientHorizontal(self: *DrawList, r: Rect, left: Color, right: Color) !void {
         try self.rectGradient(r, .{ left, right, right, left });
     }
 
-    /// How `roundedRect` draws its rectangle.
     pub const RoundedOptions = struct {
         /// Corner radius in pixels.
         radius: f32 = 8,
-        /// Draw only an outline this thick, inside the rectangle; 0 fills.
+        /// Outline thickness in pixels, inside the rectangle; 0 fills.
         stroke: f32 = 0,
-        /// Optional top-to-bottom gradient end color.
+        /// End color of a top-to-bottom gradient.
         bottom_color: ?Color = null,
     };
 
@@ -651,7 +562,7 @@ pub const DrawList = struct {
     pub fn roundedRect(self: *DrawList, r: Rect, color: Color, options: RoundedOptions) !void {
         const half = [2]f32{ r.width * 0.5, r.height * 0.5 };
         const radius = std.math.clamp(options.radius, 0, @min(half[0], half[1]));
-        // Radius and stroke ride in the texture bits, in quarter pixels.
+        // Radius and stroke are packed into the texture bits, in quarter pixels.
         const packed_radius: u32 = @intFromFloat(@min(radius * 4, 4095));
         const packed_stroke: u32 = @intFromFloat(std.math.clamp(options.stroke * 4, 0, 4095));
         const mode = pack(.rounded, packed_radius | packed_stroke << 12);
@@ -661,15 +572,13 @@ pub const DrawList = struct {
         var vertices: [4]Vertex = undefined;
         for (corners, &vertices, 0..) |corner, *vertex, index| {
             vertex.* = self.screenVertex(.{ r.x + half[0] + corner[0], r.y + half[1] + corner[1] }, corner, if (index < 2) color else bottom, mode);
-            // Half the size, for the distance computation in the shader.
             vertex.offset = half;
         }
         try self.screen.quad(self.gpa, vertices);
     }
 
-    /// Emits a filled outline with soft edges: the fill is drawn half a
-    /// pixel inside the outline and a strip that fades to nothing half a
-    /// pixel outside it. Returns the index of the first fill vertex; the
+    /// Emits fill vertices half a pixel inside the outline and a fading fringe
+    /// half a pixel outside. Returns the index of the first fill vertex; the
     /// caller adds the fill's triangles over vertices `base + i`.
     fn outlineVertices(self: *DrawList, points: []const [2]f32, color: Color) !u32 {
         const base: u32 = @intCast(self.screen.vertices.items.len);
@@ -683,7 +592,6 @@ pub const DrawList = struct {
             const q = points[(index + 1) % points.len];
             area += p[0] * q[1] - q[0] * p[1];
         }
-        // Which way is out depends on the order the outline was given in.
         const outward: f32 = if (area >= 0) 1 else -1;
         const half_pixel = 0.5 / @max(self.transform.scale(), 1e-6);
         const count: u32 = @intCast(points.len);
@@ -693,15 +601,12 @@ pub const DrawList = struct {
         for (points, 0..) |p, index| {
             const before = points[(index + points.len - 1) % points.len];
             const after = points[(index + 1) % points.len];
-            // The corner's outward direction: between the normals of the
-            // two edges that meet here, longer the sharper the corner.
             const n0 = edgeNormal(before, p, outward);
             const n1 = edgeNormal(p, after, outward);
             var miter = [2]f32{ n0[0] + n1[0], n0[1] + n1[1] };
             const length_squared = miter[0] * miter[0] + miter[1] * miter[1];
             if (length_squared > 1e-6) {
-                // 2 / |n0 + n1|^2 keeps both edges half a pixel away; capped
-                // so a needle-sharp corner does not shoot off.
+                // Capped so a needle-sharp corner does not shoot off.
                 const scale = @min(2 / length_squared, 4.0);
                 miter = .{ miter[0] * scale, miter[1] * scale };
             } else miter = n0;
@@ -735,8 +640,7 @@ pub const DrawList = struct {
         }
     }
 
-    /// Fills any simple polygon (one that does not cross itself), convex
-    /// or not, by cutting off one corner triangle at a time.
+    /// Fills any simple (non-self-intersecting) polygon by ear clipping.
     pub fn fillPolygon(self: *DrawList, points: []const [2]f32, color: Color) !void {
         if (points.len < 3) return;
         const base = try self.outlineVertices(points, color);
@@ -761,9 +665,7 @@ pub const DrawList = struct {
                 const a = points[ia];
                 const b = points[ib];
                 const c = points[ic];
-                // A corner that bends the same way as the whole outline...
                 if (cross2(a, b, c) * winding <= 0) continue;
-                // ...and has no other point inside it is an ear.
                 var blocked = false;
                 for (remaining.items) |other| {
                     if (other == ia or other == ib or other == ic) continue;
@@ -791,32 +693,28 @@ pub const DrawList = struct {
         if (points.len < 2) return;
         const segments = if (closed) points.len else points.len - 1;
         for (0..segments) |index| try self.line(points[index], points[(index + 1) % points.len], thickness, color);
-        // Discs at the corners fill the wedges between segments. They only
-        // look right for opaque colors; translucent strokes show overlap.
+        // Joint discs overlap the segments, which shows in translucent strokes.
         if (thickness > 1.5) for (points) |p| try self.circle(p, thickness * 0.5, color);
     }
 
-    /// Fills the outline a `Path` describes (see `fillPolygon`).
+    /// Fills a path's outline (see `fillPolygon`).
     pub fn fillPath(self: *DrawList, path: *const Path, color: Color) !void {
         try self.fillPolygon(path.points.items, color);
     }
 
-    /// Strokes the outline a `Path` describes.
     pub fn strokePath(self: *DrawList, path: *const Path, thickness: f32, color: Color) !void {
         try self.polyline(path.points.items, thickness, color, path.closed);
     }
 
     // ------------------------------------------------------------- sprites
 
-    /// Draws an image whose border stays its own size while the middle
-    /// stretches: panels, buttons and speech bubbles from one small image.
-    /// `border` is left, top, right, bottom in image pixels; `scale`
-    /// enlarges the border on screen.
+    /// Draws an image whose border keeps its size while the middle stretches.
+    /// `border` is left, top, right, bottom in image pixels; `scale` enlarges
+    /// the border on screen.
     pub fn nineSlice(self: *DrawList, img: Image, destination: Rect, border: [4]f32, scale: f32, options: ImageOptions) !void {
         const source = options.source orelse Rect{ .x = 0, .y = 0, .width = @floatFromInt(img.width), .height = @floatFromInt(img.height) };
         const source_x = [4]f32{ source.x, source.x + border[0], source.x + source.width - border[2], source.x + source.width };
         const source_y = [4]f32{ source.y, source.y + border[1], source.y + source.height - border[3], source.y + source.height };
-        // If the destination is smaller than the two borders, they shrink.
         const fit_x = @min(1, destination.width / @max((border[0] + border[2]) * scale, 1e-6));
         const fit_y = @min(1, destination.height / @max((border[1] + border[3]) * scale, 1e-6));
         const target_x = [4]f32{ destination.x, destination.x + border[0] * scale * fit_x, destination.x + destination.width - border[2] * scale * fit_x, destination.x + destination.width };
@@ -847,15 +745,13 @@ pub const DrawList = struct {
         });
     }
 
-    /// Filled rectangle in one color. Its edges are not antialiased, so
-    /// under a rotation they show steps.
+    /// Filled rectangle. Edges are not antialiased.
     pub fn rect(self: *DrawList, r: Rect, color: Color) !void {
         try self.screenQuad(r, .{ 0, 0, 0, 0 }, color, pack(.solid, 0));
     }
 
-    /// Border of `r`, `thickness` pixels wide and lying wholly inside it,
-    /// drawn as four rectangles that do not overlap (so translucent
-    /// colors stay even at the corners).
+    /// Border of `r`, `thickness` pixels wide, lying inside it. The four
+    /// sides do not overlap.
     pub fn rectOutline(self: *DrawList, r: Rect, thickness: f32, color: Color) !void {
         try self.rect(.{ .x = r.x, .y = r.y, .width = r.width, .height = thickness }, color);
         try self.rect(.{ .x = r.x, .y = r.y + r.height - thickness, .width = r.width, .height = thickness }, color);
@@ -863,7 +759,6 @@ pub const DrawList = struct {
         try self.rect(.{ .x = r.x + r.width - thickness, .y = r.y + thickness, .width = thickness, .height = r.height - 2 * thickness }, color);
     }
 
-    /// Filled triangle.
     pub fn triangle(self: *DrawList, a: [2]f32, b: [2]f32, c: [2]f32, color: Color) !void {
         const base = try self.outlineVertices(&.{ a, b, c }, color);
         try self.screen.indices.appendSlice(self.gpa, &.{ base, base + 1, base + 2 });
@@ -875,7 +770,6 @@ pub const DrawList = struct {
         const dy = b[1] - a[1];
         const length = @sqrt(dx * dx + dy * dy);
         if (length < 1e-6) return;
-        // Half a pixel of padding gives the edge falloff room.
         const half = thickness * 0.5 + 0.5 / @max(self.transform.scale(), 1e-6);
         const nx = -dy / length * half;
         const ny = dx / length * half;
@@ -898,13 +792,13 @@ pub const DrawList = struct {
         );
     }
 
-    /// How `image` and `nineSlice` draw their image.
+    /// Options for `image` and `nineSlice`.
     pub const ImageOptions = struct {
-        /// Sub-rectangle of the image in pixels; the whole image by default.
+        /// Sub-rectangle of the image in pixels; null is the whole image.
         source: ?Rect = null,
-        /// Multiplies the image's color and opacity; white leaves it as is.
+        /// Multiplies the image's color and opacity.
         tint: Color = .white,
-        /// Nearest-neighbour sampling, for pixel art.
+        /// Nearest-neighbour sampling.
         pixelated: bool = false,
     };
 
@@ -960,28 +854,22 @@ pub const DrawList = struct {
         var width: f32 = 0;
         var previous: ?u21 = null;
         var mark_below: ?u21 = null;
-        // The part of a ligature the next mark belongs to, when shaping
-        // said which.
         var component: u8 = 0;
         for (glyphs) |codepoint| {
-            // A change of spacing worked out while the run was shaped.
             if (font_module.spacingOf(codepoint)) |ems| {
                 width += ems;
                 continue;
             }
             if (font_module.componentOf(codepoint)) |part| {
-                // Marks on different parts do not stack on each other.
                 if (part != component) mark_below = null;
                 component = part;
                 continue;
             }
             const source = fonts.pick(codepoint);
-            // A mark set on the letter before it takes no room.
             if (previous) |base| if (source.markPlacement(base, component, mark_below, .{ 0, 0 }, codepoint) != null) {
                 mark_below = codepoint;
                 continue;
             };
-            // A mark the font does not place takes no room either.
             if (isMarkName(codepoint)) continue;
             mark_below = null;
             if (previous) |left| {
@@ -995,19 +883,11 @@ pub const DrawList = struct {
         return width * size;
     }
 
-    /// Draws text in columns, as Chinese, Japanese and Korean are set
-    /// when written downward: each character upright and centered in its
-    /// column, columns running from right to left at each line break.
-    /// `position` is the top of the first column, at its middle. A font
-    /// made for it is used as it means to be: its forms for text set
-    /// downward (brackets and long marks turned, small letters and
-    /// punctuation moved; the `vert` feature, once those glyphs are baked
-    /// with `Renderer.prepareTextWith` and that feature) and its own
-    /// advances down the column. With a font that has neither, every
-    /// character takes a square one `size` tall. Letters of scripts
-    /// written across are stacked the same way rather than turned on
-    /// their side. Of `options`, `size`, `color`, `shadow`, `fallback` and
-    /// `language` are used.
+    /// Draws text in upright columns running right to left, as for vertical
+    /// CJK. `position` is the top middle of the first column. Uses the font's
+    /// `vert` forms (once baked with `Renderer.prepareTextWith`) and vertical
+    /// advances when present; otherwise each character takes a `size` square.
+    /// Of `options`, `size`, `color`, `shadow`, `fallback`, `language` apply.
     pub fn textVertical(self: *DrawList, font: *const Font, string: []const u8, position: [2]f32, options: TextOptions) !void {
         if (options.shadow) |shadow| {
             var shadowed = options;
@@ -1023,26 +903,17 @@ pub const DrawList = struct {
         while (lines.next()) |line_text| : (column -= font.line_height * size) {
             const glyphs = try self.lineGlyphs(fonts, line_text, true);
             var top = position[1];
-            // Where the last full-size character was set, for marks on it.
             var base_top = top;
             var base_height = size;
             for (glyphs) |codepoint| {
-                // Spacing and ligature parts worked out for text set across
-                // mean nothing down a column.
                 if (font_module.spacingOf(codepoint) != null or font_module.componentOf(codepoint) != null) continue;
                 const source = fonts.pick(codepoint);
                 const baked = source.baked();
                 const glyph = baked.glyph(codepoint);
-                // A combining mark stays on the character above it.
                 const mark = (codepoint >= 0x300 and codepoint <= 0x36f) or (codepoint >= 0x3099 and codepoint <= 0x309a);
-                // The font's own advance down the column, or a square; a
-                // space in a font without such advances takes half of one,
-                // as it does between words set across.
                 const height = if (glyph.advance_down > 0) glyph.advance_down * size else if (codepoint == ' ') size * 0.5 else size;
                 const cell_top = if (mark) base_top else top;
                 const cell_height = if (mark) base_height else height;
-                // Upright and centered: the character keeps its own shape, and
-                // its advance across becomes the room it is centered in.
                 const left = column - glyph.advance * 0.5 * size;
                 const baseline = cell_top + (cell_height - size) * 0.5 + source.ascent * size / (source.ascent + source.descent);
                 if (glyph.plane[2] > glyph.plane[0]) try self.screenQuad(.{
@@ -1064,39 +935,28 @@ pub const DrawList = struct {
     fn emitGlyphs(self: *DrawList, fonts: FontSet, glyphs: []const u21, pen_start: [2]f32, size: f32, color: Color) !f32 {
         var pen = pen_start[0];
         var previous: ?u21 = null;
-        // Where the letter before was set, for marks that sit on it.
         var base_pen = pen;
-        // The mark last set on that letter and where, for marks that stack.
         var mark_below: ?u21 = null;
-        // The part of a ligature the next mark belongs to, when shaping
-        // said which.
         var component: u8 = 0;
         var mark_at: [2]f32 = .{ 0, 0 };
-        // How far above the baseline the letters stand, in ems: in a
-        // cursive script each letter hangs on the one after it.
+        // Height of the letters above the baseline, in ems (cursive scripts).
         var rise: f32 = 0;
         for (glyphs) |codepoint| {
-            // Each glyph comes from the first font that has it, so a line
-            // can mix scripts no single font covers.
             if (font_module.spacingOf(codepoint)) |ems| {
-                // A change of spacing worked out while the run was shaped.
                 pen += ems * size;
                 continue;
             }
             if (font_module.componentOf(codepoint)) |part| {
-                // Marks on different parts do not stack on each other.
                 if (part != component) mark_below = null;
                 component = part;
                 continue;
             }
             const source = fonts.pick(codepoint);
-            // One bake for both the glyph and the atlas it points into.
             const baked = source.baked();
             const glyph = baked.glyph(codepoint);
             if (previous) |base| if (source.markPlacement(base, component, mark_below, mark_at, codepoint)) |offset| {
                 mark_below = codepoint;
                 mark_at = offset;
-                // A combining mark: on its letter, where the font says.
                 if (glyph.plane[2] > glyph.plane[0]) try self.screenQuad(.{
                     .x = base_pen + (offset[0] + glyph.plane[0]) * size,
                     .y = pen_start[1] - (offset[1] + rise + glyph.plane[3]) * size,
@@ -1106,7 +966,6 @@ pub const DrawList = struct {
                 continue;
             };
             if (isMarkName(codepoint)) {
-                // A mark the font does not place: where the pen is.
                 if (glyph.plane[2] > glyph.plane[0]) try self.screenQuad(.{
                     .x = pen + glyph.plane[0] * size,
                     .y = pen_start[1] - (rise + glyph.plane[3]) * size,
@@ -1144,17 +1003,15 @@ pub const DrawList = struct {
     pub const TextRun = struct {
         /// UTF-8; only read during the `richText` call.
         text: []const u8,
-        /// Null for each of these takes the one in `RichTextOptions`.
+        /// Null for `font`, `size` or `color` takes the one in `RichTextOptions`.
         font: ?*const Font = null,
         /// Pixels per em.
         size: ?f32 = null,
         color: ?Color = null,
     };
 
-    /// How `richText` lays out its runs, and what runs that leave their
-    /// font, size or color unset are drawn with.
+    /// Layout and per-run defaults for `richText`.
     pub const RichTextOptions = struct {
-        /// Used by runs that do not set their own.
         font: *const Font,
         /// Pixels per em.
         size: f32 = 16,
@@ -1164,14 +1021,13 @@ pub const DrawList = struct {
         alignment: Alignment = .left,
         /// Multiplies the distance between lines.
         line_spacing: f32 = 1,
-        /// Fonts to take a glyph from when a run's font lacks it, in order.
+        /// Fonts tried in order for glyphs a run's font lacks.
         fallback: []const *const Font = &.{},
     };
 
-    /// Draws several runs of text as one flowing paragraph: mixed fonts,
-    /// sizes and colors share a baseline on each line, words wrap at
-    /// `max_width`, and `\n` in any run starts a new line. Returns the size
-    /// of the block drawn.
+    /// Draws runs of mixed fonts, sizes and colors as one paragraph on shared
+    /// baselines, wrapping at `max_width`; `\n` starts a new line. Returns
+    /// the size of the block drawn.
     pub fn richText(self: *DrawList, runs: []const TextRun, position: [2]f32, options: RichTextOptions) ![2]f32 {
         const Word = struct { run: usize, text: []const u8, width: f32, space: f32, line_break: bool };
         var words: std.ArrayList(Word) = .empty;
@@ -1201,7 +1057,6 @@ pub const DrawList = struct {
         var y = position[1];
         var first: usize = 0;
         while (first < words.items.len) {
-            // Take words until the line is full or a break is asked for.
             var width: f32 = 0;
             var ascent: f32 = 0;
             var descent: f32 = 0;
@@ -1256,8 +1111,7 @@ pub const DrawList = struct {
         });
     }
 
-    /// Line between two world points with a constant on-screen `thickness`
-    /// in pixels.
+    /// Line between two world points, `thickness` pixels wide on screen.
     pub fn line3d(self: *DrawList, a: math.Vec3, b: math.Vec3, thickness: f32, color: Color) !void {
         const mode = pack(.line3d, 0);
         // Each vertex carries the far endpoint in `offset`+`uv.x` and its
@@ -1305,11 +1159,9 @@ pub const DrawList = struct {
         for (string) |byte| {
             if (byte == '\n') line_count += 1;
         }
-        // Center the block vertically around the anchor.
         var baseline = (line_count * font.line_height * 0.5 - font.ascent) * size;
         var lines = std.mem.splitScalar(u8, string, '\n');
         while (lines.next()) |line_text| : (baseline -= font.line_height * size) {
-            // Shaped like 2D text: ligatures, joined forms, right-to-left.
             const fonts = FontSet{ .primary = font, .fallback = options.fallback, .cache = &self.substitutions };
             const glyphs = try self.lineGlyphs(fonts, line_text, true);
             var pen = -switch (options.alignment) {
@@ -1321,12 +1173,9 @@ pub const DrawList = struct {
             var glyph_index: usize = 0;
             var base_pen = pen;
             var mark_below: ?u21 = null;
-            // The part of a ligature the next mark belongs to, when shaping
-            // said which.
             var component: u8 = 0;
             var mark_at: [2]f32 = .{ 0, 0 };
             var rise: f32 = 0;
-            // Appending vertices never touches the glyph list.
             while (glyph_index < glyphs.len) : (glyph_index += 1) {
                 const codepoint = glyphs[glyph_index];
                 if (font_module.spacingOf(codepoint)) |ems| {
@@ -1334,18 +1183,14 @@ pub const DrawList = struct {
                     continue;
                 }
                 if (font_module.componentOf(codepoint)) |part| {
-                    // Marks on different parts do not stack on each other.
                     if (part != component) mark_below = null;
                     component = part;
                     continue;
                 }
-                // As in 2D, each glyph comes from the first font that has it.
                 const source = fonts.pick(codepoint);
                 const baked = source.baked();
                 const mode = pack(.text, baked.texture_index);
                 const glyph = baked.glyph(codepoint);
-                // A combining mark is set on the letter before it and
-                // takes no room; the pen is put back after it is drawn.
                 const anchored: ?[2]f32 = if (previous) |base| source.markPlacement(base, component, mark_below, mark_at, codepoint) else null;
                 const pen_after = pen;
                 var raise: f32 = 0;
@@ -1454,8 +1299,6 @@ test "filled shapes get a fringe that fades out around them" {
     defer list.deinit();
     const square = [_][2]f32{ .{ 10, 10 }, .{ 30, 10 }, .{ 30, 30 }, .{ 10, 30 } };
     try list.fillConvex(&square, Color.rgb(255, 0, 0));
-    // Four fill vertices half a pixel inside, four clear ones half a pixel
-    // outside; two fill triangles and two per edge of fringe.
     try std.testing.expectEqual(@as(usize, 8), list.screen.vertices.items.len);
     try std.testing.expectEqual(@as(usize, 6 + 4 * 6), list.screen.indices.items.len);
     const inner = list.screen.vertices.items[0];
@@ -1464,12 +1307,10 @@ test "filled shapes get a fringe that fades out around them" {
     try std.testing.expectApproxEqAbs(@as(f32, 9.5), outer.position[0], 1e-4);
     try std.testing.expectEqual(@as(u8, 255), inner.color.a);
     try std.testing.expectEqual(@as(u8, 0), outer.color.a);
-    // The other way round the outline, out is still out.
     list.clear();
     const reversed = [_][2]f32{ .{ 10, 30 }, .{ 30, 30 }, .{ 30, 10 }, .{ 10, 10 } };
     try list.fillConvex(&reversed, Color.rgb(255, 0, 0));
     try std.testing.expectApproxEqAbs(@as(f32, 30.5), list.screen.vertices.items[4].position[1], 1e-4);
-    // Without it, plain triangles.
     list.clear();
     list.antialias_fills = false;
     try list.fillConvex(&square, Color.rgb(255, 0, 0));

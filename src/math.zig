@@ -1,82 +1,63 @@
-//! Small linear-algebra kit shared by the renderer and applications.
-//!
-//! Conventions: right-handed world, +Y up, cameras look down -Z in view space.
+//! Linear algebra. Right-handed, +Y up, cameras look down -Z in view space.
 //! Matrices are column-major (`m[column * 4 + row]`) and multiply column
 //! vectors, so `mul(a, b)` applies `b` first. Quaternions are `{x, y, z, w}`.
 const std = @import("std");
 
-/// 2D vector or point, `{x, y}`.
 pub const Vec2 = [2]f32;
-/// 3D vector or point, `{x, y, z}`. The vector functions below (`add`,
-/// `dot`, `cross`, ...) all take this type.
 pub const Vec3 = [3]f32;
-/// Homogeneous vector `{x, y, z, w}`: w is 1 for points, 0 for directions.
+/// `{x, y, z, w}`: w is 1 for points, 0 for directions.
 pub const Vec4 = [4]f32;
-/// Rotation quaternion `{x, y, z, w}` with the scalar part last. Functions
-/// that take one expect unit length unless they say otherwise.
+/// `{x, y, z, w}`, scalar last; unit length unless stated otherwise.
 pub const Quat = [4]f32;
-/// 4x4 matrix stored column by column: element (row, column) is
-/// `m[column * 4 + row]`, and the translation of an affine transform is
-/// `m[12..15]`. The layout matches GLSL's `mat4`.
+/// Column-major: element (row, column) is `m[column * 4 + row]` and the
+/// translation is `m[12..15]`. Matches GLSL's `mat4`.
 pub const Mat4 = [16]f32;
 
-/// The matrix that leaves every vector unchanged.
 pub const identity: Mat4 = .{
     1, 0, 0, 0,
     0, 1, 0, 0,
     0, 0, 1, 0,
     0, 0, 0, 1,
 };
-/// The quaternion of no rotation.
 pub const quat_identity: Quat = .{ 0, 0, 0, 1 };
 
-/// Component-wise sum `a + b`.
 pub fn add(a: Vec3, b: Vec3) Vec3 {
     return .{ a[0] + b[0], a[1] + b[1], a[2] + b[2] };
 }
 
-/// Component-wise difference `a - b`: the vector from `b` to `a`.
 pub fn sub(a: Vec3, b: Vec3) Vec3 {
     return .{ a[0] - b[0], a[1] - b[1], a[2] - b[2] };
 }
 
-/// Multiplies every component of `a` by `s`.
 pub fn scale(a: Vec3, s: f32) Vec3 {
     return .{ a[0] * s, a[1] * s, a[2] * s };
 }
 
-/// Dot product: `|a| * |b| * cos` of the angle between them.
 pub fn dot(a: Vec3, b: Vec3) f32 {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
-/// Right-handed cross product: perpendicular to both, so that
-/// `cross(+X, +Y)` is `+Z`. Not normalized.
+/// Right-handed: `cross(+X, +Y)` is `+Z`.
 pub fn cross(a: Vec3, b: Vec3) Vec3 {
     return .{ a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0] };
 }
 
-/// Euclidean length of `a`.
 pub fn length(a: Vec3) f32 {
     return @sqrt(dot(a, a));
 }
 
-/// `a` scaled to unit length. A vector too short to have a direction
-/// (length at most 1e-20) gives zero rather than NaN.
+/// Returns zero for a length of at most 1e-20.
 pub fn normalize(a: Vec3) Vec3 {
     const len = length(a);
     return if (len > 1e-20) scale(a, 1.0 / len) else .{ 0, 0, 0 };
 }
 
-/// Linear blend from `a` (t = 0) to `b` (t = 1). `t` is not clamped, so
-/// values outside 0..1 extrapolate.
+/// `t` is not clamped.
 pub fn lerp(a: Vec3, b: Vec3, t: f32) Vec3 {
     return .{ a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t };
 }
 
-/// Matrix product `a * b`. With column vectors the result applies `b`
-/// first and then `a`, so a model matrix is built as
-/// `mul(translation, mul(rotation, scale))`.
+/// `a * b`: applies `b` first, then `a`.
 pub fn mul(a: Mat4, b: Mat4) Mat4 {
     var result: Mat4 = undefined;
     inline for (0..4) |column| {
@@ -91,7 +72,6 @@ pub fn mul(a: Mat4, b: Mat4) Mat4 {
     return result;
 }
 
-/// Matrix that moves points by `v`. Directions (w = 0) are unaffected.
 pub fn translation(v: Vec3) Mat4 {
     var result = identity;
     result[12] = v[0];
@@ -100,8 +80,6 @@ pub fn translation(v: Vec3) Mat4 {
     return result;
 }
 
-/// Matrix that scales about the origin by `v[0]`, `v[1]` and `v[2]` along
-/// X, Y and Z.
 pub fn scaling(v: Vec3) Mat4 {
     var result = identity;
     result[0] = v[0];
@@ -110,36 +88,32 @@ pub fn scaling(v: Vec3) Mat4 {
     return result;
 }
 
-/// Matrix that scales about the origin by `s` along every axis.
 pub fn uniformScaling(s: f32) Mat4 {
     return scaling(.{ s, s, s });
 }
 
-/// Rotation about +X by `angle` radians, counter-clockwise when looking
-/// down the axis toward the origin (right-hand rule: +Y turns toward +Z).
+/// `angle` in radians, right-handed about +X (+Y turns toward +Z).
 pub fn rotationX(angle: f32) Mat4 {
     const s = @sin(angle);
     const c = @cos(angle);
     return .{ 1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1 };
 }
 
-/// Counter-clockwise rotation about +Y when viewed from above.
+/// `angle` in radians, right-handed about +Y (+Z turns toward +X).
 pub fn rotationY(angle: f32) Mat4 {
     const s = @sin(angle);
     const c = @cos(angle);
     return .{ c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1 };
 }
 
-/// Rotation about +Z by `angle` radians, counter-clockwise when looking
-/// down the axis toward the origin (right-hand rule: +X turns toward +Y).
+/// `angle` in radians, right-handed about +Z (+X turns toward +Y).
 pub fn rotationZ(angle: f32) Mat4 {
     const s = @sin(angle);
     const c = @cos(angle);
     return .{ c, s, 0, 0, -s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 }
 
-/// Rotation matrix of the quaternion `q`, which must be unit length (see
-/// `quatNormalize`); anything else adds scale and shear.
+/// `q` must be unit length.
 pub fn fromQuat(q: Quat) Mat4 {
     const x = q[0];
     const y = q[1];
@@ -167,9 +141,7 @@ pub fn compose(t: Vec3, r: Quat, s: Vec3) Mat4 {
     return result;
 }
 
-/// Applies an affine `m` to the point `p` (w = 1): rotation, scale and
-/// translation. The bottom row is ignored and there is no perspective
-/// divide, so use `transformVec4` for projection matrices.
+/// Affine transform of a point (w = 1); no perspective divide.
 pub fn transformPoint(m: Mat4, p: Vec3) Vec3 {
     return .{
         m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
@@ -178,9 +150,8 @@ pub fn transformPoint(m: Mat4, p: Vec3) Vec3 {
     };
 }
 
-/// Applies the upper 3x3 of `m` to the direction `d` (w = 0), leaving the
-/// translation out. The result is not renormalized, and under non-uniform
-/// scale this is not the right transform for surface normals.
+/// Upper 3x3 applied to a direction (w = 0); not renormalized. Not the
+/// normal transform under non-uniform scale.
 pub fn transformDirection(m: Mat4, d: Vec3) Vec3 {
     return .{
         m[0] * d[0] + m[4] * d[1] + m[8] * d[2],
@@ -189,8 +160,7 @@ pub fn transformDirection(m: Mat4, d: Vec3) Vec3 {
     };
 }
 
-/// Full product `m * v` of a matrix and a homogeneous column vector. For
-/// a projection the result is in clip space; divide by its w yourself.
+/// `m * v`, with no perspective divide.
 pub fn transformVec4(m: Mat4, v: Vec4) Vec4 {
     var result: Vec4 = undefined;
     inline for (0..4) |row| {
@@ -199,7 +169,7 @@ pub fn transformVec4(m: Mat4, v: Vec4) Vec4 {
     return result;
 }
 
-/// Largest axis scale of the upper 3x3, used to scale bounding spheres.
+/// Largest axis scale of the upper 3x3.
 pub fn maxScale(m: Mat4) f32 {
     const x = length(.{ m[0], m[1], m[2] });
     const y = length(.{ m[4], m[5], m[6] });
@@ -212,11 +182,8 @@ pub fn lookAt(eye: Vec3, target: Vec3, up: Vec3) Mat4 {
     return lookTo(eye, sub(target, eye), up);
 }
 
-/// View matrix (world to view space) for a camera at `eye` looking along
-/// `direction`: right-handed, with the view direction on -Z, right on +X
-/// and up on +Y. `direction` and `up` need not be unit length nor
-/// perpendicular; `up` only picks the roll. When the two are parallel
-/// world +Z stands in for `up`.
+/// View matrix for a camera at `eye` looking along `direction` (-Z in view
+/// space). Inputs need not be unit length; world +Z replaces a parallel `up`.
 pub fn lookTo(eye: Vec3, direction: Vec3, up: Vec3) Mat4 {
     const f = normalize(direction);
     var r = cross(f, up);
@@ -254,7 +221,6 @@ pub fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far
     };
 }
 
-/// Swaps rows and columns. For a pure rotation this is also its inverse.
 pub fn transpose(m: Mat4) Mat4 {
     var result: Mat4 = undefined;
     inline for (0..4) |column| {
@@ -263,7 +229,7 @@ pub fn transpose(m: Mat4) Mat4 {
     return result;
 }
 
-/// General 4x4 inverse. Returns identity for singular matrices.
+/// Returns identity for singular matrices.
 pub fn inverse(m: Mat4) Mat4 {
     var inv: Mat4 = undefined;
     inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
@@ -289,18 +255,14 @@ pub fn inverse(m: Mat4) Mat4 {
     return inv;
 }
 
-/// Unit quaternion for a rotation of `angle` radians about `axis`,
-/// counter-clockwise when looking down the axis toward the origin
-/// (right-hand rule). `axis` is normalized here; a zero axis gives the
-/// vector part zero.
+/// `angle` in radians, right-handed about `axis`, which is normalized here.
 pub fn quatFromAxisAngle(axis: Vec3, angle: f32) Quat {
     const n = normalize(axis);
     const s = @sin(angle * 0.5);
     return .{ n[0] * s, n[1] * s, n[2] * s, @cos(angle * 0.5) };
 }
 
-/// Hamilton product: the rotation `b` followed by `a`. Components are
-/// (x, y, z, w).
+/// Hamilton product: the rotation `b` followed by `a`.
 pub fn quatMul(a: Quat, b: Quat) Quat {
     return .{
         a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
@@ -310,9 +272,7 @@ pub fn quatMul(a: Quat, b: Quat) Quat {
     };
 }
 
-/// `q` scaled to unit length, which is what `fromQuat` and `slerp` expect.
-/// A quaternion too short to normalize (length under 1e-20) gives
-/// `quat_identity`.
+/// Returns `quat_identity` for a length under 1e-20.
 pub fn quatNormalize(q: Quat) Quat {
     const len = @sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
     if (len < 1e-20) return quat_identity;

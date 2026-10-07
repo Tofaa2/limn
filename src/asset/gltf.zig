@@ -1,6 +1,6 @@
-//! glTF 2.0 import: geometry is optimized and split into meshlets, images are
-//! decoded in parallel, and the node/skin/animation data is kept for runtime
-//! posing. Everything here is CPU-side and safe to run off the render thread.
+//! glTF 2.0 import: optimizes geometry into meshlets, decodes images in
+//! parallel and keeps node/skin/animation data. CPU only; safe off the
+//! render thread.
 const std = @import("std");
 const zmesh = @import("zmesh");
 const zstbi = @import("zstbi");
@@ -10,43 +10,36 @@ const ktx2 = @import("ktx2.zig");
 const math = @import("../math.zig");
 const gltf = zmesh.io.zcgltf;
 
-/// Most vertices and triangles one meshlet holds; meshes are split into
-/// clusters no larger than this.
+/// Maximum vertices per meshlet.
 pub const max_meshlet_vertices = 64;
-/// See `max_meshlet_vertices`.
+/// Maximum triangles per meshlet.
 pub const max_meshlet_triangles = 124;
 
-/// A vertex as meshes are read and worked on, every attribute a float.
-/// What reaches the GPU is the packed `Vertex` made from it.
+/// Unpacked vertex used during import; `Vertex` is the GPU form.
 pub const FullVertex = extern struct {
     position: [3]f32,
     normal: [3]f32,
-    /// The tangent, and in w the side the bitangent is on (1 or -1).
+    /// w is the bitangent sign (1 or -1).
     tangent: [4]f32,
     uv: [2]f32,
-    /// Multiplies the material's base color: RGBA8, red in the low byte.
+    /// RGBA8, red in the low byte; multiplies the base color.
     color: u32 = 0xffffffff,
-    /// A second set of texture coordinates, for textures that ask for it.
     uv1: [2]f32 = .{ 0, 0 },
 };
 
-/// Vertex layout shared with the shaders (`Vertex` in common.glsl). The
-/// normal and tangent are unit vectors, so each is kept as a point of the
-/// octahedron in two signed 16-bit fractions: a third of the space of
-/// three floats, and exact to a few thousandths of a degree.
+/// GPU vertex layout (`Vertex` in common.glsl). Normal and tangent are
+/// octahedron-encoded signed 16-bit pairs.
 pub const Vertex = extern struct {
     position: [3]f32,
     normal: [2]i16,
-    /// The lowest bit of the second number is set when the bitangent is
-    /// on the far side (a glTF tangent with w = -1).
+    /// The lowest bit of the second component is set when the bitangent sign is
+    /// -1.
     tangent: [2]i16,
     uv: [2]f32,
-    /// Multiplies the material's base color: RGBA8, red in the low byte.
+    /// RGBA8, red in the low byte; multiplies the base color.
     color: u32 = 0xffffffff,
-    /// A second set of texture coordinates, for textures that ask for it.
     uv1: [2]f32 = .{ 0, 0 },
 
-    /// The vertex as the GPU holds it.
     pub fn pack(full: FullVertex) Vertex {
         var tangent = packDirection(full.tangent[0..3].*);
         tangent[1] = (tangent[1] & ~@as(i16, 1)) | @intFromBool(full.tangent[3] < 0);
@@ -60,14 +53,13 @@ pub const Vertex = extern struct {
         };
     }
 
-    /// The normal as a unit vector again.
     pub fn unpackNormal(self: Vertex) [3]f32 {
         return unpackDirection(self.normal);
     }
 };
 
-/// A direction as a point of the octahedron (`packDirection` in
-/// common.glsl). One of no length becomes +X.
+/// Octahedron encoding (`packDirection` in common.glsl). A zero vector
+/// becomes +X.
 fn packDirection(direction: [3]f32) [2]i16 {
     const sum = @abs(direction[0]) + @abs(direction[1]) + @abs(direction[2]);
     if (!(sum > 1e-20)) return .{ 32767, 0 };
@@ -93,36 +85,31 @@ fn unpackDirection(point: [2]i16) [3]f32 {
     return .{ x / length, y / length, z / length };
 }
 
-/// Per-vertex skinning data (`SkinVertex` in common.glsl).
+/// `SkinVertex` in common.glsl.
 pub const SkinVertex = extern struct {
     joints: [4]u32,
     weights: [4]f32,
 };
 
-/// GPU meshlet record (`Meshlet` in common.glsl). `index_offset` is relative
-/// to the first index of the owning mesh.
+/// `Meshlet` in common.glsl.
 pub const Meshlet = extern struct {
-    /// Bounding sphere of the meshlet's vertices, in mesh space.
+    /// Bounding sphere in mesh space.
     center: [3]f32,
     radius: f32,
-    /// Cone of the meshlet's triangle normals, for culling it as a whole when
-    /// it faces away: the axis, and the cutoff the view direction's dot
-    /// product with it is compared against.
+    /// Normal cone for backface culling: axis and dot-product cutoff.
     cone_axis: [3]f32,
     cone_cutoff: f32,
-    /// The meshlet's triangles: a run of `Mesh.indices`.
+    /// Range of `Mesh.indices`, relative to the mesh's first index.
     index_offset: u32,
     index_count: u32,
-    /// Geometric error (in mesh units) of the level of detail this meshlet
-    /// belongs to, and of the next coarser one. A meshlet is drawn when its
-    /// own error is too small to see and the coarser level's is not.
+    /// Geometric error, in mesh units, of this meshlet's level of detail and of
+    /// the next coarser one. Drawn when its own error is too small to see and
+    /// the parent's is not.
     lod_error: f32 = 0,
     parent_error: f32 = std.math.floatMax(f32),
-    /// With a cluster hierarchy: the bounds of the group this meshlet was
-    /// made from and of the group it was merged into (center, radius), by
-    /// whose distance the two errors are judged. A negative radius means
-    /// there is none and the whole mesh's bounds are used, as for meshes
-    /// with one level of detail per whole mesh.
+    /// With a cluster hierarchy: bounds (center, radius) of the group this
+    /// meshlet was made from and of the group it was merged into. A negative
+    /// radius means none; the whole mesh's bounds are used.
     self_sphere: [4]f32 = .{ 0, 0, 0, -1 },
     parent_sphere: [4]f32 = .{ 0, 0, 0, -1 },
 };
@@ -133,141 +120,109 @@ comptime {
     std.debug.assert(@sizeOf(Meshlet) == 80);
 }
 
-/// How a material's alpha is used (glTF `alphaMode`): ignored, compared
-/// with `Material.alpha_cutoff` to cut holes, or blended over what is
-/// behind.
+/// glTF `alphaMode`.
 pub const AlphaMode = enum { @"opaque", mask, blend };
 
-/// How a texture is filtered and what happens outside 0..1 (a glTF sampler).
+/// A glTF sampler.
 pub const SamplerData = struct {
-    /// False when the file asks for nearest magnification: texels stay sharp
-    /// squares instead of being blended.
+    /// False for nearest magnification.
     linear: bool = true,
-    /// Wrapping along U and V.
     repeat_u: AddressMode = .repeat,
     repeat_v: AddressMode = .repeat,
 
-    /// glTF wrap modes: tile, tile with every other copy mirrored, or stretch
-    /// the edge texel outward.
     pub const AddressMode = enum { repeat, mirrored_repeat, clamp_to_edge };
 };
 
-/// A texture coordinate transform (`KHR_texture_transform`): coordinates
-/// are scaled, rotated by `rotation` radians, then moved by `offset`.
+/// `KHR_texture_transform`: scale, rotate by `rotation` radians, then offset.
 pub const UvTransform = struct {
     scale: [2]f32 = .{ 1, 1 },
     rotation: f32 = 0,
     offset: [2]f32 = .{ 0, 0 },
 
-    /// Exact comparison of every component.
     pub fn eql(a: UvTransform, b: UvTransform) bool {
         return a.scale[0] == b.scale[0] and a.scale[1] == b.scale[1] and a.rotation == b.rotation and a.offset[0] == b.offset[0] and a.offset[1] == b.offset[1];
     }
 };
 
-/// A material's use of one image: which image, and how it is sampled.
 pub const TextureRef = struct {
     /// Index into `Model.images`.
     image: u32,
     sampler: SamplerData = .{},
-    /// Scale, rotation (radians) and offset applied to the coordinates
-    /// before this texture is looked up (`KHR_texture_transform`).
     transform: UvTransform = .{},
-    /// Which of the mesh's texture coordinate sets it is mapped with: 0 or 1.
+    /// Texture coordinate set: 0 or 1.
     uv_set: u8 = 0,
 };
 
-/// A surface description in glTF's metallic-roughness model, with the
-/// extensions noted on the fields. Colors are linear. Also what
-/// `MeshDesc.material` takes for application geometry; texture references
-/// only mean something for a loaded model, whose images they index.
+/// glTF metallic-roughness material plus the extensions noted on the fields.
+/// Colors are linear. Texture references index a loaded model's images and
+/// are ignored for `MeshDesc.material`.
 pub const Material = struct {
     /// Linear RGBA, multiplied with `base_color_texture` and vertex colors.
     base_color: [4]f32 = .{ 1, 1, 1, 1 },
-    /// Light the surface gives off, linear RGB; with
-    /// `KHR_materials_emissive_strength` the strength is multiplied in.
+    /// Linear RGB, with `KHR_materials_emissive_strength` multiplied in.
     emissive: [3]f32 = .{ 0, 0, 0 },
-    /// Factors 0..1, multiplied with the blue (metallic) and green (roughness)
-    /// channels of `metallic_roughness_texture`.
+    /// 0..1, multiplied with the blue (metallic) and green (roughness) channels
+    /// of `metallic_roughness_texture`.
     metallic: f32 = 1,
     roughness: f32 = 1,
-    /// Scales the X and Y of the normal map: above 1 deepens the relief.
+    /// Scales the normal map's X and Y.
     normal_scale: f32 = 1,
     /// 0 ignores the occlusion map, 1 applies it fully.
     occlusion_strength: f32 = 1,
     /// With `.mask`: alpha below this is not drawn.
     alpha_cutoff: f32 = 0.5,
     alpha_mode: AlphaMode = .@"opaque",
-    /// Drawn from both sides instead of culling back faces.
     double_sided: bool = false,
     base_color_texture: ?TextureRef = null,
     normal_texture: ?TextureRef = null,
     metallic_roughness_texture: ?TextureRef = null,
     occlusion_texture: ?TextureRef = null,
     emissive_texture: ?TextureRef = null,
-    /// Custom material shader slot (`MaterialShader.slot`), 0 for the
-    /// standard material.
+    /// `MaterialShader.slot`; 0 for the standard material.
     shader: u32 = 0,
-    /// Free parameters handed to the custom material shader.
+    /// Parameters for the custom material shader.
     params: [4]f32 = .{ 0, 0, 0, 0 },
-    /// Strength of a clear, glossy layer over the surface (car paint,
-    /// lacquer, wet stone), 0..1. `KHR_materials_clearcoat`.
+    /// `KHR_materials_clearcoat` strength, 0..1.
     clearcoat: f32 = 0,
     clearcoat_roughness: f32 = 0.03,
-    /// Maps that vary the coat over the surface: strength in the red
-    /// channel, roughness in the green one (they may be the same image),
-    /// and a normal map of the coat's own. Without one the coat follows
-    /// the smooth surface, whatever the base's normal map does.
+    /// Coat strength in red, roughness in green. Without a coat normal map the
+    /// coat ignores the base normal map.
     clearcoat_texture: ?TextureRef = null,
     clearcoat_roughness_texture: ?TextureRef = null,
     clearcoat_normal_texture: ?TextureRef = null,
     clearcoat_normal_scale: f32 = 1,
-    /// How much light passes through instead of being reflected diffusely:
-    /// glass, water, clear plastic. Such surfaces are drawn with the
-    /// transparent ones and show the scene behind them bent by `ior`.
-    /// `KHR_materials_transmission`, `_ior`, `_volume`.
+    /// `KHR_materials_transmission`, 0..1. Drawn with the transparent surfaces,
+    /// refracting the scene behind by `ior`.
     transmission: f32 = 0,
-    /// Index of refraction: 1.0 does not bend light, 1.33 is water, 1.5
-    /// glass.
+    /// Index of refraction (`KHR_materials_ior`).
     ior: f32 = 1.5,
-    /// How thick the object is taken to be when bending the view through
-    /// it, in world units.
+    /// Thickness used for refraction, in world units (`KHR_materials_volume`).
     thickness: f32 = 0.1,
-    /// A soft glow at grazing angles, as on velvet and other cloth.
     /// `KHR_materials_sheen`.
     sheen_color: [3]f32 = .{ 0, 0, 0 },
     sheen_roughness: f32 = 0.5,
-    /// Maps for the sheen: color in RGB, roughness in alpha.
+    /// Sheen color in RGB, roughness in alpha.
     sheen_color_texture: ?TextureRef = null,
     sheen_roughness_texture: ?TextureRef = null,
-    /// Stretches highlights along the surface, as on brushed metal: 0..1,
-    /// and the angle of the grain from the tangent, in radians.
-    /// `KHR_materials_anisotropy`. Needs tangents (a normal map or UVs).
+    /// `KHR_materials_anisotropy`: strength 0..1 and rotation from the tangent
+    /// in radians. Needs tangents.
     anisotropy: f32 = 0,
     anisotropy_rotation: f32 = 0,
-    /// Light spreading under the surface (skin, wax, leaves, marble), 0..1:
-    /// the shadow edge softens and wraps around, and thin parts glow when
-    /// lit from behind. An approximation, applied to the sun only.
+    /// Subsurface scattering approximation, 0..1. Applied to the sun only.
     subsurface: f32 = 0,
-    /// Texture coordinates are scaled, rotated (radians) and then offset
-    /// before texture lookups. For a loaded model this is the base color
-    /// texture's `KHR_texture_transform`; textures that carry a different
-    /// one (`TextureRef.transform`) use their own.
+    /// Scale, rotation (radians), then offset, applied to texture coordinates.
+    /// Textures with their own `TextureRef.transform` use that instead.
     uv_scale: [2]f32 = .{ 1, 1 },
     uv_rotation: f32 = 0,
     uv_offset: [2]f32 = .{ 0, 0 },
-    /// Wind: what is drawn with this material leans and sways, more the
-    /// higher it stands above the origin of its entity or instance, which
-    /// stays put: grass, leaves, flags. The number is how far a point one
-    /// unit up is carried at the strongest of a gust, in world units; the
-    /// reach grows with the square of the height, so a tuft of grass wants
-    /// about 1 and a tree a few hundredths. 0 stands still. Shadows sway
-    /// along; ray tracing sees it standing still.
+    /// Wind sway: world units a point one unit above the entity or instance
+    /// origin moves at the peak of a gust; grows with the square of height. 0
+    /// disables. Shadows sway along; ray tracing does not.
     sway: f32 = 0,
 
-    /// The material's texture references in the order shaders number
-    /// them: base color, normal, metallic-roughness, occlusion, emissive,
-    /// coat, coat roughness, coat normal, sheen color, sheen roughness.
+    /// Texture references in shader order: base color, normal,
+    /// metallic-roughness, occlusion, emissive, coat, coat roughness, coat
+    /// normal, sheen color, sheen roughness.
     pub fn textureRefs(self: Material) [10]?TextureRef {
         return .{
             self.base_color_texture,  self.normal_texture,          self.metallic_roughness_texture,  self.occlusion_texture,
@@ -276,13 +231,12 @@ pub const Material = struct {
         };
     }
 
-    /// The transform every texture gets unless it carries another.
+    /// The transform of every texture that carries none of its own.
     pub fn sharedTransform(self: Material) UvTransform {
         return .{ .scale = self.uv_scale, .rotation = self.uv_rotation, .offset = self.uv_offset };
     }
 
-    /// Whether some texture is transformed differently from the rest, so
-    /// that one transform for the whole material does not do.
+    /// Whether any texture's transform differs from the shared one.
     pub fn hasOwnTransforms(self: Material) bool {
         const shared = self.sharedTransform();
         for (self.textureRefs()) |maybe| if (maybe) |ref| {
@@ -292,78 +246,69 @@ pub const Material = struct {
     }
 };
 
-/// One texture image of a model. Exactly one of `decoded` and
-/// `compressed` holds the pixels until `Model.releaseImage` or
-/// `takeCompressed` takes them away.
+/// One texture image. Exactly one of `decoded` and `compressed` holds the
+/// pixels until `Model.releaseImage` or `takeCompressed` takes them.
 pub const Image = struct {
     width: u32 = 0,
     height: u32 = 0,
-    /// Color data (base color, emissive) is sRGB encoded; the rest is linear.
+    /// True for color data (base color, emissive).
     srgb: bool = false,
-    /// RGBA8 pixels, when the texture was neither compressed nor given a CPU
-    /// mip chain. Freed by `Model.deinit` or `releaseImage`.
+    /// RGBA8 pixels. Freed by `Model.deinit` or `releaseImage`.
     decoded: ?zstbi.Image = null,
-    /// Ready-to-upload mip chain (largest level first) when the texture was compressed
-    /// at load; `decoded` is null then. Owned by the model's allocator.
+    /// Mip chain, largest level first; `decoded` is null then. Owned by the
+    /// model's allocator.
     compressed: ?[]u8 = null,
-    /// Name of this texture in the asset cache, when one is in use.
+    /// Key in the asset cache; 0 when none.
     cache_key: u64 = 0,
-    /// Used as a normal map by some material.
     normal_map: bool = false,
-    /// For images read from a file of their own: the file, and a stamp
-    /// of its size and modification time when it was read.
+    /// For images in a file of their own: its path, and a stamp of its size and
+    /// modification time when read.
     source_path: []const u8 = "",
     source_stamp: u64 = 0,
-    /// `compressed` is BC5 (red and green only) rather than BC7.
+    /// `compressed` is BC5.
     two_channel: bool = false,
-    /// `compressed` is BC4 (red only): an occlusion map used for nothing else.
+    /// `compressed` is BC4.
     one_channel: bool = false,
-    /// How many material slots use the image, and how many of those are
-    /// occlusion.
+    /// Material slots using the image, and how many of those are occlusion.
     uses: u16 = 0,
     occlusion_uses: u16 = 0,
-    /// The block format of `compressed` when it came from a KTX2 file in
-    /// another format than the ones written here (`.bc7` otherwise, which
-    /// `two_channel` and `one_channel` turn into BC5 and BC4).
+    /// Block format of `compressed` when read from a KTX2 file. `two_channel`
+    /// and `one_channel` override `.bc7` with BC5 and BC4.
     block: Block = .bc7,
 
     /// Mip levels in `compressed`; 0 means the full chain.
     mip_levels: u32 = 0,
 
-    /// Format of the texels in `compressed`. `.rgba8` is an uncompressed mip
-    /// chain (`LoadOptions.raw_mips`).
+    /// Texel format of `compressed`. `.rgba8` is an uncompressed mip chain
+    /// (`LoadOptions.raw_mips`).
     pub const Block = enum(u8) { bc7, bc1, bc3, bc6h, rgba8 };
 
-    /// The RGBA8 pixels of `decoded`, row by row from the top; empty when the
-    /// image is compressed or has been released.
+    /// RGBA8 pixels of `decoded`, top row first; empty when compressed or
+    /// released.
     pub fn pixels(self: Image) []const u8 {
         return if (self.decoded) |image| image.data else &.{};
     }
 };
 
-/// Most morph targets a mesh can blend; further ones are ignored.
+/// Further morph targets are ignored.
 pub const max_morph_targets = 64;
 
-/// How far one morph target moves one vertex and turns its normal and
-/// tangent.
+/// One morph target's offsets for one vertex.
 pub const MorphDelta = extern struct {
     position: [3]f32,
     normal: [3]f32,
     tangent: [3]f32 = .{ 0, 0, 0 },
 };
 
-/// One glTF primitive after processing: vertices, meshlets for every level
-/// of detail and the indices they draw. The slices belong to the model's
-/// arena.
+/// One processed glTF primitive. Slices belong to the model's arena.
 pub const Mesh = struct {
     vertices: []Vertex,
-    /// Present for skinned meshes; parallel to `vertices`.
+    /// Skinned meshes only; parallel to `vertices`.
     skin: ?[]SkinVertex,
     /// Meshlet-ordered triangle list indexing `vertices`.
     indices: []u32,
     meshlets: []Meshlet,
-    /// The full-detail level comes first in `indices` and `meshlets`;
-    /// coarser levels follow.
+    /// The full-detail level comes first in `indices` and `meshlets`.
     lod0_index_count: u32,
     lod0_meshlet_count: u32,
     /// Bounding sphere of the rest pose, in mesh space.
@@ -371,28 +316,23 @@ pub const Mesh = struct {
     bounds_radius: f32,
     /// Index into `Model.materials`.
     material: u32,
-    /// Texture coordinate units per meter of surface (area-weighted mean),
-    /// which tells how many texels a texture puts on the mesh. 0 if unknown.
+    /// Texture coordinate units per meter of surface (area-weighted mean). 0 if
+    /// unknown.
     uv_density: f32 = 0,
-    /// Morph targets (blend shapes): `morph_targets` runs of one delta
-    /// per vertex, and the weights they start with. Skinned meshes only.
+    /// `morph_deltas` holds `morph_targets` runs of one delta per vertex.
+    /// Skinned meshes only.
     morph_targets: u32 = 0,
     morph_deltas: []MorphDelta = &.{},
     morph_weights: [max_morph_targets]f32 = @splat(0),
-    /// The vertices the coarser levels use come first: this many of them.
-    /// With those, and without the indices of the full-detail level, the
-    /// mesh can be drawn at every level but the finest. 0 when the mesh
-    /// cannot be split so (one level only, skinned, or with clusters
-    /// that have no coarser form).
+    /// Leading vertices used by the coarser levels. 0 when the mesh cannot be
+    /// split (one level, skinned, or clusters with no coarser form).
     coarse_vertex_count: u32 = 0,
-    /// The error to draw the mesh at when only its coarse part is there:
-    /// levels are chosen as if no error were smaller than this.
+    /// Error to draw the mesh at when only its coarse part is loaded.
     coarse_error: f32 = 0,
 };
 
-/// A node of the glTF scene hierarchy. Its local transform is `matrix`
-/// when set, otherwise translation, rotation (quaternion `{x, y, z, w}`)
-/// and scale; animations write those three.
+/// Local transform is `matrix` when set, otherwise translation, rotation
+/// (quaternion `{x, y, z, w}`) and scale.
 pub const Node = struct {
     name: []const u8 = "",
     /// Index into `Model.nodes`; null for a root.
@@ -400,11 +340,10 @@ pub const Node = struct {
     translation: [3]f32 = .{ 0, 0, 0 },
     rotation: [4]f32 = .{ 0, 0, 0, 1 },
     scale: [3]f32 = .{ 1, 1, 1 },
-    /// Used instead of TRS when the file stores a raw matrix.
     matrix: ?[16]f32 = null,
 };
 
-/// One drawable: a mesh placed by a node, optionally deformed by a skin.
+/// A mesh placed by a node, optionally deformed by a skin.
 pub const Instance = struct {
     /// Indices into `Model.meshes`, `Model.nodes` and `Model.skins`.
     mesh: u32,
@@ -412,64 +351,55 @@ pub const Instance = struct {
     skin: ?u32,
 };
 
-/// A skeleton: the nodes that act as joints and, parallel to them, the
-/// column-major matrices that take a vertex from mesh space into each
-/// joint's space at bind time. `SkinVertex.joints` index `joints`.
+/// `joints` are node indices; `SkinVertex.joints` index it. The inverse bind
+/// matrices are parallel to it and column-major.
 pub const Skin = struct {
     joints: []u32,
     inverse_bind: [][16]f32,
 };
 
-/// What an animation channel drives: a part of a node's local transform,
-/// or the morph target weights of the mesh at that node.
 pub const ChannelPath = enum { translation, rotation, scale, weights };
 
-/// One animated property of one node: keys at `times`, values in `values`.
 pub const Channel = struct {
     /// Index into `Model.nodes`.
     node: u32,
     path: ChannelPath,
-    /// Hold each key's value until the next instead of interpolating.
+    /// Hold each key's value instead of interpolating.
     step: bool,
-    /// Cubic spline keys: `values` then holds in-tangent, value and
-    /// out-tangent for every key instead of just the value.
+    /// Cubic spline: `values` holds in-tangent, value and out-tangent per key.
     cubic: bool = false,
-    /// For `.weights` channels: values per key (the mesh's target count).
+    /// For `.weights`: values per key (the mesh's target count).
     width: u32 = 0,
-    /// Key times in seconds, ascending.
+    /// Seconds, ascending.
     times: []f32,
     /// 3 floats per key for translation/scale, 4 for rotation.
     values: []f32,
 };
 
-/// A named clip: the channels that play together. `duration` is the time
-/// of the last key of any channel, in seconds.
+/// `duration` is the time of the last key of any channel, in seconds.
 pub const Animation = struct {
     name: []const u8,
     duration: f32,
     channels: []Channel,
 };
 
-/// A loaded model, CPU side. Everything is allocated from `arena` except
-/// the image pixels (`Image.decoded`, `Image.compressed`), which come from
-/// the allocator the arena was made with. Free with `deinit`.
+/// A loaded model, CPU side. Allocated from `arena`, except image pixels,
+/// which come from the arena's backing allocator. Free with `deinit`.
 pub const Model = struct {
     arena: std.heap.ArenaAllocator,
     meshes: []Mesh = &.{},
     materials: []Material = &.{},
     images: []Image = &.{},
     nodes: []Node = &.{},
-    /// The drawables: which mesh sits at which node, with which skin.
     instances: []Instance = &.{},
     skins: []Skin = &.{},
-    /// While loading: nodes whose unskinned mesh has morph targets. Each
-    /// gets a skin of its own with that node as the only joint, so the
-    /// mesh goes through the same deformation path as skinned ones.
+    /// While loading: nodes whose unskinned mesh has morph targets. Each gets a
+    /// one-joint skin of its own.
     implicit_skins: []u32 = &.{},
     animations: []Animation = &.{},
 
-    /// Frees the model and every image still held. Compressed chains handed
-    /// out by `takeCompressed` are not freed here.
+    /// Frees the model and every image still held, but not chains handed out by
+    /// `takeCompressed`.
     pub fn deinit(self: *Model) void {
         for (self.images) |*image| {
             if (image.decoded) |*decoded| decoded.deinit();
@@ -479,8 +409,8 @@ pub const Model = struct {
         self.* = undefined;
     }
 
-    /// Hands the compressed mip chain of an image to the caller, who frees
-    /// it with `freeCompressed`.
+    /// Hands an image's compressed mip chain to the caller, who frees it with
+    /// `freeCompressed`.
     pub fn takeCompressed(self: *Model, index: usize) []u8 {
         const data = self.images[index].compressed.?;
         self.images[index].compressed = null;
@@ -492,8 +422,8 @@ pub const Model = struct {
         self.arena.child_allocator.free(data);
     }
 
-    /// Frees an image's pixels, decoded or compressed, once they have been
-    /// handed to the GPU. Its size and flags stay readable.
+    /// Frees an image's pixels, decoded or compressed. Its size and flags stay
+    /// readable.
     pub fn releaseImage(self: *Model, index: usize) void {
         if (self.images[index].decoded) |*decoded| decoded.deinit();
         self.images[index].decoded = null;
@@ -505,8 +435,7 @@ pub const Model = struct {
 var library_mutex: std.Io.Mutex = .init;
 var library_references: u32 = 0;
 
-/// The C libraries behind the importer keep global allocator state, so they
-/// are initialized once and shared.
+/// Initializes the importer's C libraries once; reference counted.
 pub fn acquireLibraries(io: std.Io) void {
     library_mutex.lockUncancelable(io);
     defer library_mutex.unlock(io);
@@ -517,8 +446,8 @@ pub fn acquireLibraries(io: std.Io) void {
     library_references += 1;
 }
 
-/// Undoes one `acquireLibraries`; the libraries are shut down when the
-/// last user lets go. Models and images they decoded must be freed first.
+/// Undoes one `acquireLibraries`. Models and images must be freed before the
+/// last release.
 pub fn releaseLibraries(io: std.Io) void {
     library_mutex.lockUncancelable(io);
     defer library_mutex.unlock(io);
@@ -529,9 +458,8 @@ pub fn releaseLibraries(io: std.Io) void {
     }
 }
 
-/// Reads a whole file, relative to the working directory. The caller frees
-/// the result with `gpa`. Fails with `error.InvalidFileSize` for an empty
-/// file or one over 4 GiB.
+/// Reads a whole file, relative to the working directory. Caller frees with
+/// `gpa`. `error.InvalidFileSize` for an empty file or one over 4 GiB.
 pub fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]align(16) u8 {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
@@ -545,13 +473,9 @@ pub fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]align(1
     return bytes;
 }
 
-/// Loads and processes a `.glb`/`.gltf` file. `acquireLibraries` must have
-/// been called. The caller owns the result and must `deinit` it.
+/// Loads and processes a `.glb`/`.gltf` file. Requires `acquireLibraries`.
+/// The caller owns the result and must `deinit` it.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: LoadOptions) !Model {
-    // A model processed before, with its textures still in the cache, is
-    // read back without parsing or rebuilding anything.
-    // A model processed with a cluster hierarchy is another model as far
-    // as the cache goes.
     const cache_salt: u64 = std.hash.Wyhash.hash(@intFromBool(options.lods.clusters), std.mem.asBytes(&[2]f32{ options.lods.normal_weight, options.lods.uv_weight }));
     const model_cache_dir: ?[]const u8 = if (options.compress_textures) options.cache_dir else null;
     if (model_cache_dir) |directory| {
@@ -573,11 +497,10 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: LoadO
     defer gpa.free(path_z);
     try gltf.loadBuffers(parse_options, data, path_z.ptr);
 
-    // Images decode on worker tasks while the geometry is processed here.
     model.images = try arena.alloc(Image, data.images_count);
     for (model.images) |*image| image.* = .{};
-    // Materials first: they decide which images hold color (sRGB) data,
-    // which the image tasks need for correct mips.
+    // Materials first: they decide which images are sRGB, which the image
+    // tasks need for correct mips.
     try loadMaterials(arena, data, &model);
     const jobs = try gpa.alloc(ImageJob, data.images_count);
     defer gpa.free(jobs);
@@ -585,8 +508,6 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: LoadO
     errdefer group.cancel(io);
     for (jobs, 0..) |*job, index| {
         job.* = .{ .gpa = gpa, .io = io, .source = &data.images.?[index], .model_path = path, .output = &model.images[index], .options = options };
-        // An image in a file of its own: remember which, and what state
-        // the file was in, so the cache can tell when it is edited.
         if (data.images.?[index].buffer_view == null) if (data.images.?[index].uri) |uri_pointer| {
             const uri = std.mem.span(uri_pointer);
             if (std.mem.indexOf(u8, uri, ";base64,") == null) {
@@ -598,9 +519,6 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: LoadO
         group.async(io, decodeImage, .{job});
     }
 
-    // With textures left uncompressed there is no texture cache to read
-    // them from, but the processed geometry can still be: only the
-    // images are decoded again.
     const geometry_cache_dir: ?[]const u8 = if (options.compress_textures) null else options.cache_dir;
     const cached_geometry: ?CachedModel = if (geometry_cache_dir) |directory| readCachedGeometry(gpa, io, path, directory, arena, cache_salt) else null;
     if (cached_geometry) |cached| {
@@ -629,8 +547,6 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: LoadO
 fn elementIndex(comptime T: type, base: ?[*]T, pointer: *const T) u32 {
     return @intCast((@intFromPtr(pointer) - @intFromPtr(base.?)) / @sizeOf(T));
 }
-
-// ------------------------------------------------------------------- images
 
 const ImageJob = struct {
     gpa: std.mem.Allocator,
@@ -674,19 +590,14 @@ fn decodeImageInner(job: *ImageJob) !void {
     } else return error.MissingImageData;
 
     if (ktx2.isKtx2(encoded)) {
-        // Already in a GPU format: nothing to decode or encode.
         const texture = try ktx2.read(job.gpa, encoded);
         errdefer job.gpa.free(texture.data);
         if (texture.faces != 1 or texture.layers != 1) return error.UnsupportedKtx2;
-        // The material's use of the image decides between the sRGB and the
-        // linear variant of the format, as for the textures encoded here.
         switch (texture.format) {
             .bc7 => {},
             .bc1 => job.output.block = .bc1,
             .bc3 => job.output.block = .bc3,
             .bc6h => job.output.block = .bc6h,
-            // Red only, and red and green only: what occlusion maps and
-            // normal maps are stored as here.
             .bc4 => job.output.one_channel = true,
             .bc5 => job.output.two_channel = true,
             .rgba8, .rgba16f => return error.UnsupportedKtx2,
@@ -698,8 +609,6 @@ fn decodeImageInner(job: *ImageJob) !void {
         return;
     }
     if (!job.options.compress_textures and job.options.raw_mips) {
-        // Left uncompressed but streamed: the levels are made here, so
-        // that the small ones can be loaded without the large.
         var decoded = try zstbi.Image.loadFromMemory(encoded, 4);
         defer decoded.deinit();
         job.output.width = decoded.width;
@@ -735,7 +644,6 @@ fn decodeImageInner(job: *ImageJob) !void {
     job.output.height = decoded.height;
     const data = try texture_codec.encodeChain(job.gpa, decoded.data, decoded.width, decoded.height, job.output.srgb, if (job.output.two_channel) .bc5 else if (job.output.one_channel) .bc4 else .bc7);
     job.output.compressed = data;
-    // A cache that cannot be written only costs time on the next run.
     if (cached_path) |path| {
         var header: [12]u8 = undefined;
         header[0..4].* = cache_magic;
@@ -746,19 +654,15 @@ fn decodeImageInner(job: *ImageJob) !void {
     }
 }
 
-/// How `load` prepares textures.
 pub const LoadOptions = struct {
-    /// Encode textures as BC7 with a full mip chain instead of leaving
-    /// RGBA8 pixels for the GPU to mip.
+    /// Encode textures as BC7 with a full mip chain instead of leaving RGBA8.
     compress_textures: bool = false,
-    /// Directory where encoded textures are kept between runs, keyed by
-    /// the content of the source image. Null disables the cache.
+    /// Texture cache directory, keyed by source image content. Null disables.
     cache_dir: ?[]const u8 = null,
-    /// Without compression: build each texture's mip levels on the CPU
-    /// and keep them, as streaming needs, instead of leaving the GPU to
-    /// make them from the full picture.
+    /// Without compression: build and keep each texture's mip levels on the
+    /// CPU,
+    /// as streaming needs.
     raw_mips: bool = false,
-    /// How levels of detail are built.
     lods: LodOptions = .{},
     /// Store normal maps as BC5 instead of BC7 when compressing.
     normal_maps_bc5: bool = true,
@@ -777,8 +681,8 @@ fn cachePath(buffer: []u8, directory: []const u8, key: u64, extension: []const u
     return std.fmt.bufPrint(buffer, "{s}/{x:0>16}.{s}", .{ directory, key, extension });
 }
 
-/// Returns the cached BC7 chain for an image and fills in its size, or
-/// null when there is none (or it does not look right).
+/// Returns the cached chain for an image and fills in its size, or null when
+/// missing or invalid.
 fn readCachedTexture(gpa: std.mem.Allocator, io: std.Io, path: []const u8, output: *Image) ?[]u8 {
     const bytes = readFile(gpa, io, path) catch return null;
     defer gpa.free(bytes);
@@ -793,8 +697,8 @@ fn readCachedTexture(gpa: std.mem.Allocator, io: std.Io, path: []const u8, outpu
     return data;
 }
 
-/// Writes `parts` back to back as one cache file. It appears under its
-/// final name only once complete, so a reader never sees half a file.
+/// Writes `parts` back to back as one cache file, renamed into place only
+/// once complete.
 fn writeCacheFile(io: std.Io, directory: []const u8, path: []const u8, parts: []const []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, directory);
     var temporary_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -810,12 +714,9 @@ fn writeCacheFile(io: std.Io, directory: []const u8, path: []const u8, parts: []
     try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), path, io);
 }
 
-// -------------------------------------------------------------- model cache
-
 const CachedImage = struct { width: u32, height: u32, srgb: bool, key: u64, two_channel: bool, one_channel: bool, source_path: []const u8, source_stamp: u64 };
 
-/// Everything `load` produces except texture pixels, which stay in the
-/// texture cache under their own keys.
+/// Everything `load` produces except texture pixels.
 const CachedModel = struct {
     meshes: []Mesh,
     materials: []Material,
@@ -826,8 +727,8 @@ const CachedModel = struct {
     images: []CachedImage,
 };
 
-/// Identifies a source file by path, size and modification time. Images a
-/// `.gltf` references by URI are not part of it.
+/// Hashes path, size and modification time. Images a `.gltf` references by
+/// URI are not included.
 fn modelKey(io: std.Io, path: []const u8) !u64 {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
@@ -857,8 +758,7 @@ fn readCachedTextureJob(job: *CachedTextureJob) std.Io.Cancelable!void {
     job.missing = job.output.compressed == null;
 }
 
-/// Loads a model from the cache without touching the source file's
-/// contents. Null when any part of it is missing or stale.
+/// Null when any part of the cached model is missing or stale.
 fn loadCached(gpa: std.mem.Allocator, io: std.Io, path: []const u8, directory: []const u8, salt: u64) !?Model {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const cached_path = try cachePath(&path_buffer, directory, (modelKey(io, path) catch return null) ^ salt, "model");
@@ -877,7 +777,6 @@ fn loadCached(gpa: std.mem.Allocator, io: std.Io, path: []const u8, directory: [
     model.instances = cached.instances;
     model.skins = cached.skins;
     model.animations = cached.animations;
-    // An image file edited since the cache was written makes it stale.
     for (cached.images) |source| {
         if (source.source_path.len == 0) continue;
         if ((modelKey(io, source.source_path) catch 0) != source.source_stamp) {
@@ -896,7 +795,6 @@ fn loadCached(gpa: std.mem.Allocator, io: std.Io, path: []const u8, directory: [
     errdefer group.cancel(io);
     for (jobs, model.images) |*job, *image| {
         job.* = .{ .gpa = gpa, .io = io, .directory = directory, .output = image };
-        // Images no material uses were never encoded.
         if (image.width != 0) group.async(io, readCachedTextureJob, .{job});
     }
     try group.await(io);
@@ -908,13 +806,10 @@ fn loadCached(gpa: std.mem.Allocator, io: std.Io, path: []const u8, directory: [
 }
 
 fn storeCached(gpa: std.mem.Allocator, io: std.Io, path: []const u8, directory: []const u8, model: *const Model, salt: u64) !void {
-    // Textures that came ready-made (KTX2) are not in the texture cache,
-    // so a cached copy of their model could never be loaded.
     for (model.images) |image| if (image.compressed != null and image.cache_key == 0) return;
     const images = try gpa.alloc(CachedImage, model.images.len);
     defer gpa.free(images);
     for (images, model.images) |*out, image| {
-        // Only images that made it into the texture cache can be restored.
         const usable = image.compressed != null;
         out.* = .{
             .width = if (usable) image.width else 0,
@@ -944,9 +839,8 @@ fn storeCached(gpa: std.mem.Allocator, io: std.Io, path: []const u8, directory: 
     try writeCacheFile(io, directory, try cachePath(&path_buffer, directory, (try modelKey(io, path)) ^ salt, "model"), &.{sealed});
 }
 
-/// The processed geometry of a model, without its images: what a load
-/// with uncompressed textures keeps between runs. Read into `arena`; null
-/// when there is none or it is stale.
+/// Reads a model's cached geometry, without images, into `arena`. Null when
+/// missing or stale.
 fn readCachedGeometry(gpa: std.mem.Allocator, io: std.Io, path: []const u8, directory: []const u8, arena: std.mem.Allocator, salt: u64) ?CachedModel {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const cached_path = cachePath(&path_buffer, directory, (modelKey(io, path) catch return null) ^ salt, "geometry") catch return null;
@@ -975,29 +869,27 @@ fn storeCachedGeometry(gpa: std.mem.Allocator, io: std.Io, path: []const u8, dir
     try writeCacheFile(io, directory, try cachePath(&path_buffer, directory, (try modelKey(io, path)) ^ salt, "geometry"), &.{sealed});
 }
 
-/// Decoded equirectangular HDR image, RGBA half floats.
+/// Equirectangular HDR image, RGBA half floats.
 pub const HdrImage = struct {
     width: u32,
     height: u32,
     decoded: zstbi.Image,
-    /// World-space direction toward the brightest texel (usually the sun).
+    /// World-space direction toward the brightest texel.
     brightest_direction: [3]f32,
 
-    /// Frees the pixels. `acquireLibraries` must still be in effect.
+    /// `acquireLibraries` must still be in effect.
     pub fn deinit(self: *HdrImage) void {
         self.decoded.deinit();
     }
 
-    /// `width * height` texels of four half floats (8 bytes each), row by row
-    /// from the top. Valid until `deinit`.
+    /// 8 bytes a texel, top row first. Valid until `deinit`.
     pub fn pixels(self: HdrImage) []const u8 {
         return self.decoded.data;
     }
 };
 
-/// Decodes a Radiance `.hdr` panorama and finds its brightest texel.
-/// `acquireLibraries` must have been called. `gpa` is only used for the
-/// file's bytes while decoding; free the result with `deinit`. Fails with
+/// Decodes a Radiance `.hdr` panorama. Requires `acquireLibraries`. `gpa` is
+/// used only while decoding; free the result with `deinit`.
 /// `error.NotAnHdrImage` for any other kind of file.
 pub fn loadHdr(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !HdrImage {
     const bytes = try readFile(gpa, io, path);
@@ -1032,12 +924,8 @@ pub fn equirectDirection(u: f32, v: f32) [3]f32 {
     return .{ @sin(theta) * @cos(phi), @cos(theta), @sin(theta) * @sin(phi) };
 }
 
-// ---------------------------------------------------------------- materials
-
 fn textureRef(data: *gltf.Data, model: *Model, view: gltf.TextureView, srgb: bool) ?TextureRef {
     const texture = view.texture orelse return null;
-    // A texture may come in a Basis Universal file with a plain picture
-    // beside it for those who cannot read that; this renderer can.
     const image = (if (texture.has_basisu != 0) texture.basisu_image else null) orelse texture.image orelse return null;
     const index = elementIndex(gltf.Image, data.images, image);
     if (srgb) model.images[index].srgb = true;
@@ -1052,7 +940,6 @@ fn textureRef(data: *gltf.Data, model: *Model, view: gltf.TextureView, srgb: boo
     var uv_set: u8 = if (view.texcoord == 1) 1 else 0;
     if (view.has_transform != 0) {
         transform = .{ .scale = view.transform.scale, .rotation = view.transform.rotation, .offset = view.transform.offset };
-        // The extension may also say which coordinate set to use.
         if (view.transform.has_texcoord != 0) uv_set = if (view.transform.texcoord == 1) 1 else 0;
     }
     return .{ .image = index, .sampler = sampler, .uv_set = uv_set, .transform = transform };
@@ -1067,7 +954,6 @@ fn addressMode(mode: gltf.WrapMode) SamplerData.AddressMode {
 }
 
 fn loadMaterials(arena: std.mem.Allocator, data: *gltf.Data, model: *Model) !void {
-    // One extra default material for primitives that reference none.
     model.materials = try arena.alloc(Material, data.materials_count + 1);
     for (model.materials) |*material| material.* = .{};
     if (data.materials_count == 0) return;
@@ -1133,8 +1019,6 @@ fn loadMaterials(arena: std.mem.Allocator, data: *gltf.Data, model: *Model) !voi
     }
 }
 
-// -------------------------------------------------------------------- nodes
-
 fn loadNodes(arena: std.mem.Allocator, data: *gltf.Data, model: *Model) !void {
     model.nodes = try arena.alloc(Node, data.nodes_count);
     if (data.nodes_count == 0) return;
@@ -1149,8 +1033,6 @@ fn loadNodes(arena: std.mem.Allocator, data: *gltf.Data, model: *Model) !void {
         };
     }
 }
-
-// ------------------------------------------------------------------- meshes
 
 const FatVertex = extern struct {
     vertex: FullVertex,
@@ -1188,44 +1070,36 @@ extern fn rnd_meshopt_simplifyWithAttributes(
     result_error: *f32,
 ) usize;
 const simplify_lock_border = 1;
-/// The indices are a small part of the mesh: do not touch the rest.
+/// The indices are a small part of the mesh.
 const simplify_sparse = 2;
-/// Errors in the mesh's units instead of as a share of its size.
+/// Errors are in mesh units, not relative to mesh size.
 const simplify_error_absolute = 4;
 extern fn meshopt_simplifyScale(vertex_positions: [*]const f32, vertex_count: usize, vertex_positions_stride: usize) f32;
 
-/// Fewest triangles a mesh has for `LodOptions.clusters` to apply to it.
+/// Fewest triangles for `LodOptions.clusters` to apply to a mesh.
 const cluster_lod_min_triangles: usize = 8192;
 
-/// How a mesh's levels of detail are built.
 pub const LodOptions = struct {
-    /// A hierarchy of clusters chosen one by one rather than a few levels
-    /// of each whole mesh.
+    /// Build a cluster hierarchy instead of a few levels of each whole mesh.
     clusters: bool = false,
-    /// How much a change of a vertex's normal counts when choosing what
-    /// to remove and how large a level's error is said to be: a normal
-    /// turned all the way round counts as a shape error of twice this
-    /// share of the size of what is being simplified. 0 looks at shape
-    /// alone.
+    /// A fully reversed normal counts as a shape error of twice this fraction
+    /// of
+    /// the simplified extent. 0 considers shape only.
     normal_weight: f32 = default_lod_normal_weight,
-    /// How much texture sliding over the surface counts: 1 treats a
-    /// texture moved by some distance as a shape error of that distance,
-    /// 0 ignores it.
+    /// 1 counts a texture shifted by some distance as a shape error of that
+    /// distance; 0 ignores it.
     uv_weight: f32 = default_lod_uv_weight,
 };
-/// Default of `LodOptions.normal_weight`.
 pub const default_lod_normal_weight: f32 = 0.5;
-/// Default of `LodOptions.uv_weight`.
 pub const default_lod_uv_weight: f32 = 1;
 
-/// Normal and first texture coordinates of a vertex, as the simplifier
-/// reads them, and the weights that go with them.
+/// Normal and first texture coordinates, as the simplifier reads them.
 const SimplifyAttribute = [5]f32;
 fn simplifyWeights(normal_weight: f32, uv_weight: f32) [5]f32 {
     return .{ normal_weight, normal_weight, normal_weight, uv_weight, uv_weight };
 }
 
-/// Most levels of detail built per mesh, the full one included.
+/// Most levels of detail per mesh, including the full one.
 const max_lods = 6;
 
 extern fn meshopt_computeMeshletBounds(
@@ -1262,8 +1136,6 @@ fn unpack(gpa: std.mem.Allocator, accessor: *gltf.Accessor, components: usize) !
 }
 
 fn loadMeshes(gpa: std.mem.Allocator, arena: std.mem.Allocator, data: *gltf.Data, model: *Model, lods: LodOptions) !void {
-    // Every (mesh, primitive) pair becomes one renderer mesh. `first_mesh`
-    // maps a glTF mesh index to its first primitive.
     const first_mesh = try gpa.alloc(u32, data.meshes_count + 1);
     defer gpa.free(first_mesh);
     var mesh_count: u32 = 0;
@@ -1273,7 +1145,6 @@ fn loadMeshes(gpa: std.mem.Allocator, arena: std.mem.Allocator, data: *gltf.Data
     };
     first_mesh[data.meshes_count] = mesh_count;
 
-    // A mesh is skinned if any node instantiates it with a skin.
     const skinned = try gpa.alloc(bool, data.meshes_count);
     defer gpa.free(skinned);
     @memset(skinned, false);
@@ -1296,7 +1167,6 @@ fn loadMeshes(gpa: std.mem.Allocator, arena: std.mem.Allocator, data: *gltf.Data
     };
 
     var meshes: std.ArrayList(Mesh) = .empty;
-    // Primitives that are not triangle lists are dropped; remap indices.
     const remap = try gpa.alloc(?u32, mesh_count);
     defer gpa.free(remap);
     if (data.meshes_count != 0) for (data.meshes.?[0..data.meshes_count], 0..) |mesh, mesh_index| {
@@ -1349,7 +1219,6 @@ fn buildMesh(
     defer if (normals) |values| gpa.free(values);
     const uvs: ?[]f32 = if (findAttribute(primitive, .texcoord)) |accessor| try unpack(gpa, accessor, 2) else null;
     defer if (uvs) |values| gpa.free(values);
-    // COLOR_0 comes with or without alpha.
     var color_components: usize = 4;
     const colors: ?[]f32 = if (findAttribute(primitive, .color)) |accessor|
         (unpack(gpa, accessor, 4) catch blk: {
@@ -1417,7 +1286,6 @@ fn buildMesh(
     var mesh = try finishMesh(gpa, arena, source, source_indices, skinned, material, normals != null, tangents != null, if (target_count != 0) &reordered else null, lods);
     if (target_count == 0) try coarseFirst(gpa, &mesh);
     if (target_count != 0) {
-        // One run of deltas per target, in the mesh's final vertex order.
         const deltas = try arena.alloc(MorphDelta, target_count * mesh.vertices.len);
         @memset(deltas, .{ .position = .{ 0, 0, 0 }, .normal = .{ 0, 0, 0 }, .tangent = .{ 0, 0, 0 } });
         for (primitive.targets.?[0..target_count], 0..) |target, target_index| {
@@ -1443,10 +1311,9 @@ fn buildMesh(
     return mesh;
 }
 
-/// Optimizes a vertex/index soup and splits it into meshlets.
 /// A cluster of the level-of-detail hierarchy while it is being built.
 const BuildCluster = struct {
-    /// Its triangles, as indices into the mesh's vertices.
+    /// Triangle list indexing the mesh's vertices.
     indices: []u32,
     center: [3]f32,
     radius: f32,
@@ -1495,18 +1362,13 @@ fn appendClusters(
     return count;
 }
 
-/// A cluster on its way through one round of the hierarchy's build.
 const KeyedCluster = struct { key: u32, cluster: u32 };
 
-/// Sorts the clusters of one round (already ordered along a space-filling
-/// curve) into groups of up to `size` that share as much outline as they
-/// can: a group's outline is held still while it is simplified, so the
-/// less of it there is, the more the group can lose. Returns the clusters
-/// group after group and where each group ends.
+/// Sorts one round's clusters into groups of up to `size` that share as much
+/// boundary as possible. Returns the clusters group after group and where
+/// each group ends.
 fn groupClusters(scratch: std.mem.Allocator, clusters: []const BuildCluster, round: []const KeyedCluster, size: usize) !struct { order: []KeyedCluster, ends: []u32 } {
     const none = std.math.maxInt(u32);
-    // Every edge with the cluster it belongs to; an edge two clusters
-    // have is a piece of outline they share.
     const Edge = struct { key: u64, cluster: u32 };
     var edge_count: usize = 0;
     for (round) |item| edge_count += clusters[item.cluster].indices.len;
@@ -1542,7 +1404,6 @@ fn groupClusters(scratch: std.mem.Allocator, clusters: []const BuildCluster, rou
         run = end;
     }
     std.mem.sort(u64, pairs.items, {}, std.sort.asc(u64));
-    // Per cluster, its neighbours and how many edges it shares with each.
     const Neighbour = struct { cluster: u32, shared: u32 };
     var neighbours: std.ArrayList(Neighbour) = .empty;
     const first_neighbour = try scratch.alloc(u32, round.len + 1);
@@ -1558,8 +1419,6 @@ fn groupClusters(scratch: std.mem.Allocator, clusters: []const BuildCluster, rou
     }
     first_neighbour[round.len] = @intCast(neighbours.items.len);
 
-    // Grow each group from the first cluster not yet taken, always by the
-    // free cluster sharing the most outline with what the group has.
     const group_of = try scratch.alloc(u32, round.len);
     @memset(group_of, none);
     var sizes: std.ArrayList(u32) = .empty;
@@ -1591,8 +1450,6 @@ fn groupClusters(scratch: std.mem.Allocator, clusters: []const BuildCluster, rou
         }
         try sizes.append(scratch, @intCast(member_count));
     }
-    // A cluster left on its own between finished groups joins the one it
-    // shares the most with.
     for (0..round.len) |local| {
         if (sizes.items[group_of[local]] != 1) continue;
         var best: u32 = none;
@@ -1623,16 +1480,9 @@ fn groupClusters(scratch: std.mem.Allocator, clusters: []const BuildCluster, rou
     return .{ .order = order, .ends = ends };
 }
 
-/// Builds a hierarchy of clusters for per-cluster level of detail (after
-/// Karis et al., "Nanite"): neighbouring meshlets are merged in small
-/// groups, each group is simplified to half its triangles with its
-/// outline held still, and the result is cut into meshlets again, level
-/// upon level. Every cluster knows the error and bounds of the group it
-/// came from and of the group it was merged into, and is drawn when the
-/// first is too small to see and the second is not. Because a group's
-/// outline never moves and all its clusters switch on the same numbers,
-/// neighbouring clusters of different levels still meet exactly, so one
-/// mesh can be coarse far away and fine close by.
+/// Builds a cluster hierarchy for per-cluster level of detail (after Karis
+/// et al., "Nanite"): meshlets are merged in groups, each group simplified
+/// with its boundary locked and split into meshlets again, level upon level.
 fn buildClusterHierarchy(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -1640,11 +1490,10 @@ fn buildClusterHierarchy(
     level0: []const u32,
     minimum: [3]f32,
     maximum: [3]f32,
-    /// Per vertex, what is weighed besides shape.
     attributes: []const SimplifyAttribute,
     /// See `LodOptions.normal_weight`.
     normal_weight: f32,
-    /// The shape error a texture coordinate changing by one counts as.
+    /// The shape error a texture coordinate change of one counts as.
     uv_length: f32,
 ) !struct { indices: []u32, meshlets: []Meshlet, lod0_index_count: u32, lod0_meshlet_count: u32 } {
     var scratch_arena = std.heap.ArenaAllocator.init(gpa);
@@ -1664,14 +1513,12 @@ fn buildClusterHierarchy(
     var merged: std.ArrayList(u32) = .empty;
     var level: u32 = 0;
     while (current.items.len > 1 and level < 24) : (level += 1) {
-        // Neighbours in space end up next to each other in this order.
         for (current.items) |*item| {
             const center = clusters.items[item.cluster].center;
             var key: u32 = 0;
             inline for (0..3) |axis| {
                 const normalized = if (extent[axis] > 0) (center[axis] - minimum[axis]) / extent[axis] else 0;
                 var bits: u32 = @intFromFloat(std.math.clamp(normalized, 0, 1) * 1023);
-                // Spread the ten bits three apart.
                 bits = (bits | (bits << 16)) & 0x030000ff;
                 bits = (bits | (bits << 8)) & 0x0300f00f;
                 bits = (bits | (bits << 4)) & 0x030c30c3;
@@ -1709,28 +1556,19 @@ fn buildClusterHierarchy(
                     high[axis] = @max(high[axis], position[axis]);
                 }
             }
-            // Attributes are weighed against the size of what is being
-            // simplified, which here is the group.
             const group_extent = @max(high[0] - low[0], @max(high[1] - low[1], high[2] - low[2]));
             const weights = simplifyWeights(normal_weight, if (group_extent > 0) uv_length / group_extent else 0);
             const attribute_count: usize = if (normal_weight > 0 or uv_length > 0) weights.len else 0;
             var simplify_error: f32 = 0;
-            // The group's outline stays put: that is what lets it sit next
-            // to neighbours of another level without a crack.
             const count = if (group.len >= 2 and target >= 3)
                 rnd_meshopt_simplifyWithAttributes(simplified.ptr, merged.items.ptr, merged.items.len, positions, fat.len, @sizeOf(FatVertex), @ptrCast(attributes.ptr), @sizeOf(SimplifyAttribute), &weights, attribute_count, null, target, 0.1 * scale, simplify_lock_border | simplify_sparse | simplify_error_absolute, &simplify_error)
             else
                 0;
             if (count == 0 or count * 4 > merged.items.len * 3) {
-                // Would not get much smaller: its clusters wait for a
-                // larger group on a later round.
                 try next.appendSlice(scratch, group);
                 continue;
             }
             progressed = true;
-            // The sphere around everything the group covers, and around
-            // the spheres its clusters were made under, so that a group
-            // always looks at least as close as any of its parts.
             const center = math.scale(math.add(low, high), 0.5);
             var radius: f32 = 0;
             for (merged.items) |index| radius = @max(radius, math.length(math.sub(fat[index].vertex.position, center)));
@@ -1787,19 +1625,16 @@ fn finishMesh(
     material: u32,
     has_normals: bool,
     has_tangents: bool,
-    /// When given, receives for every final vertex its index in `source`
-    /// as passed in (owned by `gpa`).
+    /// Receives, for every final vertex, its index in `source` (owned by
+    /// `gpa`).
     reordered: ?*[]u32,
-    /// How levels of detail are built. A hierarchy of clusters is not
-    /// built for skinned meshes, whose shape the stored bounds would not
-    /// follow.
+    /// No cluster hierarchy is built for skinned meshes.
     lods: LodOptions,
 ) !Mesh {
     const vertex_count = source.len;
     if (!has_normals) generateNormals(source, source_indices);
     if (!has_tangents) try generateTangents(gpa, source, source_indices);
 
-    // Reorder for the post-transform cache, then make vertex fetch sequential.
     const cache_indices = try gpa.alloc(u32, source_indices.len);
     defer gpa.free(cache_indices);
     zmesh.opt.optimizeVertexCache(cache_indices, source_indices, vertex_count);
@@ -1831,7 +1666,6 @@ fn finishMesh(
         radius_squared = @max(radius_squared, math.dot(delta, delta));
     }
 
-    // How densely textures are mapped, for choosing which mips to keep.
     var uv_area: f64 = 0;
     var surface_area: f64 = 0;
     var corner: usize = 0;
@@ -1844,18 +1678,12 @@ fn finishMesh(
     }
     const uv_density: f32 = if (surface_area > 0) @floatCast(@sqrt(uv_area / surface_area)) else 0;
 
-    // What the simplifier weighs besides shape.
     const attributes = try gpa.alloc(SimplifyAttribute, fat.len);
     defer gpa.free(attributes);
     for (attributes, fat) |*attribute, value| attribute.* = value.vertex.normal ++ value.vertex.uv;
-    // The distance over the surface that one unit of texture coordinate
-    // covers, times how much texture sliding is to count.
     const uv_length: f32 = if (uv_density > 0) lods.uv_weight / uv_density else 0;
 
-    // A mesh of a few meshlets is drawn whole or not at all whichever way
-    // its levels are built, and whole-mesh levels then cost fewer meshlets.
     if (lods.clusters and !skinned and cache_indices.len / 3 >= cluster_lod_min_triangles) {
-        // Clusters chosen one by one instead of levels of the whole mesh.
         const built = try buildClusterHierarchy(gpa, arena, fat, cache_indices, minimum, maximum, attributes, lods.normal_weight, uv_length);
         return .{
             .vertices = vertices,
@@ -1871,10 +1699,6 @@ fn finishMesh(
         };
     }
 
-    // Coarser versions of the mesh, each about half the triangles of the
-    // one before. Every level becomes its own run of meshlets tagged with
-    // the geometric error it introduces; the renderer draws the coarsest
-    // level whose error is too small to see at the current distance.
     var levels: [max_lods][]u32 = undefined;
     var errors: [max_lods]f32 = undefined;
     levels[0] = cache_indices;
@@ -1891,9 +1715,7 @@ fn finishMesh(
         const target = previous.len / 6 * 3;
         const simplified = try gpa.alloc(u32, previous.len);
         var relative_error: f32 = 0;
-        // Borders stay put so neighbouring meshes keep meeting exactly.
         const count = rnd_meshopt_simplifyWithAttributes(simplified.ptr, previous.ptr, previous.len, positions, fat.len, @sizeOf(FatVertex), @ptrCast(attributes.ptr), @sizeOf(SimplifyAttribute), &weights, attribute_count, null, target, 0.05, simplify_lock_border, &relative_error);
-        // Stop once simplification no longer buys a real reduction.
         if (count == 0 or count * 4 > previous.len * 3) {
             gpa.free(simplified);
             break;
@@ -1984,18 +1806,13 @@ fn finishMesh(
     };
 }
 
-/// Reorders a mesh's vertices so that those its coarser levels use come
-/// first, and notes how many they are and at what error the mesh is
-/// drawn without the rest; see `Mesh.coarse_vertex_count`. The renderer
-/// can then keep only that part of a far mesh in GPU memory.
+/// Reorders vertices so those the coarser levels use come first; see
+/// `Mesh.coarse_vertex_count`.
 fn coarseFirst(gpa: std.mem.Allocator, mesh: *Mesh) !void {
     if (mesh.skin != null or mesh.morph_targets != 0) return;
     if (mesh.lod0_meshlet_count == 0 or mesh.lod0_meshlet_count >= mesh.meshlets.len) return;
-    // Every piece of the finest level gives way to a coarser one at some
-    // error; past the largest of those, none of them is drawn.
     var floor: f32 = 0;
     for (mesh.meshlets[0..mesh.lod0_meshlet_count]) |meshlet| floor = @max(floor, meshlet.parent_error);
-    // A piece with no coarser form is needed at every distance.
     if (!(floor > 0) or floor >= std.math.floatMax(f32) * 0.5) return;
     const used = try gpa.alloc(bool, mesh.vertices.len);
     defer gpa.free(used);
@@ -2030,7 +1847,6 @@ fn generateNormals(vertices: []FatVertex, indices: []const u32) void {
         const a = &vertices[indices[triangle]].vertex;
         const b = &vertices[indices[triangle + 1]].vertex;
         const c = &vertices[indices[triangle + 2]].vertex;
-        // Unnormalized cross product weights each face by its area.
         const face = math.cross(math.sub(b.position, a.position), math.sub(c.position, a.position));
         a.normal = math.add(a.normal, face);
         b.normal = math.add(b.normal, face);
@@ -2077,7 +1893,6 @@ fn generateTangents(gpa: std.mem.Allocator, vertices: []FatVertex, indices: []co
     for (vertices, bitangents) |*fat, bitangent| {
         const n = fat.vertex.normal;
         var t: [3]f32 = fat.vertex.tangent[0..3].*;
-        // Gram-Schmidt against the normal; fall back to any perpendicular.
         t = math.sub(t, math.scale(n, math.dot(n, t)));
         if (math.dot(t, t) < 1e-12) {
             const helper: [3]f32 = if (@abs(n[1]) < 0.99) .{ 0, 1, 0 } else .{ 1, 0, 0 };
@@ -2088,8 +1903,6 @@ fn generateTangents(gpa: std.mem.Allocator, vertices: []FatVertex, indices: []co
         fat.vertex.tangent = .{ t[0], t[1], t[2], handedness };
     }
 }
-
-// ------------------------------------------------------ skins and animation
 
 fn loadSkins(gpa: std.mem.Allocator, arena: std.mem.Allocator, data: *gltf.Data, model: *Model) !void {
     model.skins = try arena.alloc(Skin, data.skins_count + model.implicit_skins.len);
@@ -2131,8 +1944,6 @@ fn loadAnimations(gpa: std.mem.Allocator, arena: std.mem.Allocator, data: *gltf.
                 else => continue,
             };
             const sampler = channel.sampler;
-            // A weights channel stores one number per morph target per key
-            // in a flat list.
             const components: usize = switch (path) {
                 .rotation => 4,
                 .weights => if (sampler.input.count == 0) 0 else sampler.output.count / sampler.input.count / @as(usize, if (sampler.interpolation == .cubic_spline) 3 else 1),
@@ -2143,8 +1954,6 @@ fn loadAnimations(gpa: std.mem.Allocator, arena: std.mem.Allocator, data: *gltf.
             if (sampler.input.unpackFloats(times).len != times.len) return error.InvalidAccessor;
             const raw = try unpack(gpa, sampler.output, if (path == .weights) 1 else components);
             defer gpa.free(raw);
-            // Cubic splines store in-tangent, value, out-tangent per key and
-            // are kept whole; the other modes store one value per key.
             const cubic = sampler.interpolation == .cubic_spline;
             const per_key: usize = if (cubic) 3 else 1;
             if (times.len == 0) continue;
@@ -2184,31 +1993,30 @@ test "skinned glTF keeps skins, clips and per-vertex influences" {
     for (mesh.meshlets) |meshlet| try std.testing.expect(meshlet.index_count <= max_meshlet_triangles * 3);
 }
 
-/// Decodes an image file (PNG, JPEG, ...) to RGBA8. `acquireLibraries`
-/// must have been called. Free the result with `deinit`.
+/// Decodes an image file (PNG, JPEG, ...) to RGBA8. Requires
+/// `acquireLibraries`. Free the result with `deinit`.
 pub fn loadImage(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !zstbi.Image {
     const bytes = try readFile(gpa, io, path);
     defer gpa.free(bytes);
     return zstbi.Image.loadFromMemory(bytes, 4);
 }
 
-/// Geometry supplied directly by the application instead of a file.
+/// Geometry supplied by the application instead of a file.
 pub const MeshDesc = struct {
     positions: []const [3]f32,
     /// Generated from the triangles when null.
     normals: ?[]const [3]f32 = null,
     uvs: ?[]const [2]f32 = null,
-    /// Per-vertex colors, multiplied with the material's base color.
+    /// Multiplied with the material's base color.
     colors: ?[]const [4]f32 = null,
-    /// A second set of texture coordinates.
     uvs1: ?[]const [2]f32 = null,
-    /// Triangle list. Counter-clockwise triangles face outward.
+    /// Triangle list, counter-clockwise front faces.
     indices: []const u32,
     material: Material = .{ .metallic = 0, .roughness = 0.6 },
 };
 
-/// Builds a model from in-memory meshes. Each mesh becomes one instance at
-/// the model origin. Texture references in the materials are ignored.
+/// Builds a model from in-memory meshes, one instance each at the model
+/// origin. Texture references in the materials are ignored.
 pub fn fromMeshes(gpa: std.mem.Allocator, descs: []const MeshDesc, lods: LodOptions) !Model {
     var model = Model{ .arena = .init(gpa) };
     errdefer model.deinit();
@@ -2262,7 +2070,6 @@ test "procedural meshes become meshlets with generated normals" {
     defer model.deinit();
     try std.testing.expectEqual(@as(usize, 1), model.meshes.len);
     try std.testing.expectEqual(@as(usize, 6), model.meshes[0].indices.len);
-    // Counter-clockwise in the XZ plane seen from above faces +Y.
     try std.testing.expectApproxEqAbs(@as(f32, 1), model.meshes[0].vertices[0].unpackNormal()[1], 1e-4);
 }
 
@@ -2295,7 +2102,6 @@ test "a cluster hierarchy stays watertight at every cut" {
         try std.testing.expect(meshlet.self_sphere[3] >= 0);
         try std.testing.expect(meshlet.parent_error > meshlet.lod_error);
         if (meshlet.lod_error > 0) try thresholds.append(gpa, meshlet.lod_error);
-        // A group reaches at least as far as each group it was made from.
         if (meshlet.lod_error > 0 and meshlet.parent_error < std.math.floatMax(f32)) {
             const apart = math.length(math.sub(meshlet.self_sphere[0..3].*, meshlet.parent_sphere[0..3].*));
             try std.testing.expect(apart + meshlet.self_sphere[3] <= meshlet.parent_sphere[3] * 1.0001 + 1e-4);
@@ -2303,11 +2109,6 @@ test "a cluster hierarchy stays watertight at every cut" {
     }
     std.mem.sort(f32, thresholds.items, {}, std.sort.asc(f32));
 
-    // Whatever error is allowed, the clusters that pass form the whole
-    // surface once: the only edges with one triangle are the grid's own
-    // rim, and none has more than two, apart from the odd sliver the
-    // simplifier folds onto an edge. Seen from above the triangles add up
-    // to the grid's area: nothing is covered twice and nothing is left out.
     const Shared = struct { count: u32 = 0 };
     var edges: std.AutoHashMap(u64, Shared) = .init(gpa);
     defer edges.deinit();
@@ -2355,7 +2156,6 @@ test "a cluster hierarchy stays watertight at every cut" {
         fewest = @min(fewest, triangles);
     }
     try std.testing.expectEqual(@as(usize, cells * cells * 2), mesh.lod0_index_count / 3);
-    // The coarsest cut is a small fraction of the full mesh.
     try std.testing.expect(fewest * 8 < cells * cells * 2);
 }
 
@@ -2374,7 +2174,6 @@ test "Basis Universal textures are transcoded to BC7" {
         var expected: usize = 0;
         for (0..9) |level| expected += @as(usize, (@max(@as(u32, 480) >> @intCast(level), 1) + 3) / 4) * ((@max(@as(u32, 270) >> @intCast(level), 1) + 3) / 4) * 16;
         try std.testing.expectEqual(expected, texture.data.len);
-        // A picture, not one block over and over.
         var differing: usize = 0;
         var block: usize = 16;
         while (block + 16 <= 120 * 68 * 16) : (block += 16) {
@@ -2382,7 +2181,6 @@ test "Basis Universal textures are transcoded to BC7" {
         }
         try std.testing.expect(differing > 120 * 68 / 2);
     }
-    // A file that claims to be one and is not is refused, not read.
     var broken: [96]u8 = @splat(0);
     @memcpy(broken[0..12], &[_]u8{ 0xab, 'K', 'T', 'X', ' ', '2', '0', 0xbb, '\r', '\n', 0x1a, '\n' });
     std.mem.writeInt(u32, broken[20..24], 16, .little);
@@ -2391,9 +2189,8 @@ test "Basis Universal textures are transcoded to BC7" {
     try std.testing.expectError(error.UnsupportedKtx2, ktx2.read(gpa, &broken));
 }
 
-/// Deletes the oldest files of an asset cache directory until what is left
-/// takes at most `max_bytes`. Age is when a file was written, not when it
-/// was last used. Returns the bytes freed.
+/// Deletes the oldest files (by write time) of an asset cache directory
+/// until at most `max_bytes` remain. Returns the bytes freed.
 pub fn trimCache(gpa: std.mem.Allocator, io: std.Io, directory: []const u8, max_bytes: u64) !u64 {
     var dir = std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return 0,
@@ -2410,7 +2207,6 @@ pub fn trimCache(gpa: std.mem.Allocator, io: std.Io, directory: []const u8, max_
     var iterator = dir.iterate();
     while (try iterator.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        // Only what the cache itself writes.
         if (!std.mem.endsWith(u8, entry.name, ".bc7") and !std.mem.endsWith(u8, entry.name, ".bc5") and !std.mem.endsWith(u8, entry.name, ".bc4") and !std.mem.endsWith(u8, entry.name, ".model") and !std.mem.endsWith(u8, entry.name, ".geometry")) continue;
         const stat = dir.statFile(io, entry.name, .{}) catch continue;
         const name = try gpa.dupe(u8, entry.name);

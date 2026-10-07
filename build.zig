@@ -13,6 +13,10 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/skin.comp", .name = "skin.comp.spv" },
     .{ .src = shader_dir ++ "/skin_bounds.comp", .name = "skin_bounds.comp.spv" },
     .{ .src = shader_dir ++ "/cull.comp", .name = "cull.comp.spv" },
+    .{ .src = shader_dir ++ "/cull_instances.comp", .name = "cull_instances.comp.spv" },
+    .{ .src = shader_dir ++ "/visibility.task", .name = "visibility.task.spv" },
+    .{ .src = shader_dir ++ "/visibility.mesh", .name = "visibility.mesh.spv" },
+    .{ .src = shader_dir ++ "/hiz.comp", .name = "hiz.comp.spv" },
     .{ .src = shader_dir ++ "/cluster.comp", .name = "cluster.comp.spv" },
     .{ .src = shader_dir ++ "/forward.vert", .name = "forward.vert.spv" },
     .{ .src = shader_dir ++ "/forward.frag", .name = "forward.frag.spv" },
@@ -46,6 +50,9 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/oit_composite.frag", .name = "oit_composite.frag.spv" },
     .{ .src = shader_dir ++ "/copy.frag", .name = "copy.frag.spv" },
     .{ .src = shader_dir ++ "/upscale.frag", .name = "upscale.frag.spv" },
+    .{ .src = shader_dir ++ "/shading_rate.frag", .name = "shading_rate.frag.spv" },
+    .{ .src = shader_dir ++ "/fsr_easu.frag", .name = "fsr_easu.frag.spv" },
+    .{ .src = shader_dir ++ "/fsr_rcas.frag", .name = "fsr_rcas.frag.spv" },
     .{ .src = shader_dir ++ "/ssr.frag", .name = "ssr.frag.spv" },
     .{ .src = shader_dir ++ "/ssr.frag", .name = "ssr_rt.frag.spv", .defines = &.{"RAY_TRACED"} },
     .{ .src = shader_dir ++ "/ssr_composite.frag", .name = "ssr_composite.frag.spv" },
@@ -71,6 +78,10 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/liquid_shadow.frag", .name = "liquid_shadow.frag.spv" },
     .{ .src = shader_dir ++ "/liquid_surface.frag", .name = "liquid_surface.frag.spv" },
     .{ .src = shader_dir ++ "/pathtrace_denoise.frag", .name = "pathtrace_denoise.frag.spv" },
+    .{ .src = shader_dir ++ "/ffx_reflections_reproject.frag", .name = "ffx_reflections_reproject.frag.spv" },
+    .{ .src = shader_dir ++ "/ffx_reflections_average.frag", .name = "ffx_reflections_average.frag.spv" },
+    .{ .src = shader_dir ++ "/ffx_reflections_prefilter.frag", .name = "ffx_reflections_prefilter.frag.spv" },
+    .{ .src = shader_dir ++ "/ffx_reflections_resolve.frag", .name = "ffx_reflections_resolve.frag.spv" },
     .{ .src = shader_dir ++ "/pathtrace.frag", .name = "pathtrace.frag.spv" },
     .{ .src = shader_dir ++ "/pathtrace.frag", .name = "pathtrace_rt.frag.spv", .defines = &.{"RAY_TRACED"} },
     .{ .src = shader_dir ++ "/liquid_thickness.frag", .name = "liquid_thickness.frag.spv" },
@@ -88,6 +99,20 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/particle_sort.comp", .name = "particle_sort.comp.spv" },
     .{ .src = shader_dir ++ "/particle.vert", .name = "particle.vert.spv" },
     .{ .src = shader_dir ++ "/particle_trail.vert", .name = "particle_trail.vert.spv" },
+    .{ .src = shader_dir ++ "/impostor.vert", .name = "impostor.vert.spv" },
+    .{ .src = shader_dir ++ "/impostor.frag", .name = "impostor.frag.spv" },
+    .{ .src = shader_dir ++ "/impostor_bake.vert", .name = "impostor_bake.vert.spv" },
+    .{ .src = shader_dir ++ "/impostor_bake.frag", .name = "impostor_bake.frag.spv" },
+    .{ .src = shader_dir ++ "/lightmap_bake.vert", .name = "lightmap_bake.vert.spv" },
+    .{ .src = shader_dir ++ "/lightmap_bake.frag", .name = "lightmap_bake.frag.spv" },
+    .{ .src = shader_dir ++ "/lightmap_dilate.frag", .name = "lightmap_dilate.frag.spv" },
+    .{ .src = shader_dir ++ "/vsm_mark.comp", .name = "vsm_mark.comp.spv" },
+    .{ .src = shader_dir ++ "/vsm_allocate.comp", .name = "vsm_allocate.comp.spv" },
+    .{ .src = shader_dir ++ "/vsm_clear.vert", .name = "vsm_clear.vert.spv" },
+    .{ .src = shader_dir ++ "/hair_sim.comp", .name = "hair_sim.comp.spv" },
+    .{ .src = shader_dir ++ "/hair_shadow.vert", .name = "hair_shadow.vert.spv" },
+    .{ .src = shader_dir ++ "/hair.vert", .name = "hair.vert.spv" },
+    .{ .src = shader_dir ++ "/hair.frag", .name = "hair.frag.spv" },
     .{ .src = shader_dir ++ "/particle_mesh.vert", .name = "particle_mesh.vert.spv" },
     .{ .src = shader_dir ++ "/particle_mesh.frag", .name = "particle_mesh.frag.spv" },
     .{ .src = shader_dir ++ "/particle.frag", .name = "particle.frag.spv" },
@@ -242,6 +267,48 @@ const examples: []const Example = &.{
         .description = "Walk a skinned character through Sponza",
         .windowed = true,
     },
+    .{
+        .name = "asteroids",
+        .root = "examples/asteroids.zig",
+        .description = "A belt of millions of rocks, culled and drawn by the GPU",
+        .windowed = true,
+    },
+    .{
+        .name = "shadows",
+        .root = "examples/shadows.zig",
+        .description = "Virtual shadow maps beside the sun's cascades, down a long avenue of fine shadows",
+        .windowed = true,
+    },
+    .{
+        .name = "upscaling",
+        .root = "examples/upscaling.zig",
+        .description = "Drawing fewer pixels: bicubic, temporal and FidelityFX upscaling, and coarse shading",
+        .windowed = true,
+    },
+    .{
+        .name = "lightmap",
+        .root = "examples/lightmap.zig",
+        .description = "A room whose bounce light is baked into lightmaps by rays while you watch",
+        .windowed = true,
+    },
+    .{
+        .name = "stereo",
+        .root = "examples/stereo.zig",
+        .description = "A stereo pair: the scene once for each eye, side by side",
+        .windowed = true,
+    },
+    .{
+        .name = "hair",
+        .root = "examples/hair.zig",
+        .description = "Ten thousand strands of hair that hang, swing and blow about",
+        .windowed = true,
+    },
+    .{
+        .name = "voxels",
+        .root = "examples/voxels.zig",
+        .description = "Fly round a small planet of fifty million voxels as its chunks stream in",
+        .windowed = true,
+    },
 };
 
 /// Shaders of the examples that the verification scene draws with too.
@@ -351,6 +418,14 @@ pub fn build(b: *std.Build) void {
     shader_options.addOption([]const []const u8, "defines", &shader_defines);
     shader_options.addOption([]const u8, "include_dir", b.pathFromRoot(shader_dir));
     renderer.addOptions("shader_sources", shader_options);
+    // AMD's FidelityFX SDK, for FidelityFX Super Resolution 2 and 3. It is
+    // C++ and a thousand compiled shaders; `-Dfidelityfx=false` leaves it
+    // out, and with it `Upscaling.fsr2` and `.fsr3`.
+    const fidelityfx = b.option(bool, "fidelityfx", "Build AMD's FidelityFX SDK in, for FSR 2 and FSR 3 upscaling (default: true)") orelse true;
+    const features = b.addOptions();
+    features.addOption(bool, "fidelityfx", fidelityfx);
+    renderer.addOptions("build_features", features);
+    if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk);
 
     // Everything is compiled with LLVM, also in debug builds.
     const library = b.addLibrary(.{ .name = "limn", .root_module = renderer, .linkage = .static, .use_llvm = true });
@@ -612,6 +687,131 @@ pub fn build(b: *std.Build) void {
     verify_cache_stream.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "24", "--cache", ".zig-cache/renderer-assets", "--stream", "64", "--stream-from-cache", "--stream-skip-occluded", "--output" });
     _ = verify_cache_stream.addOutputFileArg("verify_cache_stream.png");
     verify_step.dependOn(&verify_cache_stream.step);
+}
+
+/// A pass of the FidelityFX SDK: a compute shader compiled once for
+/// every combination of its effect's options.
+const ffx_root = "src/third_party/ffx_sdk";
+const FfxEffect = struct {
+    /// The directory of its shaders and of what they include.
+    name: []const u8,
+    /// What its options' names start with.
+    prefix: []const u8,
+    passes: []const []const u8,
+};
+/// The options every pass is compiled for both ways, the first the lowest
+/// bit of a combination's number (the order of
+/// CMakeCompileFSR3UpscalerShaders.txt in the SDK, which the SDK's own
+/// lookup of a combination follows).
+const ffx_options = [_][]const u8{
+    "OPTION_REPROJECT_USE_LANCZOS_TYPE",
+    "OPTION_HDR_COLOR_INPUT",
+    "OPTION_LOW_RESOLUTION_MOTION_VECTORS",
+    "OPTION_JITTERED_MOTION_VECTORS",
+    "OPTION_INVERTED_DEPTH",
+    "OPTION_APPLY_SHARPENING",
+};
+/// What every pass is compiled with whatever the combination.
+const ffx_fixed = [_][]const u8{
+    "OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0",
+    "OPTION_ACCUMULATE_SAMPLERS_USE_DATA_HALF=0",
+    "OPTION_REPROJECT_SAMPLERS_USE_DATA_HALF=1",
+    "OPTION_POSTPROCESSLOCKSTATUS_SAMPLERS_USE_DATA_HALF=0",
+    "OPTION_UPSAMPLE_USE_LANCZOS_TYPE=2",
+};
+const ffx_effects = [_]FfxEffect{
+    .{ .name = "fsr2", .prefix = "FFX_FSR2", .passes = &.{
+        "ffx_fsr2_accumulate_pass",                 "ffx_fsr2_autogen_reactive_pass", "ffx_fsr2_compute_luminance_pyramid_pass",
+        "ffx_fsr2_depth_clip_pass",                 "ffx_fsr2_lock_pass",             "ffx_fsr2_rcas_pass",
+        "ffx_fsr2_reconstruct_previous_depth_pass", "ffx_fsr2_tcr_autogen_pass",
+    } },
+    .{ .name = "fsr3upscaler", .prefix = "FFX_FSR3UPSCALER", .passes = &.{
+        "ffx_fsr3upscaler_accumulate_pass",             "ffx_fsr3upscaler_autogen_reactive_pass", "ffx_fsr3upscaler_debug_view_pass",
+        "ffx_fsr3upscaler_luma_instability_pass",       "ffx_fsr3upscaler_luma_pyramid_pass",     "ffx_fsr3upscaler_prepare_inputs_pass",
+        "ffx_fsr3upscaler_prepare_reactivity_pass",     "ffx_fsr3upscaler_rcas_pass",             "ffx_fsr3upscaler_shading_change_pass",
+        "ffx_fsr3upscaler_shading_change_pyramid_pass",
+    } },
+};
+
+/// Builds the FidelityFX SDK and the renderer's wrapper round it, and links
+/// `renderer` with them. Shader permutations are compiled with glslc and
+/// packed into the SDK's headers by src/ffx_permutations.zig.
+fn addFidelityFx(
+    b: *std.Build,
+    renderer: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    vulkan_include: std.Build.LazyPath,
+    volk: *std.Build.Dependency,
+) void {
+    const library = b.addLibrary(.{
+        .name = "renderer_fidelityfx",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libcpp = true }),
+    });
+    const generator = b.addExecutable(.{
+        .name = "ffx_permutations",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ffx_permutations.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const gpu = b.path(ffx_root ++ "/include/FidelityFX/gpu");
+    for (ffx_effects) |effect| {
+        var option_names: [ffx_options.len][]const u8 = undefined;
+        for (ffx_options, &option_names) |option, *name| name.* = b.fmt("{s}_{s}", .{ effect.prefix, option });
+        for (effect.passes) |pass| {
+            const generate = b.addRunArtifact(generator);
+            const headers = generate.addOutputDirectoryArg(pass);
+            generate.addArg(pass);
+            generate.addArg(std.mem.join(b.allocator, ",", &option_names) catch @panic("OOM"));
+            for (0..1 << ffx_options.len) |combination| {
+                // Compiled with names kept, which is what tells the SDK
+                // what a shader binds; the generator drops the rest of
+                // what `-g` adds.
+                const compile = b.addSystemCommand(&.{ "glslc", "-fshader-stage=compute", "--target-env=vulkan1.2", "-Os", "-g", "-DFFX_GLSL=1", "-DFFX_GPU=1", "-DFFX_HALF=0" });
+                for (ffx_fixed) |fixed| compile.addArg(b.fmt("-D{s}_{s}", .{ effect.prefix, fixed }));
+                for (option_names, 0..) |name, bit| compile.addArg(b.fmt("-D{s}={d}", .{ name, (combination >> @intCast(bit)) & 1 }));
+                compile.addPrefixedDirectoryArg("-I", gpu);
+                compile.addPrefixedDirectoryArg("-I", gpu.path(b, effect.name));
+                compile.addArg("-MD");
+                compile.addArg("-MF");
+                _ = compile.addDepFileOutputArg(b.fmt("{s}_{d}.d", .{ pass, combination }));
+                compile.addFileArg(b.path(b.fmt("{s}/src/backends/vk/shaders/{s}/{s}.glsl", .{ ffx_root, effect.name, pass })));
+                compile.addArg("-o");
+                generate.addFileArg(compile.addOutputFileArg(b.fmt("{s}_{d}.spv", .{ pass, combination })));
+            }
+            library.root_module.addIncludePath(headers);
+        }
+    }
+    for ([_][]const u8{ "include", "src", "src/shared", "src/components", "src/backends/shared" }) |directory| {
+        library.root_module.addIncludePath(b.path(b.fmt("{s}/{s}", .{ ffx_root, directory })));
+    }
+    library.root_module.addIncludePath(vulkan_include);
+    library.root_module.addIncludePath(volk.path(""));
+    const flags = [_][]const u8{
+        "-std=c++17",         "-w",                                         "-fno-strict-aliasing",
+        "-include",           b.pathFromRoot(ffx_root ++ "/limn_compat.h"), "-DFFX_FSR2",
+        "-DFFX_FSR3UPSCALER", "-DFFX_SDK_DEFAULT_CONTEXT_SIZE=(1024*256)",  "-fmax-type-align=4",
+    };
+    library.root_module.addCSourceFiles(.{
+        .root = b.path(ffx_root),
+        .files = &.{
+            "src/backends/vk/ffx_vk.cpp",
+            "src/components/fsr2/ffx_fsr2.cpp",
+            "src/components/fsr3upscaler/ffx_fsr3upscaler.cpp",
+            "src/shared/ffx_assert.cpp",
+            "src/shared/ffx_message.cpp",
+            "src/shared/ffx_object_management.cpp",
+            "src/shared/ffx_breadcrumbs_list.cpp",
+            "src/backends/shared/ffx_shader_blobs.cpp",
+            "src/backends/shared/blob_accessors/ffx_fsr2_shaderblobs.cpp",
+            "src/backends/shared/blob_accessors/ffx_fsr3upscaler_shaderblobs.cpp",
+        },
+        .flags = &flags,
+    });
+    library.root_module.addCSourceFile(.{ .file = b.path("src/render/ffx/limn_ffx.cpp"), .flags = &flags });
+    renderer.linkLibrary(library);
 }
 
 fn volkModule(

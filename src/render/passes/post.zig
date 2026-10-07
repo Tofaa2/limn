@@ -1,11 +1,12 @@
-//! The passes that work on a view's whole picture once its scene has been
-//! drawn: temporal antialiasing, the lens effects, bloom and exposure, and
+//! Post-processing: temporal antialiasing, lens effects, bloom, exposure and
 //! tone mapping into the view's target. Internal to the renderer.
 const std = @import("std");
 const rhi = @import("../../rhi/rhi.zig");
 const gpu = @import("../gpu.zig");
 const render = @import("../renderer.zig");
 const ScenePass = @import("../scene_pass.zig").ScenePass;
+const ffx = @import("../ffx.zig");
+const path_tracing = @import("path_tracing.zig");
 
 const Renderer = render.Renderer;
 const ViewDesc = render.ViewDesc;
@@ -36,7 +37,7 @@ pub const TonemapPush = extern struct {
     flare_pad: u32 = 0,
 };
 
-/// 0: the target's format encodes by itself. 1: sRGB by hand. 2: HDR10.
+/// 0: the target format encodes. 1: sRGB. 2: HDR10.
 pub fn outputEncoding(renderer: *const Renderer, desc: ViewDesc, format: rhi.Format) u32 {
     const plain: u32 = @intFromBool(!format.isSrgb());
     return switch (desc.settings.output_encoding) {
@@ -46,8 +47,7 @@ pub fn outputEncoding(renderer: *const Renderer, desc: ViewDesc, format: rhi.For
     };
 }
 
-/// The tone mapping pipeline for a target of `format`, built the first
-/// time a target of that format is drawn to.
+/// The tone mapping pipeline for `format`, created on first use.
 pub fn tonemapPipeline(renderer: *Renderer, format: rhi.Format) !rhi.Pipeline {
     for (renderer.tonemap_pipelines.items) |entry| if (entry.format == format) return entry.pipeline;
     const pipeline = try renderer.device.createGraphicsPipeline(.{
@@ -61,8 +61,65 @@ pub fn tonemapPipeline(renderer: *Renderer, format: rhi.Format) !rhi.Pipeline {
     return pipeline;
 }
 
-/// Temporal antialiasing: joins the picture with the view's history.
-/// Returns the picture the passes after it carry on from.
+/// Resolves with FidelityFX Super Resolution 2 or 3 instead of TAA, when
+/// requested, rendering below output size and available. Returns whether it
+/// did.
+fn resolveWithFidelityFx(renderer: *Renderer, p: *const ScenePass, output: rhi.Texture) !bool {
+    const device = renderer.device;
+    const cmd = p.cmd;
+    const view_data = p.view_data;
+    const view = p.view;
+    const generation: ffx.Generation = switch (p.settings.upscaling) {
+        .fsr2 => .fsr2,
+        .fsr3 => .fsr3,
+        else => return false,
+    };
+    if (!ffx.available or !device.storage_images) return false;
+    const render_size = [2]u32{ p.width, p.height };
+    const output_info = device.textureInfo(output);
+    const output_size = [2]u32{ output_info.width, output_info.height };
+    if (output_size[0] <= render_size[0] and output_size[1] <= render_size[1]) return false;
+    if (view_data.upscaler) |upscaler| {
+        if (upscaler.generation != generation or !std.meta.eql(upscaler.render_size, render_size) or !std.meta.eql(upscaler.output_size, output_size)) {
+            // Frames using it may still be in flight.
+            try device.waitIdle();
+            upscaler.destroy();
+            view_data.upscaler = null;
+        }
+    }
+    var fresh = false;
+    if (view_data.upscaler == null) {
+        if (view_data.upscaler_refused) return false;
+        view_data.upscaler = ffx.Upscaler.create(device, generation, render_size, output_size) orelse {
+            std.log.warn("FidelityFX Super Resolution would not start; temporal upscaling stands in", .{});
+            view_data.upscaler_refused = true;
+            return false;
+        };
+        fresh = true;
+    }
+    cmd.beginScope("fidelityfx super resolution");
+    cmd.transition(view.hdr, .shader_read);
+    cmd.transition(view.depth, .shader_read);
+    cmd.transition(view.motion, .shader_read);
+    cmd.transition(output, .shader_read);
+    try view_data.upscaler.?.dispatch(device, cmd, .{
+        .color = view.hdr,
+        .depth = view.depth,
+        .motion = view.motion,
+        .output = output,
+        .jitter = p.jitter,
+        // Sharpening happens in tone mapping.
+        .sharpness = 0,
+        .delta_time = p.delta_time,
+        .near = p.desc.camera.near,
+        .fov_y = p.desc.camera.fov_y,
+        .reset = fresh or !view.history_valid,
+    });
+    cmd.endScope();
+    return true;
+}
+
+/// Temporal antialiasing. Returns the texture later passes continue from.
 pub fn resolveTemporal(renderer: *Renderer, p: *const ScenePass, path_traced: bool) !rhi.Texture {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -72,20 +129,26 @@ pub fn resolveTemporal(renderer: *Renderer, p: *const ScenePass, path_traced: bo
     const debugging = p.debugging;
     const frame_address = p.frame_address;
     var resolved = view.hdr;
-    // A path-traced picture is already an average over frames.
-    if (settings.temporal_antialiasing and !debugging and !path_traced) {
-        cmd.beginScope("temporal antialiasing");
+    const still: f32 = @floatFromInt(view_data.path_still -| path_tracing.frames_to_settle);
+    const settled: f32 = if (path_traced) @min(still / path_tracing.frames_to_hand_over, 1) else 0;
+    if (settings.temporal_antialiasing and !debugging) {
         const current = view.history[@intCast(view_data.frames & 1)];
         const previous = view.history[@intCast((view_data.frames + 1) & 1)];
+        if (try resolveWithFidelityFx(renderer, p, current)) {
+            view.history_valid = true;
+            return current;
+        }
+        cmd.beginScope("temporal antialiasing");
         try cmd.beginRendering(.{ .color = &.{.{ .texture = current, .load = .discard }} });
         cmd.bindPipeline(renderer.pipelines.taa);
-        cmd.pushConstants(extern struct { frame: u64, color: u32, history: u32, motion: u32, depth: u32, history_valid: u32, pad: u32 = 0 }{
+        cmd.pushConstants(extern struct { frame: u64, color: u32, history: u32, motion: u32, depth: u32, history_valid: u32, settled: f32 }{
             .frame = frame_address,
             .color = device.textureIndex(view.hdr),
             .history = device.textureIndex(previous),
             .motion = device.textureIndex(view.motion),
             .depth = device.textureIndex(view.depth),
             .history_valid = @intFromBool(view.history_valid),
+            .settled = settled,
         });
         cmd.drawFullscreen();
         cmd.endRendering();
@@ -99,8 +162,8 @@ pub fn resolveTemporal(renderer: *Renderer, p: *const ScenePass, path_traced: bo
     return resolved;
 }
 
-/// Depth of field, then motion blur, each into its own target. They
-/// come after antialiasing so the history stays sharp.
+/// Depth of field, then motion blur. They run after TAA so the history stays
+/// sharp.
 pub fn lensEffects(renderer: *Renderer, p: *const ScenePass, picture: rhi.Texture) !rhi.Texture {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -118,8 +181,6 @@ pub fn lensEffects(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textur
             const focus: f32 = if (settings.dof_autofocus) -1 else @max(settings.dof_focus_distance, desc.camera.near);
             const strength = settings.dof_aperture * 24 * scale;
             const max_radius = @max(settings.dof_max_blur, 1) * scale;
-            // Gathered straight into the full-size target, or into a
-            // smaller one that is then joined with the sharp picture.
             const gather_target = view.dof_reduced orelse lens[0];
             try cmd.beginRendering(.{ .color = &.{.{ .texture = gather_target, .load = .discard }} });
             cmd.bindPipeline(renderer.pipelines.dof);
@@ -178,8 +239,8 @@ pub fn lensEffects(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textur
     return resolved;
 }
 
-/// Builds the bloom chain from the picture and meters the exposure
-/// from its smallest level. Returns how many levels the chain has.
+/// Builds the bloom chain and meters exposure from its smallest level. Returns
+/// the level count.
 pub fn bloomAndExposure(renderer: *Renderer, p: *const ScenePass, resolved: rhi.Texture) !usize {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -208,8 +269,8 @@ pub fn bloomAndExposure(renderer: *Renderer, p: *const ScenePass, resolved: rhi.
     }
     cmd.endScope();
 
-    // The smallest level doubles as the luminance meter. It is read
-    // before the upsample chain, which never writes to it.
+    // The smallest level is the luminance meter; the upsample chain never
+    // writes it.
     cmd.beginScope("exposure");
     cmd.bindPipeline(renderer.pipelines.exposure);
     cmd.pushConstants(extern struct {
@@ -263,8 +324,8 @@ pub fn bloomAndExposure(renderer: *Renderer, p: *const ScenePass, resolved: rhi.
     return bloom_count;
 }
 
-/// Tone maps the picture into the view's target, at the target's size
-/// and in its encoding, with bloom and the lens and grading effects.
+/// Tone maps into the view's target, at its size and encoding, with bloom, lens
+/// and grading effects.
 pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Texture, bloom_count: usize, target: rhi.Texture, target_format: rhi.Format) !void {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -275,13 +336,48 @@ pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textu
     const frame_address = p.frame_address;
     var resolved = picture;
     if (view.upscaled) |upscaled| {
-        // The scene was rendered at another resolution than the output.
         cmd.beginScope("upscale");
-        try cmd.beginRendering(.{ .color = &.{.{ .texture = upscaled, .load = .discard }} });
-        cmd.bindPipeline(renderer.pipelines.upscale);
-        cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(resolved) });
-        cmd.drawFullscreen();
-        cmd.endRendering();
+        if (view.upscaled_edges) |edges| {
+            // FidelityFX Super Resolution 1: constants as in `FsrEasuCon` and
+            // `FsrRcasCon`.
+            const from = [2]f32{ @floatFromInt(p.width), @floatFromInt(p.height) };
+            const to = [2]f32{ @floatFromInt(p.output_width), @floatFromInt(p.output_height) };
+            const Bits = struct {
+                fn of(values: [4]f32) [4]u32 {
+                    return .{ @bitCast(values[0]), @bitCast(values[1]), @bitCast(values[2]), @bitCast(values[3]) };
+                }
+            };
+            try cmd.beginRendering(.{ .color = &.{.{ .texture = edges, .load = .discard }} });
+            cmd.bindPipeline(renderer.pipelines.fsr_easu);
+            cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0, con0: [4]u32, con1: [4]u32, con2: [4]u32, con3: [4]u32 }{
+                .frame = frame_address,
+                .source = device.textureIndex(resolved),
+                .con0 = Bits.of(.{ from[0] / to[0], from[1] / to[1], 0.5 * from[0] / to[0] - 0.5, 0.5 * from[1] / to[1] - 0.5 }),
+                .con1 = Bits.of(.{ 1 / from[0], 1 / from[1], 1 / from[0], -1 / from[1] }),
+                .con2 = Bits.of(.{ -1 / from[0], 2 / from[1], 1 / from[0], 2 / from[1] }),
+                .con3 = Bits.of(.{ 0, 4 / from[1], 0, 0 }),
+            });
+            cmd.drawFullscreen();
+            cmd.endRendering();
+            cmd.transition(edges, .shader_read);
+            // RCAS sharpness: 2 stops down at `sharpen` 0, none at 1.
+            const sharpness = std.math.pow(f32, 2, -2 * (1 - std.math.clamp(settings.sharpen, 0, 1)));
+            try cmd.beginRendering(.{ .color = &.{.{ .texture = upscaled, .load = .discard }} });
+            cmd.bindPipeline(renderer.pipelines.fsr_rcas);
+            cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0, con: [4]u32 }{
+                .frame = frame_address,
+                .source = device.textureIndex(edges),
+                .con = Bits.of(.{ sharpness, sharpness, 0, 0 }),
+            });
+            cmd.drawFullscreen();
+            cmd.endRendering();
+        } else {
+            try cmd.beginRendering(.{ .color = &.{.{ .texture = upscaled, .load = .discard }} });
+            cmd.bindPipeline(renderer.pipelines.upscale);
+            cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(resolved) });
+            cmd.drawFullscreen();
+            cmd.endRendering();
+        }
         cmd.transition(upscaled, .shader_read);
         cmd.endScope();
         resolved = upscaled;
@@ -304,7 +400,6 @@ pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textu
         .grain = if (debugging) 0 else @max(settings.film_grain, 0),
         .saturation = if (debugging) 1 else @max(settings.saturation, 0),
         .contrast = if (debugging) 1 else std.math.clamp(settings.contrast, 0.25, 4),
-        // Temperature shifts the balance between red and blue.
         .color_filter = .{
             settings.color_filter[0] * (1 + 0.25 * std.math.clamp(settings.temperature, -1, 1)),
             settings.color_filter[1],

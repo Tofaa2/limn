@@ -4,10 +4,8 @@
 #include "common.glsl"
 #include "rt.glsl"
 
-// Traces a fixed set of rays from every irradiance probe and stores the
-// radiance arriving along each ray together with the hit distance. Hits are
-// shaded with sun light (shadowed by another ray) plus last frame's probe
-// irradiance, which gives multiple bounces over time.
+// Traces a fixed ray set from each irradiance probe and stores radiance and hit
+// distance. Hits are lit by the shadowed sun and last frame's probes.
 layout(local_size_x = 64) in;
 
 
@@ -16,20 +14,20 @@ layout(buffer_reference, scalar) buffer Rays { vec4 data[]; };
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     Rays rays;
-    // Device address of the scene's top-level acceleration structure.
+    // TLAS device address.
     uint64_t tlas;
-    // Random rotation of the ray set, changed every frame.
+    // Per-frame random rotation of the ray set.
     vec4 rotation[3];
     uint rays_per_probe;
     uint probe_count;
     uint multibounce;
     float max_distance;
-    // Only probes with index % stride == phase are traced this frame.
+    // Only probes with index % stride == phase are traced.
     uint probe_stride;
     uint probe_phase;
-    // Which grid is being traced: 0 main, 1 coarse.
+    // Grid traced: 0 main, 1 coarse.
     uint grid;
-    // 1 to leave probes that sit inside geometry untraced most frames.
+    // 1 to trace probes inside geometry only every eighth turn.
     uint skip_buried;
 } push;
 
@@ -49,10 +47,7 @@ void main() {
     uint ray = index % push.rays_per_probe;
     uint slot = probe * push.rays_per_probe + ray;
     if (push.skip_buried != 0u && (frame.frame_index / max(push.probe_stride, 1u) + probe) % 8u != 0u) {
-        // A probe most of whose rays met the backs of surfaces last time
-        // is inside a wall or under the floor: nothing reads its light,
-        // so it keeps what it has and is looked at again every eighth
-        // turn in case the wall has gone.
+        // Buried probes (mostly backface hits last time) keep their contents.
         uint backs = 0u;
         uint spread = max(push.rays_per_probe / 8u, 1u);
         for (uint k = 0u; k < 8u; k++) backs += uint(push.rays.data[probe * push.rays_per_probe + min(k * spread, push.rays_per_probe - 1u)].w < 0.0);
@@ -69,13 +64,12 @@ void main() {
     if (met == RT_MISS) {
         vec3 sky = vec3(0.0);
         if ((frame.flags & FRAME_ENVIRONMENT) != 0u) {
-            // A blurred level keeps a small bright sun from turning into noise.
+            // Blurred mip, to keep the sun from becoming noise.
             sky = textureLod(TEX_CUBE(frame.env_specular, frame.sampler_linear_clamp), direction, 2.0).rgb * frame.env_intensity;
         }
         push.rays.data[slot] = vec4(rtThroughFluids(frame, origin, direction, push.max_distance, sky), push.max_distance);
     } else if (met == RT_BACK) {
-        // The probe is looking at the inside of a wall. Record a shortened
-        // negative distance so the probe's visibility closes off quickly.
+        // Backface: store a shortened negative distance.
         push.rays.data[slot] = vec4(0.0, 0.0, 0.0, -0.2 * t);
     } else {
         push.rays.data[slot] = vec4(rtThroughFluids(frame, origin, direction, t, radiance), t);

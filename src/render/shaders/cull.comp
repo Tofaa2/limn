@@ -1,23 +1,12 @@
 #version 460
 #include "common.glsl"
+#include "cull_view.glsl"
 
-// Tests every (instance, meshlet) pair of the scene against one view and
-// appends an indexed draw for each survivor. Bucket 0 holds opaque
-// single-sided geometry, bucket 1 everything that needs alpha testing or
-// two-sided rasterization.
-//
-// The main view can run in two phases for occlusion culling:
-//   early: draw only what was visible last frame;
-//   late:  test everything against the depth pyramid built from the early
-//          pass, draw what turned out visible but was not drawn early, and
-//          record visibility for the next frame.
-// Nothing is ever missing from the final image; a newly revealed meshlet is
-// simply drawn in the late phase.
+// Culls (instance, meshlet) pairs against one view and appends a draw per
+// survivor. Bucket 0: opaque single-sided; bucket 1: alpha-tested or two-sided.
+// Two-phase occlusion: early draws last frame's visible set, late tests the
+// rest against the depth pyramid and records visibility.
 layout(local_size_x = 64) in;
-
-const uint PHASE_SINGLE = 0u;
-const uint PHASE_EARLY = 1u;
-const uint PHASE_LATE = 2u;
 
 struct DrawCommand {
     uint index_count;
@@ -28,56 +17,26 @@ struct DrawCommand {
 };
 
 layout(buffer_reference, scalar) writeonly buffer DrawCommands { DrawCommand data[]; };
+layout(buffer_reference, scalar) writeonly buffer DrawLists { uint data[]; };
+// Mesh shader draw arguments per list (`gpu.MeshDraw`).
+struct MeshDraw {
+    uint x;
+    uint y;
+    uint z;
+    uint pad;
+};
+layout(buffer_reference, scalar) buffer MeshDraws { MeshDraw data[2]; };
+// Must match visibility.task.
+const uint meshlets_per_task = 32u;
 layout(buffer_reference, scalar) buffer DrawCounts { uint data[]; };
 layout(buffer_reference, scalar) buffer Visibility { uint data[]; };
-// Per-meshlet bounds of deformed meshes: center and radius in the space
-// their vertices are in (see skin_bounds.comp).
+// Per-meshlet bounds of skinned meshes (center, radius); see skin_bounds.comp.
 layout(buffer_reference, scalar) readonly buffer MeshletBounds { vec4 data[]; };
-// Per instance, set when a camera draws any part of it: what texture
-// streaming reads back to tell the hidden from the seen.
-layout(buffer_reference, scalar) writeonly buffer InstanceSeen { uint data[]; };
-
-layout(buffer_reference, scalar) readonly buffer CullView {
-    vec4 planes[6];
-    vec3 camera_position;
-    uint plane_count;
-    // Backface cone culling is only valid for perspective views.
-    uint cone_culling;
-    float p00;
-    float p11;
-    float near;
-    mat4 view;
-    vec3 lod_camera;
-    float lod_scale;
-    // Shadow views also draw blended surfaces, which the camera view
-    // leaves to the transparent pass.
-    uint blended_casters;
-    // Levels of detail trade places over a band: both are drawn while
-    // the coarser one's error is between 1 and this many pixels' worth
-    // (1 or less: no band, one level at a time).
-    float lod_band;
-    // Shadow views: meshlets whose bounds are smaller than this, in
-    // world units, are left out (they would cover less than the chosen
-    // number of shadow texels). 0 keeps everything.
-    float min_radius;
-    // Shadow views: 0, or how a caster is tested against what the camera
-    // sees (1: the part of its view this map shadows, 2: and what is
-    // drawn there, by the depth pyramid).
-    uint receiver_culling;
-    // The camera the shadows are for.
-    mat4 receiver_view;
-    // The part of its view this map shadows.
-    vec4 receiver_planes[6];
-    // Unit direction the light travels in.
-    vec3 light_travel;
-    // How far to the side of a caster its shadow is still read (the
-    // filter's reach).
-    float receiver_margin;
-    float receiver_p00;
-    float receiver_p11;
-    float receiver_near;
-    float receiver_pad;
-};
+// Per-instance seen flag for texture streaming, followed by one word counting
+// the flags set.
+layout(buffer_reference, scalar) buffer InstanceSeen { uint data[]; };
+// Indices of instance-group pairs to test.
+layout(buffer_reference, scalar) readonly buffer Candidates { uint data[]; };
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
@@ -90,69 +49,42 @@ layout(push_constant, scalar) uniform Push {
     uint phase;
     uint hiz_texture;
     vec2 hiz_size;
-    // Always a readable buffer, whether or not any instance uses it.
+    // Always a valid buffer.
     MeshletBounds skin_bounds;
-    // Always a writable buffer; written only when `mark_seen` is set.
+    // Always a valid buffer; written only with `mark_seen`.
     InstanceSeen seen;
     uint mark_seen;
-    uint push_pad;
+    // Entity pairs and entity instances come first: counts of each.
+    uint entity_refs;
+    // Listed pairs and their count.
+    Candidates candidates;
+    CullDispatch dispatch;
+    InstanceVisibility instance_visibility;
+    uint entity_instances;
+    // Capacity of bucket 1; bucket 0 has `bucket_capacity`.
+    uint masked_capacity;
+    // Instance count: index of the counter in `seen`.
+    uint seen_total;
+    // Nonzero with mesh shaders: survivors are written as bare references (4
+    // bytes) and `mesh_draws` receives the task group counts.
+    uint mesh_lists;
+    MeshDraws mesh_draws;
+    // `commands` viewed as a reference list.
+    DrawLists lists;
 } push;
 
-// 2D Polyhedral Bounds of a Clipped, Perspective-Projected 3D Sphere
-// (Mara & McGuire 2013). `c` is in view space with +z in front of the
-// camera. Returns false if the sphere touches the near plane.
-bool projectSphere(vec3 c, float r, float near, float p00, float p11, out vec4 aabb) {
-    if (c.z < r + near) return false;
-    vec3 cr = c * r;
-    float czr2 = c.z * c.z - r * r;
-    float vx = sqrt(c.x * c.x + czr2);
-    float min_x = (vx * c.x - cr.z) / (vx * c.z + cr.x);
-    float max_x = (vx * c.x + cr.z) / (vx * c.z - cr.x);
-    float vy = sqrt(c.y * c.y + czr2);
-    float min_y = (vy * c.y - cr.z) / (vy * c.z + cr.y);
-    float max_y = (vy * c.y + cr.z) / (vy * c.z - cr.y);
-    aabb = vec4(min_x * p00, min_y * p11, max_x * p00, max_y * p11) * 0.5 + 0.5;
-    return true;
+void markSeen(uint instance) {
+    if (push.mark_seen == 0u) return;
+    if (atomicExchange(push.seen.data[instance], 1u) == 0u) atomicAdd(push.seen.data[push.seen_total], 1u);
 }
 
-// The farthest depth the pyramid holds anywhere in a rectangle of the
-// screen.
-float farthestDepth(vec2 uv_min, vec2 uv_max) {
-    // Pick the level where the box is at most one texel wide, so its four
-    // corners touch every texel it overlaps.
-    vec2 size = (uv_max - uv_min) * push.hiz_size;
-    float level = ceil(log2(max(max(size.x, size.y), 1.0)));
-    uint s = push.frame.sampler_nearest_clamp;
-    float a = textureLod(TEX(push.hiz_texture, s), uv_min, level).r;
-    float b = textureLod(TEX(push.hiz_texture, s), vec2(uv_max.x, uv_min.y), level).r;
-    float d = textureLod(TEX(push.hiz_texture, s), vec2(uv_min.x, uv_max.y), level).r;
-    float e = textureLod(TEX(push.hiz_texture, s), uv_max, level).r;
-    return min(min(a, b), min(d, e));
-}
+#include "cull_occlusion.glsl"
 
-bool occluded(vec3 center, float radius) {
-    vec3 c = (push.view.view * vec4(center, 1.0)).xyz;
-    c.z = -c.z;
-    vec4 aabb;
-    if (!projectSphere(c, radius, push.view.near, push.view.p00, push.view.p11, aabb)) return false;
-    vec2 uv_min = clamp(min(aabb.xy, aabb.zw), 0.0, 1.0);
-    vec2 uv_max = clamp(max(aabb.xy, aabb.zw), 0.0, 1.0);
-    float farthest = farthestDepth(uv_min, uv_max);
-    // Reverse-Z depth of the sphere's nearest point.
-    float nearest = push.view.near / (c.z - radius);
-    return nearest < farthest;
-}
-
-// Shadow views: whether nothing the camera sees can be in a caster's
-// shadow. The caster's bounds are swept along the light; the shadow is
-// unseen when the sweep misses the part of the view this map shadows, or
-// when all of the sweep inside it lies behind what is drawn there. The
-// air in front of surfaces counts as seen, so fog and see-through
-// surfaces keep their shadows.
+// Shadow views: true when the caster's bounds swept along the light miss every
+// visible receiver.
 bool shadowUnseen(vec3 center, float radius) {
     radius += push.view.receiver_margin;
     vec3 travel = push.view.light_travel;
-    // The stretch of the sweep within reach of every plane.
     float from = 0.0;
     float to = 1.0e30;
     for (uint i = 0u; i < 6u; i++) {
@@ -177,7 +109,6 @@ bool shadowUnseen(vec3 center, float radius) {
     vec4 box_b;
     if (!projectSphere(a, radius, push.view.receiver_near, push.view.receiver_p00, push.view.receiver_p11, box_a)) return false;
     if (!projectSphere(b, radius, push.view.receiver_near, push.view.receiver_p00, push.view.receiver_p11, box_b)) return false;
-    // What lies between the two ends is on screen between them too.
     vec2 uv_min = clamp(min(min(box_a.xy, box_a.zw), min(box_b.xy, box_b.zw)), 0.0, 1.0);
     vec2 uv_max = clamp(max(max(box_a.xy, box_a.zw), max(box_b.xy, box_b.zw)), 0.0, 1.0);
     float nearest = push.view.receiver_near / (min(a.z, b.z) - radius);
@@ -185,8 +116,9 @@ bool shadowUnseen(vec3 center, float radius) {
 }
 
 void main() {
-    uint ref_index = gl_GlobalInvocationID.x;
-    if (ref_index >= push.ref_count) return;
+    uint listed = gl_GlobalInvocationID.x;
+    if (listed >= push.entity_refs + push.dispatch.count) return;
+    uint ref_index = listed < push.entity_refs ? listed : push.candidates.data[listed - push.entity_refs];
     MeshletRef ref = push.frame.meshlet_refs.data[ref_index];
     Instance instance = push.frame.instances.data[ref.instance];
     Mesh mesh = push.frame.meshes.data[instance.mesh];
@@ -195,55 +127,47 @@ void main() {
     bool skinned = (instance.flags & INSTANCE_SKINNED) != 0u;
     bool blended = (material.flags & MATERIAL_BLEND) != 0u;
     if (blended && push.view.blended_casters == 0u) {
-        // Drawn by the transparent pass, which does no such test.
-        if (push.mark_seen != 0u) push.seen.data[ref.instance] = 1u;
+        // Drawn by the transparent pass, which does not cull.
+        markSeen(ref.instance);
         return;
     }
 
     bool fading = false;
-    // Level of detail: of a mesh's levels, exactly one passes this test
-    // (two, inside the band where they cross-fade).
+    // LOD: exactly one level passes (two inside the cross-fade band).
     if (push.view.lod_scale > 0.0) {
         float scale = max(length(instance.transform[0].xyz), max(length(instance.transform[1].xyz), length(instance.transform[2].xyz)));
         vec3 mesh_center = skinned ? instance.bounding_sphere.xyz : (instance.transform * vec4(mesh.center, 1.0)).xyz;
         float mesh_radius = skinned ? instance.bounding_sphere.w : mesh.radius * scale;
         float distance_to_mesh = max(distance(push.view.lod_camera, mesh_center) - mesh_radius, push.view.near);
-        // Errors below 1 after this scaling are under the pixel threshold.
+        // Errors below 1 after scaling are under the pixel threshold.
         float to_threshold = scale * push.view.lod_scale / distance_to_mesh;
         float band = max(push.view.lod_band, 1.0);
-        // An instance of which only the coarse part is in memory draws
-        // as if no error were smaller than that part's: the pieces
-        // whose coarser form is no worse than that give way to it, and
-        // the coarsest of what is there is drawn however near.
+        // With only the coarse part loaded, errors are floored at its error.
         float floor_error = instance.coarse_error;
         float own_error = max(meshlet.lod_error, floor_error);
         float parent_error = max(meshlet.parent_error, floor_error);
         if (floor_error > 0.0 && parent_error <= floor_error) return;
         bool at_floor = floor_error > 0.0 && own_error <= floor_error;
-        // How large this level's error looks, and the next coarser one's.
         float own = own_error * to_threshold;
         float coarser = parent_error * to_threshold;
         if (meshlet.self_sphere.w >= 0.0 && !skinned) {
-            // A cluster of a hierarchy: each error is judged from the
-            // bounds of the group it belongs to, so a mesh can be fine
-            // near the camera and coarse far from it.
             own = lodProjected(own_error, meshlet.self_sphere, instance.transform, scale, push.view.lod_camera, push.view.lod_scale, push.view.near);
             coarser = lodProjected(parent_error, meshlet.parent_sphere, instance.transform, scale, push.view.lod_camera, push.view.lod_scale, push.view.near);
         }
         if ((own > band && !at_floor) || coarser <= 1.0) return;
-        // On its way in or out: drawn by the pass that can drop pixels.
+        // Cross-fading levels go to the alpha-tested bucket.
         fading = band > 1.0 && ((own > 1.0 && !at_floor) || coarser < band);
     } else if (instance.coarse_error > 0.0 ? max(meshlet.parent_error, instance.coarse_error) <= instance.coarse_error || meshlet.lod_error > instance.coarse_error : meshlet.lod_error > 0.0) {
-        // Without level selection: the finest level that is in memory.
         return;
     }
     bool was_visible = push.phase != PHASE_SINGLE && push.visibility.data[ref_index] != 0u;
+    // Instances culled last frame drew nothing early.
+    if (was_visible && push.phase == PHASE_LATE && ref.instance >= push.entity_instances)
+        was_visible = (push.instance_visibility.data[ref.instance - push.entity_instances] & 2u) != 0u;
     if (push.phase == PHASE_EARLY && !was_visible) return;
 
     vec3 center;
     float radius;
-    // A deformed mesh has bounds per meshlet when they were worked out
-    // this frame, else the one sphere around its whole skeleton.
     bool own_bounds = skinned && instance.bounds_offset != INVALID_ID;
     vec4 deformed = push.skin_bounds.data[own_bounds ? instance.bounds_offset + (ref.meshlet - mesh.meshlet_offset) : 0u];
     if (own_bounds) {
@@ -261,8 +185,7 @@ void main() {
 
     bool visible = true;
     if (push.view.min_radius > 0.0) {
-        // By the size of the whole thing, not of this piece of it: a
-        // large object keeps its shadow however finely it is cut up.
+        // Size cull by the whole object, not the meshlet.
         float whole = skinned ? instance.bounding_sphere.w : mesh.radius * max(length(instance.transform[0].xyz), max(length(instance.transform[1].xyz), length(instance.transform[2].xyz)));
         visible = whole >= push.view.min_radius;
     }
@@ -283,15 +206,20 @@ void main() {
     if (push.phase == PHASE_LATE) {
         if (visible && occluded(center, radius)) visible = false;
         push.visibility.data[ref_index] = visible ? 1u : 0u;
-        if (visible && push.mark_seen != 0u) push.seen.data[ref.instance] = 1u;
-        // Already drawn in the early phase.
+        if (visible) markSeen(ref.instance);
         if (was_visible) return;
     }
     if (!visible) return;
-    if (push.mark_seen != 0u && push.phase == PHASE_SINGLE) push.seen.data[ref.instance] = 1u;
+    if (push.phase == PHASE_SINGLE) markSeen(ref.instance);
 
     uint bucket = fading || (material.flags & (MATERIAL_ALPHA_TEST | MATERIAL_DOUBLE_SIDED | MATERIAL_BLEND)) != 0u ? 1u : 0u;
     uint slot = atomicAdd(push.counts.data[bucket], 1u);
+    if (slot >= (bucket == 0u ? push.bucket_capacity : push.masked_capacity)) return;
+    if (push.mesh_lists != 0u) {
+        push.lists.data[bucket * push.bucket_capacity + slot] = ref_index;
+        atomicMax(push.mesh_draws.data[bucket].x, (slot + meshlets_per_task) / meshlets_per_task);
+        return;
+    }
     DrawCommand command;
     command.index_count = meshlet.index_count;
     command.instance_count = 1u;

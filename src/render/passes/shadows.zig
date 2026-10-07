@@ -1,15 +1,17 @@
-//! The shadow maps of a view: the sun's cascades and the atlas that the
-//! local lights share.
-//! Internal to the renderer.
+//! Shadow maps of a view: sun cascades and the local lights' atlas. Internal to
+//! the renderer.
 const std = @import("std");
 const math = @import("../../math.zig");
 const gpu = @import("../gpu.zig");
+const hair_passes = @import("hair.zig");
 const render = @import("../renderer.zig");
 const scene_pass = @import("../scene_pass.zig");
 const geometry_passes = @import("geometry.zig");
 
 const Mat4 = math.Mat4;
+const Vec3 = math.Vec3;
 const Renderer = render.Renderer;
+const SceneData = render.SceneData;
 const computeCascades = render.computeCascades;
 const local_shadow_tiles_per_side = render.local_shadow_tiles_per_side;
 const local_view_base = render.local_view_base;
@@ -21,8 +23,22 @@ const LocalShadows = scene_pass.LocalShadows;
 const DrawPush = scene_pass.DrawPush;
 const Lighting = scene_pass.Lighting;
 
-/// Decides which of the view's shadow cascades are redrawn this frame
-/// and points its cache at where those now lie.
+/// Whether anything that moved this frame casts into a cascade's bounding
+/// sphere. Only the distance across the light direction counts.
+fn moverCastsInto(scene: *const SceneData, center: Vec3, radius: f32, sun_travel: Vec3) bool {
+    if (scene.movers_overflow) return true;
+    for (scene.movers.items) |mover| {
+        const offset = math.sub(mover[0..3].*, center);
+        const across = math.sub(offset, math.scale(sun_travel, math.dot(offset, sun_travel)));
+        if (math.length(across) < radius + mover[3]) return true;
+    }
+    return false;
+}
+
+/// Picks the cascades to redraw this frame. With
+/// `Settings.shadow_cascade_stagger` far cascades are redrawn every 2nd, 4th
+/// and 8th frame, or early when the camera leaves their coverage or a moving
+/// caster reaches them.
 pub fn updateCascades(renderer: *Renderer, p: *const ScenePass, shadows_enabled: bool) CascadePlan {
     const desc = p.desc;
     const settings = p.settings;
@@ -31,9 +47,6 @@ pub fn updateCascades(renderer: *Renderer, p: *const ScenePass, shadows_enabled:
     const aspect = p.aspect;
     const view_matrix = p.view_matrix;
     const sun_travel = p.sun_travel;
-    // Far cascades change slowly, so they are re-rendered every 2nd, 4th
-    // and 8th frame and reused in between. A cascade is refreshed early
-    // if the camera has moved outside what its cached map covers.
     const cascade_total = std.math.clamp(settings.shadow_cascades, 1, gpu.cascade_count);
     const ideal = computeCascades(desc.camera, view_matrix, aspect, sun_travel, settings.shadow_distance, renderer.options.shadow_resolution, cascade_total);
     var cascade_update: [gpu.cascade_count]bool = @splat(false);
@@ -47,7 +60,8 @@ pub fn updateCascades(renderer: *Renderer, p: *const ScenePass, shadows_enabled:
             const due = !settings.shadow_cascade_stagger or view_data.frames % interval == interval / 2;
             const uncovered = math.length(math.sub(ideal.centers[cascade], cache.cascades.centers[cascade])) + ideal.tight_radii[cascade] >
                 cache.cascades.radii[cascade];
-            if (!shadows_enabled or !(stale or due or uncovered)) continue;
+            const caster_moved = moverCastsInto(p.scene, cache.cascades.centers[cascade], cache.cascades.radii[cascade], sun_travel);
+            if (!shadows_enabled or !(stale or due or uncovered or caster_moved)) continue;
             cascade_update[cascade] = true;
             cache.cascades.view_proj[cascade] = ideal.view_proj[cascade];
             cache.cascades.texel_size[cascade] = ideal.texel_size[cascade];
@@ -67,8 +81,7 @@ pub fn updateCascades(renderer: *Renderer, p: *const ScenePass, shadows_enabled:
     return .{ .count = cascade_total, .update = cascade_update };
 }
 
-/// Draws the sun's shadow cascades that are due, and with colored
-/// shadows the tint that see-through casters give them.
+/// Draws the sun cascades that are due and, with colored shadows, their tint.
 pub fn drawSunShadows(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadows) !void {
     const device = renderer.device;
     const cmd = p.cmd;
@@ -84,13 +97,12 @@ pub fn drawSunShadows(renderer: *Renderer, p: *const ScenePass, sun: *const SunS
         if (!cascade_update[cascade]) continue;
         try cmd.beginRendering(.{ .depth = .{ .texture = shadow_map, .layer = @intCast(cascade), .clear = 1 } });
         cmd.bindIndexBuffer(renderer.indices.buffer, 0, .uint32);
-        cmd.pushConstants(DrawPush{ .frame = frame_address, .tinted = @intFromBool(colored_shadows), .view_proj = cascades.view_proj[cascade] });
-        const counts_offset = (1 + cascade) * 2 * @sizeOf(u32);
+        const cascade_push = DrawPush{ .frame = frame_address, .tinted = @intFromBool(colored_shadows), .view_proj = cascades.view_proj[cascade] };
         cmd.bindPipeline(renderer.pipelines.shadow);
-        cmd.drawIndexedIndirectCount(renderer.cull_commands.?, geometry_passes.commandOffset(renderer, 1 + cascade, 0), renderer.cull_counts, counts_offset, scene.ref_count);
+        geometry_passes.drawMeshlets(renderer, cmd, cascade_push, 1 + cascade, 0, scene.ref_count);
         cmd.bindPipeline(renderer.pipelines.shadow_masked);
-        cmd.drawIndexedIndirectCount(renderer.cull_commands.?, geometry_passes.commandOffset(renderer, 1 + cascade, 1), renderer.cull_counts, counts_offset + @sizeOf(u32), scene.ref_count);
-        // Liquids: their particles, as discs facing the sun.
+        geometry_passes.drawMeshlets(renderer, cmd, cascade_push, 1 + cascade, 1, scene.ref_count);
+        hair_passes.drawHairShadows(renderer, p, cascades.view_proj[cascade], cascades.texel_size[cascade], 0);
         for (scene.liquids.items) |item| {
             const state = renderer.liquids.get(item) orelse continue;
             if (state.params_frame != renderer.frame_index or state.live == 0 or state.desc.shadow <= 0) continue;
@@ -109,16 +121,13 @@ pub fn drawSunShadows(renderer: *Renderer, p: *const ScenePass, sun: *const SunS
     }
     cmd.transition(shadow_map, .shader_read);
     if (colored_shadows) {
-        // The see-through casters again, into each redrawn
-        // cascade's tint.
         const tint = view_data.shadow_color.?;
         for (0..gpu.cascade_count) |cascade| {
             if (!cascade_update[cascade]) continue;
             try cmd.beginRendering(.{ .color = &.{.{ .texture = tint, .layer = @intCast(cascade), .load = .clear, .clear = .{ 1, 1, 1, 1 } }} });
             cmd.bindIndexBuffer(renderer.indices.buffer, 0, .uint32);
             cmd.bindPipeline(renderer.pipelines.shadow_color);
-            cmd.pushConstants(DrawPush{ .frame = frame_address, .view_proj = cascades.view_proj[cascade] });
-            cmd.drawIndexedIndirectCount(renderer.cull_commands.?, geometry_passes.commandOffset(renderer, 1 + cascade, 1), renderer.cull_counts, (1 + cascade) * 2 * @sizeOf(u32) + @sizeOf(u32), scene.ref_count);
+            geometry_passes.drawMeshlets(renderer, cmd, .{ .frame = frame_address, .view_proj = cascades.view_proj[cascade] }, 1 + cascade, 1, scene.ref_count);
             cmd.endRendering();
         }
         cmd.transition(tint, .shader_read);
@@ -126,18 +135,13 @@ pub fn drawSunShadows(renderer: *Renderer, p: *const ScenePass, sun: *const SunS
     cmd.endScope();
 }
 
-/// Decides which tiles of the local lights' shadow atlas are redrawn
-/// for this view.
+/// Picks the local shadow atlas tiles to redraw for this view.
 pub fn planLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *const Lighting) LocalShadows {
     const scene_handle = p.scene_handle;
     const scene = p.scene;
     const scene_frame = p.scene_frame;
-    // The atlas is shared; it is redrawn only when it holds another
-    // scene's lights or last frame's.
     const local_shadows_current = renderer.local_shadow_frame == renderer.frame_index and
         renderer.local_shadow_scene != null and std.meta.eql(renderer.local_shadow_scene.?, scene_handle);
-    // Nothing moved and the same lights hold the same tiles as when the
-    // atlas was last drawn for this scene: it is still right.
     var shadow_key_hasher = std.hash.Wyhash.init(lighting.tiles_key);
     shadow_key_hasher.update(std.mem.asBytes(&scene.lights_version));
     shadow_key_hasher.update(std.mem.asBytes(&scene.layout_version));
@@ -145,9 +149,8 @@ pub fn planLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *con
     const shadow_key = shadow_key_hasher.final() | 1;
     const same_atlas = renderer.local_shadow_key == shadow_key and
         renderer.local_shadow_scene != null and std.meta.eql(renderer.local_shadow_scene.?, scene_handle);
-    // With the same lights in the same tiles, a tile is redrawn only if
-    // something that moved can be seen from its light, or could when it
-    // was last drawn (its shadow is still in the tile).
+    // A tile is redrawn only if a mover is in its light's view now or was when
+    // last drawn.
     var tile_dirty: [max_local_shadow_views]bool = @splat(true);
     var any_tile_dirty = lighting.tile_count != 0;
     if (same_atlas and !local_shadows_current) {
@@ -179,7 +182,7 @@ pub fn planLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *con
     return .{ .draw = draw_local_shadows, .same_atlas = same_atlas, .key = shadow_key, .tile_dirty = tile_dirty };
 }
 
-/// Draws the tiles of the local lights' shadow atlas that changed.
+/// Draws the changed tiles of the local shadow atlas.
 pub fn drawLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *const Lighting, local: *const LocalShadows) !void {
     const cmd = p.cmd;
     const scene_handle = p.scene_handle;
@@ -205,14 +208,12 @@ pub fn drawLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *con
             tile_size,
             tile_size,
         );
-        // The rest of the atlas is kept, so only this tile is emptied.
         if (same_atlas) cmd.clearDepthRect(@intCast(tile % tiles_per_side * tile_size), @intCast(tile / tiles_per_side * tile_size), tile_size, tile_size, 0);
-        cmd.pushConstants(DrawPush{ .frame = frame_address, .view_proj = lighting.tile_view_proj[tile] });
-        const counts_offset = view_index * 2 * @sizeOf(u32);
+        const tile_push = DrawPush{ .frame = frame_address, .view_proj = lighting.tile_view_proj[tile] };
         cmd.bindPipeline(renderer.pipelines.local_shadow);
-        cmd.drawIndexedIndirectCount(renderer.cull_commands.?, geometry_passes.commandOffset(renderer, view_index, 0), renderer.cull_counts, counts_offset, scene.ref_count);
+        geometry_passes.drawMeshlets(renderer, cmd, tile_push, view_index, 0, scene.ref_count);
         cmd.bindPipeline(renderer.pipelines.local_shadow_masked);
-        cmd.drawIndexedIndirectCount(renderer.cull_commands.?, geometry_passes.commandOffset(renderer, view_index, 1), renderer.cull_counts, counts_offset + @sizeOf(u32), scene.ref_count);
+        geometry_passes.drawMeshlets(renderer, cmd, tile_push, view_index, 1, scene.ref_count);
     }
     cmd.endRendering();
     cmd.transition(renderer.local_shadow_map, .shader_read);

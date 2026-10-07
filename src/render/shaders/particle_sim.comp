@@ -2,14 +2,14 @@
 #include "common.glsl"
 #include "particles.glsl"
 
-// Advances one emitter's particles and gives birth to this frame's share.
+// Simulates one emitter's particles and spawns this frame's share.
 layout(local_size_x = 64) in;
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     EmitterRef emitter;
     Particles particles;
-    // Remembered positions for trails; unused when the emitter has none.
+    // Trail positions; unused without trails.
     TrailPoints trail;
 } push;
 
@@ -37,7 +37,6 @@ void main() {
     uint slot = (index + emitter.capacity - emitter.spawn_start) % emitter.capacity;
     if (slot < emitter.spawn_count) {
         uint state = hash(index * 0x9e3779b9u + emitter.seed);
-        // A direction inside the cone around the emitter's axis.
         float cos_limit = cos(emitter.spread);
         float cos_theta = mix(1.0, cos_limit, random(state));
         float sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
@@ -46,21 +45,17 @@ void main() {
         vec3 side = normalize(abs(axis.y) < 0.99 ? cross(axis, vec3(0.0, 1.0, 0.0)) : cross(axis, vec3(1.0, 0.0, 0.0)));
         vec3 other = cross(axis, side);
         vec3 direction = axis * cos_theta + (side * cos(phi) + other * sin(phi)) * sin_theta;
-        // A point inside the emitter's sphere.
         vec3 offset = vec3(random(state), random(state), random(state)) * 2.0 - 1.0;
         offset *= emitter.radius * pow(random(state), 1.0 / 3.0) / max(length(offset), 1e-4);
         particle.velocity = direction * mix(emitter.speed.x, emitter.speed.y, random(state));
         particle.lifetime = mix(emitter.lifetime.x, emitter.lifetime.y, random(state));
-        // Births are spread over the frame rather than all at its start.
+        // Spread spawn times over the frame.
         particle.age = dt * random(state);
         particle.position = emitter.position + offset + particle.velocity * particle.age;
-        // A newborn's trail starts where it does.
         for (uint point = 0u; point < emitter.trail_count; point++)
             push.trail.data[index * emitter.trail_count + point] = vec4(particle.position, 0.0);
     } else if (particle.age < particle.lifetime) {
         if (emitter.trail_count != 0u) {
-            // The trail moves with the scene, and takes in where the
-            // particle is now when it is time to remember a point.
             if (any(notEqual(emitter.shift, vec3(0.0)))) {
                 for (uint point = 0u; point < emitter.trail_count; point++)
                     push.trail.data[index * emitter.trail_count + point].xyz += emitter.shift;
@@ -70,7 +65,6 @@ void main() {
         }
         particle.velocity += emitter.gravity * dt;
         particle.velocity *= exp(-emitter.drag * dt);
-        // Carried by a fluid: inside its box, take on the flow's velocity.
         if ((emitter.flags & EMITTER_FLUID) != 0u) {
             FluidRef fluid = emitter.fluid;
             vec3 uvw = (fluid.data.world_to_box * vec4(particle.position, 1.0)).xyz;
@@ -82,8 +76,7 @@ void main() {
             }
         }
         vec3 next = particle.position + emitter.shift + particle.velocity * dt;
-        // Bounce off what the camera saw last frame: the depth buffer is
-        // the only description of the scene's surfaces the GPU has.
+        // Collide against last frame's depth buffer.
         if ((emitter.flags & EMITTER_COLLIDE) != 0u) {
             FrameConstants frame = push.frame;
             uint nearest = frame.sampler_nearest_clamp;
@@ -92,8 +85,6 @@ void main() {
             if (clip.w > frame.near && all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)))) {
                 float depth = textureLod(TEX(emitter.collision_depth, nearest), uv, 0.0).r;
                 float surface = linearDepth(depth, frame.near);
-                // Behind the surface, but not so far that it is simply
-                // passing behind an object.
                 float behind = clip.w - surface;
                 if (depth > 0.0 && behind > 0.0 && behind < 0.5 + length(particle.velocity) * dt * 2.0) {
                     vec2 texel = 1.0 / vec2(textureSize(TEX(emitter.collision_depth, nearest), 0));
