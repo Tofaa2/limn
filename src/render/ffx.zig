@@ -43,7 +43,16 @@ const Frame = extern struct {
     reset: u32,
 };
 
+const Generate = extern struct {
+    command_buffer: usize,
+    shown: Image,
+    output: Image,
+    pq: u32,
+    reset: u32,
+};
+
 const c = if (available) struct {
+    extern fn limnFfxGenerateFrame(ffx: *anyopaque, frame: *const Generate) i32;
     extern fn limnFfxCreate(desc: *const Create) ?*anyopaque;
     extern fn limnFfxDispatch(ffx: *anyopaque, frame: *const Frame) i32;
     extern fn limnFfxDestroy(ffx: ?*anyopaque) void;
@@ -123,6 +132,22 @@ pub const Upscaler = struct {
         });
         cmd.bindGlobals();
         if (result != 0) return error.FidelityFxFailed;
+    }
+
+    /// FSR 3 frame generation: writes to `output` the picture between the
+    /// last `shown` and this one. After `dispatch` in the same frame; both
+    /// textures in `shader_read`. False when there is none to show.
+    pub fn generate(self: Upscaler, device: *rhi.Device, cmd: *rhi.CommandEncoder, shown: rhi.Texture, output: rhi.Texture, reset: bool) bool {
+        if (!available) return false;
+        const result = c.limnFfxGenerateFrame(self.handle, &.{
+            .command_buffer = @intFromEnum(cmd.command),
+            .shown = image(device, shown),
+            .output = image(device, output),
+            .pq = @intFromBool(device.hdr_active),
+            .reset = @intFromBool(reset),
+        });
+        cmd.bindGlobals();
+        return result == 1;
     }
 
     /// Sign of the upscaler's jitter relative to the renderer's projection.

@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
     const renderer = try gfx.Renderer.init(init.gpa, init.io, .{
         .application_name = "canvas",
         .pipeline_cache_path = "zig-out/pipeline.cache",
-        .surface = try window.surface(true),
+        .surface = try window.surface(false),
     });
     defer renderer.deinit();
 

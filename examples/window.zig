@@ -108,6 +108,7 @@ pub fn frameLimit(init: std.process.Init) !?u64 {
 ///   --frames N           exit after N frames
 ///   --screenshot f.png   render without a window (with validation on) and
 ///                        write the last frame, to check the picture
+///   --validation         turn the Vulkan validation layers on
 ///   --names              name GPU objects and label passes for debuggers
 ///                        such as RenderDoc; always on in a debug build
 pub const Stage = struct {
@@ -123,6 +124,9 @@ pub const Stage = struct {
     keys: [glfw.GLFW_KEY_LAST + 1]bool = @splat(false),
     /// Frames and GPU time, refreshed twice a second for a HUD.
     fps: f32 = 0,
+    /// Images shown a second: above `fps` when frames are generated.
+    shown_fps: f32 = 0,
+    meter_presented: u64 = 0,
     gpu_ms: f32 = 0,
     meter_time: f32 = 0,
     meter_frames: u32 = 0,
@@ -142,6 +146,7 @@ pub const Stage = struct {
         var frame_limit: ?u64 = null;
         var screenshot: ?[]const u8 = null;
         var debug_names = builtin.mode == .Debug;
+        var validation = false;
         var args = try init.minimal.args.iterateAllocator(init.gpa);
         defer args.deinit();
         _ = args.skip();
@@ -152,6 +157,8 @@ pub const Stage = struct {
                 screenshot = try init.gpa.dupe(u8, args.next() orelse return error.MissingArgument);
             } else if (std.mem.eql(u8, arg, "--names")) {
                 debug_names = true;
+            } else if (std.mem.eql(u8, arg, "--validation")) {
+                validation = true;
             } else if (std.mem.startsWith(u8, arg, "--")) {
                 // An option of the example itself, with its value.
                 _ = args.next();
@@ -162,8 +169,8 @@ pub const Stage = struct {
         const window: ?Window = if (screenshot != null) null else try Window.init(width, height, title);
         var renderer_options = options;
         renderer_options.application_name = title;
-        renderer_options.surface = if (window) |value| try value.surface(true) else null;
-        if (screenshot != null) renderer_options.validation = true;
+        renderer_options.surface = if (window) |value| try value.surface(false) else null;
+        if (screenshot != null or validation) renderer_options.validation = true;
         if (debug_names) renderer_options.debug_names = true;
         // Compiled shaders are kept between runs; the first run of a build
         // pays for compiling them, later ones start at once.
@@ -221,6 +228,9 @@ pub const Stage = struct {
         self.meter_frames += 1;
         if (self.time - self.meter_time >= 0.5) {
             self.fps = @as(f32, @floatFromInt(self.meter_frames)) / (self.time - self.meter_time);
+            const images = self.renderer.device.presented.load(.monotonic);
+            self.shown_fps = @as(f32, @floatFromInt(images - self.meter_presented)) / (self.time - self.meter_time);
+            self.meter_presented = images;
             self.gpu_ms = 0;
             for (self.renderer.device.passTimings()) |timing| {
                 if (timing.depth == 0) self.gpu_ms += timing.milliseconds;

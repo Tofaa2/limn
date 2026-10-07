@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
 
     const device = try rhi.Device.init(init.gpa, init.io, .{
         .application_name = "triangle",
-        .surface = try window.surface(true),
+        .surface = try window.surface(false),
     });
     defer device.deinit();
 

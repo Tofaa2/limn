@@ -689,21 +689,20 @@ pub fn build(b: *std.Build) void {
     verify_step.dependOn(&verify_cache_stream.step);
 }
 
-/// A pass of the FidelityFX SDK: a compute shader compiled once for
-/// every combination of its effect's options.
 const ffx_root = "src/third_party/ffx_sdk";
+/// An effect of the FidelityFX SDK: each pass is a compute shader compiled
+/// once for every combination of `options`.
 const FfxEffect = struct {
-    /// The directory of its shaders and of what they include.
+    /// The directory of its shaders.
     name: []const u8,
     /// What its options' names start with.
     prefix: []const u8,
+    /// The first is the lowest bit of a combination's number.
+    options: []const []const u8,
+    fixed: []const []const u8 = &.{},
     passes: []const []const u8,
 };
-/// The options every pass is compiled for both ways, the first the lowest
-/// bit of a combination's number (the order of
-/// CMakeCompileFSR3UpscalerShaders.txt in the SDK, which the SDK's own
-/// lookup of a combination follows).
-const ffx_options = [_][]const u8{
+const ffx_upscaler_options = [_][]const u8{
     "OPTION_REPROJECT_USE_LANCZOS_TYPE",
     "OPTION_HDR_COLOR_INPUT",
     "OPTION_LOW_RESOLUTION_MOTION_VECTORS",
@@ -711,8 +710,7 @@ const ffx_options = [_][]const u8{
     "OPTION_INVERTED_DEPTH",
     "OPTION_APPLY_SHARPENING",
 };
-/// What every pass is compiled with whatever the combination.
-const ffx_fixed = [_][]const u8{
+const ffx_sampler_options = [_][]const u8{
     "OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0",
     "OPTION_ACCUMULATE_SAMPLERS_USE_DATA_HALF=0",
     "OPTION_REPROJECT_SAMPLERS_USE_DATA_HALF=1",
@@ -720,16 +718,44 @@ const ffx_fixed = [_][]const u8{
     "OPTION_UPSAMPLE_USE_LANCZOS_TYPE=2",
 };
 const ffx_effects = [_]FfxEffect{
-    .{ .name = "fsr2", .prefix = "FFX_FSR2", .passes = &.{
+    .{ .name = "fsr2", .prefix = "FFX_FSR2", .options = &ffx_upscaler_options, .fixed = &ffx_sampler_options, .passes = &.{
         "ffx_fsr2_accumulate_pass",                 "ffx_fsr2_autogen_reactive_pass", "ffx_fsr2_compute_luminance_pyramid_pass",
         "ffx_fsr2_depth_clip_pass",                 "ffx_fsr2_lock_pass",             "ffx_fsr2_rcas_pass",
         "ffx_fsr2_reconstruct_previous_depth_pass", "ffx_fsr2_tcr_autogen_pass",
     } },
-    .{ .name = "fsr3upscaler", .prefix = "FFX_FSR3UPSCALER", .passes = &.{
+    .{ .name = "fsr3upscaler", .prefix = "FFX_FSR3UPSCALER", .options = &ffx_upscaler_options, .fixed = &ffx_sampler_options, .passes = &.{
         "ffx_fsr3upscaler_accumulate_pass",             "ffx_fsr3upscaler_autogen_reactive_pass", "ffx_fsr3upscaler_debug_view_pass",
         "ffx_fsr3upscaler_luma_instability_pass",       "ffx_fsr3upscaler_luma_pyramid_pass",     "ffx_fsr3upscaler_prepare_inputs_pass",
         "ffx_fsr3upscaler_prepare_reactivity_pass",     "ffx_fsr3upscaler_rcas_pass",             "ffx_fsr3upscaler_shading_change_pass",
         "ffx_fsr3upscaler_shading_change_pyramid_pass",
+    } },
+    .{
+        .name = "frameinterpolation",
+        .prefix = "FFX_FRAMEINTERPOLATION",
+        .options = &.{ "OPTION_LOW_RES_MOTION_VECTORS", "OPTION_JITTER_MOTION_VECTORS", "OPTION_INVERTED_DEPTH" },
+        .fixed = &ffx_sampler_options,
+        .passes = &.{
+            "ffx_frameinterpolation_compute_game_vector_field_inpainting_pyramid_pass",
+            "ffx_frameinterpolation_compute_inpainting_pyramid_pass",
+            "ffx_frameinterpolation_debug_view_pass",
+            "ffx_frameinterpolation_disocclusion_mask_pass",
+            "ffx_frameinterpolation_game_motion_vector_field_pass",
+            "ffx_frameinterpolation_inpainting_pass",
+            "ffx_frameinterpolation_optical_flow_vector_field_pass",
+            "ffx_frameinterpolation_pass",
+            "ffx_frameinterpolation_reconstruct_and_dilate_pass",
+            "ffx_frameinterpolation_reconstruct_previous_depth_pass",
+            "ffx_frameinterpolation_setup_pass",
+        },
+    },
+    .{ .name = "opticalflow", .prefix = "FFX_OPTICALFLOW", .options = &.{"OPTION_HDR_COLOR_INPUT"}, .passes = &.{
+        "ffx_opticalflow_compute_luminance_pyramid_pass",
+        "ffx_opticalflow_compute_optical_flow_advanced_pass_v5",
+        "ffx_opticalflow_compute_scd_divergence_pass",
+        "ffx_opticalflow_filter_optical_flow_pass_v5",
+        "ffx_opticalflow_generate_scd_histogram_pass",
+        "ffx_opticalflow_prepare_luma_pass",
+        "ffx_opticalflow_scale_optical_flow_advanced_pass_v5",
     } },
 };
 
@@ -758,19 +784,16 @@ fn addFidelityFx(
     });
     const gpu = b.path(ffx_root ++ "/include/FidelityFX/gpu");
     for (ffx_effects) |effect| {
-        var option_names: [ffx_options.len][]const u8 = undefined;
-        for (ffx_options, &option_names) |option, *name| name.* = b.fmt("{s}_{s}", .{ effect.prefix, option });
+        const option_names = b.allocator.alloc([]const u8, effect.options.len) catch @panic("OOM");
+        for (effect.options, option_names) |option, *name| name.* = b.fmt("{s}_{s}", .{ effect.prefix, option });
         for (effect.passes) |pass| {
             const generate = b.addRunArtifact(generator);
             const headers = generate.addOutputDirectoryArg(pass);
             generate.addArg(pass);
-            generate.addArg(std.mem.join(b.allocator, ",", &option_names) catch @panic("OOM"));
-            for (0..1 << ffx_options.len) |combination| {
-                // Compiled with names kept, which is what tells the SDK
-                // what a shader binds; the generator drops the rest of
-                // what `-g` adds.
+            generate.addArg(std.mem.join(b.allocator, ",", option_names) catch @panic("OOM"));
+            for (0..@as(usize, 1) << @intCast(effect.options.len)) |combination| {
                 const compile = b.addSystemCommand(&.{ "glslc", "-fshader-stage=compute", "--target-env=vulkan1.2", "-Os", "-g", "-DFFX_GLSL=1", "-DFFX_GPU=1", "-DFFX_HALF=0" });
-                for (ffx_fixed) |fixed| compile.addArg(b.fmt("-D{s}_{s}", .{ effect.prefix, fixed }));
+                for (effect.fixed) |fixed| compile.addArg(b.fmt("-D{s}_{s}", .{ effect.prefix, fixed }));
                 for (option_names, 0..) |name, bit| compile.addArg(b.fmt("-D{s}={d}", .{ name, (combination >> @intCast(bit)) & 1 }));
                 compile.addPrefixedDirectoryArg("-I", gpu);
                 compile.addPrefixedDirectoryArg("-I", gpu.path(b, effect.name));
@@ -790,9 +813,10 @@ fn addFidelityFx(
     library.root_module.addIncludePath(vulkan_include);
     library.root_module.addIncludePath(volk.path(""));
     const flags = [_][]const u8{
-        "-std=c++17",         "-w",                                         "-fno-strict-aliasing",
-        "-include",           b.pathFromRoot(ffx_root ++ "/limn_compat.h"), "-DFFX_FSR2",
-        "-DFFX_FSR3UPSCALER", "-DFFX_SDK_DEFAULT_CONTEXT_SIZE=(1024*256)",  "-fmax-type-align=4",
+        "-std=c++17",                                "-w",                                         "-fno-strict-aliasing",
+        "-include",                                  b.pathFromRoot(ffx_root ++ "/limn_compat.h"), "-DFFX_FSR2",
+        "-DFFX_FI",                                  "-DFFX_OF",                                   "-DFFX_FSR3UPSCALER",
+        "-DFFX_SDK_DEFAULT_CONTEXT_SIZE=(1024*256)", "-fmax-type-align=4",
     };
     library.root_module.addCSourceFiles(.{
         .root = b.path(ffx_root),
@@ -800,6 +824,8 @@ fn addFidelityFx(
             "src/backends/vk/ffx_vk.cpp",
             "src/components/fsr2/ffx_fsr2.cpp",
             "src/components/fsr3upscaler/ffx_fsr3upscaler.cpp",
+            "src/components/frameinterpolation/ffx_frameinterpolation.cpp",
+            "src/components/opticalflow/ffx_opticalflow.cpp",
             "src/shared/ffx_assert.cpp",
             "src/shared/ffx_message.cpp",
             "src/shared/ffx_object_management.cpp",
@@ -807,6 +833,8 @@ fn addFidelityFx(
             "src/backends/shared/ffx_shader_blobs.cpp",
             "src/backends/shared/blob_accessors/ffx_fsr2_shaderblobs.cpp",
             "src/backends/shared/blob_accessors/ffx_fsr3upscaler_shaderblobs.cpp",
+            "src/backends/shared/blob_accessors/ffx_frameinterpolation_shaderblobs.cpp",
+            "src/backends/shared/blob_accessors/ffx_opticalflow_shaderblobs.cpp",
         },
         .flags = &flags,
     });

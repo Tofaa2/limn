@@ -30,8 +30,6 @@ pub const CommandEncoder = struct {
         vkd.cmdBindDescriptorSets(self.command, .compute, self.device.pipeline_layout, 0, &.{self.device.descriptor_set}, &.{});
     }
 
-    // ------------------------------------------------------------ transitions
-
     /// Moves every mip of `texture` into `state`.
     pub fn transition(self: *CommandEncoder, texture: types.Texture, state: types.TextureState) void {
         const resource = self.device.textureResource(texture);
@@ -112,8 +110,6 @@ pub const CommandEncoder = struct {
             .p_memory_barriers = @ptrCast(&barrier),
         });
     }
-
-    // -------------------------------------------------------------- rendering
 
     /// Begins a render pass, transitioning the attachments and setting a
     /// full-size viewport and scissor.
@@ -322,8 +318,6 @@ pub const CommandEncoder = struct {
         self.device.vkd.cmdDispatchIndirect(self.command, self.device.bufferResource(buffer).handle, offset);
     }
 
-    // ---------------------------------------------------------------- copies
-
     /// Fills with the repeated 32-bit `value`; `offset` and `size` must be
     /// multiples of 4. Outside a render pass; `sync(.transfer_to_all)` before
     /// the buffer is read.
@@ -387,6 +381,22 @@ pub const CommandEncoder = struct {
         };
     }
 
+    /// Copies mip 0 of `source` to `destination` texel for texel: same size,
+    /// formats of the same texel size. Leaves them in `copy_src`/`copy_dst`.
+    pub fn copyTexture(self: *CommandEncoder, source: types.Texture, destination: types.Texture) void {
+        self.transition(source, .copy_src);
+        self.transition(destination, .copy_dst);
+        const from = self.device.textureResource(source);
+        const to = self.device.textureResource(destination);
+        self.device.vkd.cmdCopyImage(self.command, from.image, .transfer_src_optimal, to.image, .transfer_dst_optimal, &.{.{
+            .src_subresource = .{ .aspect_mask = from.aspect, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
+            .src_offset = .{ .x = 0, .y = 0, .z = 0 },
+            .dst_subresource = .{ .aspect_mask = to.aspect, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
+            .dst_offset = .{ .x = 0, .y = 0, .z = 0 },
+            .extent = .{ .width = from.info.width, .height = from.info.height, .depth = 1 },
+        }});
+    }
+
     /// Fills mips 1..n from mip 0 with linear blits and leaves the whole
     /// texture in `shader_read`.
     pub fn generateMips(self: *CommandEncoder, texture: types.Texture) void {
@@ -407,8 +417,6 @@ pub const CommandEncoder = struct {
         }
         self.transition(texture, .shader_read);
     }
-
-    // ------------------------------------------------ acceleration structures
 
     /// Builds a bottom-level structure from geometry already on the GPU.
     pub fn buildBlas(self: *CommandEncoder, blas: types.AccelerationStructure, desc: types.BlasDesc) !void {
@@ -438,8 +446,6 @@ pub const CommandEncoder = struct {
             .p_memory_barriers = @ptrCast(&barrier),
         });
     }
-
-    // ------------------------------------------------------------ diagnostics
 
     /// Opens a named GPU timing region (also a debug label under validation).
     /// `name` must outlive the frame; pass string literals.

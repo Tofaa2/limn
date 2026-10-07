@@ -1,4 +1,5 @@
-// C interface to the FidelityFX SDK's FSR 2 and FSR 3 upscalers.
+// C interface to the FidelityFX SDK's FSR 2 and FSR 3 upscalers and FSR 3
+// frame generation.
 // Mirrored in ffx.zig.
 #ifndef LIMN_FFX_H
 #define LIMN_FFX_H
@@ -56,10 +57,26 @@ typedef struct LimnFfxFrame {
     uint32_t reset;
 } LimnFfxFrame;
 
+typedef struct LimnFfxGenerate {
+    // VkCommandBuffer.
+    void* command_buffer;
+    // This frame's finished picture and where the one before it in time
+    // goes. Same size, UNORM formats, shader-read layout and left in it.
+    LimnFfxImage shown;
+    LimnFfxImage output;
+    // Nonzero when `shown` is PQ encoded; sRGB encoded otherwise.
+    uint32_t pq;
+    // Nonzero discards the history.
+    uint32_t reset;
+} LimnFfxGenerate;
+
 // Null if the SDK would not start on this device.
 LimnFfx* limnFfxCreate(const LimnFfxCreate* desc);
 // Returns 0 on success.
 int32_t limnFfxDispatch(LimnFfx* ffx, const LimnFfxFrame* frame);
+// FSR 3 only, after `limnFfxDispatch` in the same frame. Returns 1 when
+// `output` was written, 0 when there is nothing to show, negative on failure.
+int32_t limnFfxGenerateFrame(LimnFfx* ffx, const LimnFfxGenerate* frame);
 // The device must have finished with everything dispatched.
 void limnFfxDestroy(LimnFfx* ffx);
 

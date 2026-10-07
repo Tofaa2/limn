@@ -123,6 +123,8 @@ pub const FrameData = struct {
     fence: vk.Fence,
     /// Signaled when the acquired swapchain image is ready.
     image_available: vk.Semaphore,
+    /// The same for the image a generated frame goes to.
+    generated_available: vk.Semaphore,
     /// Two timestamps per timing scope.
     query_pool: vk.QueryPool,
     /// Scopes opened this frame, in `beginScope` order.
@@ -150,6 +152,24 @@ const Swapchain = struct {
     stale: bool = false,
     present_pending: bool = false,
     image_index: u32 = 0,
+    /// The backbuffer copied for the frame generator and what it writes, in
+    /// the UNORM form of the swapchain format. Null when there is no
+    /// generator or the swapchain cannot serve one.
+    generated: ?[2]types.Texture = null,
+    /// The image this frame's generated picture is in; presented first.
+    generated_index: ?u32 = null,
+    /// Presents queue for the display's refresh, which spaces a generated
+    /// picture from the one after it. Otherwise `Device.paced` does.
+    fifo: bool = true,
+};
+
+/// Makes the picture shown between two frames; see `Device.setFrameGenerator`.
+pub const FrameGenerator = struct {
+    context: *anyopaque,
+    /// `shown` is a copy of this frame's backbuffer. Both textures are in
+    /// `shader_read` and must be left in it. False when there is no picture
+    /// to show, as on the first frame.
+    generate: *const fn (context: *anyopaque, cmd: *CommandEncoder, shown: types.Texture, output: types.Texture) bool,
 };
 
 /// A frame being recorded; valid until it is submitted.
@@ -201,6 +221,17 @@ pub const Device = struct {
     validation_errors: std.atomic.Value(u32) = .init(0),
     surface: vk.SurfaceKHR = .null_handle,
     swapchain: ?Swapchain = null,
+    frame_generator: ?FrameGenerator = null,
+    /// Held to acquire from or present to the swapchain.
+    swapchain_mutex: std.Io.Mutex = .init,
+    /// The backbuffer's present, held back half a frame behind a generated
+    /// picture's. `pacing` is set while it is outstanding.
+    paced: ?std.Io.Future(void) = null,
+    paced_mutex: std.Io.Mutex = .init,
+    pacing: std.atomic.Value(bool) = .init(false),
+    last_present: ?std.Io.Timestamp = null,
+    /// Images presented since the device was made, generated ones included.
+    presented: std.atomic.Value(u64) = .init(0),
 
     /// The bindless set: sampled images at binding 0, samplers at binding 1.
     descriptor_layout: vk.DescriptorSetLayout,
@@ -322,6 +353,13 @@ pub const Device = struct {
         self.pending_upload_bytes = 0;
         self.timing_count = 0;
         self.queue_mutex = .init;
+        self.frame_generator = null;
+        self.swapchain_mutex = .init;
+        self.paced = null;
+        self.paced_mutex = .init;
+        self.pacing = .init(false);
+        self.last_present = null;
+        self.presented = .init(0);
 
         if (desc.validation) {
             self.debug_messenger = try self.instance.createDebugUtilsMessengerEXT(&.{
@@ -502,6 +540,7 @@ pub const Device = struct {
                 .command = command,
                 .fence = try self.vkd.createFence(&.{ .flags = .{ .signaled_bit = true } }, null),
                 .image_available = try self.vkd.createSemaphore(&.{}, null),
+                .generated_available = try self.vkd.createSemaphore(&.{}, null),
                 .query_pool = try self.vkd.createQueryPool(&.{
                     .query_type = .timestamp,
                     .query_count = max_timing_scopes * 2,
@@ -566,6 +605,7 @@ pub const Device = struct {
         for (&self.frames) |*frame| {
             self.vkd.destroyQueryPool(frame.query_pool, null);
             self.vkd.destroySemaphore(frame.image_available, null);
+            self.vkd.destroySemaphore(frame.generated_available, null);
             self.vkd.destroyFence(frame.fence, null);
             self.vkd.destroyCommandPool(frame.pool, null);
         }
@@ -630,8 +670,6 @@ pub const Device = struct {
     pub fn passTimings(self: *const Device) []const types.PassTiming {
         return self.timings[0..self.timing_count];
     }
-
-    // ---------------------------------------------------------------- buffers
 
     /// Names a Vulkan object for debuggers; no-op unless `debug_labels`.
     fn setName(self: *Device, object_type: vk.ObjectType, handle: u64, label: [:0]const u8) void {
@@ -765,8 +803,6 @@ pub const Device = struct {
         } });
         self.pending_upload_bytes += data.len;
     }
-
-    // --------------------------------------------------------------- textures
 
     /// Starts in `undefined` with no contents. A `sampled` texture takes one
     /// of 16384 bindless slots. Fails with `error.InvalidTextureDesc` or
@@ -1056,8 +1092,6 @@ pub const Device = struct {
         return gpa.dupe(u8, self.mapped(staging)[0..@intCast(size)]);
     }
 
-    // ------------------------------------------------- acceleration structures
-
     fn blasGeometry(self: *Device, desc: types.BlasDesc) vk.AccelerationStructureGeometryKHR {
         return .{
             .geometry_type = .triangles_khr,
@@ -1218,8 +1252,6 @@ pub const Device = struct {
         }}, &ranges);
     }
 
-    // --------------------------------------------------------------- samplers
-
     /// Takes one of 256 bindless slots; `error.BindlessTableFull` beyond that.
     pub fn createSampler(self: *Device, desc: types.SamplerDesc) !types.Sampler {
         const anisotropy = std.math.clamp(desc.max_anisotropy, 1, self.properties.limits.max_sampler_anisotropy);
@@ -1268,8 +1300,6 @@ pub const Device = struct {
     pub fn samplerIndex(self: *Device, sampler: types.Sampler) u32 {
         return (self.samplers.get(sampler) orelse @panic("stale or invalid sampler handle")).bindless_index;
     }
-
-    // -------------------------------------------------------------- pipelines
 
     /// `compileGraphicsPipeline` followed by `adoptPipeline`.
     pub fn createGraphicsPipeline(self: *Device, desc: types.GraphicsPipelineDesc) !types.Pipeline {
@@ -1490,8 +1520,6 @@ pub const Device = struct {
         return self.pipelines.get(pipeline) orelse @panic("stale or invalid pipeline handle");
     }
 
-    // ------------------------------------------------------------- frame loop
-
     /// Format of the swapchain images.
     pub fn backbufferFormat(self: *Device) !types.Format {
         if (self.swapchain == null) return error.NoSurface;
@@ -1532,6 +1560,15 @@ pub const Device = struct {
         }
     }
 
+    /// With a generator every frame presents two images: the generator's,
+    /// then the backbuffer half a frame later. Needs `storage_images`; takes
+    /// effect at the next swapchain rebuild. No-op when headless.
+    pub fn setFrameGenerator(self: *Device, generator: ?FrameGenerator) void {
+        const swapchain = if (self.swapchain) |*value| value else return;
+        if ((self.frame_generator == null) != (generator == null)) swapchain.dirty = true;
+        self.frame_generator = generator;
+    }
+
     /// `waitForFrame` + `prepareSurface` + `acquireImage` + `startFrame`.
     /// Returns null when there is nothing to draw to; try again next time.
     pub fn beginFrame(self: *Device) !?Frame {
@@ -1559,7 +1596,10 @@ pub const Device = struct {
     pub fn prepareSurface(self: *Device) !bool {
         const swapchain = if (self.swapchain) |*value| value else return true;
         if (swapchain.requested_width == 0 or swapchain.requested_height == 0) return false;
-        if (swapchain.dirty or swapchain.stale or swapchain.handle == .null_handle) try self.recreateSwapchain();
+        if (swapchain.dirty or swapchain.stale or swapchain.handle == .null_handle) {
+            self.finishPacedPresent();
+            try self.recreateSwapchain();
+        }
         return true;
     }
 
@@ -1568,16 +1608,34 @@ pub const Device = struct {
     pub fn acquireImage(self: *Device) !bool {
         const swapchain = if (self.swapchain) |*value| value else return true;
         const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
-        const acquired = self.vkd.acquireNextImageKHR(swapchain.handle, std.math.maxInt(u64), frame.image_available, .null_handle) catch |err| switch (err) {
+        swapchain.image_index = self.acquire(frame.image_available) catch |err| switch (err) {
             error.OutOfDateKHR => {
                 swapchain.stale = true;
                 return false;
             },
             else => return err,
         };
-        if (acquired.result == .suboptimal_khr) swapchain.stale = true;
-        swapchain.image_index = acquired.image_index;
         return true;
+    }
+
+    /// Blocks for the next swapchain image. While a paced present is
+    /// outstanding it polls instead, so as not to hold the swapchain from it.
+    fn acquire(self: *Device, semaphore: vk.Semaphore) !u32 {
+        const swapchain = &self.swapchain.?;
+        while (true) {
+            const timeout: u64 = if (self.pacing.load(.acquire)) 0 else std.math.maxInt(u64);
+            self.swapchain_mutex.lockUncancelable(self.io);
+            const acquired = self.vkd.acquireNextImageKHR(swapchain.handle, timeout, semaphore, .null_handle);
+            self.swapchain_mutex.unlock(self.io);
+            const result = try acquired;
+            switch (result.result) {
+                .timeout, .not_ready => self.io.sleep(std.Io.Duration.fromNanoseconds(100_000), .awake) catch {},
+                else => {
+                    if (result.result == .suboptimal_khr) swapchain.stale = true;
+                    return result.image_index;
+                },
+            }
+        }
     }
 
     /// Begins recording, after `waitForFrame` and `acquireImage`. On failure
@@ -1615,7 +1673,10 @@ pub const Device = struct {
             self.abandonAcquiredImage(frame);
         }
         const presenting = self.swapchain != null;
-        if (presenting) self.encoder.transition(self.swapchain.?.textures.items[self.swapchain.?.image_index], .present);
+        if (presenting) {
+            self.recordGeneratedFrame(frame);
+            self.encoder.transition(self.swapchain.?.textures.items[self.swapchain.?.image_index], .present);
+        }
         try self.vkd.endCommandBuffer(frame.command);
         self.in_frame = false;
 
@@ -1625,30 +1686,64 @@ pub const Device = struct {
             frame.fence = signaled;
         } else |_| {};
         const command_info = vk.CommandBufferSubmitInfo{ .command_buffer = frame.command, .device_mask = 0 };
-        var wait_info: vk.SemaphoreSubmitInfo = undefined;
-        var signal_info: vk.SemaphoreSubmitInfo = undefined;
+        var wait_info: [2]vk.SemaphoreSubmitInfo = undefined;
+        var signal_info: [2]vk.SemaphoreSubmitInfo = undefined;
+        var semaphore_count: u32 = 0;
         if (self.swapchain) |*swapchain| {
-            wait_info = .{ .semaphore = frame.image_available, .value = 0, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
-            signal_info = .{
-                .semaphore = swapchain.render_finished.items[swapchain.image_index],
-                .value = 0,
-                .stage_mask = .{ .all_commands_bit = true },
-                .device_index = 0,
-            };
+            const acquired = [2]vk.Semaphore{ frame.image_available, frame.generated_available };
+            const indices = [2]?u32{ swapchain.image_index, swapchain.generated_index };
+            for (acquired, indices) |semaphore, index| {
+                const image = index orelse continue;
+                wait_info[semaphore_count] = .{ .semaphore = semaphore, .value = 0, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
+                signal_info[semaphore_count] = .{
+                    .semaphore = swapchain.render_finished.items[image],
+                    .value = 0,
+                    .stage_mask = .{ .all_commands_bit = true },
+                    .device_index = 0,
+                };
+                semaphore_count += 1;
+            }
         }
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
         try self.vkd.queueSubmit2(self.queue, &.{.{
-            .wait_semaphore_info_count = if (presenting) 1 else 0,
-            .p_wait_semaphore_infos = @ptrCast(&wait_info),
+            .wait_semaphore_info_count = semaphore_count,
+            .p_wait_semaphore_infos = &wait_info,
             .command_buffer_info_count = 1,
             .p_command_buffer_infos = @ptrCast(&command_info),
-            .signal_semaphore_info_count = if (presenting) 1 else 0,
-            .p_signal_semaphore_infos = @ptrCast(&signal_info),
+            .signal_semaphore_info_count = semaphore_count,
+            .p_signal_semaphore_infos = &signal_info,
         }}, frame.fence);
         if (self.swapchain) |*swapchain| swapchain.present_pending = true;
         frame.submitted = true;
         self.frame_number += 1;
+    }
+
+    /// Has the generator make the picture before this frame's and puts it in
+    /// a second swapchain image. Leaves `Swapchain.generated_index` null when
+    /// there is none.
+    fn recordGeneratedFrame(self: *Device, frame: *FrameData) void {
+        const swapchain = &self.swapchain.?;
+        swapchain.generated_index = null;
+        const generator = self.frame_generator orelse return;
+        const shown, const output = swapchain.generated orelse return;
+        const cmd = &self.encoder;
+        cmd.beginScope("frame generation");
+        defer cmd.endScope();
+        cmd.copyTexture(swapchain.textures.items[swapchain.image_index], shown);
+        cmd.transition(shown, .shader_read);
+        cmd.transition(output, .shader_read);
+        if (!generator.generate(generator.context, cmd, shown, output)) return;
+        const index = self.acquire(frame.generated_available) catch {
+            swapchain.stale = true;
+            return;
+        };
+        const image = swapchain.textures.items[index];
+        self.textureResource(image).states[0] = .undefined;
+        cmd.copyTexture(output, image);
+        cmd.transition(output, .shader_read);
+        cmd.transition(image, .present);
+        swapchain.generated_index = index;
     }
 
     /// Marks the image acquired for `frame` as never presented: the swapchain
@@ -1664,19 +1759,59 @@ pub const Device = struct {
         const swapchain = if (self.swapchain) |*value| value else return;
         if (!swapchain.present_pending) return;
         swapchain.present_pending = false;
+        self.finishPacedPresent();
+        const now = std.Io.Timestamp.now(self.io, .awake);
+        const interval: i96 = if (self.last_present) |last| @min(last.durationTo(now).nanoseconds, 100 * std.time.ns_per_ms) else 0;
+        self.last_present = now;
+        const generated = swapchain.generated_index orelse return self.present(swapchain.image_index);
+        swapchain.generated_index = null;
+        try self.present(generated);
+        if (!swapchain.fifo) {
+            self.pacing.store(true, .release);
+            self.paced_mutex.lockUncancelable(self.io);
+            defer self.paced_mutex.unlock(self.io);
+            if (self.io.concurrent(presentPaced, .{ self, swapchain.image_index, now.addDuration(.fromNanoseconds(@divTrunc(interval, 2))) })) |future| {
+                self.paced = future;
+                return;
+            } else |_| self.pacing.store(false, .release);
+        }
+        try self.present(swapchain.image_index);
+    }
+
+    fn present(self: *Device, image: u32) !void {
+        const swapchain = &self.swapchain.?;
+        self.swapchain_mutex.lockUncancelable(self.io);
+        defer self.swapchain_mutex.unlock(self.io);
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
+        _ = self.presented.fetchAdd(1, .monotonic);
         const result = self.vkd.queuePresentKHR(self.queue, &.{
             .wait_semaphore_count = 1,
-            .p_wait_semaphores = @ptrCast(&swapchain.render_finished.items[swapchain.image_index]),
+            .p_wait_semaphores = @ptrCast(&swapchain.render_finished.items[image]),
             .swapchain_count = 1,
             .p_swapchains = @ptrCast(&swapchain.handle),
-            .p_image_indices = @ptrCast(&swapchain.image_index),
+            .p_image_indices = @ptrCast(&image),
         }) catch |err| switch (err) {
             error.OutOfDateKHR => vk.Result.suboptimal_khr,
             else => return err,
         };
         if (result == .suboptimal_khr) swapchain.stale = true;
+    }
+
+    fn presentPaced(self: *Device, image: u32, at: std.Io.Timestamp) void {
+        const wait = std.Io.Timestamp.now(self.io, .awake).durationTo(at);
+        if (wait.nanoseconds > 0) self.io.sleep(wait, .awake) catch {};
+        self.present(image) catch {
+            self.swapchain.?.stale = true;
+        };
+        self.pacing.store(false, .release);
+    }
+
+    fn finishPacedPresent(self: *Device) void {
+        self.paced_mutex.lockUncancelable(self.io);
+        defer self.paced_mutex.unlock(self.io);
+        if (self.paced) |*future| future.await(self.io);
+        self.paced = null;
     }
 
     /// Closes the open render pass and timing scopes of a frame whose
@@ -1689,6 +1824,7 @@ pub const Device = struct {
 
     /// Blocks until every submitted frame has finished on the GPU.
     pub fn waitIdle(self: *Device) !void {
+        self.finishPacedPresent();
         {
             self.queue_mutex.lockUncancelable(self.io);
             defer self.queue_mutex.unlock(self.io);
@@ -1711,8 +1847,6 @@ pub const Device = struct {
     pub fn pendingUploadBytes(self: *const Device) u64 {
         return self.pending_upload_bytes;
     }
-
-    // ---------------------------------------------------------------- private
 
     /// The shader stages push constants and the table of textures reach.
     pub fn shaderStages(self: *const Device) vk.ShaderStageFlags {
@@ -1961,6 +2095,8 @@ pub const Device = struct {
                 }
             }
         }
+        const usage = capabilities.supported_usage_flags;
+        const generating = self.frame_generator != null and self.storage_images and usage.transfer_src_bit and usage.transfer_dst_bit;
         var present_mode: vk.PresentModeKHR = .fifo_khr;
         if (!swapchain.vsync) {
             for (modes) |mode| if (mode == .mailbox_khr) {
@@ -1978,7 +2114,7 @@ pub const Device = struct {
                 .height = std.math.clamp(swapchain.requested_height, capabilities.min_image_extent.height, capabilities.max_image_extent.height),
             };
         if (extent.width == 0 or extent.height == 0) return error.SurfaceUnsupported;
-        var image_count = @max(capabilities.min_image_count + 1, 3);
+        var image_count = @max(capabilities.min_image_count + 1, 3) + @as(u32, @intFromBool(generating));
         if (capabilities.max_image_count != 0) image_count = @min(image_count, capabilities.max_image_count);
         var composite_alpha: vk.CompositeAlphaFlagsKHR = .{ .opaque_bit_khr = true };
         if (!capabilities.supported_composite_alpha.opaque_bit_khr) composite_alpha = .{ .inherit_bit_khr = true };
@@ -1991,7 +2127,7 @@ pub const Device = struct {
             .image_color_space = format.color_space,
             .image_extent = extent,
             .image_array_layers = 1,
-            .image_usage = .{ .color_attachment_bit = true },
+            .image_usage = .{ .color_attachment_bit = true, .transfer_src_bit = generating, .transfer_dst_bit = generating },
             .image_sharing_mode = .exclusive,
             .pre_transform = capabilities.current_transform,
             .composite_alpha = composite_alpha,
@@ -2006,9 +2142,13 @@ pub const Device = struct {
             const fresh = try self.vkd.createSemaphore(&.{}, null);
             self.vkd.destroySemaphore(frame.image_available, null);
             frame.image_available = fresh;
+            const fresh_generated = try self.vkd.createSemaphore(&.{}, null);
+            self.vkd.destroySemaphore(frame.generated_available, null);
+            frame.generated_available = fresh_generated;
             frame.acquire_abandoned = false;
         }
         swapchain.handle = handle;
+        swapchain.fifo = present_mode == .fifo_khr;
         swapchain.format = format;
         swapchain.extent = extent;
         swapchain.dirty = false;
@@ -2035,10 +2175,26 @@ pub const Device = struct {
             }, false));
             try swapchain.render_finished.append(self.gpa, try self.vkd.createSemaphore(&.{}, null));
         }
+        if (generating) swapchain.generated = self.createGeneratedTextures(texture_format, extent) catch null;
+    }
+
+    fn createGeneratedTextures(self: *Device, format: types.Format, extent: vk.Extent2D) ![2]types.Texture {
+        const plain: types.Format = switch (format) {
+            .bgra8_srgb => .bgra8_unorm,
+            .rgba8_srgb => .rgba8_unorm,
+            else => format,
+        };
+        var desc = types.TextureDesc{ .name = "frame generation", .width = extent.width, .height = extent.height, .format = plain, .usage = .{ .sampled = true, .copy_src = true, .copy_dst = true } };
+        const shown = try self.createTexture(desc);
+        errdefer self.destroyTexture(shown);
+        desc.usage = .{ .sampled = true, .copy_src = true, .storage = true };
+        return .{ shown, try self.createTexture(desc) };
     }
 
     fn releaseSwapchainImages(self: *Device) void {
         const swapchain = &self.swapchain.?;
+        if (swapchain.generated) |textures| for (textures) |texture| self.destroyTexture(texture);
+        swapchain.generated = null;
         for (swapchain.textures.items) |texture| {
             const resource = self.textures.remove(texture) orelse continue;
             self.vkd.destroyImageView(resource.view, null);
@@ -2050,6 +2206,7 @@ pub const Device = struct {
 
     fn destroySwapchain(self: *Device) void {
         if (self.swapchain == null) return;
+        self.finishPacedPresent();
         self.releaseSwapchainImages();
         const swapchain = &self.swapchain.?;
         swapchain.textures.deinit(self.gpa);

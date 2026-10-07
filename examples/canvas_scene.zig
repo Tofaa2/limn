@@ -44,7 +44,6 @@ pub fn draw(list: *gfx.DrawList, font: *const gfx.Font, assets: Assets, size: [2
     const width = size[0];
     const height = size[1];
 
-    // ------------------------------------------------------------ world
     // Everything inside this transform lives in "world" pixels and is
     // viewed through a slowly drifting, zooming, rotating 2D camera.
     const zoom = 1.0 + 0.15 * @sin(time * 0.4);
@@ -75,7 +74,6 @@ pub fn draw(list: *gfx.DrawList, font: *const gfx.Font, assets: Assets, size: [2
     try list.text(font, "origin", .{ 0, 54 }, .{ .size = 18, .alignment = .center, .color = Color.hex(0xb8c4ff) });
     list.popTransform();
 
-    // -------------------------------------------------------------- HUD
     try list.rect(.{ .x = 0, .y = 0, .width = width, .height = 54 }, Color.rgba(12, 14, 22, 215));
     try list.text(font, "2D canvas", .{ 18, 10 }, .{ .size = 30 });
     try list.text(font, "shapes · sprites · distance-field text", .{ width - 18, 18 }, .{
@@ -110,7 +108,6 @@ pub fn draw(list: *gfx.DrawList, font: *const gfx.Font, assets: Assets, size: [2
     try list.rect(.{ .x = bar.x + 3, .y = bar.y + 3, .width = (bar.width - 6) * level, .height = bar.height - 6 }, Color.hex(0x3ddc97));
     try list.text(font, "signal", .{ bar.x, bar.y - 22 }, .{ .size = 15, .shadow = .black });
 
-    // --- Newer shapes: a card built from them, top right. ---
     const card = gfx.Rect{ .x = width - 330, .y = 72, .width = 312, .height = 250 };
     // Drop shadow, body with a vertical gradient, and a thin outline.
     try list.roundedRect(.{ .x = card.x + 3, .y = card.y + 5, .width = card.width, .height = card.height }, Color.rgba(0, 0, 0, 90), .{ .radius = 16 });
@@ -166,7 +163,6 @@ pub fn draw(list: *gfx.DrawList, font: *const gfx.Font, assets: Assets, size: [2
     try list.nineSlice(assets.checker, .{ .x = card.x + 16, .y = card.y + 200, .width = 120 + 60 * level, .height = 36 }, .{ 2, 2, 2, 2 }, 3, .{ .pixelated = true });
     try list.text(font, "nine-slice", .{ card.x + 210, card.y + 210 }, .{ .size = 15, .color = Color.hex(0x9aa7d0) });
 
-    // --- Text: ligatures, right-to-left scripts, mixed runs. ---
     const words = gfx.Rect{ .x = width - 330, .y = 336, .width = 312, .height = 226 };
     try list.roundedRect(words, Color.rgba(12, 14, 22, 215), .{ .radius = 12 });
     try list.text(font, "office affluent fjord flight", .{ words.x + 14, words.y + 10 }, .{ .size = 20 });

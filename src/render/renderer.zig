@@ -349,6 +349,10 @@ pub const Renderer = struct {
     frame_target_count: u32 = 0,
     /// Scene views recorded so far this frame.
     frame_scene_views: u32 = 0,
+    /// The upscaler of the view this frame generates frames from, and whether
+    /// its history was reset.
+    generating: ?@import("ffx.zig").Upscaler = null,
+    generating_reset: bool = false,
     /// Scene whose lights the local shadow atlas currently holds.
     local_shadow_scene: ?Scene = null,
     local_shadow_frame: u64 = std.math.maxInt(u64),
@@ -686,8 +690,6 @@ pub const Renderer = struct {
         stats.gpu_memory_bytes = self.device.memoryStats().used_bytes;
         return stats;
     }
-
-    // --------------------------------------------------------------- assets
 
     fn lodOptions(self: *const Renderer) gltf.LodOptions {
         return .{ .clusters = self.options.cluster_lods, .normal_weight = self.options.lod_normal_weight, .uv_weight = self.options.lod_uv_weight };
@@ -1414,8 +1416,6 @@ pub const Renderer = struct {
         self.mesh_boxes.items[record] = .{ tree.nodes[0].min, tree.nodes[0].max };
     }
 
-    // ----------------------------------------------------- geometry streaming
-
     /// Releases geometry of models far from every camera and restores it for
     /// near ones.
     fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
@@ -1585,8 +1585,6 @@ pub const Renderer = struct {
         }
         entry.geometry_resident = true;
     }
-
-    // ------------------------------------------------------ texture streaming
 
     fn createStreamTexture(self: *Renderer, stream: *const TextureStream, wanted_first: u32) !rhi.Texture {
         const device = self.device;
@@ -2135,8 +2133,6 @@ pub const Renderer = struct {
         }
     }
 
-    // ------------------------------------------------- locking and 2D assets
-
     /// Takes the renderer lock. Public methods lock internally; hold it only
     /// to use `device` from a non-rendering thread. Not reentrant: call no
     /// renderer methods while holding it.
@@ -2473,8 +2469,6 @@ pub const Renderer = struct {
         }
     }
 
-    // ---------------------------------------------------------------- views
-
     /// Creates persistent state for an extra camera. Its render targets are
     /// allocated on first use and follow the size it is drawn at.
     pub fn createView(self: *Renderer) !View {
@@ -2614,8 +2608,6 @@ pub const Renderer = struct {
         self.draw_pipelines.clearRetainingCapacity();
         return @intCast(shader_sources.names.len);
     }
-
-    // ------------------------------------------------------ material shaders
 
     /// Registers a custom material. `spirv` is a fragment shader that defines
     /// `CUSTOM_MATERIAL`, includes "shade.glsl" and defines
@@ -2812,8 +2804,6 @@ pub const Renderer = struct {
         try data.decals.appendSlice(self.gpa, decals);
     }
 
-    // ------------------------------------------------------------ instances
-
     /// Places many static copies of a model, stored on the GPU. They do not
     /// animate and blended meshes are skipped. They take part in probe GI
     /// while the scene holds at most `Options.gi_instance_limit` of them.
@@ -2934,8 +2924,6 @@ pub const Renderer = struct {
         scene.layout_dirty = true;
     }
 
-    // ---------------------------------------------------------------- water
-
     /// Adds a sheet of simulated water to a scene.
     pub fn createWater(self: *Renderer, scene: Scene, desc: WaterDesc) !Water {
         self.mutex.lockUncancelable(self.io);
@@ -3010,8 +2998,6 @@ pub const Renderer = struct {
             break;
         };
     }
-
-    // --------------------------------------------------------------- hair
 
     /// Adds strands of hair, fur or grass to a scene (see `HairDesc`).
     pub fn createHair(self: *Renderer, scene: Scene, desc: HairDesc) !Hair {
@@ -3139,8 +3125,6 @@ pub const Renderer = struct {
             break;
         };
     }
-
-    // ------------------------------------------------------------- liquid
 
     pub fn createLiquid(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
         const liquid = try self.createLiquidAlone(scene, desc);
@@ -3273,8 +3257,6 @@ pub const Renderer = struct {
         state.cleared = false;
         state.current = 0;
     }
-
-    // --------------------------------------------------------------- fluids
 
     /// Adds a box of GPU-simulated smoke and fire to a scene.
     pub fn createFluid(self: *Renderer, scene: Scene, desc: FluidDesc) !Fluid {
@@ -3463,8 +3445,6 @@ pub const Renderer = struct {
         state.flipbook = null;
         state.picture = null;
     }
-
-    // ------------------------------------------------------------ particles
 
     /// Adds a GPU-simulated particle emitter to a scene.
     pub fn createEmitter(self: *Renderer, scene: Scene, desc: EmitterDesc) !Emitter {
@@ -3783,8 +3763,6 @@ pub const Renderer = struct {
         }
     }
 
-    // -------------------------------------------------------------- picking
-
     /// Asks which entity is under `pixel` (in the view's pixels; null is the
     /// main view). The answer arrives through `takePick` a few frames later.
     /// A new request replaces an unserved one. Blended surfaces do not pick.
@@ -3838,8 +3816,6 @@ pub const Renderer = struct {
             .distance = pending.near / @max(raw.depth, 1e-9),
         };
     }
-
-    // --------------------------------------------------------------- scenes
 
     /// Creates an empty scene: no entities or lights, sun off, no
     /// environment.
@@ -4674,8 +4650,6 @@ pub const Renderer = struct {
         };
     }
 
-    // ---------------------------------------------------------------- frame
-
     /// Renders one frame; false when skipped because the window has no
     /// drawable surface. Call from one thread at a time; the lock is held
     /// only while recording, not while waiting for the GPU or display.
@@ -4710,6 +4684,7 @@ pub const Renderer = struct {
                 };
             };
             self.stats.indirect_draws = frame.cmd.indirect_draws;
+            device.setFrameGenerator(if (self.generating != null and failure == null) .{ .context = self, .generate = generateFrame } else null);
             try device.submitFrame();
             self.stats.cpu_ms = @as(f32, @floatFromInt(cpu_start.untilNow(self.io).raw.nanoseconds)) / 1e6;
             self.frame_index += 1;
@@ -4718,6 +4693,12 @@ pub const Renderer = struct {
         try device.presentFrame();
         if (failure) |err| return err;
         return true;
+    }
+
+    fn generateFrame(context: *anyopaque, cmd: *rhi.CommandEncoder, shown: rhi.Texture, output: rhi.Texture) bool {
+        const self: *Renderer = @ptrCast(@alignCast(context));
+        const upscaler = self.generating orelse return false;
+        return upscaler.generate(self.device, cmd, shown, output, self.generating_reset);
     }
 
     fn renderFrame(self: *Renderer, frame: rhi.Frame, desc: FrameDesc) !void {
@@ -4731,6 +4712,7 @@ pub const Renderer = struct {
         arena.reset(self.device);
         self.frame_target_count = 0;
         self.frame_scene_views = 0;
+        self.generating = null;
         self.resolvePick(@intCast(frame.index % rhi.frames_in_flight));
 
         cmd.beginScope("streaming");
@@ -5505,6 +5487,10 @@ pub const Renderer = struct {
             .height = height,
             .output_width = output_width,
             .output_height = output_height,
+            .fills_backbuffer = if (frame.backbuffer) |backbuffer|
+                std.meta.eql(backbuffer, target) and std.meta.eql(device.backbufferSize(), .{ output_width, output_height })
+            else
+                false,
             .delta_time = delta_time,
             .debugging = debugging,
             .aspect = aspect,

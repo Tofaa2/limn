@@ -48,6 +48,7 @@ pub const DeviceDispatch = struct {
     vkCmdBindPipeline: ?vk.PfnCmdBindPipeline = null,
     vkCmdBindVertexBuffers: ?vk.PfnCmdBindVertexBuffers = null,
     vkCmdBlitImage: ?vk.PfnCmdBlitImage = null,
+    vkCmdCopyImage: ?vk.PfnCmdCopyImage = null,
     vkCmdBuildAccelerationStructuresKHR: ?vk.PfnCmdBuildAccelerationStructuresKHR = null,
     vkCreateAccelerationStructureKHR: ?vk.PfnCreateAccelerationStructureKHR = null,
     vkDestroyAccelerationStructureKHR: ?vk.PfnDestroyAccelerationStructureKHR = null,
