@@ -51,7 +51,7 @@ fn evaluatePoses(self: *Renderer, scene: *SceneData) !void {
     var most_nodes: usize = 0;
     for (scene.layout.items) |entry| {
         if (!entry.first_of_entity) continue;
-        const entity = self.entities.get(entry.entity).?;
+        const entity = self.entities.table.get(entry.entity).?;
         if (entity.node_world.len == 0) continue;
         try self.posed.append(self.gpa, entry.entity);
         most_nodes = @max(most_nodes, entity.node_world.len);
@@ -80,8 +80,8 @@ fn evaluatePoses(self: *Renderer, scene: *SceneData) !void {
 /// two batches share an entity.
 fn poseEntities(self: *Renderer, entities: []const Entity, scratch: []animation.Local) void {
     for (entities) |handle_value| {
-        const entity = self.entities.get(handle_value).?;
-        const model = self.models.get(entity.model).?;
+        const entity = self.entities.table.get(handle_value).?;
+        const model = self.models.table.get(entity.model).?;
         std.mem.swap([]Mat4, &entity.node_world, &entity.previous_node_world);
         animation.evaluate(&model.source.?, model.pose_order, entity.pose, scratch, entity.node_world);
         if (entity.history_frames == 0) @memcpy(entity.previous_node_world, entity.node_world);
@@ -98,9 +98,9 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     scene.triangle_count = 0;
     scene.masked_ref_count = 0;
     for (scene.entities.items) |entity_handle| {
-        const entity = self.entities.get(entity_handle) orelse continue;
+        const entity = self.entities.table.get(entity_handle) orelse continue;
         if (!entity.visible) continue;
-        const model = self.models.get(entity.model) orelse continue;
+        const model = self.models.table.get(entity.model) orelse continue;
         if (model.state != .ready or !model.geometry_resident) continue;
         try resolveEntity(self, entity, model);
         const source = &model.source.?;
@@ -123,10 +123,10 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     scene.entity_ref_count = @intCast(self.scratch_refs.items.len);
     scene.static_ranges.clearRetainingCapacity();
     for (scene.groups.items) |group_handle| {
-        const group = self.instance_groups.get(group_handle) orelse continue;
+        const group = self.instances.table.get(group_handle) orelse continue;
         group.base = @as(u32, @intCast(scene.layout.items.len)) + scene.static_count;
         group.per_copy = 0;
-        const model = self.models.get(group.model) orelse continue;
+        const model = self.models.table.get(group.model) orelse continue;
         if (model.state != .ready or !model.geometry_resident) continue;
         const source = &model.source.?;
         group.per_copy = @intCast(source.instances.len);
@@ -223,7 +223,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena, slot
     scene.movers.clearRetainingCapacity();
     scene.movers_overflow = false;
     for (scene.hairs.items) |hair_handle| {
-        const hair = self.hairs.get(hair_handle) orelse continue;
+        const hair = self.hairs.table.get(hair_handle) orelse continue;
         if (hair.simulation == null) continue;
         const center = math.transformPoint(hair.desc.transform, hair.bounds[0..3].*);
         noteMover(self, scene, .{ center[0], center[1], center[2], hair.bounds[3] * math.maxScale(hair.desc.transform) * 1.6 });
@@ -234,8 +234,8 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena, slot
     const glowing = try arena.alloc(device, Glowing, max_glowing);
     var glowing_count: u32 = 0;
     for (scene.layout.items, instance_records, 0..) |entry, *out, instance_index| {
-        const entity = self.entities.get(entry.entity).?;
-        const model = self.models.get(entity.model).?;
+        const entity = self.entities.table.get(entry.entity).?;
+        const model = self.models.table.get(entity.model).?;
         const source = &model.source.?;
         const node_world = if (entity.node_world.len != 0) entity.node_world else model.node_world;
         const previous_node_world = if (entity.node_world.len != 0) entity.previous_node_world else model.node_world;
@@ -412,7 +412,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena, slot
 
     var driven = false;
     for (scene.groups.items) |group_handle| {
-        const group = self.instance_groups.get(group_handle) orelse continue;
+        const group = self.instances.table.get(group_handle) orelse continue;
         if (group.driver != null) driven = true;
     }
     if (driven or records.static_version != scene.static_version or records.entity_count != entity_count) {
@@ -424,9 +424,9 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena, slot
         scene.static_transmissive = false;
         try self.scratch_instances.ensureTotalCapacity(self.gpa, scene.static_count);
         for (scene.groups.items) |group_handle| {
-            const group = self.instance_groups.get(group_handle) orelse continue;
+            const group = self.instances.table.get(group_handle) orelse continue;
             if (group.per_copy == 0) continue;
-            const model = self.models.get(group.model) orelse continue;
+            const model = self.models.table.get(group.model) orelse continue;
             const source = &model.source.?;
             const driver = groupDriver(self, group, source.instances.len);
             var impostor_index: u32 = 0;
@@ -538,9 +538,9 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena, slot
             scene.static_tlas.clearRetainingCapacity();
             var record: u32 = @intCast(entity_count);
             for (scene.groups.items) |group_handle| {
-                const group = self.instance_groups.get(group_handle) orelse continue;
+                const group = self.instances.table.get(group_handle) orelse continue;
                 if (group.per_copy == 0) continue;
-                const model = self.models.get(group.model) orelse continue;
+                const model = self.models.table.get(group.model) orelse continue;
                 const source = &model.source.?;
                 const driver = groupDriver(self, group, source.instances.len);
                 for (group.transforms) |placement| {
@@ -571,7 +571,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena, slot
 
     for (scene.layout.items) |entry| {
         if (!entry.first_of_entity) continue;
-        const entity = self.entities.get(entry.entity).?;
+        const entity = self.entities.table.get(entry.entity).?;
         entity.travelled = math.length(math.sub(entity.transform[12..15].*, entity.previous_transform[12..15].*));
         entity.previous_transform = entity.transform;
         entity.history_frames +|= 1;
@@ -604,7 +604,7 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
     const device = self.device;
     var fluid_lights: usize = 0;
     for (scene.fluids.items) |item| {
-        if (self.fluids.get(item)) |state| fluid_lights += @intFromBool(state.desc.light > 0);
+        if (self.fluids.table.get(item)) |state| fluid_lights += @intFromBool(state.desc.light > 0);
     }
     const lights = try arena.alloc(device, gpu.Light, scene.lights.items.len + fluid_lights);
     const tiles = try arena.alloc(device, gpu.ShadowTile, max_local_shadow_views);
@@ -703,7 +703,7 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
     }
     var fluid_slot: usize = scene.lights.items.len;
     for (scene.fluids.items) |item| {
-        const state = self.fluids.get(item) orelse continue;
+        const state = self.fluids.table.get(item) orelse continue;
         if (state.desc.light <= 0) continue;
         const t = state.desc.transform;
         const height = math.length(.{ t[4], t[5], t[6] });
@@ -733,7 +733,7 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
             var last_entry: ?*ModelEntry = null;
             var last_mesh: usize = 0;
             var last_end: u32 = 0;
-            for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
+            for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
                 if (entry.state != .ready or !entry.geometry_resident or entry.geometry_coarse) continue;
                 for (entry.meshes, 0..) |mesh, index| {
                     const end = if (vertices) mesh.vertex_offset + mesh.vertex_count else mesh.index_offset + mesh.index_count;
@@ -771,7 +771,7 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
                 };
                 try self.meshes.write(self.device, entry.mesh_base + @as(u32, @intCast(last_mesh)), std.mem.asBytes(&record));
             }
-            if (vertices) for (self.scenes.slots.items) |*slot| if (slot.value) |*scene| {
+            if (vertices) for (self.scenes.table.slots.items) |*slot| if (slot.value) |*scene| {
                 scene.static_version += 1;
             };
             self.stats.geometry_bytes_compacted += @as(u64, count) * pool.stride;
@@ -791,7 +791,7 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
     const device = self.device;
     var still_pending: u32 = 0;
     var finished = false;
-    for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
+    for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
         if (!entry.blas_pending) continue;
         const frame_now = frame_index orelse {
             if (entry.blas_job) |job| {

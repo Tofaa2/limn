@@ -37,22 +37,22 @@ pub fn main(init: std.process.Init) !void {
     }
     var stage = try Stage.create(init, "Limn shadows", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     var sun_turn: f32 = 0.9;
     var sky = gfx.SkyDesc{ .sun_direction = .{ -@cos(sun_turn), -0.42, -@sin(sun_turn) * 0.4 } };
-    renderer.setSun(scene, gfx.skySun(sky));
-    const environment = try renderer.createSky(sky);
-    renderer.setEnvironment(scene, environment, 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky));
+    const environment = try renderer.environments.createSky(sky);
+    renderer.scenes.setEnvironment(scene, environment, 1);
 
     var positions: [24][3]f32 = undefined;
     var indices: [36]u32 = undefined;
     window.boxMesh(.{ 0.5, 0.5, 0.5 }, &positions, &indices);
-    const ground = try renderer.createModel(&.{.{
+    const ground = try renderer.models.create(&.{.{
         .positions = &positions,
         .indices = &indices,
         .material = .{ .base_color = .{ 0.62, 0.60, 0.56, 1 }, .metallic = 0, .roughness = 0.85 },
     }});
-    const wood = try renderer.createModel(&.{.{
+    const wood = try renderer.models.create(&.{.{
         .positions = &positions,
         .indices = &indices,
         .material = .{ .base_color = .{ 0.33, 0.22, 0.13, 1 }, .metallic = 0, .roughness = 0.8 },
@@ -64,13 +64,13 @@ pub fn main(init: std.process.Init) !void {
     const ball_indices = try gpa.create([window.sphere_index_count]u32);
     defer gpa.destroy(ball_indices);
     window.sphereMesh(0.6, ball_positions, ball_normals, ball_indices);
-    const ball = try renderer.createModel(&.{.{
+    const ball = try renderer.models.create(&.{.{
         .positions = ball_positions,
         .normals = ball_normals,
         .indices = ball_indices,
         .material = .{ .base_color = .{ 0.75, 0.2, 0.15, 1 }, .metallic = 0, .roughness = 0.4 },
     }});
-    _ = try renderer.spawn(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.5, -avenue_length * 0.5 }), math.scaling(.{ 60, 1, avenue_length + 40 })) });
+    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.5, -avenue_length * 0.5 }), math.scaling(.{ 60, 1, avenue_length + 40 })) });
 
     var bars: std.ArrayList(math.Mat4) = .empty;
     defer bars.deinit(gpa);
@@ -84,13 +84,13 @@ pub fn main(init: std.process.Init) !void {
             try bars.append(gpa, math.mul(math.translation(.{ x, height, -avenue_length * 0.5 }), math.scaling(.{ 0.03, 0.04, avenue_length })));
         }
     }
-    _ = try renderer.createInstances(scene, wood, bars.items);
-    const roller = try renderer.spawn(scene, .{ .model = ball, .transform = math.translation(.{ 0, 0.6, -6 }) });
+    _ = try renderer.instances.create(scene, wood, bars.items);
+    const roller = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.translation(.{ 0, 0.6, -6 }) });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var text: [256]u8 = undefined;
     var rolling = true;
     var rolled: f32 = 0;
@@ -104,11 +104,11 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_T)) {
             sun_turn += tick.dt * 0.4;
             sky.sun_direction = .{ -@cos(sun_turn), -0.42, -@sin(sun_turn) * 0.4 };
-            renderer.setSky(environment, sky);
-            renderer.setSun(scene, gfx.skySun(sky));
+            renderer.environments.setSky(environment, sky);
+            renderer.scenes.setSun(scene, gfx.skySun(sky));
         }
         if (rolling) rolled += tick.dt;
-        renderer.setTransform(roller, math.translation(.{ @sin(rolled * 0.5) * 1.2, 0.6, -6 - @mod(rolled * 3, 60) }));
+        renderer.entities.setTransform(roller, math.translation(.{ @sin(rolled * 0.5) * 1.2, 0.6, -6 - @mod(rolled * 3, 60) }));
 
         var cascades_ms: f32 = 0;
         var virtual_ms: f32 = 0;

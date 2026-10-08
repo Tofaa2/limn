@@ -78,7 +78,7 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
     if (dt <= 0) return;
     var any = false;
     for (p.scene.hairs.items) |handle| {
-        const hair = renderer.hairs.get(handle) orelse continue;
+        const hair = renderer.hairs.table.get(handle) orelse continue;
         if (hair.simulation == null) continue;
         if (hair.moving == null) {
             var made: [4]?rhi.Buffer = @splat(null);
@@ -99,7 +99,7 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
     cmd.beginScope("hair simulation");
     cmd.bindPipeline(renderer.pipelines.hair_simulation);
     for (p.scene.hairs.items) |handle| {
-        const hair = renderer.hairs.get(handle) orelse continue;
+        const hair = renderer.hairs.table.get(handle) orelse continue;
         const simulation = hair.simulation orelse continue;
         const moving = &hair.moving.?;
         const next = 1 - moving.current;
@@ -108,7 +108,7 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
         const half = hair.bounds[3] * scale * 1.5;
         const density_low = [3]f32{ middle[0] - half, middle[1] - half, middle[2] - half };
         const density_cell = 2 * half / @as(f32, density_size);
-        const field: ?*render.CollisionFieldState = if (simulation.field) |field_handle| renderer.collision_fields.get(field_handle) else null;
+        const field: ?*render.CollisionFieldState = if (simulation.field) |field_handle| renderer.hairs.fields.get(field_handle) else null;
         const params = try p.arena.alloc(device, SimulationParams, 1);
         params.items[0] = .{
             .rest = device.bufferAddress(hair.points),
@@ -166,7 +166,7 @@ pub fn drawHairShadows(renderer: *Renderer, p: *const ScenePass, view_proj: [16]
     if (p.scene.hairs.items.len == 0) return;
     cmd.bindPipeline(renderer.pipelines.hair_shadow);
     for (p.scene.hairs.items) |handle| {
-        const hair = renderer.hairs.get(handle) orelse continue;
+        const hair = renderer.hairs.table.get(handle) orelse continue;
         const moving = if (hair.moving) |moving| (if (moving.steps != 0) moving else null) else null;
         const width = hair.desc.width * (if (moving != null) math.maxScale(hair.desc.transform) else 1);
         const spread = hair.desc.spread * (if (moving != null) math.maxScale(hair.desc.transform) else 1);
@@ -202,7 +202,7 @@ pub fn drawHair(renderer: *Renderer, p: *const ScenePass) !void {
     });
     cmd.bindPipeline(renderer.pipelines.hair);
     for (p.scene.hairs.items) |handle| {
-        const hair = renderer.hairs.get(handle) orelse continue;
+        const hair = renderer.hairs.table.get(handle) orelse continue;
         const moving = if (hair.moving) |moving| (if (moving.steps != 0) moving else null) else null;
         const in_world: f32 = if (moving != null) math.maxScale(hair.desc.transform) else 1;
         const width = hair.desc.width * in_world;

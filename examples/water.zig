@@ -22,19 +22,19 @@ const boxMesh = @import("window").boxMesh;
 pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn water", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     var sun_height: f32 = 0.7;
     var sky = gfx.SkyDesc{ .sun_direction = .{ -0.5 * @cos(sun_height), -@sin(sun_height), -0.6 } };
-    renderer.setSun(scene, gfx.skySun(sky));
-    const environment = try renderer.createSky(sky);
-    renderer.setEnvironment(scene, environment, 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky));
+    const environment = try renderer.environments.createSky(sky);
+    renderer.scenes.setEnvironment(scene, environment, 1);
 
     var positions: [1][24][3]f32 = undefined;
     var indices: [1][36]u32 = undefined;
     boxMesh(.{ 0.5, 0.5, 0.5 }, &positions[0], &indices[0]);
-    const stone = try renderer.createModel(&.{.{ .positions = &positions[0], .indices = &indices[0], .material = .{ .base_color = .{ 0.62, 0.6, 0.55, 1 }, .metallic = 0, .roughness = 0.8 } }});
-    const tile = try renderer.createModel(&.{.{ .positions = &positions[0], .indices = &indices[0], .material = .{ .base_color = .{ 0.25, 0.45, 0.55, 1 }, .metallic = 0, .roughness = 0.5 } }});
-    const red = try renderer.createModel(&.{.{ .positions = &positions[0], .indices = &indices[0], .material = .{ .base_color = .{ 0.75, 0.12, 0.08, 1 }, .metallic = 0, .roughness = 0.4 } }});
+    const stone = try renderer.models.create(&.{.{ .positions = &positions[0], .indices = &indices[0], .material = .{ .base_color = .{ 0.62, 0.6, 0.55, 1 }, .metallic = 0, .roughness = 0.8 } }});
+    const tile = try renderer.models.create(&.{.{ .positions = &positions[0], .indices = &indices[0], .material = .{ .base_color = .{ 0.25, 0.45, 0.55, 1 }, .metallic = 0, .roughness = 0.5 } }});
+    const red = try renderer.models.create(&.{.{ .positions = &positions[0], .indices = &indices[0], .material = .{ .base_color = .{ 0.75, 0.12, 0.08, 1 }, .metallic = 0, .roughness = 0.4 } }});
     const Box = struct { model: gfx.Model, at: math.Vec3, size: math.Vec3 };
     const boxes = [_]Box{
         .{ .model = tile, .at = .{ 0, -1.6, 0 }, .size = .{ 12, 0.2, 12 } },
@@ -47,14 +47,14 @@ pub fn main(init: std.process.Init) !void {
         .{ .model = red, .at = .{ 1.0, -0.2, 1.5 }, .size = .{ 1.2, 1.2, 1.2 } },
         .{ .model = tile, .at = .{ -3.5, -1.2, 2.5 }, .size = .{ 1.5, 0.6, 1.5 } },
     };
-    for (boxes) |box| _ = try renderer.spawn(scene, .{ .model = box.model, .transform = math.mul(math.translation(box.at), math.scaling(box.size)) });
+    for (boxes) |box| _ = try renderer.entities.spawn(scene, .{ .model = box.model, .transform = math.mul(math.translation(box.at), math.scaling(box.size)) });
     const helpers = @import("window");
     var ball_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(0.4, &ball_positions, &ball_normals, &ball_indices);
-    const ball_model = try renderer.createModel(&.{.{ .positions = &ball_positions, .normals = &ball_normals, .indices = &ball_indices, .material = .{ .base_color = .{ 0.95, 0.75, 0.1, 1 }, .metallic = 0, .roughness = 0.3 } }});
-    const ball = try renderer.spawn(scene, .{ .model = ball_model, .transform = math.translation(.{ 3.6, -0.3, 0 }) });
+    const ball_model = try renderer.models.create(&.{.{ .positions = &ball_positions, .normals = &ball_normals, .indices = &ball_indices, .material = .{ .base_color = .{ 0.95, 0.75, 0.1, 1 }, .metallic = 0, .roughness = 0.3 } }});
+    const ball = try renderer.entities.spawn(scene, .{ .model = ball_model, .transform = math.translation(.{ 3.6, -0.3, 0 }) });
     try renderer.waitUntilLoaded();
 
     var desc = gfx.WaterDesc{
@@ -62,11 +62,11 @@ pub fn main(init: std.process.Init) !void {
         .rain = 6,
         .splashes = 1,
     };
-    const water = try renderer.createWater(scene, desc);
+    const water = try renderer.waters.create(scene, desc);
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var orbit: f32 = 0.6;
     var random = std.Random.DefaultPrng.init(3);
     const rng = random.random();
@@ -93,16 +93,16 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_T)) {
             sun_height = @mod(sun_height + tick.dt * 0.25, std.math.pi);
             sky.sun_direction = .{ -0.5 * @cos(sun_height), -@max(@sin(sun_height), -0.05), -0.6 };
-            renderer.setSky(environment, sky);
-            renderer.setSun(scene, gfx.skySun(sky));
+            renderer.environments.setSky(environment, sky);
+            renderer.scenes.setSun(scene, gfx.skySun(sky));
         }
         since_drop += tick.dt;
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE) or since_drop > 0.9) {
             since_drop = 0;
-            renderer.addRipple(water, .{ (rng.float(f32) - 0.5) * 9, -0.25, (rng.float(f32) - 0.5) * 9 }, 0.45, 0.22);
+            renderer.waters.addRipple(water, .{ (rng.float(f32) - 0.5) * 9, -0.25, (rng.float(f32) - 0.5) * 9 }, 0.45, 0.22);
         }
-        renderer.setTransform(ball, math.translation(.{ @cos(tick.time * 0.9) * 3.6, -0.3, @sin(tick.time * 0.9) * 3.6 }));
-        try renderer.setWater(water, desc);
+        renderer.entities.setTransform(ball, math.translation(.{ @cos(tick.time * 0.9) * 3.6, -0.3, @sin(tick.time * 0.9) * 3.6 }));
+        try renderer.waters.set(water, desc);
 
         list.clear();
         const stats = renderer.getStats();

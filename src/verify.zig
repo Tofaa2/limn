@@ -596,32 +596,32 @@ pub fn main(init: std.process.Init) !void {
     });
     defer device.destroyTexture(target);
 
-    const scene = try renderer.createScene();
-    const environment = try renderer.loadEnvironment("examples/assets/world/venice_sunset_2k.hdr", 24);
-    const sponza = try renderer.loadModel("examples/assets/world/Sponza.glb");
-    const robot = try renderer.loadModel("examples/assets/world/RobotExpressive.glb");
+    const scene = try renderer.scenes.create();
+    const environment = try renderer.environments.load("examples/assets/world/venice_sunset_2k.hdr", 24);
+    const sponza = try renderer.models.load("examples/assets/world/Sponza.glb");
+    const robot = try renderer.models.load("examples/assets/world/RobotExpressive.glb");
     try renderer.waitUntilLoaded();
-    if (renderer.modelState(sponza) != .ready) return renderer.modelError(sponza) orelse error.ModelLoadFailed;
-    if (renderer.modelState(robot) != .ready) return renderer.modelError(robot) orelse error.ModelLoadFailed;
+    if (renderer.models.state(sponza) != .ready) return renderer.models.loadError(sponza) orelse error.ModelLoadFailed;
+    if (renderer.models.state(robot) != .ready) return renderer.models.loadError(robot) orelse error.ModelLoadFailed;
     std.log.info("assets loaded in {d} ms", .{elapsedMs(init.io, start)});
 
-    const sponza_info = renderer.modelInfo(sponza).?;
+    const sponza_info = renderer.models.info(sponza).?;
     std.log.info("sponza: {d} meshes, {d} triangles, {d} meshlets, {d} textures", .{
         sponza_info.mesh_count, sponza_info.triangle_count, sponza_info.meshlet_count, sponza_info.texture_count,
     });
 
-    renderer.setEnvironment(scene, environment, environment_intensity);
-    renderer.setSun(scene, .{ .direction = sun_direction, .color = .{ 1.0, 0.93, 0.82 }, .intensity = sun_intensity });
+    renderer.scenes.setEnvironment(scene, environment, environment_intensity);
+    renderer.scenes.setSun(scene, .{ .direction = sun_direction, .color = .{ 1.0, 0.93, 0.82 }, .intensity = sun_intensity });
     var sky_environment: ?gfx.Environment = null;
-    defer if (sky_environment) |handle| renderer.destroyEnvironment(handle);
+    defer if (sky_environment) |handle| renderer.environments.destroy(handle);
     if (sky) {
         const sky_desc = gfx.SkyDesc{ .sun_direction = if (stars) .{ -0.4, 0.25, -0.3 } else sun_direction, .turbidity = sky_turbidity, .stars = if (stars) 1 else 0, .moon = if (stars) 1 else 0, .moon_direction = .{ -0.3, -0.9, 0.05 } };
-        sky_environment = try renderer.createSky(sky_desc);
-        renderer.setEnvironment(scene, sky_environment, 1);
-        renderer.setSun(scene, gfx.skySun(sky_desc));
+        sky_environment = try renderer.environments.createSky(sky_desc);
+        renderer.scenes.setEnvironment(scene, sky_environment, 1);
+        renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
     }
     var cube_environment: ?gfx.Environment = null;
-    defer if (cube_environment) |handle| renderer.destroyEnvironment(handle);
+    defer if (cube_environment) |handle| renderer.environments.destroy(handle);
     if (cube_env) |path| {
         const size = 32;
         const face_colors = [6][3]f32{ .{ 1.6, 0.5, 0.4 }, .{ 0.4, 1.4, 0.5 }, .{ 0.9, 1.3, 2.4 }, .{ 0.25, 0.2, 0.15 }, .{ 1.5, 1.4, 0.4 }, .{ 1.2, 0.4, 1.5 } };
@@ -639,41 +639,41 @@ pub fn main(init: std.process.Init) !void {
         const file = try gfx.ktx2.write(init.gpa, .{ .width = size, .height = size, .format = .rgba16f, .srgb = false, .levels = 2, .faces = 6, .data = texels });
         defer init.gpa.free(file);
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = file });
-        cube_environment = try renderer.loadEnvironment(path, 24);
+        cube_environment = try renderer.environments.load(path, 24);
         try renderer.waitUntilLoaded();
-        const info = renderer.environmentInfo(cube_environment.?) orelse return error.CubeEnvironmentNotLoaded;
+        const info = renderer.environments.info(cube_environment.?) orelse return error.CubeEnvironmentNotLoaded;
         const expected = math.normalize(.{ 1, -((8.5 / 32.0) * 2 - 1), -((20.5 / 32.0) * 2 - 1) });
         if (math.dot(info.brightest_direction, expected) < 0.9999) return error.CubeEnvironmentBrightestWrong;
-        renderer.setEnvironment(scene, cube_environment, environment_intensity);
+        renderer.scenes.setEnvironment(scene, cube_environment, environment_intensity);
     }
-    _ = try renderer.spawn(scene, .{ .model = sponza });
-    const player = try renderer.spawn(scene, .{
+    _ = try renderer.entities.spawn(scene, .{ .model = sponza });
+    const player = try renderer.entities.spawn(scene, .{
         .model = robot,
         .transform = math.mul(math.translation(.{ 2.0, 0, -0.4 }), math.mul(math.rotationY(1.9), math.uniformScaling(0.42))),
     });
-    if (tints) renderer.setTint(player, .{ 1.0, 0.45, 0.4 });
-    if (morph) renderer.setMorphWeights(player, &.{ 1, 1, 1 });
-    if (no_player) renderer.setVisible(player, false);
+    if (tints) renderer.entities.setTint(player, .{ 1.0, 0.45, 0.4 });
+    if (morph) renderer.entities.setMorphWeights(player, &.{ 1, 1, 1 });
+    if (no_player) renderer.entities.setVisible(player, false);
     if (ktx2_model) |directory| {
         const path = try writeKtx2Panel(init.gpa, init.io, directory);
         defer init.gpa.free(path);
-        const checkered = try renderer.loadModel(path);
-        _ = try renderer.spawn(scene, .{ .model = checkered, .transform = math.mul(math.translation(.{ 3.0, 0.3, 1.2 }), math.rotationY(std.math.pi * 0.5)) });
+        const checkered = try renderer.models.load(path);
+        _ = try renderer.entities.spawn(scene, .{ .model = checkered, .transform = math.mul(math.translation(.{ 3.0, 0.3, 1.2 }), math.rotationY(std.math.pi * 0.5)) });
         try renderer.waitUntilLoaded();
-        if (renderer.modelState(checkered) != .ready) return error.Ktx2ModelNotLoaded;
+        if (renderer.models.state(checkered) != .ready) return error.Ktx2ModelNotLoaded;
     }
     if (morph_row) |directory| {
         const path = try writeMorphRow(init.gpa, init.io, directory);
         defer init.gpa.free(path);
-        const tiles = try renderer.loadModel(path);
+        const tiles = try renderer.models.load(path);
         try renderer.waitUntilLoaded();
-        if (renderer.modelState(tiles) != .ready) return renderer.modelError(tiles) orelse error.MorphRowNotLoaded;
-        const info = renderer.modelInfo(tiles).?;
+        if (renderer.models.state(tiles) != .ready) return renderer.models.loadError(tiles) orelse error.MorphRowNotLoaded;
+        const info = renderer.models.info(tiles).?;
         if (info.morph_targets != morph_row_tiles) return error.MorphRowTargetsMissing;
-        const row = try renderer.spawn(scene, .{ .model = tiles, .transform = math.mul(math.translation(.{ 3.0, 0.2, -0.4 }), math.rotationY(std.math.pi * 0.5)) });
+        const row = try renderer.entities.spawn(scene, .{ .model = tiles, .transform = math.mul(math.translation(.{ 3.0, 0.2, -0.4 }), math.rotationY(std.math.pi * 0.5)) });
         var weights: [morph_row_tiles]f32 = @splat(0);
         for ([_]usize{ 1, 9, 10, 11 }) |tile| weights[tile] = 1;
-        renderer.setMorphWeights(row, &weights);
+        renderer.entities.setMorphWeights(row, &weights);
     }
     if (terrain) {
         const cells = 512;
@@ -692,36 +692,36 @@ pub fn main(init: std.process.Init) !void {
             const corner: u32 = @intCast(row * (cells + 1) + column);
             indices[(row * cells + column) * 6 ..][0..6].* = .{ corner, corner + cells + 1, corner + 1, corner + 1, corner + cells + 1, corner + cells + 2 };
         };
-        const land = try renderer.createModel(&.{.{ .positions = positions, .indices = indices, .material = .{ .base_color = .{ 0.36, 0.42, 0.27, 1 }, .metallic = 0, .roughness = 0.9 } }});
-        _ = try renderer.spawn(scene, .{ .model = land, .transform = math.translation(.{ 160, -8, 0 }) });
+        const land = try renderer.models.create(&.{.{ .positions = positions, .indices = indices, .material = .{ .base_color = .{ 0.36, 0.42, 0.27, 1 }, .metallic = 0, .roughness = 0.9 } }});
+        _ = try renderer.entities.spawn(scene, .{ .model = land, .transform = math.translation(.{ 160, -8, 0 }) });
         try renderer.waitUntilLoaded();
-        const land_info = renderer.modelInfo(land).?;
+        const land_info = renderer.models.info(land).?;
         std.log.info("terrain: {d} triangles, {d} meshlets", .{ land_info.triangle_count, land_info.meshlet_count });
     }
     if (mirror_panel) {
         const corners = [_][3]f32{ .{ -0.9, 0, 0 }, .{ 0.9, 0, 0 }, .{ 0.9, 1.9, 0 }, .{ -0.9, 1.9, 0 } };
         const two_triangles = [_]u32{ 0, 1, 2, 0, 2, 3 };
-        const mirror = try renderer.createModel(&.{.{ .positions = &corners, .indices = &two_triangles, .material = .{
+        const mirror = try renderer.models.create(&.{.{ .positions = &corners, .indices = &two_triangles, .material = .{
             .base_color = .{ 0.95, 0.95, 0.95, 1 },
             .metallic = 1,
             .roughness = 0.03,
             .double_sided = true,
         } }});
-        _ = try renderer.spawn(scene, .{ .model = mirror, .transform = math.mul(math.translation(.{ if (mirror_far) -4.5 else 4.2, 0.1, 0.9 }), math.rotationY(std.math.pi * 0.5)) });
+        _ = try renderer.entities.spawn(scene, .{ .model = mirror, .transform = math.mul(math.translation(.{ if (mirror_far) -4.5 else 4.2, 0.1, 0.9 }), math.rotationY(std.math.pi * 0.5)) });
     }
-    if (reflection_probe) _ = try renderer.createReflectionProbe(scene, .{ .position = .{ 1.0, 1.6, -0.2 }, .extent = .{ 14, 6, 3 }, .settle_frames = probe_settle });
+    if (reflection_probe) _ = try renderer.probes.create(scene, .{ .position = .{ 1.0, 1.6, -0.2 }, .extent = .{ 14, 6, 3 }, .settle_frames = probe_settle });
     if (transform_panel) {
-        const tiled = try renderer.loadModel(panel_model);
-        _ = try renderer.spawn(scene, .{ .model = tiled, .transform = math.mul(math.translation(.{ 3.0, 0.3, -0.4 }), math.rotationY(std.math.pi * 0.5)) });
+        const tiled = try renderer.models.load(panel_model);
+        _ = try renderer.entities.spawn(scene, .{ .model = tiled, .transform = math.mul(math.translation(.{ 3.0, 0.3, -0.4 }), math.rotationY(std.math.pi * 0.5)) });
         try renderer.waitUntilLoaded();
-        if (renderer.modelState(tiled) != .ready) return error.PanelNotLoaded;
+        if (renderer.models.state(tiled) != .ready) return error.PanelNotLoaded;
     }
     const crowd_entities = try init.gpa.alloc(gfx.Entity, if (crowd_group) 0 else crowd);
     defer init.gpa.free(crowd_entities);
     for (crowd_entities, 0..) |*member, index| {
         const column: f32 = @floatFromInt(index % 20);
         const row: f32 = @floatFromInt(index / 20);
-        member.* = try renderer.spawn(scene, .{
+        member.* = try renderer.entities.spawn(scene, .{
             .model = robot,
             .transform = math.mul(math.translation(.{ -7 + column * 0.75, 0, -1.6 + row * 0.6 }), math.mul(math.rotationY(1.9), math.uniformScaling(0.2))),
         });
@@ -734,18 +734,18 @@ pub fn main(init: std.process.Init) !void {
             const row: f32 = @floatFromInt(index / 20);
             placement.* = math.mul(math.translation(.{ -7 + column * 0.75, 0, -1.6 + row * 0.6 }), math.mul(math.rotationY(1.9), math.uniformScaling(0.2)));
         }
-        const followers = try renderer.createInstances(scene, robot, placements);
-        renderer.setInstancesPose(followers, player);
+        const followers = try renderer.instances.create(scene, robot, placements);
+        renderer.instances.setPose(followers, player);
     }
-    if (morph) if (renderer.modelInfo(robot)) |info| std.log.info("morph: {d} meshes with targets, up to {d} each", .{ info.morph_meshes, info.morph_targets });
-    const walk = renderer.findAnimation(robot, "Walking") orelse 0;
-    if (panel) try renderer.setLights(scene, &.{
+    if (morph) if (renderer.models.info(robot)) |info| std.log.info("morph: {d} meshes with targets, up to {d} each", .{ info.morph_meshes, info.morph_targets });
+    const walk = renderer.models.findAnimation(robot, "Walking") orelse 0;
+    if (panel) try renderer.scenes.setLights(scene, &.{
         .{ .kind = .rectangle, .position = .{ 3.0, 1.2, -4.6 }, .direction = .{ 0, -0.25, 1 }, .color = .{ 1.0, 0.6, 0.9 }, .intensity = 14, .range = 8, .source_length = 2.4, .source_height = 0.8, .cast_shadows = true },
     });
-    if (tube) try renderer.setLights(scene, &.{
+    if (tube) try renderer.scenes.setLights(scene, &.{
         .{ .position = .{ 3.0, 0.5, -3.6 }, .direction = .{ 1, 0, 0 }, .color = .{ 0.5, 0.8, 1.0 }, .intensity = 18, .range = 8, .source_length = 4, .source_radius = 0.04, .cast_shadows = tube_shadows },
     });
-    if (fluid_lamp) try renderer.setLights(scene, &.{
+    if (fluid_lamp) try renderer.scenes.setLights(scene, &.{
         .{ .kind = .spot, .position = .{ -4.6, 3.4, 0.9 }, .direction = .{ 1.0, -0.55, 0 }, .color = .{ 0.7, 0.85, 1.0 }, .intensity = 260, .range = 14, .inner_angle = 0.3, .outer_angle = 0.5, .cast_shadows = true },
     });
     if (many_lights != 0) {
@@ -762,9 +762,9 @@ pub fn main(init: std.process.Init) !void {
                 .range = 2.5,
             };
         }
-        try renderer.setLights(scene, row);
+        try renderer.scenes.setLights(scene, row);
     }
-    if (lights) try renderer.setLights(scene, &.{
+    if (lights) try renderer.scenes.setLights(scene, &.{
         .{ .position = .{ 4.0, 1.2, -3.6 }, .color = .{ 1.0, 0.45, 0.15 }, .intensity = 12, .range = 6 },
         .{ .position = .{ -4.0, 1.2, 3.4 }, .color = .{ 0.3, 1.0, 0.4 }, .intensity = 12, .range = 6 },
         .{ .position = .{ 3.2, 1.0, -1.5 }, .color = .{ 0.4, 0.6, 1.0 }, .intensity = 25, .range = 9, .cast_shadows = true, .source_radius = light_size },
@@ -784,7 +784,7 @@ pub fn main(init: std.process.Init) !void {
     if (glass) {
         const pane = [_][3]f32{ .{ -0.9, 0, 0 }, .{ 0.9, 0, 0 }, .{ 0.9, 1.9, 0 }, .{ -0.9, 1.9, 0 } };
         const quad = [_]u32{ 0, 1, 2, 0, 2, 3 };
-        const panes = try renderer.createModel(&.{
+        const panes = try renderer.models.create(&.{
             .{ .positions = &pane, .indices = &quad, .material = .{
                 .base_color = .{ 0.25, 0.75, 0.95, 0.35 },
                 .metallic = 0,
@@ -793,7 +793,7 @@ pub fn main(init: std.process.Init) !void {
                 .double_sided = true,
             } },
         });
-        const amber = try renderer.createModel(&.{
+        const amber = try renderer.models.create(&.{
             .{ .positions = &pane, .indices = &quad, .material = .{
                 .base_color = .{ 1.0, 0.55, 0.15, 0.55 },
                 .metallic = 0,
@@ -802,8 +802,8 @@ pub fn main(init: std.process.Init) !void {
                 .double_sided = true,
             } },
         });
-        _ = try renderer.spawn(scene, .{ .model = panes, .transform = math.mul(math.translation(.{ 3.6, 0, 0.5 }), math.rotationY(1.25)) });
-        _ = try renderer.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 4.6, 0, -1.3 }), math.rotationY(1.75)) });
+        _ = try renderer.entities.spawn(scene, .{ .model = panes, .transform = math.mul(math.translation(.{ 3.6, 0, 0.5 }), math.rotationY(1.25)) });
+        _ = try renderer.entities.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 4.6, 0, -1.3 }), math.rotationY(1.75)) });
         if (pane_row != .none) {
             var row: [5]math.Mat4 = undefined;
             for (&row, 0..) |*transform, index| {
@@ -811,16 +811,16 @@ pub fn main(init: std.process.Init) !void {
                 transform.* = math.mul(math.translation(.{ 1.0 + step * 0.7, 0, 0.9 - step * 0.45 }), math.rotationY(1.1 + step * 0.2));
             }
             if (pane_row == .group) {
-                _ = try renderer.createInstances(scene, amber, &row);
+                _ = try renderer.instances.create(scene, amber, &row);
             } else for (row) |transform| {
-                _ = try renderer.spawn(scene, .{ .model = amber, .transform = transform });
+                _ = try renderer.entities.spawn(scene, .{ .model = amber, .transform = transform });
             }
         }
         if (flat_panes) {
-            _ = try renderer.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 2.4, 1.2, 0.2 }), math.rotationX(-std.math.pi * 0.5)) });
-            _ = try renderer.spawn(scene, .{ .model = panes, .transform = math.mul(math.translation(.{ 0.2, 1.2, 0.2 }), math.rotationX(-std.math.pi * 0.5)) });
+            _ = try renderer.entities.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 2.4, 1.2, 0.2 }), math.rotationX(-std.math.pi * 0.5)) });
+            _ = try renderer.entities.spawn(scene, .{ .model = panes, .transform = math.mul(math.translation(.{ 0.2, 1.2, 0.2 }), math.rotationX(-std.math.pi * 0.5)) });
         }
-        const lens = try renderer.createModel(&.{
+        const lens = try renderer.models.create(&.{
             .{ .positions = &pane, .indices = &quad, .material = .{
                 .base_color = .{ 0.85, 1.0, 0.9, 1 },
                 .metallic = 0,
@@ -831,15 +831,15 @@ pub fn main(init: std.process.Init) !void {
                 .double_sided = true,
             } },
         });
-        _ = try renderer.spawn(scene, .{ .model = lens, .transform = math.mul(math.translation(.{ 2.6, 0, -1.9 }), math.rotationY(1.45)) });
-        if (lens_pane) _ = try renderer.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 3.8, 0, -2.0 }), math.rotationY(1.45)) });
-        if (mirror_panel) _ = try renderer.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 9.8, 0.2, 1.2 }), math.rotationY(std.math.pi * 0.5)) });
+        _ = try renderer.entities.spawn(scene, .{ .model = lens, .transform = math.mul(math.translation(.{ 2.6, 0, -1.9 }), math.rotationY(1.45)) });
+        if (lens_pane) _ = try renderer.entities.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 3.8, 0, -2.0 }), math.rotationY(1.45)) });
+        if (mirror_panel) _ = try renderer.entities.spawn(scene, .{ .model = amber, .transform = math.mul(math.translation(.{ 9.8, 0.2, 1.2 }), math.rotationY(std.math.pi * 0.5)) });
         try renderer.waitUntilLoaded();
     }
     var lava_shader: ?gfx.MaterialShader = null;
-    defer if (lava_shader) |shader| renderer.destroyMaterialShader(shader);
+    defer if (lava_shader) |shader| renderer.materials.destroyShader(shader);
     if (custom_material) {
-        lava_shader = try renderer.createMaterialShader(@embedFile("lava.frag.spv"));
+        lava_shader = try renderer.materials.createShader(@embedFile("lava.frag.spv"));
         var positions: [24][3]f32 = undefined;
         var indices: [36]u32 = undefined;
         const half = [3]f32{ 0.45, 0.45, 0.45 };
@@ -858,18 +858,18 @@ pub fn main(init: std.process.Init) !void {
             const base: u32 = @intCast(face * 4);
             indices[face * 6 ..][0..6].* = .{ base, base + 1, base + 2, base, base + 2, base + 3 };
         }
-        const block = try renderer.createModel(&.{.{
+        const block = try renderer.models.create(&.{.{
             .positions = &positions,
             .indices = &indices,
             .material = .{ .metallic = 0, .roughness = 0.8, .shader = lava_shader.?.slot, .params = .{ 3.5, 3, 0, 0 } },
         }});
-        _ = try renderer.spawn(scene, .{ .model = block, .transform = math.translation(.{ 3.3, 0.45, -1.4 }) });
-        if (instance_params) _ = try renderer.spawn(scene, .{ .model = block, .transform = math.translation(.{ 3.3, 0.45, -0.2 }), .params = .{ 0.85, 0, 0, 0 } });
+        _ = try renderer.entities.spawn(scene, .{ .model = block, .transform = math.translation(.{ 3.3, 0.45, -1.4 }) });
+        if (instance_params) _ = try renderer.entities.spawn(scene, .{ .model = block, .transform = math.translation(.{ 3.3, 0.45, -0.2 }), .params = .{ 0.85, 0, 0, 0 } });
         try renderer.waitUntilLoaded();
     }
     if (particles) {
         const base = math.Vec3{ 3.4, 0.1, -1.5 };
-        _ = try renderer.createEmitter(scene, .{
+        _ = try renderer.emitters.create(scene, .{
             .position = base,
             .radius = 0.18,
             .capacity = 512,
@@ -884,7 +884,7 @@ pub fn main(init: std.process.Init) !void {
             .blend = .additive,
             .lit = false,
         });
-        _ = try renderer.createEmitter(scene, .{
+        _ = try renderer.emitters.create(scene, .{
             .position = base,
             .radius = 0.1,
             .capacity = 256,
@@ -901,7 +901,7 @@ pub fn main(init: std.process.Init) !void {
             .lit = false,
             .softness = 0,
         });
-        _ = try renderer.createEmitter(scene, .{
+        _ = try renderer.emitters.create(scene, .{
             .position = math.add(base, .{ 0, 0.7, 0 }),
             .radius = 0.15,
             .capacity = 512,
@@ -916,11 +916,11 @@ pub fn main(init: std.process.Init) !void {
             .color_end = .{ 0.7, 0.7, 0.75, 0 },
         });
     }
-    if (clouds) try renderer.setClouds(scene, .{ .coverage = cloud_coverage, .environment_interval = if (cloud_lighting) 4 else 0 });
+    if (clouds) try renderer.scenes.setClouds(scene, .{ .coverage = cloud_coverage, .environment_interval = if (cloud_lighting) 4 else 0 });
     var fluid_picture: ?gfx.Image = null;
     var flat_fluid: ?gfx.Fluid = null;
     if (fluid) {
-        _ = try renderer.createFluid(scene, .{
+        _ = try renderer.fluids.create(scene, .{
             .resolution = .{ 48, 72, 48 },
             .sharp_velocity = fluid_sharp,
             .vorticity = if (fluid_sharp) 4 else 12,
@@ -929,19 +929,19 @@ pub fn main(init: std.process.Init) !void {
             .sources = if (fluid_lamp) &.{.{ .smoke = 6, .temperature = 3 }} else &.{.{ .fuel = 7, .temperature = 7 }},
             .obstacles = &.{.{ .sphere = .{ .center = .{ 0.5, 0.45, 0.5 }, .radius = 0.08 } }},
         });
-        const flat = try renderer.createFluid(scene, .{
+        const flat = try renderer.fluids.create(scene, .{
             .resolution = .{ 64, 64, 1 },
             .sharp_velocity = fluid_sharp,
             .transform = math.translation(.{ 0, -40, 0 }),
             .sources = &.{.{ .smoke = 5, .temperature = 2 }},
             .walls = .closed,
         });
-        fluid_picture = try renderer.fluidImage(flat);
+        fluid_picture = try renderer.fluids.image(flat);
         flat_fluid = flat;
-        if (fluid_flipbook != null) _ = try renderer.recordFluidFlipbook(flat, .{ .columns = 4, .rows = 4, .interval = 2 });
+        if (fluid_flipbook != null) _ = try renderer.fluids.recordFlipbook(flat, .{ .columns = 4, .rows = 4, .interval = 2 });
     }
     var lut_image: ?gfx.Image = null;
-    defer if (lut_image) |image| renderer.destroyImage(image);
+    defer if (lut_image) |image| renderer.images.destroy(image);
     if (lut) |kind| {
         const n = 16;
         var pixels: [n * n * n * 4]u8 = undefined;
@@ -953,10 +953,10 @@ pub fn main(init: std.process.Init) !void {
             const out: [3]f32 = if (warm) .{ @min(red * 1.1 + 0.03, 1), green, blue * 0.75 } else .{ red, green, blue };
             pixels[(g * n * n + b * n + r) * 4 ..][0..4].* = .{ @intFromFloat(out[0] * 255 + 0.5), @intFromFloat(out[1] * 255 + 0.5), @intFromFloat(out[2] * 255 + 0.5), 255 };
         };
-        lut_image = try renderer.createImage(n * n, n, &pixels, false);
+        lut_image = try renderer.images.create(n * n, n, &pixels, false);
         settings.color_lut = lut_image;
     }
-    const sorted_emitter: ?gfx.Emitter = if (sort_test) try renderer.createEmitter(scene, .{
+    const sorted_emitter: ?gfx.Emitter = if (sort_test) try renderer.emitters.create(scene, .{
         .position = .{ 2.5, 1.0, 0.5 },
         .radius = 0.6,
         .capacity = 300,
@@ -968,8 +968,8 @@ pub fn main(init: std.process.Init) !void {
     }) else null;
     var decal_image: ?gfx.Image = null;
     var bump_image: ?gfx.Image = null;
-    defer if (bump_image) |image| renderer.destroyImage(image);
-    defer if (decal_image) |image| renderer.destroyImage(image);
+    defer if (bump_image) |image| renderer.images.destroy(image);
+    defer if (decal_image) |image| renderer.images.destroy(image);
     if (decals) {
         const size = 128;
         const pixels = try init.gpa.alloc(u8, size * size * 4);
@@ -996,11 +996,11 @@ pub fn main(init: std.process.Init) !void {
             const file = try gfx.ktx2.write(init.gpa, .{ .width = 64, .height = 64, .format = .bc1, .srgb = true, .levels = 1, .data = &blocks });
             defer init.gpa.free(file);
             try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = file });
-            decal_image = try renderer.loadImage(path);
+            decal_image = try renderer.images.load(path);
         } else if (decal_ktx2) |path| {
-            try renderer.writeKtx2(path, size, size, pixels, true);
-            decal_image = try renderer.loadImage(path);
-        } else decal_image = if (compress_images) try renderer.createImageCompressed(size, size, pixels, true) else try renderer.createImage(size, size, pixels, true);
+            try renderer.images.writeKtx2(path, size, size, pixels, true);
+            decal_image = try renderer.images.load(path);
+        } else decal_image = if (compress_images) try renderer.images.createCompressed(size, size, pixels, true) else try renderer.images.create(size, size, pixels, true);
         if (bumps) {
             const bump_size = 64;
             var bump_pixels: [bump_size * bump_size * 4]u8 = undefined;
@@ -1014,7 +1014,7 @@ pub fn main(init: std.process.Init) !void {
                 const length = @sqrt(nx * nx + ny * ny + 1);
                 bump_pixels[(y * bump_size + x) * 4 ..][0..4].* = .{ @intFromFloat((nx / length * 0.5 + 0.5) * 255), @intFromFloat((ny / length * 0.5 + 0.5) * 255), @intFromFloat((1 / length * 0.5 + 0.5) * 255), 255 };
             };
-            bump_image = try renderer.createImage(bump_size, bump_size, &bump_pixels, false);
+            bump_image = try renderer.images.create(bump_size, bump_size, &bump_pixels, false);
         }
         var list: std.ArrayList(gfx.DecalDesc) = .empty;
         defer list.deinit(init.gpa);
@@ -1040,10 +1040,10 @@ pub fn main(init: std.process.Init) !void {
                 .color = .{ 0.1 + 0.05 * column, 0.6, 0.9 - 0.05 * column, 0.9 },
             });
         }
-        try renderer.setDecals(scene, list.items);
+        try renderer.scenes.setDecals(scene, list.items);
     }
     var coat_images: [3]?gfx.Image = .{ null, null, null };
-    defer for (coat_images) |maybe| if (maybe) |image| renderer.destroyImage(image);
+    defer for (coat_images) |maybe| if (maybe) |image| renderer.images.destroy(image);
     if (coat and coat_maps) {
         const n = 64;
         var pixels: [n * n * 4]u8 = undefined;
@@ -1051,12 +1051,12 @@ pub fn main(init: std.process.Init) !void {
             const light = (x / 8 + y / 8) % 2 == 0;
             pixels[(y * n + x) * 4 ..][0..4].* = if (light) .{ 235, 235, 235, 255 } else .{ 60, 60, 60, 255 };
         };
-        coat_images[0] = try renderer.createImage(n, n, &pixels, true);
+        coat_images[0] = try renderer.images.create(n, n, &pixels, true);
         for (0..n) |y| for (0..n) |x| {
             const on = (y / 6) % 2 == 0;
             pixels[(y * n + x) * 4 ..][0..4].* = .{ if (on) 255 else 0, 255, 0, 255 };
         };
-        coat_images[1] = try renderer.createImage(n, n, &pixels, false);
+        coat_images[1] = try renderer.images.create(n, n, &pixels, false);
         for (0..n) |y| for (0..n) |x| {
             const u = (@as(f32, @floatFromInt(x)) + 0.5) / n * 2 - 1;
             const v = (@as(f32, @floatFromInt(y)) + 0.5) / n * 2 - 1;
@@ -1067,7 +1067,7 @@ pub fn main(init: std.process.Init) !void {
             const length = @sqrt(nx * nx + ny * ny + 1);
             pixels[(y * n + x) * 4 ..][0..4].* = .{ @intFromFloat((nx / length * 0.5 + 0.5) * 255), @intFromFloat((ny / length * 0.5 + 0.5) * 255), @intFromFloat((1 / length * 0.5 + 0.5) * 255), 255 };
         };
-        coat_images[2] = try renderer.createImage(n, n, &pixels, false);
+        coat_images[2] = try renderer.images.create(n, n, &pixels, false);
     }
     if (coat) {
         const rings = 24;
@@ -1094,7 +1094,7 @@ pub fn main(init: std.process.Init) !void {
             sphere_indices[(ring * segments + segment) * 6 ..][0..6].* = .{ a, a + 1, b, a + 1, b + 1, b };
         };
         for ([3]f32{ 0, 0.5, 1 }, 0..) |amount, index| {
-            const sphere = try renderer.createModel(&.{.{
+            const sphere = try renderer.models.create(&.{.{
                 .positions = &positions,
                 .normals = &normals,
                 .uvs = &uvs,
@@ -1109,13 +1109,13 @@ pub fn main(init: std.process.Init) !void {
                 else
                     .{ .base_color = .{ 0.55, 0.03, 0.03, 1 }, .metallic = 0, .roughness = 0.65, .clearcoat = amount, .clearcoat_roughness = 0.04 },
             }});
-            if (coat_maps) try renderer.setMaterialTextures(sphere, null, switch (index) {
+            if (coat_maps) try renderer.materials.setTextures(sphere, null, switch (index) {
                 0 => .{ .base_color = coat_images[0] },
                 1 => .{ .clearcoat_normal = coat_images[2] },
                 else => .{ .clearcoat = coat_images[1], .clearcoat_roughness = coat_images[1] },
             });
             const place: math.Vec3 = if (wax) .{ 4.2 + 0.95 * @as(f32, @floatFromInt(index)), 0.45, 1.3 } else .{ 3.0, 0.45, -1.3 + 1.0 * @as(f32, @floatFromInt(index)) };
-            _ = try renderer.spawn(scene, .{ .model = sphere, .transform = math.translation(place) });
+            _ = try renderer.entities.spawn(scene, .{ .model = sphere, .transform = math.translation(place) });
         }
         try renderer.waitUntilLoaded();
     }
@@ -1138,7 +1138,7 @@ pub fn main(init: std.process.Init) !void {
             const base: u32 = @intCast(face * 4);
             indices[face * 6 ..][0..6].* = .{ base, base + 1, base + 2, base, base + 2, base + 3 };
         }
-        const block = try renderer.createModel(&.{.{
+        const block = try renderer.models.create(&.{.{
             .positions = &positions,
             .indices = &indices,
             .material = .{ .base_color = .{ 0.2, 0.75, 0.9, 1 }, .metallic = 0, .roughness = 0.4 },
@@ -1153,9 +1153,9 @@ pub fn main(init: std.process.Init) !void {
             transform.* = math.mul(math.translation(position), math.mul(math.rotationY(rng.float(f32) * 6.28), math.uniformScaling(0.5 + rng.float(f32))));
         }
         if (instances_as_entities) {
-            for (transforms) |transform| _ = try renderer.spawn(scene, .{ .model = block, .transform = transform });
+            for (transforms) |transform| _ = try renderer.entities.spawn(scene, .{ .model = block, .transform = transform });
         } else {
-            const group = try renderer.createInstances(scene, block, transforms);
+            const group = try renderer.instances.create(scene, block, transforms);
             if (tints) {
                 const colors = try init.gpa.alloc([3]f32, transforms.len);
                 defer init.gpa.free(colors);
@@ -1163,14 +1163,14 @@ pub fn main(init: std.process.Init) !void {
                     const hue = @as(f32, @floatFromInt(index % 7)) / 7.0;
                     color.* = .{ 0.35 + 0.65 * hue, 1.0 - 0.6 * hue, 0.4 + 0.6 * @abs(hue - 0.5) };
                 }
-                try renderer.setInstanceColors(group, colors);
+                try renderer.instances.setColors(group, colors);
             }
         }
     }
     if (helmet) {
-        const model = try renderer.loadModel("examples/assets/DamagedHelmet.glb");
+        const model = try renderer.models.load("examples/assets/DamagedHelmet.glb");
         try renderer.waitUntilLoaded();
-        _ = try renderer.spawn(scene, .{
+        _ = try renderer.entities.spawn(scene, .{
             .model = model,
             .transform = math.mul(math.translation(.{ 0, 1.2, 0 }), math.mul(math.rotationY(1.2), math.uniformScaling(0.6))),
         });
@@ -1202,22 +1202,22 @@ pub fn main(init: std.process.Init) !void {
             const step: u8 = @intCast(texel);
             shapes[(y * 32 + x) * 4 ..][0..4].* = if (second) .{ 240, 230 - step * 10, 40, 255 } else .{ 20, 40 + step * 8, 170, 255 };
         };
-        bc7_picture = if (compress_images) try renderer.createImageCompressed(32, 32, &shapes, true) else try renderer.createImage(32, 32, &shapes, true);
+        bc7_picture = if (compress_images) try renderer.images.createCompressed(32, 32, &shapes, true) else try renderer.images.create(32, 32, &shapes, true);
     }
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
-    const capitals: ?*const gfx.Font = if (text_fallback) try renderer.loadFont("src/render/fonts/DejaVuSans.ttf", &.{.{ 'A', 'Z' }}) else null;
-    defer if (capitals) |loaded| renderer.destroyFont(loaded);
-    const shaped_font: ?*const gfx.Font = if (shape_font) |path| try renderer.loadFont(path, &.{.{ 32, 126 }}) else null;
-    defer if (shaped_font) |loaded| renderer.destroyFont(loaded);
-    if (shaped_font) |loaded| try renderer.prepareText(loaded, shape_text);
-    if (shaped_font) |loaded| try renderer.prepareTextWith(loaded, shape_text, null, &.{"vert".*});
+    const font = renderer.fonts.default();
+    const capitals: ?*const gfx.Font = if (text_fallback) try renderer.fonts.load("src/render/fonts/DejaVuSans.ttf", &.{.{ 'A', 'Z' }}) else null;
+    defer if (capitals) |loaded| renderer.fonts.destroy(loaded);
+    const shaped_font: ?*const gfx.Font = if (shape_font) |path| try renderer.fonts.load(path, &.{.{ 32, 126 }}) else null;
+    defer if (shaped_font) |loaded| renderer.fonts.destroy(loaded);
+    if (shaped_font) |loaded| try renderer.fonts.prepareText(loaded, shape_text);
+    if (shaped_font) |loaded| try renderer.fonts.prepareTextWith(loaded, shape_text, null, &.{"vert".*});
     var inset = gfx.DrawList.init(init.gpa);
     defer inset.deinit();
     var banner = gfx.DrawList.init(init.gpa);
     defer banner.deinit();
-    const views = [2]gfx.View{ try renderer.createView(), try renderer.createView() };
+    const views = [2]gfx.View{ try renderer.views.create(), try renderer.views.create() };
     if (lightmap_box != 0) {
         var positions: [24][3]f32 = undefined;
         var patches: [24][2]f32 = undefined;
@@ -1243,7 +1243,7 @@ pub fn main(init: std.process.Init) !void {
             const base: u32 = @intCast(face * 4);
             box_indices[face * 6 ..][0..6].* = .{ base, base + 1, base + 2, base, base + 2, base + 3 };
         }
-        const box = try renderer.createModel(&.{.{
+        const box = try renderer.models.create(&.{.{
             .positions = &positions,
             .uvs1 = &patches,
             .indices = &box_indices,
@@ -1252,8 +1252,8 @@ pub fn main(init: std.process.Init) !void {
         try renderer.waitUntilLoaded();
         const toward = math.normalize(math.sub(camera_target, camera_position));
         const place = math.add(camera_position, math.scale(toward, 2.6));
-        const stands = try renderer.spawn(scene, .{ .model = box, .transform = math.translation(.{ place[0], 0.45, place[2] }) });
-        if (lightmap_box == 2) try renderer.bakeLightmap(stands, .{ .resolution = 192, .frames = 48, .rays = 16 });
+        const stands = try renderer.entities.spawn(scene, .{ .model = box, .transform = math.translation(.{ place[0], 0.45, place[2] }) });
+        if (lightmap_box == 2) try renderer.entities.bakeLightmap(stands, .{ .resolution = 192, .frames = 48, .rays = 16 });
     }
     if (hair) {
         const strands = 24000;
@@ -1275,19 +1275,19 @@ pub fn main(init: std.process.Init) !void {
                 points[strand * per_strand + index] = point;
             }
         }
-        _ = try renderer.createHair(scene, .{
+        _ = try renderer.hairs.create(scene, .{
             .points = points,
             .points_per_strand = per_strand,
             .transform = math.translation(math.add(camera_position, math.scale(math.normalize(math.sub(camera_target, camera_position)), 1.6))),
             .width = 0.004,
         });
     }
-    defer for (views) |view| renderer.destroyView(view);
+    defer for (views) |view| renderer.views.destroy(view);
     var outline = Outline{};
     defer if (outline.pipeline) |pipeline| renderer.device.destroyPipeline(pipeline);
     const passes: []const gfx.Pass = if (custom_pass) &.{.{ .stage = .after_tonemap, .context = &outline, .run = Outline.run }} else &.{};
-    const monitor = try renderer.createTarget(320, 180);
-    defer renderer.destroyTarget(monitor);
+    const monitor = try renderer.views.createTarget(320, 180);
+    defer renderer.views.destroyTarget(monitor);
     const canvas_assets = try canvas_scene.Assets.init(renderer);
     defer canvas_assets.deinit(renderer);
     var world_shift = math.Vec3{ 0, 0, 0 };
@@ -1297,18 +1297,18 @@ pub fn main(init: std.process.Init) !void {
         if (sky_sweep) {
             const elevation = 1.0 - t * 0.5;
             const desc = gfx.SkyDesc{ .sun_direction = .{ -@cos(elevation) * 0.6, -@sin(elevation), -@cos(elevation) * 0.8 }, .turbidity = sky_turbidity, .rebuild_frames = sky_spread };
-            renderer.setSky(sky_environment.?, desc);
-            renderer.setSun(scene, gfx.skySun(desc));
+            renderer.environments.setSky(sky_environment.?, desc);
+            renderer.scenes.setSun(scene, gfx.skySun(desc));
         }
         var player_pose = gfx.Pose{ .animation = walk, .time = t };
         if (wave) player_pose.layers[0] = .{
-            .animation = renderer.findAnimation(robot, "Wave") orelse walk,
+            .animation = renderer.models.findAnimation(robot, "Wave") orelse walk,
             .time = t,
             .weight = 1,
-            .root = renderer.findNode(robot, "Abdomen"),
+            .root = renderer.models.findNode(robot, "Abdomen"),
         };
-        renderer.setPose(player, player_pose);
-        for (crowd_entities, 0..) |member, place| renderer.setPose(member, .{ .animation = walk, .time = if (crowd_sync) t else t + @as(f32, @floatFromInt(place)) * 0.137 });
+        renderer.entities.setPose(player, player_pose);
+        for (crowd_entities, 0..) |member, place| renderer.entities.setPose(member, .{ .animation = walk, .time = if (crowd_sync) t else t + @as(f32, @floatFromInt(place)) * 0.137 });
         if (teleport_frame != null and teleport_frame.? == index) {
             camera_position = teleport_to[0..3].*;
             camera_target = teleport_to[3..6].*;
@@ -1316,7 +1316,7 @@ pub fn main(init: std.process.Init) !void {
         }
         if (shift_frame == index) {
             world_shift = .{ 512.25, 0, -1024.5 };
-            try renderer.shiftScene(scene, world_shift);
+            try renderer.scenes.shift(scene, world_shift);
             camera_position = math.add(camera_position, world_shift);
             camera_target = math.add(camera_target, world_shift);
             camera = gfx.Camera.lookAt(camera_position, camera_target);
@@ -1326,7 +1326,7 @@ pub fn main(init: std.process.Init) !void {
             const offset = math.Vec3{ 0, 0, 1.5 * t };
             camera = gfx.Camera.lookAt(math.add(camera_position, offset), math.add(camera_target, offset));
             player_position = math.add(.{ 2.0, 0, -1.4 + 1.2 * t }, world_shift);
-            renderer.setTransform(player, math.mul(math.translation(player_position), math.uniformScaling(0.42)));
+            renderer.entities.setTransform(player, math.mul(math.translation(player_position), math.uniformScaling(0.42)));
         }
 
         list.clear();
@@ -1360,7 +1360,7 @@ pub fn main(init: std.process.Init) !void {
             });
         }
         if (reload_frame != null and reload_frame.? == index) {
-            const count = try renderer.reloadShaders();
+            const count = try renderer.shaders.reload();
             std.log.info("frame {d}: reloaded {d} shaders", .{ index, count });
         }
         if (pick_pixel) |pixel| renderer.requestPick(null, pixel);
@@ -1385,7 +1385,7 @@ pub fn main(init: std.process.Init) !void {
             const monitor_camera = gfx.Camera.lookAt(math.add(player_position, .{ -2.5, 2.2, 2.0 }), math.add(player_position, .{ 0, 1, 0 }));
             const reverse = gfx.Camera.lookAt(math.add(camera_target, .{ 3, 0.5, 0 }), camera.position);
             inset.clear();
-            const monitor_image = renderer.targetImage(monitor);
+            const monitor_image = renderer.views.targetImage(monitor);
             try inset.rect(.{ .x = 14, .y = @floatFromInt(height - 196), .width = 324, .height = 184 }, gfx.Color.rgba(255, 255, 255, 220));
             try inset.image(monitor_image, .{ .x = 16, .y = @floatFromInt(height - 194), .width = 320, .height = 180 }, .{});
             banner.clear();
@@ -1428,7 +1428,7 @@ pub fn main(init: std.process.Init) !void {
             }},
             .delta_time = 1.0 / 60.0,
         });
-        try renderer.waitForShaderVariants();
+        try renderer.shaders.waitForVariants();
         if (index >= frames / 2) cpu_ns += @intCast(frame_start.untilNow(init.io).raw.nanoseconds);
     }
     worker_state.stop.store(true, .release);
@@ -1463,15 +1463,15 @@ pub fn main(init: std.process.Init) !void {
         stats.meshlets_drawn, stats.meshlets, stats.shadow_meshlets_drawn,
     });
     if (fluid_flipbook) |path| if (flat_fluid) |flat| {
-        std.log.info("fluid flipbook: {d} frames recorded", .{renderer.fluidFlipbookFrames(flat)});
-        try renderer.saveFluidFlipbook(flat, path);
+        std.log.info("fluid flipbook: {d} frames recorded", .{renderer.fluids.flipbookFrames(flat)});
+        try renderer.fluids.saveFlipbook(flat, path);
     };
     if (fluid_frame) |path| if (flat_fluid) |flat| {
-        try renderer.saveFluidImage(flat, path);
+        try renderer.fluids.saveImage(flat, path);
         std.log.info("wrote fluid frame {s}", .{path});
     };
     if (sorted_emitter) |emitter| {
-        const keys = try renderer.emitterSortKeys(init.gpa, emitter);
+        const keys = try renderer.emitters.sortKeys(init.gpa, emitter);
         defer init.gpa.free(keys);
         var alive: usize = 0;
         for (keys, 0..) |key, index| {
@@ -1543,8 +1543,8 @@ fn coarseLevels(gpa: std.mem.Allocator, renderer: *gfx.Renderer, scene: gfx.Scen
         at += 6;
     };
     const camera = gfx.Camera.lookAt(.{ 8.5, 2.1, -0.6 }, .{ 0.0, 2.4, -0.2 });
-    const ball = try renderer.createModel(&.{.{ .positions = positions, .indices = indices, .material = .{ .base_color = .{ 0.85, 0.25, 0.1, 1 }, .metallic = 0, .roughness = 0.5, .double_sided = true } }});
-    const entity = try renderer.spawn(scene, .{ .model = ball, .transform = math.translation(.{ -8, 3.2, -0.2 }) });
+    const ball = try renderer.models.create(&.{.{ .positions = positions, .indices = indices, .material = .{ .base_color = .{ 0.85, 0.25, 0.1, 1 }, .metallic = 0, .roughness = 0.5, .double_sided = true } }});
+    const entity = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.translation(.{ -8, 3.2, -0.2 }) });
     try renderer.waitUntilLoaded();
     for (0..30) |_| _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings }} });
     const far = renderer.getStats();
@@ -1552,7 +1552,7 @@ fn coarseLevels(gpa: std.mem.Allocator, renderer: *gfx.Renderer, scene: gfx.Scen
     if (expect_coarse and far.geometry_models_coarse == 0) return error.CoarseLevelsNotKept;
     if (!expect_coarse and far.geometry_models_coarse != 0) return error.CoarseLevelsKeptUnasked;
     if (near) {
-        renderer.setTransform(entity, math.translation(.{ 5.2, 2.2, -0.5 }));
+        renderer.entities.setTransform(entity, math.translation(.{ 5.2, 2.2, -0.5 }));
         for (0..12) |_| _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings }} });
         const close = renderer.getStats();
         std.log.info("coarse levels: {d} models coarse with the ball near", .{close.geometry_models_coarse});
@@ -1578,16 +1578,16 @@ fn compaction(gpa: std.mem.Allocator, renderer: *gfx.Renderer, scene: gfx.Scene,
         at += 6;
     };
     const camera = gfx.Camera.lookAt(.{ 8.5, 2.1, -0.6 }, .{ 0.0, 2.4, -0.2 });
-    const large = try renderer.createModel(&.{.{ .positions = positions, .indices = indices, .material = .{ .metallic = 0, .roughness = 0.8 } }});
-    const small = try renderer.createModel(&.{.{ .positions = positions[0 .. side * 60], .indices = indices[0 .. (side - 1) * 6 * 59], .material = .{ .base_color = .{ 0.9, 0.2, 0.1, 1 }, .metallic = 0, .roughness = 0.8, .double_sided = true } }});
-    const entity = try renderer.spawn(scene, .{ .model = small, .transform = math.translation(.{ 1.5, 4.4, -0.9 }) });
-    const group = try renderer.createInstances(scene, small, &.{ math.translation(.{ 1.5, 4.0, -0.2 }), math.translation(.{ 1.5, 3.6, 0.5 }) });
+    const large = try renderer.models.create(&.{.{ .positions = positions, .indices = indices, .material = .{ .metallic = 0, .roughness = 0.8 } }});
+    const small = try renderer.models.create(&.{.{ .positions = positions[0 .. side * 60], .indices = indices[0 .. (side - 1) * 6 * 59], .material = .{ .base_color = .{ 0.9, 0.2, 0.1, 1 }, .metallic = 0, .roughness = 0.8, .double_sided = true } }});
+    const entity = try renderer.entities.spawn(scene, .{ .model = small, .transform = math.translation(.{ 1.5, 4.4, -0.9 }) });
+    const group = try renderer.instances.create(scene, small, &.{ math.translation(.{ 1.5, 4.0, -0.2 }), math.translation(.{ 1.5, 3.6, 0.5 }) });
     try renderer.waitUntilLoaded();
     for (0..40) |_| _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings }} });
     const pixels_before = try renderer.device.readTexture(gpa, target);
     defer gpa.free(pixels_before);
     const before = renderer.getStats();
-    try renderer.destroyModel(large);
+    try renderer.models.destroy(large);
     for (0..12) |_| _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings }} });
     const after = renderer.getStats();
     std.log.info("compaction: {d} KiB moved, gpu memory {d} -> {d} KiB", .{ (after.geometry_bytes_compacted - before.geometry_bytes_compacted) / 1024, before.gpu_memory_bytes / 1024, after.gpu_memory_bytes / 1024 });
@@ -1609,10 +1609,10 @@ fn soak(renderer: *gfx.Renderer, scene: gfx.Scene, target: gfx.rhi.Texture, sett
     const camera = gfx.Camera.lookAt(.{ 6, 2, 3 }, .{ 0, 1, 0 });
     var before: u64 = 0;
     for (0..cycles) |cycle| {
-        const fox = try renderer.loadModel("examples/assets/world/Fox.glb");
+        const fox = try renderer.models.load("examples/assets/world/Fox.glb");
         var entities: [4]gfx.Entity = undefined;
         for (&entities, 0..) |*entity, index| {
-            entity.* = try renderer.spawn(scene, .{
+            entity.* = try renderer.entities.spawn(scene, .{
                 .model = fox,
                 .transform = math.mul(math.translation(.{ @floatFromInt(index), 0, 1.5 }), math.uniformScaling(0.012)),
             });
@@ -1620,13 +1620,13 @@ fn soak(renderer: *gfx.Renderer, scene: gfx.Scene, target: gfx.rhi.Texture, sett
         for (0..6) |frame| {
             if (frame == 1 and cycle % 2 == 0) try renderer.waitUntilLoaded();
             for (entities, 0..) |entity, index|
-                renderer.setPose(entity, .{ .animation = @intCast(index % 3), .time = @as(f32, @floatFromInt(frame)) * 0.1 });
-            if (frame == 3) renderer.setVisible(entities[0], false);
+                renderer.entities.setPose(entity, .{ .animation = @intCast(index % 3), .time = @as(f32, @floatFromInt(frame)) * 0.1 });
+            if (frame == 3) renderer.entities.setVisible(entities[0], false);
             _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings }} });
         }
-        if (renderer.destroyModel(fox) != error.ModelInUse) return error.ExpectedModelInUse;
-        for (entities) |entity| renderer.despawn(entity);
-        try renderer.destroyModel(fox);
+        if (renderer.models.destroy(fox) != error.ModelInUse) return error.ExpectedModelInUse;
+        for (entities) |entity| renderer.entities.despawn(entity);
+        try renderer.models.destroy(fox);
         if (cycle == 0) {
             try renderer.device.waitIdle();
             before = renderer.getStats().gpu_memory_bytes;
@@ -1666,28 +1666,28 @@ fn workerLoop(state: *WorkerState, index: u32) !void {
     var iteration: u32 = 0;
     while (!state.stop.load(.acquire)) : (iteration += 1) {
         const x = @as(f32, @floatFromInt(index)) * 0.8 - 2.0;
-        const entity = try renderer.spawn(state.scene, .{
+        const entity = try renderer.entities.spawn(state.scene, .{
             .model = state.model,
             .transform = math.mul(math.translation(.{ x, 0, 1.2 }), math.uniformScaling(0.2)),
         });
         for (0..16) |step| {
             const t = @as(f32, @floatFromInt(iteration * 16 + @as(u32, @intCast(step)))) * 0.02;
-            renderer.setTransform(entity, math.mul(math.translation(.{ x, 0.1 * @sin(t), 1.2 }), math.uniformScaling(0.2)));
-            renderer.setPose(entity, .{ .animation = (index + iteration) % 8, .time = t });
-            if (step == 8) renderer.setVisible(entity, iteration % 2 == 0);
-            _ = renderer.modelInfo(state.model);
+            renderer.entities.setTransform(entity, math.mul(math.translation(.{ x, 0.1 * @sin(t), 1.2 }), math.uniformScaling(0.2)));
+            renderer.entities.setPose(entity, .{ .animation = (index + iteration) % 8, .time = t });
+            if (step == 8) renderer.entities.setVisible(entity, iteration % 2 == 0);
+            _ = renderer.models.info(state.model);
             _ = renderer.getStats();
             list.clear();
-            try list.text(renderer.defaultFont(), "worker", .{ 0, 0 }, .{});
-            try list.text3d(renderer.defaultFont(), "worker", .{ x, 1, 1.2 }, .{});
+            try list.text(renderer.fonts.default(), "worker", .{ 0, 0 }, .{});
+            try list.text3d(renderer.fonts.default(), "worker", .{ x, 1, 1.2 }, .{});
         }
-        const image = try renderer.createImage(2, 2, &pixels, true);
-        renderer.destroyImage(image);
+        const image = try renderer.images.create(2, 2, &pixels, true);
+        renderer.images.destroy(image);
         if (iteration % 8 == 0) {
-            const font = try renderer.loadFont("src/render/fonts/DejaVuSans.ttf", &.{.{ 'A', 'Z' }});
-            renderer.destroyFont(font);
+            const font = try renderer.fonts.load("src/render/fonts/DejaVuSans.ttf", &.{.{ 'A', 'Z' }});
+            renderer.fonts.destroy(font);
         }
-        renderer.despawn(entity);
+        renderer.entities.despawn(entity);
         _ = state.calls.fetchAdd(16 * 5 + 4, .monotonic);
         try state.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
@@ -1735,10 +1735,10 @@ fn benchmark(
         const angle = t * 0.35;
         const position = math.Vec3{ 6.5 * @cos(angle), 2.2 + 0.8 * @sin(angle * 2), 1.6 * @sin(angle) };
         const camera = gfx.Camera.lookAt(position, .{ -2.0 * @cos(angle), 1.8, -0.5 * @sin(angle) });
-        renderer.setPose(player, .{ .animation = walk, .time = t });
-        renderer.setTransform(player, math.mul(math.translation(.{ 2.0 + @sin(t * 0.5), 0, -0.4 }), math.uniformScaling(0.42)));
+        renderer.entities.setPose(player, .{ .animation = walk, .time = t });
+        renderer.entities.setTransform(player, math.mul(math.translation(.{ 2.0 + @sin(t * 0.5), 0, -0.4 }), math.uniformScaling(0.42)));
         _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings }}, .delta_time = 1.0 / 60.0 });
-        try renderer.waitForShaderVariants();
+        try renderer.shaders.waitForVariants();
         if (index < warmup) continue;
         var total: f32 = 0;
         for (renderer.device.passTimings()) |timing| {
@@ -1867,14 +1867,14 @@ fn outOfMemory(
     for (0..rounds) |round| {
         failing.fail_index.store(failing.alloc_index.load(.monotonic) + round, .monotonic);
         const outcome: anyerror!void = blk: {
-            const model = renderer.createModel(&.{.{ .positions = &triangle, .indices = &indices }}) catch |err| break :blk err;
-            defer renderer.destroyModel(model) catch {};
-            const entity = renderer.spawn(scene, .{ .model = model, .transform = math.translation(.{ 2, 1, 0 }) }) catch |err| break :blk err;
-            defer renderer.despawn(entity);
+            const model = renderer.models.create(&.{.{ .positions = &triangle, .indices = &indices }}) catch |err| break :blk err;
+            defer renderer.models.destroy(model) catch {};
+            const entity = renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{ 2, 1, 0 }) }) catch |err| break :blk err;
+            defer renderer.entities.despawn(entity);
             list.clear();
-            list.text(renderer.defaultFont(), "out of memory test", .{ 20, 20 }, .{ .size = 18 }) catch |err| break :blk err;
+            list.text(renderer.fonts.default(), "out of memory test", .{ 20, 20 }, .{ .size = 18 }) catch |err| break :blk err;
             const lights = [_]gfx.Light{.{ .position = .{ 2, 2, 0 }, .color = .{ 1, 1, 1 }, .intensity = 5, .range = 6 }};
-            renderer.setLights(scene, &lights) catch |err| break :blk err;
+            renderer.scenes.setLights(scene, &lights) catch |err| break :blk err;
             _ = renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .draw_lists = &.{&list}, .target = .{ .texture = target }, .settings = settings }} }) catch |err| break :blk err;
         };
         failing.fail_index.store(std.math.maxInt(usize), .monotonic);
@@ -1884,22 +1884,22 @@ fn outOfMemory(
         }
         _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings }} });
     }
-    try renderer.setLights(scene, &.{});
+    try renderer.scenes.setLights(scene, &.{});
     std.log.info("out of memory: {d} of {d} rounds hit an injected failure, all recovered", .{ failures, rounds });
 
     const path = "examples/assets/world/Fox.glb";
     const before = failing.alloc_index.load(.monotonic);
     {
-        const clean = try renderer.loadModel(path);
+        const clean = try renderer.models.load(path);
         try renderer.waitUntilLoaded();
-        if (renderer.modelState(clean) != .ready) return error.ModelNotLoaded;
-        try renderer.destroyModel(clean);
+        if (renderer.models.state(clean) != .ready) return error.ModelNotLoaded;
+        try renderer.models.destroy(clean);
     }
     const allocations = failing.alloc_index.load(.monotonic) - before;
     var load_failures: usize = 0;
     for (0..rounds) |round| {
         failing.fail_index.store(failing.alloc_index.load(.monotonic) + round * allocations / rounds, .monotonic);
-        const loaded: ?gfx.Model = renderer.loadModel(path) catch |err| blk: {
+        const loaded: ?gfx.Model = renderer.models.load(path) catch |err| blk: {
             if (err != error.OutOfMemory) return err;
             break :blk null;
         };
@@ -1907,16 +1907,16 @@ fn outOfMemory(
             renderer.waitUntilLoaded() catch |err| if (err != error.OutOfMemory) return err;
             failing.fail_index.store(std.math.maxInt(usize), .monotonic);
             try renderer.waitUntilLoaded();
-            switch (renderer.modelState(model)) {
+            switch (renderer.models.state(model)) {
                 .ready => {},
                 .failed => {
-                    const cause = renderer.modelError(model) orelse return error.UnexpectedLoadFailure;
+                    const cause = renderer.models.loadError(model) orelse return error.UnexpectedLoadFailure;
                     if (cause != error.OutOfMemory) return cause;
                     load_failures += 1;
                 },
                 else => return error.ModelStillLoading,
             }
-            try renderer.destroyModel(model);
+            try renderer.models.destroy(model);
         } else load_failures += 1;
         failing.fail_index.store(std.math.maxInt(usize), .monotonic);
         _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target }, .settings = settings }} });
@@ -1942,8 +1942,8 @@ fn outOfGpuMemory(
     for (0..rounds) |round| {
         device.failGpuAllocation(@intCast(round));
         const outcome: anyerror!void = blk: {
-            const view = renderer.createView() catch |err| break :blk err;
-            defer renderer.destroyView(view);
+            const view = renderer.views.create() catch |err| break :blk err;
+            defer renderer.views.destroy(view);
             const small = device.createTexture(.{
                 .name = "small output",
                 .width = @intCast(192 + round * 2),
@@ -1952,12 +1952,12 @@ fn outOfGpuMemory(
                 .usage = .{ .color_attachment = true, .sampled = true, .copy_src = true },
             }) catch |err| break :blk err;
             defer device.destroyTexture(small);
-            const image = renderer.createImage(16, 16, &pixels, true) catch |err| break :blk err;
-            defer renderer.destroyImage(image);
-            const model = renderer.createModel(&.{.{ .positions = &triangle, .indices = &indices }}) catch |err| break :blk err;
-            defer renderer.destroyModel(model) catch {};
-            const entity = renderer.spawn(scene, .{ .model = model, .transform = math.translation(.{ 2, 1, 0 }) }) catch |err| break :blk err;
-            defer renderer.despawn(entity);
+            const image = renderer.images.create(16, 16, &pixels, true) catch |err| break :blk err;
+            defer renderer.images.destroy(image);
+            const model = renderer.models.create(&.{.{ .positions = &triangle, .indices = &indices }}) catch |err| break :blk err;
+            defer renderer.models.destroy(model) catch {};
+            const entity = renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{ 2, 1, 0 }) }) catch |err| break :blk err;
+            defer renderer.entities.despawn(entity);
             _ = renderer.render(.{ .views = &.{.{ .view = view, .scene = scene, .camera = camera, .target = .{ .texture = small }, .settings = settings }} }) catch |err| break :blk err;
         };
         if (!device.gpuAllocationFailurePending()) failures += 1;
@@ -2053,7 +2053,7 @@ fn compareReference(
         std.log.info("reference {s}: skipped, this device has no ray tracing", .{path});
         return;
     }
-    const stored = renderer.readImageFile(init.gpa, path) catch |err| blk: {
+    const stored = renderer.images.readFile(init.gpa, path) catch |err| blk: {
         if (err != error.FileNotFound) return err;
         break :blk null;
     };

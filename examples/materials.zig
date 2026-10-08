@@ -20,14 +20,14 @@ const spacing = 1.35;
 pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn materials", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
 
-    const studio = try renderer.loadEnvironment("examples/assets/studio_small_03_1k.hdr", 64);
+    const studio = try renderer.environments.load("examples/assets/studio_small_03_1k.hdr", 64);
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.6, -0.45 } };
-    const sky = try renderer.createSky(sky_desc);
+    const sky = try renderer.environments.createSky(sky_desc);
     var outdoors = false;
-    renderer.setEnvironment(scene, studio, 1);
-    renderer.setSun(scene, .{ .direction = sky_desc.sun_direction, .intensity = 0 });
+    renderer.scenes.setEnvironment(scene, studio, 1);
+    renderer.scenes.setSun(scene, .{ .direction = sky_desc.sun_direction, .intensity = 0 });
 
     var positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var normals: [helpers.sphere_vertex_count][3]f32 = undefined;
@@ -37,13 +37,13 @@ pub fn main(init: std.process.Init) !void {
     for (0..rows) |row| for (0..columns) |column| {
         const metallic = @as(f32, @floatFromInt(row)) / (rows - 1);
         const roughness = 0.04 + 0.96 * @as(f32, @floatFromInt(column)) / (columns - 1);
-        const model = try renderer.createModel(&.{.{
+        const model = try renderer.models.create(&.{.{
             .positions = &positions,
             .normals = &normals,
             .indices = &indices,
             .material = .{ .base_color = .{ 0.82, 0.3, 0.16, 1 }, .metallic = metallic, .roughness = roughness },
         }});
-        _ = try renderer.spawn(scene, .{ .model = model, .transform = math.translation(.{
+        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{
             (@as(f32, @floatFromInt(column)) - (columns - 1) * 0.5) * spacing,
             1.2 + @as(f32, @floatFromInt(row)) * spacing,
             -1.5,
@@ -60,22 +60,22 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "glowing", .material = .{ .base_color = .{ 0.02, 0.02, 0.02, 1 }, .emissive = .{ 0.4, 2.5, 4.0 }, .metallic = 0, .roughness = 0.5 } },
     };
     for (special, 0..) |item, index| {
-        const model = try renderer.createModel(&.{.{ .positions = &positions, .normals = &normals, .indices = &indices, .material = item.material }});
-        _ = try renderer.spawn(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - @as(f32, special.len - 1) * 0.5) * spacing, 0.5, 1.2 }) });
+        const model = try renderer.models.create(&.{.{ .positions = &positions, .normals = &normals, .indices = &indices, .material = item.material }});
+        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - @as(f32, special.len - 1) * 0.5) * spacing, 0.5, 1.2 }) });
     }
 
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 9, 0.05, 6 }, &box_positions, &box_indices);
-    const floor = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.2, 0.2, 0.21, 1 }, .metallic = 0, .roughness = 0.35 } }});
-    _ = try renderer.spawn(scene, .{ .model = floor, .transform = math.translation(.{ 0, -0.05, 0 }) });
-    const helmet = try renderer.loadModel("examples/assets/DamagedHelmet.glb");
-    _ = try renderer.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 6.2, 1.0, 0.3 }), math.mul(math.rotationY(-0.7), math.rotationX(std.math.pi * 0.5))) });
+    const floor = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.2, 0.2, 0.21, 1 }, .metallic = 0, .roughness = 0.35 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = floor, .transform = math.translation(.{ 0, -0.05, 0 }) });
+    const helmet = try renderer.models.load("examples/assets/DamagedHelmet.glb");
+    _ = try renderer.entities.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 6.2, 1.0, 0.3 }), math.mul(math.rotationY(-0.7), math.rotationX(std.math.pi * 0.5))) });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var orbit: f32 = 0.25;
     var hud_buffer: [96]u8 = undefined;
 
@@ -84,8 +84,8 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_D)) orbit += tick.dt * 0.8;
         if (stage.keyPressed(glfw.GLFW_KEY_E)) {
             outdoors = !outdoors;
-            renderer.setEnvironment(scene, if (outdoors) sky else studio, 1);
-            renderer.setSun(scene, if (outdoors) gfx.skySun(sky_desc) else .{ .direction = sky_desc.sun_direction, .intensity = 0 });
+            renderer.scenes.setEnvironment(scene, if (outdoors) sky else studio, 1);
+            renderer.scenes.setSun(scene, if (outdoors) gfx.skySun(sky_desc) else .{ .direction = sky_desc.sun_direction, .intensity = 0 });
         }
 
         list.clear();

@@ -203,20 +203,20 @@ pub fn main(init: std.process.Init) !void {
 
     var stage = try Stage.create(init, "Limn hair", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     const sky = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.75, -0.45 } };
-    renderer.setSun(scene, gfx.skySun(sky));
-    renderer.setEnvironment(scene, try renderer.createSky(sky), 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
 
     var ground_positions: [24][3]f32 = undefined;
     var ground_indices: [36]u32 = undefined;
     window.boxMesh(.{ 6, 0.05, 6 }, &ground_positions, &ground_indices);
-    const ground = try renderer.createModel(&.{.{
+    const ground = try renderer.models.create(&.{.{
         .positions = &ground_positions,
         .indices = &ground_indices,
         .material = .{ .base_color = .{ 0.35, 0.36, 0.38, 1 }, .metallic = 0, .roughness = 0.8 },
     }});
-    _ = try renderer.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.05, 0 }) });
+    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.05, 0 }) });
 
     var from_file = true;
     const points = loadHair(gpa, init.io, hair_path) catch |failure| made: {
@@ -230,8 +230,8 @@ pub fn main(init: std.process.Init) !void {
     const head = head: {
         if (from_file) if (loadObj(gpa, init.io, head_path)) |mesh| {
             defer mesh.deinit(gpa);
-            head_field = try renderer.createCollisionField(mesh.positions, mesh.indices, 64);
-            break :head try renderer.createModel(&.{.{ .positions = mesh.positions, .indices = mesh.indices, .material = skin }});
+            head_field = try renderer.hairs.createCollisionField(mesh.positions, mesh.indices, 64);
+            break :head try renderer.models.create(&.{.{ .positions = mesh.positions, .indices = mesh.indices, .material = skin }});
         } else |failure| std.log.info("{s}: {}; a ball for a head instead", .{ head_path, failure });
         const ball_positions = try gpa.create([window.sphere_vertex_count][3]f32);
         defer gpa.destroy(ball_positions);
@@ -241,15 +241,15 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.destroy(ball_indices);
         window.sphereMesh(body[0][3], ball_positions, ball_normals, ball_indices);
         for (ball_positions) |*position| position.* = math.add(position.*, body[0][0..3].*);
-        break :head try renderer.createModel(&.{.{ .positions = ball_positions, .normals = ball_normals, .indices = ball_indices, .material = skin }});
+        break :head try renderer.models.create(&.{.{ .positions = ball_positions, .normals = ball_normals, .indices = ball_indices, .material = skin }});
     };
     try renderer.waitUntilLoaded();
 
     const upright = math.mul(math.rotationX(-std.math.pi * 0.5), math.uniformScaling(scale));
     var placement = math.mul(math.translation(.{ 0, head_height, 0 }), upright);
-    const head_entity = try renderer.spawn(scene, .{ .model = head, .transform = placement });
+    const head_entity = try renderer.entities.spawn(scene, .{ .model = head, .transform = placement });
     var simulation = gfx.HairSimulation{};
-    const hair = try renderer.createHair(scene, .{
+    const hair = try renderer.hairs.create(scene, .{
         .points = points,
         .points_per_strand = points_per_strand,
         .transform = placement,
@@ -264,7 +264,7 @@ pub fn main(init: std.process.Init) !void {
 
     var list = gfx.DrawList.init(gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var text: [200]u8 = undefined;
     var moving = true;
     var orbit: f32 = 0.9;
@@ -281,8 +281,8 @@ pub fn main(init: std.process.Init) !void {
         if (turning) turn_time += tick.dt;
         turned = @sin(turn_time * 1.6) * 0.9;
         placement = math.mul(math.translation(.{ 0, head_height, 0 }), math.mul(math.rotationY(turned), upright));
-        renderer.setTransform(head_entity, placement);
-        renderer.setHairTransform(hair, placement);
+        renderer.entities.setTransform(head_entity, placement);
+        renderer.hairs.setTransform(hair, placement);
         var colliders: [body.len][4]f32 = undefined;
         for (body, &colliders) |sphere, *collider| {
             const center = math.transformPoint(placement, sphere[0..3].*);
@@ -292,7 +292,7 @@ pub fn main(init: std.process.Init) !void {
         simulation.field = head_field;
         simulation.field_transform = placement;
         simulation.wind = if (windy) .{ -4.5, 0.6, 2 } else .{ 0, 0, 0 };
-        renderer.setHairSimulation(hair, if (moving) simulation else null);
+        renderer.hairs.setSimulation(hair, if (moving) simulation else null);
 
         const stats = renderer.getStats();
         list.clear();

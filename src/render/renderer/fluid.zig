@@ -1,5 +1,6 @@
 //! Fluid volumes and the pictures saved from them. Internal to the renderer.
 const std = @import("std");
+const handle = @import("../../handle.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const png = @import("../../png.zig");
 const gpu = @import("../gpu.zig");
@@ -17,128 +18,159 @@ const hdr_format = renderer_state.hdr_format;
 const max_fluids = renderer_state.max_fluids;
 const FluidState = renderer_state.FluidState;
 
-/// Adds a box of GPU-simulated smoke and fire to a scene.
-pub fn createFluid(self: *Renderer, scene: Scene, desc: FluidDesc) !Fluid {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const data = self.scenes.get(scene) orelse return error.InvalidScene;
-    if (data.fluids.items.len == max_fluids) return error.TooManyFluids;
-    if (desc.sources.len > gpu.max_fluid_sources) return error.TooManyFluidSources;
-    if (desc.obstacles.len > gpu.max_fluid_obstacles) return error.TooManyFluidObstacles;
-    var state = FluidState{ .scene = scene, .desc = desc };
-    state.setSources(desc.sources);
-    try createFluidTextures(self, &state);
-    errdefer destroyFluidTextures(self, &state);
-    const fluid = try self.fluids.insert(state);
-    errdefer _ = self.fluids.remove(fluid);
-    try data.fluids.append(self.gpa, fluid);
-    return fluid;
-}
+/// Boxes of simulated smoke and fire.
+pub const Fluids = struct {
+    table: handle.HandleTable(renderer_state.FluidState, api.FluidTag),
 
-/// Replaces a fluid's description. Changing the resolution restarts the
-/// simulation.
-pub fn setFluid(self: *Renderer, fluid: Fluid, desc: FluidDesc) !void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const state = self.fluids.get(fluid) orelse return error.InvalidFluid;
-    if (desc.sources.len > gpu.max_fluid_sources) return error.TooManyFluidSources;
-    if (desc.obstacles.len > gpu.max_fluid_obstacles) return error.TooManyFluidObstacles;
-    const resized = !std.mem.eql(u32, &desc.resolution, &state.desc.resolution);
-    state.desc = desc;
-    state.setSources(desc.sources);
-    if (resized) {
-        destroyFluidTextures(self, state);
-        try createFluidTextures(self, state);
+    fn renderer(fluids: *Fluids) *Renderer {
+        return @alignCast(@fieldParentPtr("fluids", fluids));
     }
-}
 
-/// Empties a fluid: no smoke, no heat, no motion.
-pub fn resetFluid(self: *Renderer, fluid: Fluid) void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    if (self.fluids.get(fluid)) |state| state.cleared = false;
-}
-
-/// The fluid seen along its depth (smoke as coverage, fire as glow),
-/// redrawn each frame its scene renders. `resolution` pixels in size;
-/// lasts as long as the fluid.
-pub fn fluidImage(self: *Renderer, fluid: Fluid) !Image {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const state = self.fluids.get(fluid) orelse return error.InvalidFluid;
-    if (state.picture == null) {
-        state.picture = try self.device.createTexture(.{
-            .name = "fluid picture",
-            .width = state.size[0],
-            .height = state.size[1],
-            .format = hdr_format,
-            .usage = .{ .sampled = true, .color_attachment = true, .copy_src = true },
-        });
-        state.picture_drawn = false;
+    /// Adds a box of GPU-simulated smoke and fire to a scene.
+    pub fn create(fluids: *Fluids, scene: Scene, desc: FluidDesc) !Fluid {
+        const self = fluids.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+        if (data.fluids.items.len == max_fluids) return error.TooManyFluids;
+        if (desc.sources.len > gpu.max_fluid_sources) return error.TooManyFluidSources;
+        if (desc.obstacles.len > gpu.max_fluid_obstacles) return error.TooManyFluidObstacles;
+        var state = FluidState{ .scene = scene, .desc = desc };
+        state.setSources(desc.sources);
+        try createFluidTextures(self, &state);
+        errdefer destroyFluidTextures(self, &state);
+        const fluid = try self.fluids.table.insert(state);
+        errdefer _ = self.fluids.table.remove(fluid);
+        try data.fluids.append(self.gpa, fluid);
+        return fluid;
     }
-    return .{ .index = self.device.textureIndex(state.picture.?), .width = state.size[0], .height = state.size[1] };
-}
 
-/// Saves the fluid's picture as a PNG with alpha. Waits for the GPU; call
-/// between frames, after `fluidImage` and at least one rendered frame.
-pub fn saveFluidImage(self: *Renderer, fluid: Fluid, path: []const u8) !void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const state = self.fluids.get(fluid) orelse return error.InvalidFluid;
-    const picture = state.picture orelse return error.NoFluidImage;
-    try saveHdrPicture(self, picture, state.size[0], state.size[1], path);
-}
-
-/// Starts recording the fluid's picture into a `columns` x `rows` sheet,
-/// one frame every `interval` steps, row-major from the top left. The
-/// sheet lasts while the fluid keeps its resolution; calling again
-/// restarts it.
-pub fn recordFluidFlipbook(self: *Renderer, fluid: Fluid, desc: FluidFlipbookDesc) !Image {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const state = self.fluids.get(fluid) orelse return error.InvalidFluid;
-    if (desc.columns == 0 or desc.rows == 0) return error.InvalidFlipbook;
-    const frame = desc.frame_size orelse [2]u32{ state.size[0], state.size[1] };
-    const width = frame[0] * desc.columns;
-    const height = frame[1] * desc.rows;
-    if (frame[0] == 0 or frame[1] == 0 or width > 16384 or height > 16384) return error.InvalidFlipbook;
-    const old = state.flipbook_desc;
-    if (state.flipbook == null or old.columns != desc.columns or old.rows != desc.rows or !std.meta.eql(state.flipbook_frame, frame)) {
-        const sheet = try self.device.createTexture(.{
-            .name = "fluid flipbook",
-            .width = width,
-            .height = height,
-            .format = hdr_format,
-            .usage = .{ .sampled = true, .color_attachment = true, .copy_src = true },
-        });
-        if (state.flipbook) |texture| self.device.destroyTexture(texture);
-        state.flipbook = sheet;
+    /// Replaces a fluid's description. Changing the resolution restarts the
+    /// simulation.
+    pub fn set(fluids: *Fluids, fluid: Fluid, desc: FluidDesc) !void {
+        const self = fluids.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
+        if (desc.sources.len > gpu.max_fluid_sources) return error.TooManyFluidSources;
+        if (desc.obstacles.len > gpu.max_fluid_obstacles) return error.TooManyFluidObstacles;
+        const resized = !std.mem.eql(u32, &desc.resolution, &state.desc.resolution);
+        state.desc = desc;
+        state.setSources(desc.sources);
+        if (resized) {
+            destroyFluidTextures(self, state);
+            try createFluidTextures(self, state);
+        }
     }
-    state.flipbook_desc = desc;
-    state.flipbook_frame = frame;
-    state.flipbook_recorded = 0;
-    state.flipbook_wait = 0;
-    return .{ .index = self.device.textureIndex(state.flipbook.?), .width = width, .height = height };
-}
 
-/// Flipbook frames recorded so far; `columns * rows` when full.
-pub fn fluidFlipbookFrames(self: *Renderer, fluid: Fluid) u32 {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const state = self.fluids.get(fluid) orelse return 0;
-    return state.flipbook_recorded;
-}
+    /// Empties a fluid: no smoke, no heat, no motion.
+    pub fn reset(fluids: *Fluids, fluid: Fluid) void {
+        const self = fluids.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.fluids.table.get(fluid)) |state| state.cleared = false;
+    }
 
-/// Saves the flipbook as recorded so far as a PNG with alpha. Waits for
-/// the GPU; call between frames.
-pub fn saveFluidFlipbook(self: *Renderer, fluid: Fluid, path: []const u8) !void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const state = self.fluids.get(fluid) orelse return error.InvalidFluid;
-    const sheet = state.flipbook orelse return error.NoFluidImage;
-    if (state.flipbook_recorded == 0) return error.NoFluidImage;
-    try saveHdrPicture(self, sheet, state.flipbook_frame[0] * state.flipbook_desc.columns, state.flipbook_frame[1] * state.flipbook_desc.rows, path);
-}
+    /// The fluid seen along its depth (smoke as coverage, fire as glow),
+    /// redrawn each frame its scene renders. `resolution` pixels in size;
+    /// lasts as long as the fluid.
+    pub fn image(fluids: *Fluids, fluid: Fluid) !Image {
+        const self = fluids.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
+        if (state.picture == null) {
+            state.picture = try self.device.createTexture(.{
+                .name = "fluid picture",
+                .width = state.size[0],
+                .height = state.size[1],
+                .format = hdr_format,
+                .usage = .{ .sampled = true, .color_attachment = true, .copy_src = true },
+            });
+            state.picture_drawn = false;
+        }
+        return .{ .index = self.device.textureIndex(state.picture.?), .width = state.size[0], .height = state.size[1] };
+    }
+
+    /// Saves the fluid's picture as a PNG with alpha. Waits for the GPU; call
+    /// between frames, after `fluids.image` and at least one rendered frame.
+    pub fn saveImage(fluids: *Fluids, fluid: Fluid, path: []const u8) !void {
+        const self = fluids.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
+        const picture = state.picture orelse return error.NoFluidImage;
+        try saveHdrPicture(self, picture, state.size[0], state.size[1], path);
+    }
+
+    /// Starts recording the fluid's picture into a `columns` x `rows` sheet,
+    /// one frame every `interval` steps, row-major from the top left. The
+    /// sheet lasts while the fluid keeps its resolution; calling again
+    /// restarts it.
+    pub fn recordFlipbook(fluids: *Fluids, fluid: Fluid, desc: FluidFlipbookDesc) !Image {
+        const self = fluids.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
+        if (desc.columns == 0 or desc.rows == 0) return error.InvalidFlipbook;
+        const frame = desc.frame_size orelse [2]u32{ state.size[0], state.size[1] };
+        const width = frame[0] * desc.columns;
+        const height = frame[1] * desc.rows;
+        if (frame[0] == 0 or frame[1] == 0 or width > 16384 or height > 16384) return error.InvalidFlipbook;
+        const old = state.flipbook_desc;
+        if (state.flipbook == null or old.columns != desc.columns or old.rows != desc.rows or !std.meta.eql(state.flipbook_frame, frame)) {
+            const sheet = try self.device.createTexture(.{
+                .name = "fluid flipbook",
+                .width = width,
+                .height = height,
+                .format = hdr_format,
+                .usage = .{ .sampled = true, .color_attachment = true, .copy_src = true },
+            });
+            if (state.flipbook) |texture| self.device.destroyTexture(texture);
+            state.flipbook = sheet;
+        }
+        state.flipbook_desc = desc;
+        state.flipbook_frame = frame;
+        state.flipbook_recorded = 0;
+        state.flipbook_wait = 0;
+        return .{ .index = self.device.textureIndex(state.flipbook.?), .width = width, .height = height };
+    }
+
+    /// Flipbook frames recorded so far; `columns * rows` when full.
+    pub fn flipbookFrames(fluids: *Fluids, fluid: Fluid) u32 {
+        const self = fluids.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const state = self.fluids.table.get(fluid) orelse return 0;
+        return state.flipbook_recorded;
+    }
+
+    /// Saves the flipbook as recorded so far as a PNG with alpha. Waits for
+    /// the GPU; call between frames.
+    pub fn saveFlipbook(fluids: *Fluids, fluid: Fluid, path: []const u8) !void {
+        const self = fluids.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
+        const sheet = state.flipbook orelse return error.NoFluidImage;
+        if (state.flipbook_recorded == 0) return error.NoFluidImage;
+        try saveHdrPicture(self, sheet, state.flipbook_frame[0] * state.flipbook_desc.columns, state.flipbook_frame[1] * state.flipbook_desc.rows, path);
+    }
+
+    /// A stale handle is ignored.
+    pub fn destroy(fluids: *Fluids, fluid: Fluid) void {
+        const self = fluids.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var removed = self.fluids.table.remove(fluid) orelse return;
+        destroyFluidTextures(self, &removed);
+        const scene = self.scenes.table.get(removed.scene) orelse return;
+        for (scene.fluids.items, 0..) |item, index| if (std.meta.eql(item, fluid)) {
+            _ = scene.fluids.orderedRemove(index);
+            break;
+        };
+    }
+};
 
 /// Writes a half-float, linear, straight-alpha texture as an 8-bit
 /// sRGB PNG.
@@ -157,19 +189,6 @@ fn saveHdrPicture(self: *Renderer, texture: rhi.Texture, width: u32, height: u32
         }
     }
     try png.write(self.gpa, self.io, path, .{ .width = width, .height = height, .pixels = pixels });
-}
-
-/// A stale handle is ignored.
-pub fn destroyFluid(self: *Renderer, fluid: Fluid) void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    var removed = self.fluids.remove(fluid) orelse return;
-    destroyFluidTextures(self, &removed);
-    const scene = self.scenes.get(removed.scene) orelse return;
-    for (scene.fluids.items, 0..) |item, index| if (std.meta.eql(item, fluid)) {
-        _ = scene.fluids.orderedRemove(index);
-        break;
-    };
 }
 
 fn createFluidTextures(self: *Renderer, state: *FluidState) !void {

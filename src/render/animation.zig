@@ -5,7 +5,7 @@ const math = @import("../math.zig");
 const gltf = @import("../asset/gltf.zig");
 
 /// An animated entity's state at one moment: a base clip and time, with
-/// optional clips blended on top. Passed to `Renderer.setPose` each frame.
+/// optional clips blended on top. Passed to `Renderer.entities.setPose` each frame.
 pub const Pose = struct {
     /// Index into the model's animation list; out of range gives the rest pose.
     animation: u32,
@@ -22,7 +22,7 @@ pub const Pose = struct {
     /// Further clips applied in order on top of the base and `blend`.
     layers: [max_layers]?Blend = @splat(null),
     /// Root motion: holds this node's x and z translation at its rest value.
-    /// The application moves the entity by `Renderer.rootMotion` instead.
+    /// The application moves the entity by `Renderer.models.rootMotion` instead.
     in_place: ?u32 = null,
 
     pub const max_layers = 4;

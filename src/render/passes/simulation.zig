@@ -90,7 +90,7 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
     defer cmd.endScope();
     const Push = extern struct { liquid: u64, particles: u64, counts: u64, cells: u64, mode: u32, flip: u32 };
     for (scene.liquids.items) |item| {
-        const state = renderer.liquids.get(item) orelse continue;
+        const state = renderer.liquids.table.get(item) orelse continue;
         const desc = state.desc;
         const box = liquidBox(desc.transform);
         const radius = desc.particle_radius;
@@ -140,9 +140,9 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
         }
         if (desc.obstacles) for (scene.entities.items) |entity_handle| {
             if (record.sphere_count == record.spheres.len) break;
-            const entity = renderer.entities.get(entity_handle) orelse continue;
+            const entity = renderer.entities.table.get(entity_handle) orelse continue;
             if (!entity.visible) continue;
-            const model = renderer.models.get(entity.model) orelse continue;
+            const model = renderer.models.table.get(entity.model) orelse continue;
             if (model.state != .ready) continue;
             const center = math.sub(math.transformPoint(entity.transform, model.info.bounds_center), box.corner);
             const reach = model.info.bounds_radius * math.maxScale(entity.transform);
@@ -240,7 +240,7 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
         }
         state.params = params_address + (records.items.len - 1) * stride;
         state.params_frame = renderer.frame_index;
-        if (state.proxy) |stand_in| if (renderer.entities.get(stand_in)) |proxy| {
+        if (state.proxy) |stand_in| if (renderer.entities.table.get(stand_in)) |proxy| {
             const volume = @as(f32, @floatFromInt(state.live)) * spacing * spacing * spacing;
             const filled = std.math.clamp(volume / (box.extent[0] * box.extent[1] * box.extent[2]), 0.002, 1);
             proxy.transform = math.mul(desc.transform, math.mul(math.translation(.{ 0, -0.5 + filled * 0.5, 0 }), math.scaling(.{ 1, filled, 1 })));
@@ -256,7 +256,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     cmd.beginScope("water simulation");
     defer cmd.endScope();
     for (scene.waters.items) |item| {
-        const state = renderer.waters.get(item) orelse continue;
+        const state = renderer.waters.table.get(item) orelse continue;
         const desc = state.desc;
         if (!state.cleared) {
             for (state.state) |texture| {
@@ -291,9 +291,9 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             const to_sheet = math.inverse(t);
             for (scene.entities.items) |entity_handle| {
                 if (state.ripple_count == state.ripples.len) break;
-                const entity = renderer.entities.get(entity_handle) orelse continue;
+                const entity = renderer.entities.table.get(entity_handle) orelse continue;
                 if (!entity.visible or entity.travelled < 1e-4) continue;
-                const model = renderer.models.get(entity.model) orelse continue;
+                const model = renderer.models.table.get(entity.model) orelse continue;
                 if (model.state != .ready) continue;
                 const center = math.transformPoint(entity.transform, model.info.bounds_center);
                 const radius = model.info.bounds_radius * math.maxScale(entity.transform);
@@ -316,7 +316,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
                 state.ripple_count += 1;
             }
         }
-        if (state.splash) |spraying| if (renderer.emitters.get(spraying)) |emitter| {
+        if (state.splash) |spraying| if (renderer.emitters.table.get(spraying)) |emitter| {
             var spray = splashDesc(desc);
             if (splash_strength > 0.15) {
                 spray.position = splash_at;
@@ -373,7 +373,7 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
     cmd.beginScope("fluid simulation");
     defer cmd.endScope();
     for (scene.fluids.items) |item| {
-        const state = renderer.fluids.get(item) orelse continue;
+        const state = renderer.fluids.table.get(item) orelse continue;
         const desc = state.desc;
         if (!state.cleared) {
             for (state.textures()) |texture| {

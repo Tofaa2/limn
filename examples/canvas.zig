@@ -35,8 +35,8 @@ pub fn main(init: std.process.Init) !void {
         const now = window.time();
 
         list.clear();
-        try canvas_scene.draw(&list, renderer.defaultFont(), assets, .{ @floatFromInt(size[0]), @floatFromInt(size[1]) }, @floatCast(now));
-        try list.text(renderer.defaultFont(), fps_text, .{ @as(f32, @floatFromInt(size[0])) * 0.5, 16 }, .{ .size = 20, .alignment = .center });
+        try canvas_scene.draw(&list, renderer.fonts.default(), assets, .{ @floatFromInt(size[0]), @floatFromInt(size[1]) }, @floatCast(now));
+        try list.text(renderer.fonts.default(), fps_text, .{ @as(f32, @floatFromInt(size[0])) * 0.5, 16 }, .{ .size = 20, .alignment = .center });
 
         if (try renderer.render(.{ .views = &.{.{ .draw_lists = &.{&list}, .clear_color = .{ 0.02, 0.025, 0.045, 1 } }} })) {
             frames += 1;

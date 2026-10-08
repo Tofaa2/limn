@@ -42,30 +42,30 @@ pub fn main(init: std.process.Init) !void {
     const renderer = stage.renderer;
     const support = renderer.pathTracing();
     const hardware = support == .hardware;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.25, -1.0, 0.12 } };
-    renderer.setEnvironment(scene, try renderer.createSky(sky_desc), 1);
-    renderer.setSun(scene, gfx.skySun(sky_desc));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
-    const sponza = try renderer.loadModel("examples/assets/world/Sponza.glb");
-    _ = try renderer.spawn(scene, .{ .model = sponza });
-    const helmet = try renderer.loadModel("examples/assets/DamagedHelmet.glb");
-    _ = try renderer.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 0.5, 1.3, -0.2 }), math.mul(math.rotationY(1.2), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.7)))) });
+    const sponza = try renderer.models.load("examples/assets/world/Sponza.glb");
+    _ = try renderer.entities.spawn(scene, .{ .model = sponza });
+    const helmet = try renderer.models.load("examples/assets/DamagedHelmet.glb");
+    _ = try renderer.entities.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 0.5, 1.3, -0.2 }), math.mul(math.rotationY(1.2), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.7)))) });
 
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(0.55, &sphere_positions, &sphere_normals, &sphere_indices);
-    const mirror = try renderer.createModel(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0.95, 0.95, 0.95, 1 }, .metallic = 1, .roughness = 0.03 } }});
-    const polished = try renderer.createModel(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0.75, 0.12, 0.1, 1 }, .metallic = 0, .roughness = 0.12 } }});
-    _ = try renderer.spawn(scene, .{ .model = mirror, .transform = math.translation(.{ 2.6, 0.55, 0.9 }) });
-    _ = try renderer.spawn(scene, .{ .model = polished, .transform = math.translation(.{ 2.4, 0.55, -1.2 }) });
+    const mirror = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0.95, 0.95, 0.95, 1 }, .metallic = 1, .roughness = 0.03 } }});
+    const polished = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0.75, 0.12, 0.1, 1 }, .metallic = 0, .roughness = 0.12 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = mirror, .transform = math.translation(.{ 2.6, 0.55, 0.9 }) });
+    _ = try renderer.entities.spawn(scene, .{ .model = polished, .transform = math.translation(.{ 2.4, 0.55, -1.2 }) });
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.12, 0.7, 0.12 }, &box_positions, &box_indices);
-    const glow = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0, 0, 0, 1 }, .emissive = .{ 2, 9, 14 }, .metallic = 0, .roughness = 0.5 } }});
-    _ = try renderer.spawn(scene, .{ .model = glow, .transform = math.translation(.{ -2.2, 0.7, 0.6 }) });
+    const glow = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0, 0, 0, 1 }, .emissive = .{ 2, 9, 14 }, .metallic = 0, .roughness = 0.5 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = glow, .transform = math.translation(.{ -2.2, 0.7, 0.6 }) });
     try renderer.waitUntilLoaded();
 
     const cameras = [_][2]math.Vec3{
@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var hud_buffer: [160]u8 = undefined;
     var count_buffer: [48]u8 = undefined;
 
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE)) lamp_moving = !lamp_moving;
         if (lamp_moving and !path_traced) lamp_clock += tick.dt;
 
-        try renderer.setLights(scene, &.{.{
+        try renderer.scenes.setLights(scene, &.{.{
             .position = .{ 1.5 + @sin(lamp_clock * 0.5) * 2.5, 2.2, @cos(lamp_clock * 0.37) * 0.9 },
             .color = .{ 1.0, 0.82, 0.6 },
             .intensity = 26,

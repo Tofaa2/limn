@@ -59,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
         .texture_streaming = .{ .budget_bytes = 2 << 30 },
     });
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
 
     const lights = try gfx.loadSceneLights(gpa, init.io, scene_path);
     defer gpa.free(lights);
@@ -81,13 +81,13 @@ pub fn main(init: std.process.Init) !void {
         }),
     };
 
-    const model = try renderer.loadModel(scene_path);
-    const bistro = try renderer.spawn(scene, .{ .model = model });
+    const model = try renderer.models.load(scene_path);
+    const bistro = try renderer.entities.spawn(scene, .{ .model = model });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var text: [256]u8 = undefined;
     var eye = views[view][0];
     var yaw: f32 = std.math.atan2(views[view][1][0], -views[view][1][2]);
@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
         }
         if (stage.keyPressed(glfw.GLFW_KEY_P)) animating = !animating;
         if (animating) clock += tick.dt;
-        renderer.setPose(bistro, .{ .animation = 0, .time = clock, .every_clip = true });
+        renderer.entities.setPose(bistro, .{ .animation = 0, .time = clock, .every_clip = true });
         if (stage.window) |shown| {
             if (stage.keyPressed(glfw.GLFW_KEY_TAB)) {
                 looking = !looking;
@@ -143,13 +143,13 @@ pub fn main(init: std.process.Init) !void {
         if (applied_night != night) {
             applied_night = night;
             const sky = gfx.SkyDesc{ .sun_direction = if (night) .{ 0.3, 0.25, 0.2 } else sun_direction, .intensity = if (night) 0.02 else 1 };
-            renderer.setEnvironment(scene, try renderer.createSky(sky), 1);
+            renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
             const sun = gfx.skySun(sky);
-            renderer.setSun(scene, .{ .direction = sun.direction, .color = sun.color, .intensity = 0 });
+            renderer.scenes.setSun(scene, .{ .direction = sun.direction, .color = sun.color, .intensity = 0 });
             lit.clearRetainingCapacity();
             try lit.append(gpa, .{ .kind = .directional, .position = .{ 0, 0, 0 }, .direction = sun.direction, .color = sun.color, .intensity = sun.intensity, .cast_shadows = true, .source_radius = 0.005 });
             try lit.appendSlice(gpa, lamps.items);
-            try renderer.setLights(scene, lit.items);
+            try renderer.scenes.setLights(scene, lit.items);
         }
 
         const stats = renderer.getStats();

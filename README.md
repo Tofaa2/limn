@@ -35,10 +35,10 @@ const gfx = @import("limn");
 const renderer = try gfx.Renderer.init(gpa, io, .{ .surface = surface });
 defer renderer.deinit();
 
-const scene = try renderer.createScene();
-const model = try renderer.loadModel("helmet.glb");
-_ = try renderer.spawn(scene, .{ .model = model });
-renderer.setSun(scene, .{ .direction = .{ -0.4, -1.0, -0.3 } });
+const scene = try renderer.scenes.create();
+const model = try renderer.models.load("helmet.glb");
+_ = try renderer.entities.spawn(scene, .{ .model = model });
+renderer.scenes.setSun(scene, .{ .direction = .{ -0.4, -1.0, -0.3 } });
 
 while (running) {
     _ = try renderer.render(.{

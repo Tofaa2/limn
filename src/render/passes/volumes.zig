@@ -110,7 +110,7 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             .flash = flash,
         };
         cloud_address = params.address;
-        if (scene.environment) |handle_value| if (renderer.environments.get(handle_value)) |sky_entry| {
+        if (scene.environment) |handle_value| if (renderer.environments.table.get(handle_value)) |sky_entry| {
             if ((sky_entry.sky_desc != null or sky_entry.state == .ready) and layer.environment_interval > 0 and
                 (sky_entry.clouds == null or renderer.time - sky_entry.cloud_bake_time >= layer.environment_interval))
             {
@@ -123,7 +123,7 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             }
         };
     }
-    if (scene.clouds == null) if (scene.environment) |handle_value| if (renderer.environments.get(handle_value)) |sky_entry| {
+    if (scene.clouds == null) if (scene.environment) |handle_value| if (renderer.environments.table.get(handle_value)) |sky_entry| {
         if (sky_entry.clouds != null) {
             sky_entry.clouds = null;
             sky_entry.sky_dirty = true;
@@ -163,7 +163,7 @@ pub fn shadowingFluids(renderer: *Renderer, p: *const ScenePass) gpu.FluidList {
     const scene = p.scene;
     var list = gpu.FluidList{};
     for (scene.fluids.items) |item| {
-        const state = renderer.fluids.get(item) orelse continue;
+        const state = renderer.fluids.table.get(item) orelse continue;
         if (state.params_frame != renderer.frame_index or state.desc.shadow <= 0) continue;
         list.fluids[list.count] = state.params;
         list.count += 1;
@@ -183,7 +183,7 @@ pub fn lightFluids(renderer: *Renderer, p: *const ScenePass, lighting: *const Li
         var fluid_slot: u32 = @intCast(scene.lights.items.len);
         var bound = false;
         for (scene.fluids.items) |item| {
-            const state = renderer.fluids.get(item) orelse continue;
+            const state = renderer.fluids.table.get(item) orelse continue;
             if (state.desc.light <= 0) continue;
             defer fluid_slot += 1;
             if (state.params_frame != renderer.frame_index) continue;
@@ -217,7 +217,7 @@ pub fn drawFluids(renderer: *Renderer, p: *const ScenePass) !void {
             .fluids = @splat(0),
         };
         for (scene.fluids.items) |item| {
-            const state = renderer.fluids.get(item) orelse continue;
+            const state = renderer.fluids.table.get(item) orelse continue;
             if (state.params_frame != renderer.frame_index) continue;
             push.fluids[push.count] = state.params;
             push.count += 1;

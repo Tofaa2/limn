@@ -25,7 +25,7 @@ fn drawImage(renderer: *gfx.Renderer, comptime shape: fn (x: f32, y: f32) f32) !
         const alpha = std.math.clamp(shape(u, v), 0, 1);
         pixels[(y * size + x) * 4 ..][0..4].* = .{ 255, 255, 255, @intFromFloat(alpha * 255) };
     };
-    return renderer.createImage(size, size, &pixels, true);
+    return renderer.images.create(size, size, &pixels, true);
 }
 
 fn arrow(x: f32, y: f32) f32 {
@@ -54,26 +54,26 @@ fn project(position: math.Vec3, turn_y: f32, tilt_x: f32, extent: [2]f32, depth:
 pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn decals", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.45, -0.7, -0.5 } };
-    renderer.setEnvironment(scene, try renderer.createSky(sky_desc), 1);
-    renderer.setSun(scene, gfx.skySun(sky_desc));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
-    const asphalt = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.13, 0.13, 0.14, 1 }, .metallic = 0, .roughness = 0.85 } }});
-    const plaster = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.75, 0.72, 0.66, 1 }, .metallic = 0, .roughness = 0.8 } }});
-    _ = try renderer.spawn(scene, .{ .model = asphalt, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 24, 0.5, 16 })) });
-    _ = try renderer.spawn(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ 0, 2, -5 }), math.scaling(.{ 24, 4, 0.5 })) });
+    const asphalt = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.13, 0.13, 0.14, 1 }, .metallic = 0, .roughness = 0.85 } }});
+    const plaster = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.75, 0.72, 0.66, 1 }, .metallic = 0, .roughness = 0.8 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = asphalt, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 24, 0.5, 16 })) });
+    _ = try renderer.entities.spawn(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ 0, 2, -5 }), math.scaling(.{ 24, 4, 0.5 })) });
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(1.2, &sphere_positions, &sphere_normals, &sphere_indices);
-    const ball = try renderer.createModel(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0.8, 0.8, 0.8, 1 }, .metallic = 0, .roughness = 0.5 } }});
-    _ = try renderer.spawn(scene, .{ .model = ball, .transform = math.translation(.{ 3.5, 1.2, -1.5 }) });
-    _ = try renderer.spawn(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ -3.2, 0.6, 0.4 }), math.scaling(.{ 1.2, 1.2, 1.2 })), .receive_decals = false, .tint = .{ 0.9, 0.5, 0.3 } });
+    const ball = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0.8, 0.8, 0.8, 1 }, .metallic = 0, .roughness = 0.5 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.translation(.{ 3.5, 1.2, -1.5 }) });
+    _ = try renderer.entities.spawn(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ -3.2, 0.6, 0.4 }), math.scaling(.{ 1.2, 1.2, 1.2 })), .receive_decals = false, .tint = .{ 0.9, 0.5, 0.3 } });
 
     const arrow_image = try drawImage(renderer, arrow);
     const ring_image = try drawImage(renderer, ring);
@@ -82,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var orbit: f32 = 0.3;
     var clock: f32 = 0;
     var moving = true;
@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
         const mark = math.Vec3{ @sin(clock * 0.6) * 6, 0, @cos(clock * 0.6) * 3.5 - 0.5 };
         decals[count] = .{ .transform = project(mark, clock, down, .{ 1.8, 1.8 }, 3.0), .image = ring_image, .color = .{ 1.0, 0.75, 0.1, 1 }, .emissive = 2 };
         count += 1;
-        try renderer.setDecals(scene, decals[0..count]);
+        try renderer.scenes.setDecals(scene, decals[0..count]);
 
         list.clear();
         try list.text3d(font, "opted out", .{ -3.2, 1.5, 0.4 }, .{ .size = 0.16 });

@@ -186,17 +186,17 @@ pub fn main(init: std.process.Init) !void {
 
     var stage = try Stage.create(init, "Limn asteroids", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     const sun_direction = math.normalize(math.Vec3{ -0.55, -0.35, -0.6 });
-    renderer.setSun(scene, .{ .direction = sun_direction, .color = .{ 1, 0.96, 0.9 }, .intensity = 6 });
-    const environment = try renderer.createSky(.{ .sun_direction = .{ 0, 1, 0 }, .stars = 40 });
-    renderer.setEnvironment(scene, environment, 0.35);
+    renderer.scenes.setSun(scene, .{ .direction = sun_direction, .color = .{ 1, 0.96, 0.9 }, .intensity = 6 });
+    const environment = try renderer.environments.createSky(.{ .sun_direction = .{ 0, 1, 0 }, .stars = 40 });
+    renderer.scenes.setEnvironment(scene, environment, 0.35);
 
     var models: [kinds.len]gfx.Model = undefined;
     for (kinds, &models, 0..) |kind, *model, index| {
         const shape = try Shape.create(gpa, kind.splits, 17 + index);
         defer shape.deinit(gpa);
-        model.* = try renderer.createModel(&.{.{
+        model.* = try renderer.models.create(&.{.{
             .positions = shape.positions,
             .indices = shape.indices,
             .material = .{ .base_color = kind.color, .metallic = 0, .roughness = 0.95 },
@@ -210,14 +210,14 @@ pub fn main(init: std.process.Init) !void {
         const indices = try gpa.create([window.sphere_index_count]u32);
         defer gpa.destroy(indices);
         window.sphereMesh(planet_radius, positions, normals, indices);
-        break :planet try renderer.createModel(&.{.{
+        break :planet try renderer.models.create(&.{.{
             .positions = positions,
             .normals = normals,
             .indices = indices,
             .material = .{ .base_color = .{ 0.62, 0.45, 0.30, 1 }, .metallic = 0, .roughness = 0.85 },
         }});
     };
-    _ = try renderer.spawn(scene, .{ .model = planet, .transform = math.identity });
+    _ = try renderer.entities.spawn(scene, .{ .model = planet, .transform = math.identity });
     try renderer.waitUntilLoaded();
 
     const transforms = try gpa.alloc(math.Mat4, max_count);
@@ -227,15 +227,15 @@ pub fn main(init: std.process.Init) !void {
     for (kinds, models, &groups, 0..) |kind, model, *group, index| {
         const share = shareOf(kind, count);
         scatter(transforms[0..share], kind, 100 + index);
-        group.* = try renderer.createInstances(scene, model, transforms[0..share]);
+        group.* = try renderer.instances.create(scene, model, transforms[0..share]);
         placed += share;
     }
 
-    if (impostors) for (groups) |group| try renderer.setInstancesImpostor(group, .{ .pixels = impostor_pixels });
+    if (impostors) for (groups) |group| try renderer.instances.setImpostor(group, .{ .pixels = impostor_pixels });
 
     var list = gfx.DrawList.init(gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var occlusion = true;
     var detail = true;
     var shadows = true;
@@ -262,7 +262,7 @@ pub fn main(init: std.process.Init) !void {
             for (kinds, groups, 0..) |kind, group, index| {
                 const share = shareOf(kind, count);
                 scatter(transforms[0..share], kind, 100 + index);
-                try renderer.setInstances(group, transforms[0..share]);
+                try renderer.instances.set(group, transforms[0..share]);
                 placed += share;
             }
         }
@@ -271,7 +271,7 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_S)) shadows = !shadows;
         if (stage.keyPressed(glfw.GLFW_KEY_I)) {
             impostors = !impostors;
-            for (groups) |group| try renderer.setInstancesImpostor(group, if (impostors) .{ .pixels = impostor_pixels } else null);
+            for (groups) |group| try renderer.instances.setImpostor(group, if (impostors) .{ .pixels = impostor_pixels } else null);
         }
         if (stage.keyPressed(glfw.GLFW_KEY_TAB)) meshlet_view = !meshlet_view;
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE)) flying = !flying;

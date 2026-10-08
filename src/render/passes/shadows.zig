@@ -104,7 +104,7 @@ pub fn drawSunShadows(renderer: *Renderer, p: *const ScenePass, sun: *const SunS
         geometry_passes.drawMeshlets(renderer, cmd, cascade_push, 1 + cascade, 1, scene.ref_count);
         hair_passes.drawHairShadows(renderer, p, cascades.view_proj[cascade], cascades.texel_size[cascade], 0);
         for (scene.liquids.items) |item| {
-            const state = renderer.liquids.get(item) orelse continue;
+            const state = renderer.liquids.table.get(item) orelse continue;
             if (state.params_frame != renderer.frame_index or state.live == 0 or state.desc.shadow <= 0) continue;
             cmd.bindPipeline(renderer.pipelines.liquid_shadow);
             cmd.pushConstants(extern struct { frame: u64, liquid: u64, particles: u64, view_proj: Mat4, swell: f32, strength: f32 }{

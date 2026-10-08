@@ -1,5 +1,6 @@
 //! Models: loading, building their GPU records and freeing them. Internal to the renderer.
 const std = @import("std");
+const handle = @import("../../handle.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
 const gltf = @import("../../asset/gltf.zig");
@@ -35,137 +36,157 @@ fn lodOptions(self: *const Renderer) gltf.LodOptions {
     return .{ .clusters = self.options.cluster_lods, .normal_weight = self.options.lod_normal_weight, .uv_weight = self.options.lod_uv_weight };
 }
 
-/// Starts loading a glTF model in the background. Entities may reference
-/// it at once; they appear when it is ready.
-pub fn loadModel(self: *Renderer, path: []const u8) !Model {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const job = try self.gpa.create(ModelJob);
-    errdefer self.gpa.destroy(job);
-    job.* = .{
-        .gpa = self.options.job_allocator orelse std.heap.smp_allocator,
-        .io = self.io,
-        .path = try self.gpa.dupe(u8, path),
-        .options = .{
-            .compress_textures = self.options.texture_compression == .bc7 and self.device.bc_textures,
-            .normal_maps_bc5 = self.options.normal_maps_bc5,
-            .raw_mips = self.options.texture_streaming != null,
-            .lods = lodOptions(self),
-            .cache_dir = self.options.asset_cache_dir,
-        },
-    };
-    errdefer self.gpa.free(job.path);
-    const model = try self.models.insert(.{ .job = job });
-    job.group.concurrent(self.io, runModelJob, .{job}) catch job.group.async(self.io, runModelJob, .{job});
-    self.loading_count += 1;
-    return model;
-}
+/// Shared geometry, materials and animations.
+pub const Models = struct {
+    table: handle.HandleTable(renderer_state.ModelEntry, api.ModelTag),
 
-/// Creates a model from geometry in memory. Ready on the next frame or
-/// `waitUntilLoaded`.
-pub fn createModel(self: *Renderer, meshes: []const MeshDesc) !Model {
-    var source = try gltf.fromMeshes(self.options.job_allocator orelse std.heap.smp_allocator, meshes, lodOptions(self));
-    errdefer source.deinit();
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const model = try self.models.insert(.{ .source = source });
-    self.loading_count += 1;
-    return model;
-}
-
-/// A handle that names no model reports `.failed`. Safe from any thread.
-pub fn modelState(self: *Renderer, model: Model) AssetState {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    return (self.models.get(model) orelse return .failed).state;
-}
-
-/// The error a failed load ended with, if any.
-pub fn modelError(self: *Renderer, model: Model) ?anyerror {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    return (self.models.get(model) orelse return error.InvalidModel).failure;
-}
-
-/// Null until the model is ready.
-pub fn modelInfo(self: *Renderer, model: Model) ?ModelInfo {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const entry = self.models.get(model) orelse return null;
-    return if (entry.state == .ready) entry.info else null;
-}
-
-/// Number of animation clips; 0 until the model is ready.
-pub fn animationCount(self: *Renderer, model: Model) u32 {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const entry = self.models.get(model) orelse return 0;
-    if (entry.state != .ready) return 0;
-    return @intCast(entry.source.?.animations.len);
-}
-
-/// Null until the model is ready or when `index` is out of range. The
-/// name is not copied: valid until the model is destroyed.
-pub fn animationInfo(self: *Renderer, model: Model, index: u32) ?AnimationInfo {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const entry = self.models.get(model) orelse return null;
-    if (entry.state != .ready or index >= entry.source.?.animations.len) return null;
-    const clip = entry.source.?.animations[index];
-    return .{ .name = clip.name, .duration = clip.duration };
-}
-
-/// Index of the named node, for `Pose.Blend.root`. Null until loaded or
-/// if there is none.
-pub fn findNode(self: *Renderer, model: Model, name: []const u8) ?u32 {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const entry = self.models.get(model) orelse return null;
-    if (entry.state != .ready) return null;
-    for (entry.source.?.nodes, 0..) |node, index| {
-        if (std.mem.eql(u8, node.name, name)) return @intCast(index);
+    fn renderer(models: *Models) *Renderer {
+        return @alignCast(@fieldParentPtr("models", models));
     }
-    return null;
-}
 
-/// How far an animation carries `node` between two times, in model
-/// space. Times past the clip's length count whole loops.
-pub fn rootMotion(self: *Renderer, model: Model, animation_index: u32, node: u32, from: f32, to: f32) !Vec3 {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const entry = self.models.get(model) orelse return error.InvalidModel;
-    if (entry.state != .ready) return error.ModelNotReady;
-    const source = &entry.source.?;
-    if (node >= source.nodes.len) return error.InvalidNode;
-    try self.scratch_locals.resize(self.gpa, source.nodes.len * 3);
-    const moved = animation.rootMotion(source, self.scratch_locals.items, animation_index, node, from, to, true);
-    return if (source.nodes[node].parent) |parent| math.transformDirection(entry.node_world[parent], moved) else moved;
-}
-
-/// Index of the first clip with exactly this name, for `Pose.animation`.
-/// Null until loaded or if there is none.
-pub fn findAnimation(self: *Renderer, model: Model, name: []const u8) ?u32 {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const entry = self.models.get(model) orelse return null;
-    if (entry.state != .ready) return null;
-    for (entry.source.?.animations, 0..) |clip, index| {
-        if (std.mem.eql(u8, clip.name, name)) return @intCast(index);
+    /// Starts loading a glTF model in the background. Entities may reference
+    /// it at once; they appear when it is ready.
+    pub fn load(models: *Models, path: []const u8) !Model {
+        const self = models.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const job = try self.gpa.create(ModelJob);
+        errdefer self.gpa.destroy(job);
+        job.* = .{
+            .gpa = self.options.job_allocator orelse std.heap.smp_allocator,
+            .io = self.io,
+            .path = try self.gpa.dupe(u8, path),
+            .options = .{
+                .compress_textures = self.options.texture_compression == .bc7 and self.device.bc_textures,
+                .normal_maps_bc5 = self.options.normal_maps_bc5,
+                .raw_mips = self.options.texture_streaming != null,
+                .lods = lodOptions(self),
+                .cache_dir = self.options.asset_cache_dir,
+            },
+        };
+        errdefer self.gpa.free(job.path);
+        const model = try self.models.table.insert(.{ .job = job });
+        job.group.concurrent(self.io, runModelJob, .{job}) catch job.group.async(self.io, runModelJob, .{job});
+        self.loading_count += 1;
+        return model;
     }
-    return null;
-}
 
-/// Fails with `error.ModelInUse` while any entity still references it.
-pub fn destroyModel(self: *Renderer, model: Model) !void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const entry = self.models.get(model) orelse return error.InvalidModel;
-    if (entry.references != 0) return error.ModelInUse;
-    var removed = self.models.remove(model).?;
-    if (removed.state == .loading) self.loading_count -= 1;
-    freeModel(self, &removed);
-    self.asset_generation += 1;
-}
+    /// Creates a model from geometry in memory. Ready on the next frame or
+    /// `waitUntilLoaded`.
+    pub fn create(models: *Models, meshes: []const MeshDesc) !Model {
+        const self = models.renderer();
+        var source = try gltf.fromMeshes(self.options.job_allocator orelse std.heap.smp_allocator, meshes, lodOptions(self));
+        errdefer source.deinit();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const model = try self.models.table.insert(.{ .source = source });
+        self.loading_count += 1;
+        return model;
+    }
+
+    /// A handle that names no model reports `.failed`. Safe from any thread.
+    pub fn state(models: *Models, model: Model) AssetState {
+        const self = models.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return (self.models.table.get(model) orelse return .failed).state;
+    }
+
+    /// The error a failed load ended with, if any.
+    pub fn loadError(models: *Models, model: Model) ?anyerror {
+        const self = models.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return (self.models.table.get(model) orelse return error.InvalidModel).failure;
+    }
+
+    /// Null until the model is ready.
+    pub fn info(models: *Models, model: Model) ?ModelInfo {
+        const self = models.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.models.table.get(model) orelse return null;
+        return if (entry.state == .ready) entry.info else null;
+    }
+
+    /// Number of animation clips; 0 until the model is ready.
+    pub fn animationCount(models: *Models, model: Model) u32 {
+        const self = models.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.models.table.get(model) orelse return 0;
+        if (entry.state != .ready) return 0;
+        return @intCast(entry.source.?.animations.len);
+    }
+
+    /// Null until the model is ready or when `index` is out of range. The
+    /// name is not copied: valid until the model is destroyed.
+    pub fn animationInfo(models: *Models, model: Model, index: u32) ?AnimationInfo {
+        const self = models.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.models.table.get(model) orelse return null;
+        if (entry.state != .ready or index >= entry.source.?.animations.len) return null;
+        const clip = entry.source.?.animations[index];
+        return .{ .name = clip.name, .duration = clip.duration };
+    }
+
+    /// Index of the named node, for `Pose.Blend.root`. Null until loaded or
+    /// if there is none.
+    pub fn findNode(models: *Models, model: Model, name: []const u8) ?u32 {
+        const self = models.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.models.table.get(model) orelse return null;
+        if (entry.state != .ready) return null;
+        for (entry.source.?.nodes, 0..) |node, index| {
+            if (std.mem.eql(u8, node.name, name)) return @intCast(index);
+        }
+        return null;
+    }
+
+    /// How far an animation carries `node` between two times, in model
+    /// space. Times past the clip's length count whole loops.
+    pub fn rootMotion(models: *Models, model: Model, animation_index: u32, node: u32, from: f32, to: f32) !Vec3 {
+        const self = models.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.models.table.get(model) orelse return error.InvalidModel;
+        if (entry.state != .ready) return error.ModelNotReady;
+        const source = &entry.source.?;
+        if (node >= source.nodes.len) return error.InvalidNode;
+        try self.scratch_locals.resize(self.gpa, source.nodes.len * 3);
+        const moved = animation.rootMotion(source, self.scratch_locals.items, animation_index, node, from, to, true);
+        return if (source.nodes[node].parent) |parent| math.transformDirection(entry.node_world[parent], moved) else moved;
+    }
+
+    /// Index of the first clip with exactly this name, for `Pose.animation`.
+    /// Null until loaded or if there is none.
+    pub fn findAnimation(models: *Models, model: Model, name: []const u8) ?u32 {
+        const self = models.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.models.table.get(model) orelse return null;
+        if (entry.state != .ready) return null;
+        for (entry.source.?.animations, 0..) |clip, index| {
+            if (std.mem.eql(u8, clip.name, name)) return @intCast(index);
+        }
+        return null;
+    }
+
+    /// Fails with `error.ModelInUse` while any entity still references it.
+    pub fn destroy(models: *Models, model: Model) !void {
+        const self = models.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.models.table.get(model) orelse return error.InvalidModel;
+        if (entry.references != 0) return error.ModelInUse;
+        var removed = self.models.table.remove(model).?;
+        if (removed.state == .loading) self.loading_count -= 1;
+        freeModel(self, &removed);
+        self.asset_generation += 1;
+    }
+};
 
 pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
     const device = self.device;
@@ -252,13 +273,13 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
         budget.* -|= pixels.len;
     }
 
-    entry.material_base = try self.materials.alloc(self, @intCast(source.materials.len));
+    entry.material_base = try self.materials.pool.alloc(self, @intCast(source.materials.len));
     var transform_count: u32 = 0;
     for (source.materials) |material| {
         if (material.hasOwnTransforms()) transform_count += 1;
     }
     if (transform_count != 0) {
-        entry.transform_base = try self.materials.alloc(self, transform_count * gpu.texture_transform_slots);
+        entry.transform_base = try self.materials.pool.alloc(self, transform_count * gpu.texture_transform_slots);
         entry.transform_count = transform_count;
         self.texture_transform_users += 1;
         var slot = entry.transform_base;
@@ -269,7 +290,7 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
                 const transform = if (maybe) |ref| ref.transform else material.sharedTransform();
                 out.* = .{ .matrix = uvMatrix(transform.scale, transform.rotation), .offset = transform.offset };
             }
-            try self.materials.write(device, slot, std.mem.sliceAsBytes(&block));
+            try self.materials.pool.write(device, slot, std.mem.sliceAsBytes(&block));
             slot += gpu.texture_transform_slots;
         }
     }
@@ -277,9 +298,9 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
     defer gpa.free(materials);
     for (source.materials, materials, 0..) |material, *out, index| {
         out.* = try encodeMaterial(self, entry, material, index);
-        self.material_shader_users[out.shader] += 1;
+        self.materials.shader_users[out.shader] += 1;
     }
-    try self.materials.write(device, entry.material_base, std.mem.sliceAsBytes(materials));
+    try self.materials.pool.write(device, entry.material_base, std.mem.sliceAsBytes(materials));
 
     entry.mesh_base = try self.meshes.alloc(self, @intCast(source.meshes.len));
     entry.meshes = try gpa.alloc(ModelMesh, source.meshes.len);
@@ -437,9 +458,9 @@ pub fn buildSceneTree(self: *Renderer, scene: *SceneData, entities: []const gpu.
     }
     var record: u32 = @intCast(entities.len);
     for (scene.groups.items) |group_handle| {
-        const group = self.instance_groups.get(group_handle) orelse continue;
+        const group = self.instances.table.get(group_handle) orelse continue;
         if (group.per_copy == 0) continue;
-        const model = self.models.get(group.model) orelse continue;
+        const model = self.models.table.get(group.model) orelse continue;
         const source = &model.source.?;
         for (group.transforms) |placement| {
             for (source.instances) |instance| {
@@ -586,14 +607,14 @@ pub fn freeModel(self: *Renderer, entry: *ModelEntry) void {
     }
     if (entry.source) |*source| {
         if (entry.transform_count != 0) {
-            self.materials.free(self, entry.transform_base, entry.transform_count * gpu.texture_transform_slots);
+            self.materials.pool.free(self, entry.transform_base, entry.transform_count * gpu.texture_transform_slots);
             self.texture_transform_users -= 1;
             entry.transform_count = 0;
         }
         if (entry.meshes.len != 0) self.meshes.free(self, entry.mesh_base, @intCast(source.meshes.len));
         if (entry.state == .ready) {
-            for (source.materials) |material| self.material_shader_users[if (material.shader < self.material_shaders.len) material.shader else 0] -= 1;
-            self.materials.free(self, entry.material_base, @intCast(source.materials.len));
+            for (source.materials) |material| self.materials.shader_users[if (material.shader < self.materials.shaders.len) material.shader else 0] -= 1;
+            self.materials.pool.free(self, entry.material_base, @intCast(source.materials.len));
         }
         source.deinit();
         entry.source = null;

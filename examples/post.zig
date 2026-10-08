@@ -20,24 +20,24 @@ const Stage = helpers.Stage;
 pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn post effects", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ 0.55, -0.22, -0.8 } };
-    renderer.setEnvironment(scene, try renderer.createSky(sky_desc), 1);
-    renderer.setSun(scene, gfx.skySun(sky_desc));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
-    const block = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.6, 0.6, 0.62, 1 }, .metallic = 0, .roughness = 0.45 } }});
-    _ = try renderer.spawn(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 60, 0.5, 60 })), .tint = .{ 0.5, 0.5, 0.52 } });
+    const block = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.6, 0.6, 0.62, 1 }, .metallic = 0, .roughness = 0.45 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 60, 0.5, 60 })), .tint = .{ 0.5, 0.5, 0.52 } });
     var posts: [40]math.Mat4 = undefined;
     for (&posts, 0..) |*post, index| {
         const along: f32 = @floatFromInt(index / 2);
         const side: f32 = if (index % 2 == 0) -1 else 1;
         post.* = math.mul(math.translation(.{ side * 2.2, 1, 4 - along * 2.6 }), math.scaling(.{ 0.3, 2, 0.3 }));
     }
-    _ = try renderer.createInstances(scene, block, &posts);
+    _ = try renderer.instances.create(scene, block, &posts);
     const lamp_colors = [_][3]f32{ .{ 14, 3, 1 }, .{ 1.5, 10, 4 }, .{ 2, 5, 16 }, .{ 14, 10, 1 } };
     var lamps: [lamp_colors.len]gfx.Entity = undefined;
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
@@ -45,11 +45,11 @@ pub fn main(init: std.process.Init) !void {
     var sphere_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(0.22, &sphere_positions, &sphere_normals, &sphere_indices);
     for (lamp_colors, &lamps) |color, *lamp| {
-        const model = try renderer.createModel(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0, 0, 0, 1 }, .emissive = color, .metallic = 0, .roughness = 0.5 } }});
-        lamp.* = try renderer.spawn(scene, .{ .model = model });
+        const model = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0, 0, 0, 1 }, .emissive = color, .metallic = 0, .roughness = 0.5 } }});
+        lamp.* = try renderer.entities.spawn(scene, .{ .model = model });
     }
-    const helmet = try renderer.loadModel("examples/assets/DamagedHelmet.glb");
-    _ = try renderer.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 0, 1.3, 0 }), math.mul(math.rotationY(0.5), math.rotationX(std.math.pi * 0.5))) });
+    const helmet = try renderer.models.load("examples/assets/DamagedHelmet.glb");
+    _ = try renderer.entities.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 0, 1.3, 0 }), math.mul(math.rotationY(0.5), math.rotationX(std.math.pi * 0.5))) });
     try renderer.waitUntilLoaded();
 
     const Effect = enum { bloom, dof, motion_blur, vignette, grain, fringes, flare, grade, sharpen, antialiasing, upscale, manual_exposure };
@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init) !void {
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var orbit: f32 = 0.15;
     var clock: f32 = 0;
     var moving = true;
@@ -101,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
 
         for (lamps, 0..) |lamp, index| {
             const angle = clock * 2.2 + @as(f32, @floatFromInt(index)) * std.math.tau / lamps.len;
-            renderer.setTransform(lamp, math.translation(.{ @cos(angle) * 1.6, 1.3 + 0.5 * @sin(angle * 0.7), @sin(angle) * 1.6 }));
+            renderer.entities.setTransform(lamp, math.translation(.{ @cos(angle) * 1.6, 1.3 + 0.5 * @sin(angle * 0.7), @sin(angle) * 1.6 }));
         }
 
         const settings = gfx.Settings{

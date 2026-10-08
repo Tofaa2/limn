@@ -42,25 +42,25 @@ const mixed = "Left to right, then מימין לשמאל and back.";
 pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn text", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.4, -0.6, -0.5 } };
-    renderer.setEnvironment(scene, try renderer.createSky(sky_desc), 1);
-    renderer.setSun(scene, gfx.skySun(sky_desc));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 6, 0.05, 6 }, &box_positions, &box_indices);
-    const floor = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.3, 0.32, 0.36, 1 }, .metallic = 0, .roughness = 0.4 } }});
-    _ = try renderer.spawn(scene, .{ .model = floor });
+    const floor = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.3, 0.32, 0.36, 1 }, .metallic = 0, .roughness = 0.4 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = floor });
 
-    const font = renderer.defaultFont();
-    try renderer.prepareText(font, hebrew ++ arabic ++ mixed ++ "→·“”");
-    try renderer.prepareLigatures(font);
+    const font = renderer.fonts.default();
+    try renderer.fonts.prepareText(font, hebrew ++ arabic ++ mixed ++ "→·“”");
+    try renderer.fonts.prepareLigatures(font);
 
     var loaded: [samples.len]*const gfx.Font = undefined;
     for (samples, &loaded) |sample, *slot| {
         var path_buffer: [128]u8 = undefined;
-        slot.* = try renderer.loadFont(try std.fmt.bufPrint(&path_buffer, fonts_dir ++ "{s}", .{sample.file}), &.{.{ 32, 126 }});
-        try renderer.prepareText(slot.*, sample.text);
+        slot.* = try renderer.fonts.load(try std.fmt.bufPrint(&path_buffer, fonts_dir ++ "{s}", .{sample.file}), &.{.{ 32, 126 }});
+        try renderer.fonts.prepareText(slot.*, sample.text);
     }
     try renderer.waitUntilLoaded();
 

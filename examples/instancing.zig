@@ -41,12 +41,12 @@ fn scatter(trees: []Tree, seed: u64) void {
 pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn instancing", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     var sun_height: f32 = 0.55;
     var sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -@sin(sun_height), -0.45 } };
-    renderer.setSun(scene, gfx.skySun(sky_desc));
-    const environment = try renderer.createSky(sky_desc);
-    renderer.setEnvironment(scene, environment, 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
+    const environment = try renderer.environments.createSky(sky_desc);
+    renderer.scenes.setEnvironment(scene, environment, 1);
 
     var positions: [3][24][3]f32 = undefined;
     var indices: [3][36]u32 = undefined;
@@ -55,13 +55,13 @@ pub fn main(init: std.process.Init) !void {
     boxMesh(.{ 0.32, 0.42, 0.32 }, &positions[2], &indices[2]);
     for (&positions[1]) |*p| p[1] += 0.5;
     for (&positions[2]) |*p| p[1] += 1.3;
-    const ground = try renderer.createModel(&.{.{
+    const ground = try renderer.models.create(&.{.{
         .positions = &positions[0],
         .indices = &indices[0],
         .material = .{ .base_color = .{ 0.16, 0.22, 0.12, 1 }, .metallic = 0, .roughness = 0.9 },
     }});
-    _ = try renderer.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.1, 0 }) });
-    const tree = try renderer.createModel(&.{
+    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.1, 0 }) });
+    const tree = try renderer.models.create(&.{
         .{ .positions = &positions[1], .indices = &indices[1], .material = .{ .base_color = .{ 0.27, 0.17, 0.09, 1 }, .metallic = 0, .roughness = 0.9 } },
         .{ .positions = &positions[2], .indices = &indices[2], .material = .{ .base_color = .{ 0.12, 0.42, 0.14, 1 }, .metallic = 0, .roughness = 0.8 } },
     });
@@ -76,11 +76,11 @@ pub fn main(init: std.process.Init) !void {
     var seed: u64 = 1;
     scatter(trees, seed);
     for (trees[0..count], transforms[0..count]) |item, *out| out.* = item.transform(0);
-    const forest = try renderer.createInstances(scene, tree, transforms[0..count]);
+    const forest = try renderer.instances.create(scene, tree, transforms[0..count]);
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var sway = false;
     var orbit: f32 = 0.5;
     var picked: ?u32 = null;
@@ -112,8 +112,8 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_T)) {
             sun_height = @mod(sun_height + tick.dt * 0.25, std.math.pi);
             sky_desc.sun_direction = .{ -0.5 * @cos(sun_height), -@max(@sin(sun_height), -0.05), -0.45 };
-            renderer.setSky(environment, sky_desc);
-            renderer.setSun(scene, gfx.skySun(sky_desc));
+            renderer.environments.setSky(environment, sky_desc);
+            renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
         }
 
         if (changed or sway) {
@@ -121,7 +121,7 @@ pub fn main(init: std.process.Init) !void {
                 const lean = if (sway) @sin(tick.time * 1.6 + item.position[0] * 0.25 + item.position[2] * 0.18) * 0.12 else 0;
                 out.* = item.transform(lean);
             }
-            try renderer.setInstances(forest, transforms[0..count]);
+            try renderer.instances.set(forest, transforms[0..count]);
             if (changed) picked = null;
         }
 

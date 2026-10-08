@@ -36,14 +36,14 @@ pub const CollisionFieldTag = opaque {};
 pub const LiquidTag = opaque {};
 pub const InstanceGroupTag = opaque {};
 /// Geometry, materials and animations shared by entities; see
-/// `Renderer.loadModel`. Handles are 32-bit copyable values; calls given a
+/// `Renderer.models.load`. Handles are 32-bit copyable values; calls given a
 /// stale handle do nothing or return an error.
 pub const Model = handle.Handle(ModelTag);
-/// A sky and its image-based lighting; see `Renderer.loadEnvironment`.
+/// A sky and its image-based lighting; see `Renderer.environments.load`.
 pub const Environment = handle.Handle(EnvironmentTag);
-/// A world of entities, lights and effects; see `Renderer.createScene`.
+/// A world of entities, lights and effects; see `Renderer.scenes.create`.
 pub const Scene = handle.Handle(SceneTag);
-/// One placement of a model in a scene; see `Renderer.spawn`.
+/// One placement of a model in a scene; see `Renderer.entities.spawn`.
 pub const Entity = handle.Handle(EntityTag);
 /// Per-camera state that persists between frames.
 pub const View = handle.Handle(ViewTag);
@@ -51,29 +51,29 @@ pub const View = handle.Handle(ViewTag);
 pub const Emitter = handle.Handle(EmitterTag);
 /// A local reflection probe in a scene.
 pub const ReflectionProbe = handle.Handle(ReflectionProbeTag);
-/// A box of simulated smoke and fire in a scene; see `Renderer.createFluid`.
+/// A box of simulated smoke and fire in a scene; see `Renderer.fluids.create`.
 pub const Fluid = handle.Handle(FluidTag);
-/// A shape that hair is kept out of; see `Renderer.createCollisionField`.
+/// A shape that hair is kept out of; see `Renderer.hairs.createCollisionField`.
 pub const CollisionField = handle.Handle(CollisionFieldTag);
-/// Strands of hair, fur or grass in a scene; see `Renderer.createHair`.
+/// Strands of hair, fur or grass in a scene; see `Renderer.hairs.create`.
 pub const Hair = handle.Handle(HairTag);
-/// A sheet of simulated water in a scene; see `Renderer.createWater`.
+/// A sheet of simulated water in a scene; see `Renderer.waters.create`.
 pub const Water = handle.Handle(WaterTag);
-/// A volume of particle-simulated liquid; see `Renderer.createLiquid`.
+/// A volume of particle-simulated liquid; see `Renderer.liquids.create`.
 pub const Liquid = handle.Handle(LiquidTag);
-/// Many copies of one model; see `Renderer.createInstances`.
+/// Many copies of one model; see `Renderer.instances.create`.
 pub const InstanceGroup = handle.Handle(InstanceGroupTag);
-/// Animation clips an entity plays; see `Renderer.setPose`.
+/// Animation clips an entity plays; see `Renderer.entities.setPose`.
 pub const Pose = animation.Pose;
-/// Application-supplied geometry for `Renderer.createModel`.
+/// Application-supplied geometry for `Renderer.models.create`.
 pub const MeshDesc = gltf.MeshDesc;
 /// Surface description of a mesh.
 pub const Material = gltf.Material;
 /// 2D shapes, images and text drawn over a view.
 pub const DrawList = draw_list.DrawList;
-/// A texture for draw lists, lights and settings; see `Renderer.createImage`.
+/// A texture for draw lists, lights and settings; see `Renderer.images.create`.
 pub const Image = draw_list.Image;
-/// A font baked into a distance-field atlas; see `Renderer.loadFont`.
+/// A font baked into a distance-field atlas; see `Renderer.fonts.load`.
 pub const Font = font_module.Font;
 
 /// Creation-time options for `Renderer.init`; fixed for its lifetime.
@@ -173,7 +173,7 @@ pub const LiquidSource = struct {
     rate: f32 = 0,
 };
 
-/// A box of particle-simulated liquid; see `Renderer.createLiquid`. Costs far
+/// A box of particle-simulated liquid; see `Renderer.liquids.create`. Costs far
 /// more than a `WaterDesc` sheet of the same area.
 pub const LiquidDesc = struct {
     /// Places the containing box: the unit cube centered on the origin. Its
@@ -257,7 +257,7 @@ pub const TextureStreaming = struct {
 
 /// See `Options.texture_compression`. `.none` is RGBA8.
 pub const TextureCompression = enum { none, bc7 };
-/// See `Renderer.bakeLightmap`.
+/// See `Renderer.entities.bakeLightmap`.
 pub const LightmapDesc = struct {
     /// Texels per side.
     resolution: u32 = 256,
@@ -268,7 +268,7 @@ pub const LightmapDesc = struct {
     reach: f32 = 200,
 };
 
-/// See `Renderer.setInstancesImpostor`.
+/// See `Renderer.instances.setImpostor`.
 pub const ImpostorDesc = struct {
     /// Copies smaller than this many pixels across are drawn as impostor cards.
     pixels: f32 = 24,
@@ -276,7 +276,7 @@ pub const ImpostorDesc = struct {
     resolution: u32 = 64,
 };
 
-/// Strands of hair, fur or grass; see `Renderer.createHair`. Each strand is a
+/// Strands of hair, fur or grass; see `Renderer.hairs.create`. Each strand is a
 /// row of points drawn as a camera-facing ribbon. Strands cast no shadows.
 pub const HairDesc = struct {
     /// All strands' points, each root to tip, in hair space. Copied.
@@ -302,7 +302,7 @@ pub const HairDesc = struct {
     simulation: ?HairSimulation = null,
 };
 
-/// Strand dynamics; see `HairDesc.simulation` and `Renderer.setHairSimulation`.
+/// Strand dynamics; see `HairDesc.simulation` and `Renderer.hairs.setSimulation`.
 /// Roots stay fixed; strands keep their length and are pulled toward their
 /// given shape. At most 64 points per strand. World units and seconds.
 pub const HairSimulation = struct {
@@ -320,7 +320,7 @@ pub const HairSimulation = struct {
     damping: f32 = 0.04,
     /// Collision spheres: center and radius, in world space. At most 6; copied.
     colliders: []const [4]f32 = &.{},
-    /// Collision shape from `Renderer.createCollisionField`; `field_transform`
+    /// Collision shape from `Renderer.hairs.createCollisionField`; `field_transform`
     /// places it in the world.
     field: ?CollisionField = null,
     field_transform: Mat4 = math.identity,
@@ -330,7 +330,7 @@ pub const HairSimulation = struct {
     volume: f32 = 0.4,
 };
 
-/// A sheet of simulated water; see `Renderer.createWater`.
+/// A sheet of simulated water; see `Renderer.waters.create`.
 pub const WaterDesc = struct {
     /// Cells of the simulation along each side, 16..1024.
     resolution: [2]u32 = .{ 256, 256 },
@@ -404,7 +404,7 @@ pub const FluidObstacle = union(enum) {
     box: struct { min: Vec3, max: Vec3 },
 };
 
-/// Frames recorded from a running fluid; see `Renderer.recordFluidFlipbook`.
+/// Frames recorded from a running fluid; see `Renderer.fluids.recordFlipbook`.
 pub const FluidFlipbookDesc = struct {
     columns: u32 = 8,
     rows: u32 = 8,
@@ -414,7 +414,7 @@ pub const FluidFlipbookDesc = struct {
     frame_size: ?[2]u32 = null,
 };
 
-/// A box of simulated smoke and fire; see `Renderer.createFluid`.
+/// A box of simulated smoke and fire; see `Renderer.fluids.create`.
 pub const FluidDesc = struct {
     /// Cells along each axis, 8..256. A depth of 1 makes the fluid 2D.
     resolution: [3]u32 = .{ 64, 96, 64 },
@@ -476,7 +476,7 @@ pub const FluidDesc = struct {
     ambient: f32 = 1,
 };
 
-/// A layer of volumetric clouds; see `Renderer.setClouds`.
+/// A layer of volumetric clouds; see `Renderer.scenes.setClouds`.
 pub const CloudDesc = struct {
     /// Share of the sky the clouds fill, 0..1.
     coverage: f32 = 0.5,
@@ -509,14 +509,14 @@ pub const CloudDesc = struct {
     /// Storm cells, 0..1: anvil-topped towers where coverage is heaviest.
     anvil: f32 = 0,
     /// Lightning flashes per minute near the camera, and their brightness. They
-    /// light only the cloud; see `Renderer.cloudFlash`.
+    /// light only the cloud; see `Renderer.scenes.cloudFlash`.
     lightning: f32 = 0,
     lightning_brightness: f32 = 40,
     /// Radius of the planet the layer wraps around.
     planet_radius: f32 = 6_360_000,
 };
 
-/// A lightning flash in a cloud layer; see `Renderer.cloudFlash`.
+/// A lightning flash in a cloud layer; see `Renderer.scenes.cloudFlash`.
 pub const CloudFlash = struct { position: Vec3, brightness: f32 };
 
 /// See `Settings.transparency`.
@@ -553,7 +553,7 @@ pub const AssetState = enum {
     /// Entities that use it are not drawn yet.
     loading,
     ready,
-    /// The load failed (see `Renderer.modelError`) or the handle is invalid.
+    /// The load failed (see `Renderer.models.loadError`) or the handle is invalid.
     failed,
 };
 
@@ -598,7 +598,7 @@ pub const Camera = struct {
     }
 };
 
-/// The scene's one shadow-casting directional light; see `Renderer.setSun`.
+/// The scene's one shadow-casting directional light; see `Renderer.scenes.setSun`.
 pub const Sun = struct {
     /// Direction the light travels.
     direction: Vec3 = .{ -0.4, -1.0, -0.3 },
@@ -650,11 +650,11 @@ pub const Light = struct {
     /// Spot lights only: an image projected by the light.
     cookie: ?Image = null,
     /// Brightness by angle from `direction`: a strip image, left edge along the
-    /// axis, right edge straight behind. See `Renderer.loadLightProfile`.
+    /// axis, right edge straight behind. See `Renderer.images.loadLightProfile`.
     profile: ?Image = null,
 };
 
-/// What `Renderer.spawn` makes an entity from. Everything but the model can be
+/// What `Renderer.entities.spawn` makes an entity from. Everything but the model can be
 /// changed afterwards.
 pub const EntityDesc = struct {
     /// May still be loading; the entity appears once it is ready.
@@ -670,7 +670,7 @@ pub const EntityDesc = struct {
     receive_decals: bool = true,
 };
 
-/// One animation clip of a model; see `Renderer.animationInfo`.
+/// One animation clip of a model; see `Renderer.models.animationInfo`.
 pub const AnimationInfo = struct {
     /// Owned by the model; valid until it is destroyed.
     name: []const u8,
@@ -678,7 +678,7 @@ pub const AnimationInfo = struct {
     duration: f32,
 };
 
-/// See `Renderer.modelInfo`.
+/// See `Renderer.models.info`.
 pub const ModelInfo = struct {
     mesh_count: u32,
     triangle_count: u32,
@@ -697,7 +697,7 @@ pub const ModelInfo = struct {
     bounds_radius: f32,
 };
 
-/// See `Renderer.environmentInfo`.
+/// See `Renderer.environments.info`.
 pub const EnvironmentInfo = struct {
     /// Direction toward the brightest part of the panorama, usually the sun.
     /// Negate it to get a matching `Sun.direction`.
@@ -1016,7 +1016,7 @@ pub const Settings = struct {
     /// Multiplies the picture before tone mapping, like a lens filter.
     color_filter: [3]f32 = .{ 1, 1, 1 },
     /// Color lookup table applied to the finished picture: a strip of N slices,
-    /// N*N wide and N tall, in sRGB. Load it with `createImage(..., false)`.
+    /// N*N wide and N tall, in sRGB. Load it with `Renderer.images.create(..., false)`.
     color_lut: ?Image = null,
     /// Blend of the table's result, 0..1.
     color_lut_strength: f32 = 1,
@@ -1186,7 +1186,7 @@ pub const Pick = struct {
     distance: f32,
 };
 
-/// See `Renderer.createMaterialShader`.
+/// See `Renderer.materials.createShader`.
 pub const MaterialShader = struct {
     /// Value for `Material.shader`.
     slot: u32,
@@ -1224,7 +1224,7 @@ pub const DecalDesc = struct {
 /// Most decals a scene can hold.
 pub const max_decals = gpu.cluster_decal_words * 32;
 
-/// A procedural clear sky; see `Renderer.createSky`.
+/// A procedural clear sky; see `Renderer.environments.createSky`.
 pub const SkyDesc = struct {
     /// Direction the sun's light travels, as in `Sun.direction`.
     sun_direction: Vec3 = .{ -0.4, -1.0, -0.3 },
@@ -1255,7 +1255,7 @@ pub const sky_sun_strength = 8.0;
 
 /// The `Sun` matching a sky: its direction, and its color and intensity after
 /// crossing the atmosphere (zero below the horizon). Pass it to
-/// `Renderer.setSun`.
+/// `Renderer.scenes.setSun`.
 pub fn skySun(desc: SkyDesc) Sun {
     const to_sun = math.normalize(math.scale(desc.sun_direction, -1));
     if (to_sun[1] <= -0.02) return .{ .direction = desc.sun_direction, .intensity = 0 };
@@ -1333,7 +1333,7 @@ pub const SizeCurve = struct {
 
 /// A local reflection capture, used by surfaces inside its box where neither
 /// the screen nor a ray gives a reflection. See
-/// `Renderer.createReflectionProbe`.
+/// `Renderer.probes.create`.
 pub const ReflectionProbeDesc = struct {
     /// Capture point and center of the box.
     position: Vec3,
@@ -1354,7 +1354,7 @@ pub const ReflectionProbeDesc = struct {
 /// Most reflection probes a scene can hold.
 pub const max_reflection_probes = 16;
 
-/// A source of particles; see `Renderer.createEmitter`.
+/// A source of particles; see `Renderer.emitters.create`.
 pub const EmitterDesc = struct {
     position: Vec3 = .{ 0, 0, 0 },
     /// Particles are born inside a sphere of this radius.
@@ -1453,7 +1453,7 @@ pub const ViewDesc = struct {
 /// Everything `Renderer.render` draws in one frame.
 pub const FrameDesc = struct {
     /// Drawn in order. A view may draw into a texture a later view shows (see
-    /// `Renderer.targetImage`).
+    /// `Renderer.views.targetImage`).
     views: []const ViewDesc,
     /// Seconds since the previous frame.
     delta_time: f32 = 1.0 / 60.0,

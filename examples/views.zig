@@ -17,17 +17,17 @@ const Stage = helpers.Stage;
 pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn views", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.6, -0.4 } };
-    renderer.setEnvironment(scene, try renderer.createSky(sky_desc), 1);
-    renderer.setSun(scene, gfx.skySun(sky_desc));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
-    const block = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.7, 0.7, 0.72, 1 }, .metallic = 0, .roughness = 0.6 } }});
-    _ = try renderer.spawn(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 40, 0.5, 40 })), .tint = .{ 0.45, 0.5, 0.42 } });
+    const block = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.7, 0.7, 0.72, 1 }, .metallic = 0, .roughness = 0.6 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 40, 0.5, 40 })), .tint = .{ 0.45, 0.5, 0.42 } });
     var towers: [64]math.Mat4 = undefined;
     var colors: [64][3]f32 = undefined;
     for (&towers, &colors, 0..) |*tower, *color, index| {
@@ -38,23 +38,23 @@ pub fn main(init: std.process.Init) !void {
         tower.* = math.mul(math.translation(.{ x, tall * 0.5, z }), math.scaling(.{ 1.3, tall, 1.3 }));
         color.* = .{ 0.6 + 0.4 * @sin(seed), 0.6 + 0.4 * @sin(seed * 1.7 + 1), 0.6 + 0.4 * @sin(seed * 2.3 + 2) };
     }
-    const group = try renderer.createInstances(scene, block, &towers);
-    try renderer.setInstanceColors(group, &colors);
-    const fox_model = try renderer.loadModel("examples/assets/world/Fox.glb");
-    const fox = try renderer.spawn(scene, .{ .model = fox_model });
+    const group = try renderer.instances.create(scene, block, &towers);
+    try renderer.instances.setColors(group, &colors);
+    const fox_model = try renderer.models.load("examples/assets/world/Fox.glb");
+    const fox = try renderer.entities.spawn(scene, .{ .model = fox_model });
     try renderer.waitUntilLoaded();
-    const run = renderer.findAnimation(fox_model, "Run") orelse 0;
-    const run_length = if (renderer.animationInfo(fox_model, run)) |clip| clip.duration else 1;
+    const run = renderer.models.findAnimation(fox_model, "Run") orelse 0;
+    const run_length = if (renderer.models.animationInfo(fox_model, run)) |clip| clip.duration else 1;
 
-    const right_view = try renderer.createView();
-    const chase_view = try renderer.createView();
-    const chase_target = try renderer.createTarget(480, 270);
+    const right_view = try renderer.views.create();
+    const chase_view = try renderer.views.create();
+    const chase_target = try renderer.views.createTarget(480, 270);
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
     var overlay = gfx.DrawList.init(init.gpa);
     defer overlay.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     const modes = [_]struct { name: []const u8, view: gfx.DebugView }{
         .{ .name = "meshlets", .view = .meshlets },
         .{ .name = "normals", .view = .normal },
@@ -72,8 +72,8 @@ pub fn main(init: std.process.Init) !void {
 
         const angle = clock * 0.5;
         const place = math.Vec3{ @sin(angle) * 15.2, 0, @cos(angle) * 15.2 };
-        renderer.setTransform(fox, math.mul(math.translation(place), math.mul(math.rotationY(angle + std.math.pi * 0.5), math.uniformScaling(0.02))));
-        renderer.setPose(fox, .{ .animation = run, .time = @mod(clock * 1.2, run_length) });
+        renderer.entities.setTransform(fox, math.mul(math.translation(place), math.mul(math.rotationY(angle + std.math.pi * 0.5), math.uniformScaling(0.02))));
+        renderer.entities.setPose(fox, .{ .animation = run, .time = @mod(clock * 1.2, run_length) });
 
         const size = tick.size;
         const half = size[0] / 2;
@@ -89,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
         const height: f32 = @floatFromInt(size[1]);
         try overlay.rect(.{ .x = @as(f32, @floatFromInt(half)) - 1, .y = 0, .width = 2, .height = height }, gfx.Color.white);
         try overlay.rect(.{ .x = 14, .y = height - 288, .width = 484, .height = 274 }, gfx.Color.white);
-        try overlay.image(renderer.targetImage(chase_target), .{ .x = 16, .y = height - 286, .width = 480, .height = 270 }, .{});
+        try overlay.image(renderer.views.targetImage(chase_target), .{ .x = 16, .y = height - 286, .width = 480, .height = 270 }, .{});
         try overlay.text(font, "a third camera, rendered to a texture", .{ 24, height - 280 }, .{ .size = 13, .shadow = gfx.Color.rgba(0, 0, 0, 200) });
         try overlay.rect(.{ .x = 12, .y = 12, .width = 330, .height = 58 }, gfx.Color.rgba(10, 12, 20, 180));
         try overlay.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · 3 views", .{ stage.fps, stage.gpu_ms }), .{ 24, 20 }, .{ .size = 16 });

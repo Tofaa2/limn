@@ -449,7 +449,7 @@ pub const ModelMesh = struct {
 };
 
 /// Application images used as a material's textures (see
-/// `Renderer.setMaterialTextures`). Null keeps the model's own. Channels
+/// `Renderer.materials.setTextures`). Null keeps the model's own. Channels
 /// follow glTF: roughness in green and metallic in blue, occlusion in red,
 /// coat strength in red, coat roughness in green, sheen roughness in alpha.
 pub const MaterialTextures = struct {
@@ -475,7 +475,7 @@ pub const ModelEntry = struct {
     streams: []TextureStream = &.{},
     streamed: u32 = 0,
     materials_stale: bool = false,
-    /// Overrides from `setMaterialTextures`; empty, or one per material.
+    /// Overrides from `materials.setTextures`; empty, or one per material.
     material_images: []MaterialTextures = &.{},
     next_image: usize = 0,
     meshes: []ModelMesh = &.{},
@@ -642,7 +642,7 @@ pub const SceneData = struct {
     gi_middle: ?GiVolume = null,
     /// Explicit probe volume; null derives it from the static geometry.
     gi_bounds: ?[2]Vec3 = null,
-    /// This scene's origin in the application's world; see `shiftScene`.
+    /// This scene's origin in the application's world; see `scenes.shift`.
     origin: [3]f64 = .{ 0, 0, 0 },
     clouds: ?CloudDesc = null,
     /// Accumulated cloud drift, and when it was last updated.
@@ -1426,10 +1426,10 @@ pub const FluidState = struct {
     current: u32 = 0,
     pressure_current: u32 = 0,
     cleared: bool = false,
-    /// The flattened picture `fluidImage` hands out, once asked for.
+    /// The flattened picture `fluids.image` hands out, once asked for.
     picture: ?rhi.Texture = null,
     picture_drawn: bool = false,
-    /// The sheet `recordFluidFlipbook` fills, and its progress.
+    /// The sheet `fluids.recordFlipbook` fills, and its progress.
     flipbook: ?rhi.Texture = null,
     flipbook_desc: FluidFlipbookDesc = .{},
     flipbook_frame: [2]u32 = .{ 0, 0 },
@@ -1467,7 +1467,7 @@ pub const InstanceGroupData = struct {
     tints: []u32 = &.{},
     /// One set of shader parameters per copy, or empty for zeros.
     params: [][4]f32 = &.{},
-    /// The entity whose pose every copy takes; see `setInstancesPose`.
+    /// The entity whose pose every copy takes; see `instances.setPose`.
     driver: ?Entity = null,
     /// First GPU instance index, and GPU instances per copy; set when the
     /// layout is rebuilt.

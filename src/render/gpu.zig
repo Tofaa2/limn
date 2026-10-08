@@ -604,7 +604,7 @@ pub const Emitter = extern struct {
     softness: f32,
     seed: u32,
     pad: u32 = 0,
-    /// Added to every live particle this frame; see `shiftScene`.
+    /// Added to every live particle this frame; see `scenes.shift`.
     shift: [3]f32 = .{ 0, 0, 0 },
     /// How far the oldest trail point has slid toward the next one.
     trail_fraction: f32 = 0,

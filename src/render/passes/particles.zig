@@ -23,7 +23,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
     defer cmd.endScope();
     cmd.bindPipeline(renderer.pipelines.particle_sim);
     for (scene.emitters.items) |handle_value| {
-        const emitter = renderer.emitters.get(handle_value) orelse continue;
+        const emitter = renderer.emitters.table.get(handle_value) orelse continue;
         const desc = emitter.desc;
         const steps: u32 = if (emitter.warmed or desc.prewarm <= 0 or delta_time <= 0) 1 else @min(@as(u32, @intFromFloat(desc.prewarm / delta_time)) + 1, 600);
         emitter.warmed = true;
@@ -32,7 +32,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
             emitter.pending += @max(desc.rate, 0) * delta_time;
             const births: u32 = @min(@as(u32, @intFromFloat(@min(emitter.pending, 1e9))), emitter.capacity);
             emitter.pending -= @floatFromInt(births);
-            const carrier: u64 = if (desc.fluid) |fluid| (if (renderer.fluids.get(fluid)) |state| (if (state.params_frame == renderer.frame_index) state.params else 0) else 0) else 0;
+            const carrier: u64 = if (desc.fluid) |fluid| (if (renderer.fluids.table.get(fluid)) |state| (if (state.params_frame == renderer.frame_index) state.params else 0) else 0) else 0;
             var trail_record = false;
             const trail_interval = @max(desc.trail_seconds, 1e-3) / @as(f32, @floatFromInt(@max(emitter.trail_points, 1)));
             if (emitter.trail_points != 0) {
@@ -102,7 +102,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
 /// The mesh an emitter's particles are drawn as, once loaded; null for sprites.
 pub fn emitterMesh(renderer: *Renderer, emitter: *const EmitterData) ?ModelMesh {
     const model = emitter.desc.mesh orelse return null;
-    const entry = renderer.models.get(model) orelse return null;
+    const entry = renderer.models.table.get(model) orelse return null;
     if (entry.state != .ready or entry.meshes.len == 0) return null;
     entry.geometry_pinned = true;
     if (!entry.geometry_resident) return null;
@@ -118,7 +118,7 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     cmd.beginScope("particles");
     defer cmd.endScope();
     for (scene.emitters.items) |handle_value| {
-        const emitter = renderer.emitters.get(handle_value) orelse continue;
+        const emitter = renderer.emitters.table.get(handle_value) orelse continue;
         const order = emitter.order orelse continue;
         if (emitter.frame_params == 0) continue;
         const count = emitter.order_count;
@@ -154,7 +154,7 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         camera: Vec3,
 
         fn distance(context: @This(), handle_value: Emitter) f32 {
-            const emitter = context.renderer.emitters.get(handle_value) orelse return 0;
+            const emitter = context.renderer.emitters.table.get(handle_value) orelse return 0;
             const delta = math.sub(emitter.desc.position, context.camera);
             return math.dot(delta, delta);
         }
@@ -167,7 +167,7 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     var mesh_total: u32 = 0;
     var mesh_pass = false;
     for (scene.emitters.items) |handle_value| {
-        const emitter = renderer.emitters.get(handle_value) orelse continue;
+        const emitter = renderer.emitters.table.get(handle_value) orelse continue;
         if (emitter.frame_params == 0) continue;
         const mesh = emitterMesh(renderer, emitter) orelse continue;
         if (!mesh_pass) {
@@ -197,7 +197,7 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     cmd.bindPipeline(renderer.pipelines.particles);
     var total: u32 = 0;
     for (ordered) |handle_value| {
-        const emitter = renderer.emitters.get(handle_value) orelse continue;
+        const emitter = renderer.emitters.table.get(handle_value) orelse continue;
         if (emitter.frame_params == 0) continue;
         if (emitter.trail) |trail| {
             cmd.bindPipeline(renderer.pipelines.particle_trails);

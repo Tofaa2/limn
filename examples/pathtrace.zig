@@ -37,11 +37,11 @@ pub fn main(init: std.process.Init) !void {
     }
     var stage = try Stage.create(init, "Limn path tracing", options);
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.35, -0.8, -0.45 } };
-    renderer.setEnvironment(scene, try renderer.createSky(sky_desc), 1);
-    renderer.setSun(scene, gfx.skySun(sky_desc));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
@@ -56,11 +56,11 @@ pub fn main(init: std.process.Init) !void {
         .{ .color = .{ 0.8, 0.8, 0.8, 1 }, .at = .{ 2.4, 0.75, -1.4 }, .size = .{ 1.2, 1.5, 1.2 } },
     };
     for (walls) |wall| {
-        const model = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = wall.color, .metallic = 0, .roughness = wall.roughness } }});
-        _ = try renderer.spawn(scene, .{ .model = model, .transform = math.mul(math.translation(wall.at), math.scaling(wall.size)) });
+        const model = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = wall.color, .metallic = 0, .roughness = wall.roughness } }});
+        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.mul(math.translation(wall.at), math.scaling(wall.size)) });
     }
-    const bar = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0, 0, 0, 1 }, .emissive = .{ 9, 6.5, 3.5 }, .metallic = 0, .roughness = 0.5 } }});
-    _ = try renderer.spawn(scene, .{ .model = bar, .transform = math.mul(math.translation(.{ 2.6, 3.0, -1.2 }), math.scaling(.{ 2.4, 0.08, 0.3 })) });
+    const bar = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0, 0, 0, 1 }, .emissive = .{ 9, 6.5, 3.5 }, .metallic = 0, .roughness = 0.5 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = bar, .transform = math.mul(math.translation(.{ 2.6, 3.0, -1.2 }), math.scaling(.{ 2.4, 0.08, 0.3 })) });
 
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
@@ -73,16 +73,16 @@ pub fn main(init: std.process.Init) !void {
         .{ .material = .{ .base_color = .{ 0.2, 0.35, 0.8, 1 }, .metallic = 0, .roughness = 0.15 }, .at = .{ 0.9, 0.7, -0.9 } },
     };
     for (balls) |ball| {
-        const model = try renderer.createModel(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = ball.material }});
-        _ = try renderer.spawn(scene, .{ .model = model, .transform = math.translation(ball.at) });
+        const model = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = ball.material }});
+        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(ball.at) });
     }
-    const helmet = try renderer.loadModel("examples/assets/DamagedHelmet.glb");
-    _ = try renderer.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ -3.0, 1.0, 1.8 }), math.mul(math.rotationY(0.9), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.8)))) });
+    const helmet = try renderer.models.load("examples/assets/DamagedHelmet.glb");
+    _ = try renderer.entities.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ -3.0, 1.0, 1.8 }), math.mul(math.rotationY(0.9), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.8)))) });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var bounces: u32 = 5;
     var orbit: f32 = 0.2;
     var hud_buffer: [160]u8 = undefined;

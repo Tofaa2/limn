@@ -39,7 +39,7 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
         cmd.beginScope("liquid");
         defer cmd.endScope();
         for (scene.liquids.items) |item| {
-            const state = renderer.liquids.get(item) orelse continue;
+            const state = renderer.liquids.table.get(item) orelse continue;
             if (state.params_frame != renderer.frame_index or state.live == 0) continue;
             const radius = state.desc.particle_radius;
             const ParticlePush = extern struct { frame: u64, liquid: u64, particles: u64, depth: u32, swell: f32 };
@@ -126,7 +126,7 @@ pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
         try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
         cmd.bindPipeline(renderer.pipelines.water);
         for (scene.waters.items) |item| {
-            const state = renderer.waters.get(item) orelse continue;
+            const state = renderer.waters.table.get(item) orelse continue;
             if (state.params_frame != renderer.frame_index) continue;
             cmd.pushConstants(extern struct { frame: u64, water: u64, depth: u32, scene: u32, quads: u32, pad: u32 = 0 }{
                 .frame = frame_address,
@@ -141,14 +141,14 @@ pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
         cmd.transition(view.hdr, .shader_read);
         var any_depth = false;
         for (scene.waters.items) |item| {
-            const state = renderer.waters.get(item) orelse continue;
+            const state = renderer.waters.table.get(item) orelse continue;
             if (state.params_frame == renderer.frame_index and state.desc.write_depth) any_depth = true;
         }
         if (any_depth) {
             try cmd.beginRendering(.{ .depth = .{ .texture = view.depth, .load = .load } });
             cmd.bindPipeline(renderer.pipelines.water_depth);
             for (scene.waters.items) |item| {
-                const state = renderer.waters.get(item) orelse continue;
+                const state = renderer.waters.table.get(item) orelse continue;
                 if (state.params_frame != renderer.frame_index or !state.desc.write_depth) continue;
                 cmd.pushConstants(extern struct { frame: u64, water: u64, depth: u32, scene: u32, quads: u32, pad: u32 = 0 }{
                     .frame = frame_address,
@@ -163,7 +163,7 @@ pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.transition(view.depth, .shader_read);
         }
         for (scene.waters.items) |item| {
-            const state = renderer.waters.get(item) orelse continue;
+            const state = renderer.waters.table.get(item) orelse continue;
             if (state.params_frame != renderer.frame_index or !state.desc.underwater) continue;
             const local = math.transformPoint(math.inverse(state.desc.transform), desc.camera.position);
             if (local[1] >= 0 or @abs(local[0]) > 0.5 or @abs(local[2]) > 0.5) continue;

@@ -12,82 +12,110 @@ const Pipelines = renderer_state.Pipelines;
 const GiPipelines = renderer_state.GiPipelines;
 const shade_reflective_targets = renderer_state.shade_reflective_targets;
 
-/// Recompiles the built-in shaders from source with `glslc` and rebuilds
-/// every pipeline. On a compile error nothing changes. Returns the number
-/// of shaders compiled.
-pub fn reloadShaders(self: *Renderer) !u32 {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const gpa = self.gpa;
-    const device = self.device;
-    var compiled: std.ArrayList([]u8) = .empty;
-    defer {
-        for (compiled.items) |code| gpa.free(code);
-        compiled.deinit(gpa);
-    }
-    const include = try std.fmt.allocPrint(gpa, "-I{s}", .{shader_sources.include_dir});
-    defer gpa.free(include);
-    for (shader_sources.sources, shader_sources.defines, shader_sources.names) |source, define, name| {
-        var argv: [8][]const u8 = undefined;
-        var count: usize = 0;
-        for ([_][]const u8{ "glslc", "--target-env=vulkan1.3", "-O", include }) |arg| {
-            argv[count] = arg;
-            count += 1;
-        }
-        const define_arg = try std.fmt.allocPrint(gpa, "-D{s}", .{define});
-        defer gpa.free(define_arg);
-        if (define.len != 0) {
-            argv[count] = define_arg;
-            count += 1;
-        }
-        for ([_][]const u8{ source, "-o", "-" }) |arg| {
-            argv[count] = arg;
-            count += 1;
-        }
-        const result = try std.process.run(gpa, self.io, .{ .argv = argv[0..count] });
-        defer gpa.free(result.stderr);
-        errdefer gpa.free(result.stdout);
-        const ok = switch (result.term) {
-            .exited => |code| code == 0,
-            else => false,
-        };
-        if (!ok or result.stdout.len == 0 or result.stdout.len % 4 != 0) {
-            std.log.err("shader {s} did not compile:\n{s}", .{ name, result.stderr });
-            gpa.free(result.stdout);
-            return error.ShaderCompileFailed;
-        }
-        try compiled.append(gpa, result.stdout);
+/// The built-in shaders.
+pub const Shaders = struct {
+    fn renderer(shaders: *Shaders) *Renderer {
+        return @alignCast(@fieldParentPtr("shaders", shaders));
     }
 
-    dropShadeVariants(self);
-    for (shader_sources.names, compiled.items) |name, *code| {
-        const previous = try shader_overrides.fetchPut(gpa, name, code.*);
-        if (previous) |old| gpa.free(old.value);
-        code.* = &.{};
+    /// Recompiles the built-in shaders from source with `glslc` and rebuilds
+    /// every pipeline. On a compile error nothing changes. Returns the number
+    /// of shaders compiled.
+    pub fn reload(shaders: *Shaders) !u32 {
+        const self = shaders.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const gpa = self.gpa;
+        const device = self.device;
+        var compiled: std.ArrayList([]u8) = .empty;
+        defer {
+            for (compiled.items) |code| gpa.free(code);
+            compiled.deinit(gpa);
+        }
+        const include = try std.fmt.allocPrint(gpa, "-I{s}", .{shader_sources.include_dir});
+        defer gpa.free(include);
+        for (shader_sources.sources, shader_sources.defines, shader_sources.names) |source, define, name| {
+            var argv: [8][]const u8 = undefined;
+            var count: usize = 0;
+            for ([_][]const u8{ "glslc", "--target-env=vulkan1.3", "-O", include }) |arg| {
+                argv[count] = arg;
+                count += 1;
+            }
+            const define_arg = try std.fmt.allocPrint(gpa, "-D{s}", .{define});
+            defer gpa.free(define_arg);
+            if (define.len != 0) {
+                argv[count] = define_arg;
+                count += 1;
+            }
+            for ([_][]const u8{ source, "-o", "-" }) |arg| {
+                argv[count] = arg;
+                count += 1;
+            }
+            const result = try std.process.run(gpa, self.io, .{ .argv = argv[0..count] });
+            defer gpa.free(result.stderr);
+            errdefer gpa.free(result.stdout);
+            const ok = switch (result.term) {
+                .exited => |code| code == 0,
+                else => false,
+            };
+            if (!ok or result.stdout.len == 0 or result.stdout.len % 4 != 0) {
+                std.log.err("shader {s} did not compile:\n{s}", .{ name, result.stderr });
+                gpa.free(result.stdout);
+                return error.ShaderCompileFailed;
+            }
+            try compiled.append(gpa, result.stdout);
+        }
+
+        dropShadeVariants(self);
+        for (shader_sources.names, compiled.items) |name, *code| {
+            const previous = try shader_overrides.fetchPut(gpa, name, code.*);
+            if (previous) |old| gpa.free(old.value);
+            code.* = &.{};
+        }
+        try device.waitIdle();
+        const pipelines = try createPipelines(device);
+        inline for (@typeInfo(Pipelines).@"struct".fields) |field| {
+            const pipeline = @field(self.pipelines, field.name);
+            if (@typeInfo(@TypeOf(pipeline)) == .optional) {
+                if (pipeline) |made| device.destroyPipeline(made);
+            } else device.destroyPipeline(pipeline);
+        }
+        self.pipelines = pipelines;
+        if (self.gi_pipelines) |old| {
+            const rebuilt = try createGiPipelines(device);
+            inline for (@typeInfo(GiPipelines).@"struct".fields) |field| device.destroyPipeline(@field(old, field.name));
+            self.gi_pipelines = rebuilt;
+        }
+        for (self.tonemap_pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
+        self.tonemap_pipelines.clearRetainingCapacity();
+        for (self.draw_pipelines.items) |entry| {
+            device.destroyPipeline(entry.flat);
+            device.destroyPipeline(entry.depth_tested);
+        }
+        self.draw_pipelines.clearRetainingCapacity();
+        return @intCast(shader_sources.names.len);
     }
-    try device.waitIdle();
-    const pipelines = try createPipelines(device);
-    inline for (@typeInfo(Pipelines).@"struct".fields) |field| {
-        const pipeline = @field(self.pipelines, field.name);
-        if (@typeInfo(@TypeOf(pipeline)) == .optional) {
-            if (pipeline) |made| device.destroyPipeline(made);
-        } else device.destroyPipeline(pipeline);
+
+    /// Blocks until background shading variant compiles are done. For tools,
+    /// tests and benchmarks.
+    pub fn waitForVariants(shaders: *Shaders) !void {
+        const self = shaders.renderer();
+        while (true) {
+            {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+                var pending = false;
+                for (self.shade_variants.items) |variant| {
+                    if (variant.job) |job| if (!job.done.load(.acquire)) {
+                        pending = true;
+                    };
+                }
+                if (!pending) return;
+            }
+            try self.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+        }
     }
-    self.pipelines = pipelines;
-    if (self.gi_pipelines) |old| {
-        const rebuilt = try createGiPipelines(device);
-        inline for (@typeInfo(GiPipelines).@"struct".fields) |field| device.destroyPipeline(@field(old, field.name));
-        self.gi_pipelines = rebuilt;
-    }
-    for (self.tonemap_pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
-    self.tonemap_pipelines.clearRetainingCapacity();
-    for (self.draw_pipelines.items) |entry| {
-        device.destroyPipeline(entry.flat);
-        device.destroyPipeline(entry.depth_tested);
-    }
-    self.draw_pipelines.clearRetainingCapacity();
-    return @intCast(shader_sources.names.len);
-}
+};
 
 /// Waits for shading variants being compiled and frees them all. Must
 /// run before the shader code they are built from goes away.
@@ -101,25 +129,6 @@ pub fn dropShadeVariants(self: *Renderer) void {
         if (variant.pipeline) |pipeline| self.device.destroyPipeline(pipeline);
     }
     self.shade_variants.clearRetainingCapacity();
-}
-
-/// Blocks until background shading variant compiles are done. For tools,
-/// tests and benchmarks.
-pub fn waitForShaderVariants(self: *Renderer) !void {
-    while (true) {
-        {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            var pending = false;
-            for (self.shade_variants.items) |variant| {
-                if (variant.job) |job| if (!job.done.load(.acquire)) {
-                    pending = true;
-                };
-            }
-            if (!pending) return;
-        }
-        try self.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
-    }
 }
 
 pub fn createPipelines(device: *rhi.Device) !Pipelines {
@@ -444,10 +453,10 @@ pub fn createGiPipelines(device: *rhi.Device) !GiPipelines {
     };
 }
 
-/// Shaders that `reloadShaders` has compiled, by name.
+/// Shaders that `shaders.reload` has compiled, by name.
 pub var shader_overrides: std.StringHashMapUnmanaged([]u8) = .empty;
 
-/// Shader code by name: what `reloadShaders` last compiled, or else what
+/// Shader code by name: what `shaders.reload` last compiled, or else what
 /// was built into the program.
 pub fn shaderCode(comptime name: []const u8) []const u8 {
     if (shader_overrides.get(name)) |code| return code;
