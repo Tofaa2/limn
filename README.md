@@ -1,6 +1,9 @@
 # Limn
 A high quality, performant, realtime, concurrency-first, physically based renderer written in zig with Vulkan 1.3
 
+Latest docs are published to https://tofaa2.github.io/limn/
+Changes can also be found in CHANGEME.md
+
 # Path tracing
 Path tracing is WIP and contains noise, unfortunately RTX is an oversold concept for marketting that requires vendor locked software and tooling to make it look actually good. Its recommended to keep regular ray tracing enabled and path tracing disabled.
 
