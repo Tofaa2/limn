@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Validation of glTF files and font glyph sizes (`-Dvalidate_input=false` leaves it out).
+
+### Changed
+- Breaking: handles are 64 bits, so a reused slot no longer revives a stale handle.
+
+### Fixed
+- Tint, params, `receive_decals` and `rays_only` on skinned entities.
+- Global illumination restarting when a scene has a reflection probe or several views.
+
 ## 0.1.3
 
 ### Changed

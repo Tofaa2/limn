@@ -9,6 +9,7 @@ const model_cache = @import("model_cache.zig");
 const ktx2 = @import("ktx2.zig");
 const dds = @import("dds.zig");
 const math = @import("../math.zig");
+const build_features = @import("build_features");
 const gltf = zmesh.io.zcgltf;
 
 /// Maximum vertices per meshlet.
@@ -504,6 +505,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: LoadO
     const path_z = try gpa.dupeZ(u8, path);
     defer gpa.free(path_z);
     try gltf.loadBuffers(parse_options, data, path_z.ptr);
+    if (build_features.validate_input and gltf.validate(data) != .success) return error.InvalidGltf;
 
     model.images = try arena.alloc(Image, data.images_count);
     for (model.images) |*image| image.* = .{};
@@ -703,6 +705,7 @@ pub fn loadLights(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]Scene
         .free_func = zmesh.mem.zmeshFreeUser,
     } }, bytes);
     defer gltf.free(data);
+    if (build_features.validate_input and gltf.validate(data) != .success) return error.InvalidGltf;
     var lights: std.ArrayList(SceneLight) = .empty;
     errdefer lights.deinit(gpa);
     if (data.nodes_count == 0) return lights.toOwnedSlice(gpa);

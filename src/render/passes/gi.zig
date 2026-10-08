@@ -91,7 +91,9 @@ pub fn ensureGiVolume(renderer: *Renderer, slot: *?GiVolume, scene_origin: [3]f6
 }
 
 /// Sizes the probe volume and the TLAS for this frame. Returns null when global
-/// illumination is off, unsupported or there is nothing to trace.
+/// illumination is off, unsupported or there is nothing to trace. The volumes
+/// belong to the scene: its first view in a frame shapes them and later views
+/// share them.
 pub fn prepareGi(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame, settings: Settings, camera_position: Vec3) !?*GiVolume {
     const device = renderer.device;
     const pipelines = renderer.gi_pipelines orelse return null;
@@ -110,6 +112,11 @@ pub fn prepareGi(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame
         scene.tlas = try device.createTlas(scene.tlas_capacity);
         scene.tlas_hash = 0;
     }
+
+    if (scene.gi_frame == renderer.frame_index) {
+        if (scene.gi) |*volume| return volume;
+    }
+    scene.gi_frame = renderer.frame_index;
 
     const bounds = scene.gi_bounds orelse scene_frame.bounds;
     inline for (0..3) |axis| if (!(bounds[1][axis] >= bounds[0][axis]) or !std.math.isFinite(bounds[1][axis] - bounds[0][axis])) return null;

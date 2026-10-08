@@ -892,7 +892,7 @@ fn debugCallback(
 }
 
 pub fn sameHandle(a: anytype, b: @TypeOf(a)) bool {
-    return @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
+    return std.meta.eql(a, b);
 }
 
 pub const scratch_alignment = 256;
