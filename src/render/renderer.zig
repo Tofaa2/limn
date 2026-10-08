@@ -8,7 +8,6 @@ const gltf = @import("../asset/gltf.zig");
 const gpu = @import("gpu.zig");
 const animation = @import("animation.zig");
 const bvh = @import("bvh.zig");
-const handle = @import("../handle.zig");
 const font_module = @import("font_baker").font;
 const models_module = @import("renderer/models.zig");
 const streaming_module = @import("renderer/streaming.zig");
@@ -63,10 +62,7 @@ pub const HairDesc = api.HairDesc;
 pub const HairSimulation = api.HairSimulation;
 pub const ImpostorDesc = api.ImpostorDesc;
 pub const LightmapDesc = api.LightmapDesc;
-const HairTag = api.HairTag;
 pub const CollisionField = api.CollisionField;
-const CollisionFieldTag = api.CollisionFieldTag;
-const HairState = renderer_state.HairState;
 pub const Liquid = api.Liquid;
 pub const InstanceGroup = api.InstanceGroup;
 pub const Pose = api.Pose;
@@ -155,8 +151,6 @@ pub const shadeVariantDesc = renderer_state.shadeVariantDesc;
 pub const runShadeVariantJob = renderer_state.runShadeVariantJob;
 pub const ModelMesh = renderer_state.ModelMesh;
 pub const MaterialTextures = renderer_state.MaterialTextures;
-const ModelEntry = renderer_state.ModelEntry;
-const EnvironmentEntry = renderer_state.EnvironmentEntry;
 pub const SceneData = renderer_state.SceneData;
 const EntityData = renderer_state.EntityData;
 pub const TransparentDraw = renderer_state.TransparentDraw;
@@ -177,24 +171,17 @@ const PickRequest = renderer_state.PickRequest;
 pub const ReflectionTargets = renderer_state.ReflectionTargets;
 pub const cloud_noise_size = renderer_state.cloud_noise_size;
 pub const cloud_noise_tiles = renderer_state.cloud_noise_tiles;
-const MaterialPipelines = renderer_state.MaterialPipelines;
 pub const packTint = renderer_state.packTint;
 pub const max_fluids = renderer_state.max_fluids;
 const max_pose_threads = renderer_state.max_pose_threads;
 pub const liquid_cell_slots = renderer_state.liquid_cell_slots;
-const LiquidState = renderer_state.LiquidState;
 pub const max_hair_colliders = renderer_state.max_hair_colliders;
 pub const hair_density_size = renderer_state.hair_density_size;
 pub const CollisionFieldState = renderer_state.CollisionFieldState;
 pub const water_quads = renderer_state.water_quads;
-const WaterState = renderer_state.WaterState;
-const FluidState = renderer_state.FluidState;
-const InstanceGroupData = renderer_state.InstanceGroupData;
 pub const EmitterData = renderer_state.EmitterData;
-const ProbeData = renderer_state.ProbeData;
 const PickPending = renderer_state.PickPending;
 const DrawPipelines = renderer_state.DrawPipelines;
-const ImageEntry = renderer_state.ImageEntry;
 
 const bakeLoadedClouds = environments_module.bakeLoadedClouds;
 const bakeSky = environments_module.bakeSky;
@@ -221,7 +208,8 @@ const updateTextureStreaming = streaming_module.updateTextureStreaming;
 
 /// Owns the device and everything made through it. Methods lock internally
 /// (see `lock`), so other threads may load and edit while one renders.
-/// Only `device` and `options` are public fields.
+/// Everything about one kind of object is under its field: `models`, `scenes`,
+/// `entities` and so on. Those, `device` and `options` are the public fields.
 pub const Renderer = struct {
     gpa: std.mem.Allocator,
     /// Fixed for the renderer's lifetime.
@@ -229,6 +217,23 @@ pub const Renderer = struct {
     io: std.Io,
     /// For custom passes and offscreen targets.
     device: *rhi.Device,
+
+    models: models_module.Models,
+    materials: materials_module.Materials,
+    environments: environments_module.Environments,
+    scenes: scenes_module.Scenes,
+    entities: scenes_module.Entities,
+    instances: instances_module.Instances,
+    emitters: emitters_module.Emitters,
+    probes: probes_module.Probes,
+    fluids: fluid_module.Fluids,
+    waters: water_module.Waters,
+    liquids: liquid_module.Liquids,
+    hairs: hair_module.Hairs,
+    views: views_module.Views,
+    fonts: fonts_module.Fonts = .{},
+    images: images_module.Images = .{},
+    shaders: pipelines_module.Shaders = .{},
 
     pipelines: Pipelines,
     tonemap_pipelines: std.ArrayList(TonemapPipeline) = .empty,
@@ -244,10 +249,6 @@ pub const Renderer = struct {
     draw_pipelines: std.ArrayList(DrawPipelines) = .empty,
     /// Guards all renderer and device state; see `lock`.
     mutex: std.Io.Mutex = .init,
-    default_font: *Font = undefined,
-    fonts: std.ArrayList(*Font) = .empty,
-    font_textures: std.ArrayList(rhi.Texture) = .empty,
-    images: std.ArrayList(ImageEntry) = .empty,
     sampler_linear_clamp: rhi.Sampler,
     sampler_nearest_clamp: rhi.Sampler,
     sampler_linear_repeat: rhi.Sampler,
@@ -266,7 +267,6 @@ pub const Renderer = struct {
     /// Mesh-space box of each mesh with a BVH, by mesh record index.
     mesh_boxes: std.ArrayList(?[2][3]f32) = .empty,
     meshes: Pool,
-    materials: Pool,
 
     arenas: [rhi.frames_in_flight]FrameArena,
     cull_commands: ?rhi.Buffer = null,
@@ -297,25 +297,12 @@ pub const Renderer = struct {
     blas_pending: u32 = 0,
     brdf_lut: rhi.Texture,
 
-    models: handle.HandleTable(ModelEntry, ModelTag),
-    environments: handle.HandleTable(EnvironmentEntry, EnvironmentTag),
-    scenes: handle.HandleTable(SceneData, SceneTag),
-    entities: handle.HandleTable(EntityData, EntityTag),
-    emitters: handle.HandleTable(EmitterData, EmitterTag),
-    probes: handle.HandleTable(ProbeData, ReflectionProbeTag),
-    fluids: handle.HandleTable(FluidState, FluidTag),
-    waters: handle.HandleTable(WaterState, WaterTag),
-    hairs: handle.HandleTable(HairState, HairTag),
-    collision_fields: handle.HandleTable(CollisionFieldState, CollisionFieldTag),
-    liquids: handle.HandleTable(LiquidState, LiquidTag),
     /// Ray-tracing stand-in box for liquids; made with the first liquid.
     liquid_proxy_model: ?Model = null,
-    instance_groups: handle.HandleTable(InstanceGroupData, InstanceGroupTag),
     /// Bumped whenever the set of ready models changes.
     asset_generation: u64 = 1,
     loading_count: u32 = 0,
 
-    views: handle.HandleTable(ViewData, ViewTag),
     main_view: View = undefined,
     /// Targets drawn to this frame; the first view to touch one clears it.
     frame_targets: [16]rhi.Texture = undefined,
@@ -335,10 +322,6 @@ pub const Renderer = struct {
     local_tile_had_mover: [max_local_shadow_views]bool = @splat(false),
     /// A computed sky is waiting to be rebuilt.
     skies_dirty: bool = false,
-    /// Pipelines of custom material shaders; slot 0 is the standard material.
-    material_shaders: [32]?MaterialPipelines = @splat(null),
-    /// Loaded materials using each slot.
-    material_shader_users: [32]u32 = @splat(0),
     pick_buffer: rhi.Buffer = undefined,
     pick_readback: [rhi.frames_in_flight]rhi.Buffer = undefined,
     pick_request: ?PickRequest = null,
@@ -415,7 +398,7 @@ pub const Renderer = struct {
             .bvh_nodes = try Pool.init(device, "bvh nodes", @sizeOf(bvh.Node), 1 << 10, storage),
             .bvh_items = try Pool.init(device, "bvh items", @sizeOf(u32), 1 << 10, storage),
             .meshes = try Pool.init(device, "meshes", @sizeOf(gpu.Mesh), 1 << 12, storage),
-            .materials = try Pool.init(device, "materials", @sizeOf(gpu.Material), 1 << 12, storage),
+            .materials = .{ .pool = try Pool.init(device, "materials", @sizeOf(gpu.Material), 1 << 12, storage) },
             .arenas = undefined,
             .cull_counts = try device.createBuffer(.{ .name = "cull counts", .size = view_count * 2 * @sizeOf(u32), .usage = .{ .storage = true, .indirect = true, .copy_src = true } }),
             .cull_mesh_draws = try device.createBuffer(.{ .name = "cull mesh draws", .size = view_count * 2 * @sizeOf(gpu.MeshDraw), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } }),
@@ -452,19 +435,18 @@ pub const Renderer = struct {
                 .format = .rg16_float,
                 .usage = .{ .sampled = true, .color_attachment = true },
             }),
-            .models = .init(gpa),
-            .environments = .init(gpa),
-            .scenes = .init(gpa),
-            .views = .init(gpa),
-            .entities = .init(gpa),
-            .emitters = .init(gpa),
-            .probes = .init(gpa),
-            .fluids = .init(gpa),
-            .waters = .init(gpa),
-            .hairs = .init(gpa),
-            .collision_fields = .init(gpa),
-            .liquids = .init(gpa),
-            .instance_groups = .init(gpa),
+            .models = .{ .table = .init(gpa) },
+            .environments = .{ .table = .init(gpa) },
+            .scenes = .{ .table = .init(gpa) },
+            .views = .{ .table = .init(gpa) },
+            .entities = .{ .table = .init(gpa) },
+            .emitters = .{ .table = .init(gpa) },
+            .probes = .{ .table = .init(gpa) },
+            .fluids = .{ .table = .init(gpa) },
+            .waters = .{ .table = .init(gpa) },
+            .hairs = .{ .table = .init(gpa), .fields = .init(gpa) },
+            .liquids = .{ .table = .init(gpa) },
+            .instances = .{ .table = .init(gpa) },
         };
         for (&self.arenas) |*arena| arena.* = try FrameArena.init(device, 4 * 1024 * 1024);
         if (device.ray_tracing) self.gi_pipelines = try createGiPipelines(device);
@@ -479,9 +461,9 @@ pub const Renderer = struct {
             @memset(device.mapped(buffer.*), 0);
         }
 
-        self.default_font = try gpa.create(Font);
-        self.default_font.* = try font_module.load(gpa, @embedFile("fonts/DejaVuSans.ttf"), font_module.default_ranges);
-        try registerFont(self, self.default_font);
+        self.fonts.default_font = try gpa.create(Font);
+        self.fonts.default_font.* = try font_module.load(gpa, @embedFile("fonts/DejaVuSans.ttf"), font_module.default_ranges);
+        try registerFont(self, self.fonts.default_font);
         if (options.asset_cache_max_bytes != 0) if (options.asset_cache_dir) |directory| {
             _ = gltf.trimCache(gpa, self.io, directory, options.asset_cache_max_bytes) catch |err| std.log.warn("asset cache not trimmed: {}", .{err});
         };
@@ -510,53 +492,53 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         const device = self.device;
         device.waitIdle() catch {};
-        while (self.entities.popAny()) |entity| freeEntityStorage(self, entity);
-        while (self.scenes.popAny()) |scene_value| {
+        while (self.entities.table.popAny()) |entity| freeEntityStorage(self, entity);
+        while (self.scenes.table.popAny()) |scene_value| {
             var scene = scene_value;
             freeScene(self, &scene);
         }
-        while (self.models.popAny()) |model_value| {
+        while (self.models.table.popAny()) |model_value| {
             var model = model_value;
             freeModel(self, &model);
         }
-        while (self.environments.popAny()) |environment_value| {
+        while (self.environments.table.popAny()) |environment_value| {
             var environment = environment_value;
             freeEnvironment(self, &environment);
         }
-        self.entities.deinit();
-        while (self.emitters.popAny()) |emitter| {
+        self.entities.table.deinit();
+        while (self.emitters.table.popAny()) |emitter| {
             device.destroyBuffer(emitter.buffer);
             if (emitter.order) |order| device.destroyBuffer(order);
         }
-        self.emitters.deinit();
-        self.probes.deinit();
-        while (self.fluids.popAny()) |fluid| {
+        self.emitters.table.deinit();
+        self.probes.table.deinit();
+        while (self.fluids.table.popAny()) |fluid| {
             var state = fluid;
             destroyFluidTextures(self, &state);
         }
-        self.fluids.deinit();
-        while (self.waters.popAny()) |water| for (water.state) |texture| device.destroyTexture(texture);
-        self.waters.deinit();
-        while (self.hairs.popAny()) |hair| freeHair(self, hair);
-        self.hairs.deinit();
-        while (self.collision_fields.popAny()) |field| device.destroyTexture(field.texture);
-        self.collision_fields.deinit();
-        for (self.liquids.slots.items) |*slot| if (slot.value) |*state| state.deinit(self.device);
-        self.liquids.deinit();
-        while (self.instance_groups.popAny()) |group| {
+        self.fluids.table.deinit();
+        while (self.waters.table.popAny()) |water| for (water.state) |texture| device.destroyTexture(texture);
+        self.waters.table.deinit();
+        while (self.hairs.table.popAny()) |hair| freeHair(self, hair);
+        self.hairs.table.deinit();
+        while (self.hairs.fields.popAny()) |field| device.destroyTexture(field.texture);
+        self.hairs.fields.deinit();
+        for (self.liquids.table.slots.items) |*slot| if (slot.value) |*state| state.deinit(self.device);
+        self.liquids.table.deinit();
+        while (self.instances.table.popAny()) |group| {
             self.gpa.free(group.transforms);
             self.gpa.free(group.tints);
             self.gpa.free(group.params);
         }
-        self.instance_groups.deinit();
-        self.scenes.deinit();
-        self.models.deinit();
-        self.environments.deinit();
-        while (self.views.popAny()) |view_value| {
+        self.instances.table.deinit();
+        self.scenes.table.deinit();
+        self.models.table.deinit();
+        self.environments.table.deinit();
+        while (self.views.table.popAny()) |view_value| {
             var view = view_value;
             view.deinit(device);
         }
-        self.views.deinit();
+        self.views.table.deinit();
         if (self.gi_pipelines) |pipelines| {
             device.destroyPipeline(pipelines.trace);
             device.destroyPipeline(pipelines.irradiance);
@@ -576,15 +558,15 @@ pub const Renderer = struct {
             device.destroyPipeline(entry.depth_tested);
         }
         self.draw_pipelines.deinit(self.gpa);
-        for (self.fonts.items, self.font_textures.items) |font, texture| {
+        for (self.fonts.list.items, self.fonts.textures.items) |font, texture| {
             device.destroyTexture(texture);
             font.deinit();
             self.gpa.destroy(font);
         }
-        self.fonts.deinit(self.gpa);
-        self.font_textures.deinit(self.gpa);
-        for (self.images.items) |entry| device.destroyTexture(entry.texture);
-        self.images.deinit(self.gpa);
+        self.fonts.list.deinit(self.gpa);
+        self.fonts.textures.deinit(self.gpa);
+        for (self.images.list.items) |entry| device.destroyTexture(entry.texture);
+        self.images.list.deinit(self.gpa);
         inline for (@typeInfo(Pipelines).@"struct".fields) |field| {
             const pipeline = @field(self.pipelines, field.name);
             if (@typeInfo(@TypeOf(pipeline)) == .optional) {
@@ -600,7 +582,8 @@ pub const Renderer = struct {
         device.destroyTexture(self.local_shadow_map);
         device.destroyBuffer(self.clusters);
         self.transparent_order.deinit(self.gpa);
-        inline for (.{ "vertices", "skin_vertices", "morph_deltas", "indices", "meshlets", "bvh_nodes", "bvh_items", "meshes", "materials" }) |name| @field(self, name).deinit(self);
+        inline for (.{ "vertices", "skin_vertices", "morph_deltas", "indices", "meshlets", "bvh_nodes", "bvh_items", "meshes" }) |name| @field(self, name).deinit(self);
+        self.materials.pool.deinit(self);
         self.mesh_boxes.deinit(self.gpa);
         for (&self.arenas) |*arena| arena.deinit(device);
         device.destroyBuffer(self.cull_counts);
@@ -610,7 +593,7 @@ pub const Renderer = struct {
         device.destroyBuffer(self.cull_mesh_draws);
         for (self.count_readback) |buffer| device.destroyBuffer(buffer);
         device.destroyBuffer(self.pick_buffer);
-        for (self.material_shaders) |shader| if (shader) |pipelines| {
+        for (self.materials.shaders) |shader| if (shader) |pipelines| {
             device.destroyPipeline(pipelines.plain);
             device.destroyPipeline(pipelines.reflective);
         };
@@ -664,24 +647,6 @@ pub const Renderer = struct {
         return stats;
     }
 
-    pub const loadModel = models_module.loadModel;
-    pub const createModel = models_module.createModel;
-    pub const modelState = models_module.modelState;
-    pub const modelError = models_module.modelError;
-    pub const modelInfo = models_module.modelInfo;
-    pub const animationCount = models_module.animationCount;
-    pub const animationInfo = models_module.animationInfo;
-    pub const findNode = models_module.findNode;
-    pub const rootMotion = models_module.rootMotion;
-    pub const findAnimation = models_module.findAnimation;
-    pub const destroyModel = models_module.destroyModel;
-    pub const loadEnvironment = environments_module.loadEnvironment;
-    pub const createSky = environments_module.createSky;
-    pub const setSky = environments_module.setSky;
-    pub const environmentState = environments_module.environmentState;
-    pub const environmentInfo = environments_module.environmentInfo;
-    pub const destroyEnvironment = environments_module.destroyEnvironment;
-
     /// True while any model or environment is still streaming in.
     pub fn isLoading(self: *Renderer) bool {
         self.mutex.lockUncancelable(self.io);
@@ -711,11 +676,11 @@ pub const Renderer = struct {
     }
 
     fn anyJobFinished(self: *Renderer) bool {
-        for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
+        for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
             if (entry.state != .loading) continue;
             if (entry.job == null or entry.job.?.done.load(.acquire)) return true;
         };
-        for (self.environments.slots.items) |*slot| if (slot.value) |*entry| {
+        for (self.environments.table.slots.items) |*slot| if (slot.value) |*entry| {
             if (entry.state == .loading and entry.job.?.done.load(.acquire)) return true;
         };
         return false;
@@ -729,7 +694,7 @@ pub const Renderer = struct {
         if (self.loading_count == 0) return false;
         var budget = budget_bytes;
         var progressed = false;
-        for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
+        for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
             if (entry.state != .loading) continue;
             if (entry.job) |job| if (!job.done.load(.acquire)) continue;
             progressed = true;
@@ -746,7 +711,7 @@ pub const Renderer = struct {
             }
             if (budget == 0) break;
         };
-        for (self.environments.slots.items) |*slot| if (slot.value) |*entry| {
+        for (self.environments.table.slots.items) |*slot| if (slot.value) |*entry| {
             if (entry.state != .loading or entry.job == null or !entry.job.?.done.load(.acquire)) continue;
             progressed = true;
             finalizeEnvironment(self, entry, cmd) catch |err| {
@@ -760,6 +725,13 @@ pub const Renderer = struct {
         return progressed;
     }
 
+    /// Deletes the oldest-written asset cache files until at most `max_bytes`
+    /// remain; returns the bytes freed.
+    pub fn trimAssetCache(self: *Renderer, max_bytes: u64) !u64 {
+        const directory = self.options.asset_cache_dir orelse return 0;
+        return gltf.trimCache(self.gpa, self.io, directory, max_bytes);
+    }
+
     /// Takes the renderer lock. Public methods lock internally; hold it only
     /// to use `device` from a non-rendering thread. Not reentrant: call no
     /// renderer methods while holding it.
@@ -771,75 +743,6 @@ pub const Renderer = struct {
     pub fn unlock(self: *Renderer) void {
         self.mutex.unlock(self.io);
     }
-
-    pub const defaultFont = fonts_module.defaultFont;
-    pub const loadFont = fonts_module.loadFont;
-    pub const loadFontFromMemory = fonts_module.loadFontFromMemory;
-    pub const prepareLigatures = fonts_module.prepareLigatures;
-    pub const prepareText = fonts_module.prepareText;
-    pub const prepareTextWith = fonts_module.prepareTextWith;
-    pub const destroyFont = fonts_module.destroyFont;
-    pub const createImageCompressed = images_module.createImageCompressed;
-    pub const createImage = images_module.createImage;
-    pub const readImageFile = images_module.readImageFile;
-    pub const loadImage = images_module.loadImage;
-    pub const trimAssetCache = images_module.trimAssetCache;
-    pub const writeKtx2 = images_module.writeKtx2;
-    pub const createLightProfile = images_module.createLightProfile;
-    pub const loadLightProfile = images_module.loadLightProfile;
-    pub const destroyImage = images_module.destroyImage;
-    pub const createView = views_module.createView;
-    pub const destroyView = views_module.destroyView;
-    pub const createTarget = views_module.createTarget;
-    pub const destroyTarget = views_module.destroyTarget;
-    pub const targetImage = views_module.targetImage;
-    pub const reloadShaders = pipelines_module.reloadShaders;
-    pub const createMaterialShader = materials_module.createMaterialShader;
-    pub const destroyMaterialShader = materials_module.destroyMaterialShader;
-    pub const setMaterialShader = materials_module.setMaterialShader;
-    pub const setMaterialTextures = materials_module.setMaterialTextures;
-    pub const setClouds = scenes_module.setClouds;
-    pub const cloudFlash = scenes_module.cloudFlash;
-    pub const setDecals = scenes_module.setDecals;
-    pub const createInstances = instances_module.createInstances;
-    pub const setInstances = instances_module.setInstances;
-    pub const setInstanceColors = instances_module.setInstanceColors;
-    pub const setInstanceParams = instances_module.setInstanceParams;
-    pub const setInstancesImpostor = instances_module.setInstancesImpostor;
-    pub const setInstancesPose = instances_module.setInstancesPose;
-    pub const destroyInstances = instances_module.destroyInstances;
-    pub const createWater = water_module.createWater;
-    pub const setWater = water_module.setWater;
-    pub const addRipple = water_module.addRipple;
-    pub const destroyWater = water_module.destroyWater;
-    pub const createHair = hair_module.createHair;
-    pub const createCollisionField = hair_module.createCollisionField;
-    pub const destroyCollisionField = hair_module.destroyCollisionField;
-    pub const setHairSimulation = hair_module.setHairSimulation;
-    pub const setHairTransform = hair_module.setHairTransform;
-    pub const destroyHair = hair_module.destroyHair;
-    pub const createLiquid = liquid_module.createLiquid;
-    pub const setLiquid = liquid_module.setLiquid;
-    pub const liquidParticles = liquid_module.liquidParticles;
-    pub const destroyLiquid = liquid_module.destroyLiquid;
-    pub const createFluid = fluid_module.createFluid;
-    pub const setFluid = fluid_module.setFluid;
-    pub const resetFluid = fluid_module.resetFluid;
-    pub const fluidImage = fluid_module.fluidImage;
-    pub const saveFluidImage = fluid_module.saveFluidImage;
-    pub const recordFluidFlipbook = fluid_module.recordFluidFlipbook;
-    pub const fluidFlipbookFrames = fluid_module.fluidFlipbookFrames;
-    pub const saveFluidFlipbook = fluid_module.saveFluidFlipbook;
-    pub const destroyFluid = fluid_module.destroyFluid;
-    pub const createEmitter = emitters_module.createEmitter;
-    pub const emitterSortKeys = emitters_module.emitterSortKeys;
-    pub const setEmitter = emitters_module.setEmitter;
-    pub const createReflectionProbe = probes_module.createReflectionProbe;
-    pub const setReflectionProbe = probes_module.setReflectionProbe;
-    pub const updateReflectionProbe = probes_module.updateReflectionProbe;
-    pub const destroyReflectionProbe = probes_module.destroyReflectionProbe;
-    pub const destroyEmitter = emitters_module.destroyEmitter;
-    pub const waitForShaderVariants = pipelines_module.waitForShaderVariants;
 
     /// Asks which entity is under `pixel` (in the view's pixels; null is the
     /// main view). The answer arrives through `takePick` a few frames later.
@@ -866,11 +769,11 @@ pub const Renderer = struct {
         var result = PickResult{ .pixel = pending.pixel, .hit = null };
         defer self.pick_result = result;
         if (raw.instance == gpu.invalid_id) return;
-        const scene = self.scenes.get(pending.scene) orelse return;
+        const scene = self.scenes.table.get(pending.scene) orelse return;
         if (scene.layout_version != pending.layout_version) return;
         if (raw.instance >= scene.layout.items.len) {
             for (scene.groups.items) |group_handle| {
-                const group = self.instance_groups.get(group_handle) orelse continue;
+                const group = self.instances.table.get(group_handle) orelse continue;
                 if (group.per_copy == 0 or raw.instance < group.base) continue;
                 const offset = raw.instance - group.base;
                 if (offset >= group.transforms.len * group.per_copy) continue;
@@ -894,23 +797,6 @@ pub const Renderer = struct {
             .distance = pending.near / @max(raw.depth, 1e-9),
         };
     }
-
-    pub const createScene = scenes_module.createScene;
-    pub const destroyScene = scenes_module.destroyScene;
-    pub const setSun = scenes_module.setSun;
-    pub const setEnvironment = scenes_module.setEnvironment;
-    pub const setLights = scenes_module.setLights;
-    pub const spawn = scenes_module.spawn;
-    pub const despawn = scenes_module.despawn;
-    pub const setTransform = scenes_module.setTransform;
-    pub const teleport = scenes_module.teleport;
-    pub const setTint = scenes_module.setTint;
-    pub const setParams = scenes_module.setParams;
-    pub const setMorphWeights = scenes_module.setMorphWeights;
-    pub const bakeLightmap = scenes_module.bakeLightmap;
-    pub const lightmapProgress = scenes_module.lightmapProgress;
-    pub const setVisible = scenes_module.setVisible;
-    pub const setPose = scenes_module.setPose;
 
     /// Renders one frame; false when skipped because the window has no
     /// drawable surface. Call from one thread at a time; the lock is held
@@ -981,7 +867,7 @@ pub const Renderer = struct {
         try updateGeometryStreaming(self, desc);
         if (self.skies_dirty) {
             self.skies_dirty = false;
-            for (self.environments.slots.items) |*slot| if (slot.value) |*entry| {
+            for (self.environments.table.slots.items) |*slot| if (slot.value) |*entry| {
                 if (entry.sky_desc == null) {
                     if (entry.sky_dirty) try bakeLoadedClouds(self, entry, cmd);
                 } else if (entry.sky_dirty or entry.bake_step != 0) try bakeSky(self, entry, cmd, false);
@@ -1011,10 +897,6 @@ pub const Renderer = struct {
         defer self.mutex.unlock(self.io);
         return self.device.hdr_active;
     }
-
-    pub const shiftScene = scenes_module.shiftScene;
-    pub const sceneOrigin = scenes_module.sceneOrigin;
-    pub const setGiVolume = scenes_module.setGiVolume;
 };
 
 pub const cullView = view_math_module.cullView;

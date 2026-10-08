@@ -19,12 +19,12 @@ const Stage = @import("window").Stage;
 pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn clouds", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     var sun_height: f32 = 0.75;
     var sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.6 * @cos(sun_height), -@sin(sun_height), -0.5 } };
-    renderer.setSun(scene, gfx.skySun(sky_desc));
-    const environment = try renderer.createSky(sky_desc);
-    renderer.setEnvironment(scene, environment, 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
+    const environment = try renderer.environments.createSky(sky_desc);
+    renderer.scenes.setEnvironment(scene, environment, 1);
 
     const cells = 360;
     const extent = 9000.0;
@@ -56,8 +56,8 @@ pub fn main(init: std.process.Init) !void {
         const corner: u32 = @intCast(row * (cells + 1) + column);
         land_indices[(row * cells + column) * 6 ..][0..6].* = .{ corner, corner + cells + 1, corner + 1, corner + 1, corner + cells + 1, corner + cells + 2 };
     };
-    const land = try renderer.createModel(&.{.{ .positions = land_positions, .normals = land_normals, .colors = land_colors, .indices = land_indices, .material = .{ .metallic = 0, .roughness = 0.95 } }});
-    _ = try renderer.spawn(scene, .{ .model = land });
+    const land = try renderer.models.create(&.{.{ .positions = land_positions, .normals = land_normals, .colors = land_colors, .indices = land_indices, .material = .{ .metallic = 0, .roughness = 0.95 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = land });
 
     var fir_positions: [4 * 9][3]f32 = undefined;
     var fir_normals: [4 * 9][3]f32 = undefined;
@@ -78,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
         fir_normals[tier_index * 9 + 8] = .{ 0, 1, 0 };
         fir_colors[tier_index * 9 + 8] = if (trunk) .{ 0.2, 0.14, 0.09, 1 } else .{ 0.1, 0.24, 0.11, 1 };
     }
-    const fir = try renderer.createModel(&.{.{ .positions = &fir_positions, .normals = &fir_normals, .colors = &fir_colors, .indices = &fir_indices, .material = .{ .metallic = 0, .roughness = 0.9, .double_sided = true } }});
+    const fir = try renderer.models.create(&.{.{ .positions = &fir_positions, .normals = &fir_normals, .colors = &fir_colors, .indices = &fir_indices, .material = .{ .metallic = 0, .roughness = 0.9, .double_sided = true } }});
     var random = std.Random.DefaultPrng.init(7);
     const rng = random.random();
     const firs = try init.gpa.alloc(math.Mat4, 6000);
@@ -94,14 +94,14 @@ pub fn main(init: std.process.Init) !void {
         firs[placed] = math.mul(math.translation(.{ x, height - 0.5, z }), math.mul(math.rotationY(rng.float(f32) * std.math.tau), math.scaling(.{ size, size * (1.4 + rng.float(f32) * 0.6), size })));
         placed += 1;
     }
-    _ = try renderer.createInstances(scene, fir, firs);
+    _ = try renderer.instances.create(scene, fir, firs);
     try renderer.waitUntilLoaded();
 
     var clouds = gfx.CloudDesc{ .cirrus = 0.35, .coverage = 0.42, .density = 0.03, .thickness = 2200, .variation = 0.9, .detail = 0.5 };
     var settings = gfx.Settings{ .shadow_distance = 900, .global_illumination = false, .aerial_perspective = 0.0006 };
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var altitude: f32 = 30;
     var arguments = try init.minimal.args.iterateAllocator(init.gpa);
     defer arguments.deinit();
@@ -110,12 +110,12 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, argument, "--sun")) sun_height = try std.fmt.parseFloat(f32, arguments.next() orelse "0.75");
         if (std.mem.eql(u8, argument, "--pane")) {
             const corners = [_][3]f32{ .{ -30, 0, -20 }, .{ 30, 0, -20 }, .{ 30, 0, 20 }, .{ -30, 0, 20 } };
-            const pane = try renderer.createModel(&.{.{
+            const pane = try renderer.models.create(&.{.{
                 .positions = &corners,
                 .indices = &.{ 0, 2, 1, 0, 3, 2 },
                 .material = .{ .base_color = .{ 0.9, 0.15, 0.1, 0.6 }, .metallic = 0, .roughness = 0.1, .alpha_mode = .blend, .double_sided = true },
             }});
-            _ = try renderer.spawn(scene, .{ .model = pane, .transform = math.translation(.{ 0, 22, -110 }) });
+            _ = try renderer.entities.spawn(scene, .{ .model = pane, .transform = math.translation(.{ 0, 22, -110 }) });
             settings.colored_shadows = true;
         }
         if (std.mem.eql(u8, argument, "--clear")) {
@@ -139,8 +139,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     sky_desc.sun_direction = .{ -0.6 * @cos(sun_height), -@max(@sin(sun_height), -0.05), -0.5 };
-    renderer.setSky(environment, sky_desc);
-    renderer.setSun(scene, gfx.skySun(sky_desc));
+    renderer.environments.setSky(environment, sky_desc);
+    renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
     var heading: f32 = 0;
     var hud_buffer: [200]u8 = undefined;
 
@@ -158,10 +158,10 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_T)) {
             sun_height = @mod(sun_height + tick.dt * 0.25, std.math.pi);
             sky_desc.sun_direction = .{ -0.6 * @cos(sun_height), -@max(@sin(sun_height), -0.05), -0.5 };
-            renderer.setSky(environment, sky_desc);
-            renderer.setSun(scene, gfx.skySun(sky_desc));
+            renderer.environments.setSky(environment, sky_desc);
+            renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
         }
-        try renderer.setClouds(scene, clouds);
+        try renderer.scenes.setClouds(scene, clouds);
 
         list.clear();
         const stats = renderer.getStats();

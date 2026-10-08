@@ -140,30 +140,30 @@ fn burners(act: Act, time: f32, fire_on: bool, smoke_on: bool, sources: *[4]gfx.
 pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn fluid", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     const sky = gfx.SkyDesc{ .sun_direction = .{ -0.55, -0.6, -0.4 } };
-    renderer.setSun(scene, gfx.skySun(sky));
-    renderer.setEnvironment(scene, try renderer.createSky(sky), 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
 
     var positions: [3][24][3]f32 = undefined;
     var indices: [3][36]u32 = undefined;
     boxMesh(.{ 30, 0.25, 30 }, &positions[0], &indices[0]);
     boxMesh(.{ 0.55, 0.12, 0.55 }, &positions[1], &indices[1]);
     boxMesh(.{ 0.5, 1.4, 0.5 }, &positions[2], &indices[2]);
-    const ground = try renderer.createModel(&.{.{ .positions = &positions[0], .indices = &indices[0], .material = .{ .base_color = .{ 0.3, 0.3, 0.32, 1 }, .metallic = 0, .roughness = 0.85 } }});
-    const hearth = try renderer.createModel(&.{.{ .positions = &positions[1], .indices = &indices[1], .material = .{ .base_color = .{ 0.12, 0.1, 0.09, 1 }, .metallic = 0, .roughness = 0.9 } }});
-    const pillar = try renderer.createModel(&.{.{ .positions = &positions[2], .indices = &indices[2], .material = .{ .base_color = .{ 0.7, 0.66, 0.6, 1 }, .metallic = 0, .roughness = 0.7 } }});
-    _ = try renderer.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.25, 0 }) });
-    _ = try renderer.spawn(scene, .{ .model = hearth, .transform = math.translation(.{ 0, 0.12, 0 }) });
-    _ = try renderer.spawn(scene, .{ .model = pillar, .transform = math.translation(.{ -3.2, 1.4, -1.5 }) });
-    _ = try renderer.spawn(scene, .{ .model = pillar, .transform = math.translation(.{ 3.0, 1.4, -2.2 }) });
+    const ground = try renderer.models.create(&.{.{ .positions = &positions[0], .indices = &indices[0], .material = .{ .base_color = .{ 0.3, 0.3, 0.32, 1 }, .metallic = 0, .roughness = 0.85 } }});
+    const hearth = try renderer.models.create(&.{.{ .positions = &positions[1], .indices = &indices[1], .material = .{ .base_color = .{ 0.12, 0.1, 0.09, 1 }, .metallic = 0, .roughness = 0.9 } }});
+    const pillar = try renderer.models.create(&.{.{ .positions = &positions[2], .indices = &indices[2], .material = .{ .base_color = .{ 0.7, 0.66, 0.6, 1 }, .metallic = 0, .roughness = 0.7 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.25, 0 }) });
+    _ = try renderer.entities.spawn(scene, .{ .model = hearth, .transform = math.translation(.{ 0, 0.12, 0 }) });
+    _ = try renderer.entities.spawn(scene, .{ .model = pillar, .transform = math.translation(.{ -3.2, 1.4, -1.5 }) });
+    _ = try renderer.entities.spawn(scene, .{ .model = pillar, .transform = math.translation(.{ 3.0, 1.4, -2.2 }) });
     const helpers = @import("window");
     var ball_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(ball_radius, &ball_positions, &ball_normals, &ball_indices);
-    const ball = try renderer.createModel(&.{.{ .positions = &ball_positions, .normals = &ball_normals, .indices = &ball_indices, .material = .{ .base_color = .{ 0.2, 0.2, 0.22, 1 }, .metallic = 1, .roughness = 0.35 } }});
-    const ball_entity = try renderer.spawn(scene, .{ .model = ball, .transform = math.translation(ballAt(.hung, 0)) });
+    const ball = try renderer.models.create(&.{.{ .positions = &ball_positions, .normals = &ball_normals, .indices = &ball_indices, .material = .{ .base_color = .{ 0.2, 0.2, 0.22, 1 }, .metallic = 1, .roughness = 0.35 } }});
+    const ball_entity = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.translation(ballAt(.hung, 0)) });
     try renderer.waitUntilLoaded();
 
     var scene_obstacles = false;
@@ -190,8 +190,8 @@ pub fn main(init: std.process.Init) !void {
     };
     if (scene_obstacles) desc.obstacles = &.{};
     desc.vorticity = if (sharp_velocity) 4 else act.swirl();
-    const fluid = try renderer.createFluid(scene, desc);
-    const flat = try renderer.createFluid(scene, .{
+    const fluid = try renderer.fluids.create(scene, desc);
+    const flat = try renderer.fluids.create(scene, .{
         .resolution = .{ 128, 128, 1 },
         .transform = math.mul(math.translation(.{ 0, -50, 0 }), math.scaling(.{ 1, 1, 0.3 })),
         .sources = &.{.{ .position = .{ 0.5, 0.06, 0.5 }, .radius = 0.06, .velocity = .{ 0, 0.6, 0 }, .fuel = 6, .temperature = 6 }},
@@ -199,7 +199,7 @@ pub fn main(init: std.process.Init) !void {
         .absorption = 14,
         .light = 0,
     });
-    const flat_picture = try renderer.fluidImage(flat);
+    const flat_picture = try renderer.fluids.image(flat);
     var ember_desc = gfx.EmitterDesc{
         .position = .{ 0, 0.5, 0 },
         .radius = 0.25,
@@ -222,11 +222,11 @@ pub fn main(init: std.process.Init) !void {
     };
     const ember_rate = ember_desc.rate;
     if (act == .rings) ember_desc.rate = 0;
-    const embers = try renderer.createEmitter(scene, ember_desc);
+    const embers = try renderer.emitters.create(scene, ember_desc);
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var orbit: f32 = 0.4;
     var wind: f32 = 0;
     var hud_buffer: [200]u8 = undefined;
@@ -237,14 +237,14 @@ pub fn main(init: std.process.Init) !void {
             if (chosen == act or !stage.keyPressed(glfw.GLFW_KEY_1 + @as(c_int, @intCast(index)))) continue;
             act = chosen;
             desc.vorticity = if (sharp_velocity) 4 else act.swirl();
-            renderer.resetFluid(fluid);
+            renderer.fluids.reset(fluid);
             ember_desc.rate = if (act == .rings) 0 else ember_rate;
-            renderer.setEmitter(embers, ember_desc);
+            renderer.emitters.set(embers, ember_desc);
         }
         if (stage.keyPressed(glfw.GLFW_KEY_F)) fire_on = !fire_on;
         if (stage.keyPressed(glfw.GLFW_KEY_G)) smoke_on = !smoke_on;
         if (stage.keyPressed(glfw.GLFW_KEY_B)) desc.walls = if (desc.walls == .closed) .floor else .closed;
-        if (stage.keyPressed(glfw.GLFW_KEY_R)) renderer.resetFluid(fluid);
+        if (stage.keyPressed(glfw.GLFW_KEY_R)) renderer.fluids.reset(fluid);
         if (stage.keyDown(glfw.GLFW_KEY_RIGHT)) wind = @min(wind + tick.dt * 0.4, 0.6);
         if (stage.keyDown(glfw.GLFW_KEY_LEFT)) wind = @max(wind - tick.dt * 0.4, -0.6);
         if (stage.keyDown(glfw.GLFW_KEY_UP)) desc.vorticity = @min(desc.vorticity + tick.dt * 10, 40);
@@ -261,8 +261,8 @@ pub fn main(init: std.process.Init) !void {
         const ball_at = ballAt(act, tick.time);
         const ball_obstacle = [1]gfx.FluidObstacle{.{ .sphere = .{ .center = inBox(ball_at), .radius = ball_radius / box_size[1] } }};
         if (!scene_obstacles) desc.obstacles = &ball_obstacle;
-        renderer.setTransform(ball_entity, math.translation(ball_at));
-        try renderer.setFluid(fluid, desc);
+        renderer.entities.setTransform(ball_entity, math.translation(ball_at));
+        try renderer.fluids.set(fluid, desc);
 
         list.clear();
         const stats = renderer.getStats();
@@ -283,7 +283,7 @@ pub fn main(init: std.process.Init) !void {
         const panel = gfx.Rect{ .x = @as(f32, @floatFromInt(tick.size[0])) - 268, .y = 12, .width = 256, .height = 256 };
         try list.rect(panel, gfx.Color.rgba(6, 7, 12, 230));
         try list.image(flat_picture, panel, .{});
-        try list.text(font, "2D fluid (fluidImage)", .{ panel.x + 8, panel.y + 6 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
+        try list.text(font, "2D fluid (fluids.image)", .{ panel.x + 8, panel.y + 6 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
 
         const eye = math.Vec3{ @sin(orbit) * 11, 3.6, @cos(orbit) * 11 };
         try stage.end(try renderer.render(.{

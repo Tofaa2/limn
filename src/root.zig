@@ -11,7 +11,7 @@ pub const rhi = @import("rhi/rhi.zig");
 pub const math = @import("math.zig");
 /// A minimal PNG encoder.
 pub const png = @import("png.zig");
-/// TrueType loading and glyph metrics; see `Renderer.loadFont`.
+/// TrueType loading and glyph metrics; see `Renderer.fonts.load`.
 pub const font = @import("font_baker").font;
 /// KTX2 texture files, including Basis Universal and Zstandard.
 pub const ktx2 = @import("asset/ktx2.zig");
@@ -29,20 +29,20 @@ pub const Options = renderer.Options;
 /// Hooks for an external CPU profiler; see `Options.profiler`.
 pub const Profiler = renderer.Profiler;
 /// Handle to shared geometry, materials and animations; see
-/// `Renderer.loadModel`. Handles are copyable values that stop resolving once
+/// `Renderer.models.load`. Handles are copyable values that stop resolving once
 /// their object is destroyed.
 pub const Model = renderer.Model;
-/// Handle to a sky and its image-based lighting; see `Renderer.loadEnvironment`
-/// and `Renderer.createSky`.
+/// Handle to a sky and its image-based lighting; see `Renderer.environments.load`
+/// and `Renderer.environments.createSky`.
 pub const Environment = renderer.Environment;
 /// Handle to a world of entities, lights and effects; see
-/// `Renderer.createScene`.
+/// `Renderer.scenes.create`.
 pub const Scene = renderer.Scene;
-/// Handle to one placement of a model in a scene; see `Renderer.spawn`.
+/// Handle to one placement of a model in a scene; see `Renderer.entities.spawn`.
 pub const Entity = renderer.Entity;
-/// What `Renderer.spawn` makes an entity from.
+/// What `Renderer.entities.spawn` makes an entity from.
 pub const EntityDesc = renderer.EntityDesc;
-/// Load state of a model or environment; see `Renderer.modelState`.
+/// Load state of a model or environment; see `Renderer.models.state`.
 pub const AssetState = renderer.AssetState;
 /// GPU storage of material textures; see `Options.texture_compression`.
 pub const TextureCompression = renderer.TextureCompression;
@@ -53,25 +53,25 @@ pub const TextureStreaming = renderer.TextureStreaming;
 pub const TransparencyMode = renderer.TransparencyMode;
 /// Encoding of a view's final picture; see `Settings.output_encoding`.
 pub const OutputEncoding = renderer.OutputEncoding;
-/// Counts and rest-pose bounds of a model; see `Renderer.modelInfo`.
+/// Counts and rest-pose bounds of a model; see `Renderer.models.info`.
 pub const ModelInfo = renderer.ModelInfo;
-/// Name and duration of an animation clip; see `Renderer.animationInfo`.
+/// Name and duration of an animation clip; see `Renderer.models.animationInfo`.
 pub const AnimationInfo = renderer.AnimationInfo;
-/// See `Renderer.environmentInfo`.
+/// See `Renderer.environments.info`.
 pub const EnvironmentInfo = renderer.EnvironmentInfo;
 /// Where a view is seen from; see `ViewDesc.camera`.
 pub const Camera = renderer.Camera;
-/// A scene's shadow-casting directional light; see `Renderer.setSun`.
+/// A scene's shadow-casting directional light; see `Renderer.scenes.setSun`.
 pub const Sun = renderer.Sun;
-/// A point, spot, directional or rectangle light; see `Renderer.setLights`.
+/// A point, spot, directional or rectangle light; see `Renderer.scenes.setLights`.
 pub const Light = renderer.Light;
-/// Application-supplied geometry for `Renderer.createModel`; its slices are
+/// Application-supplied geometry for `Renderer.models.create`; its slices are
 /// only read during that call.
 pub const MeshDesc = renderer.MeshDesc;
 /// Surface description in glTF's metallic-roughness model.
 pub const Material = renderer.Material;
 pub const LightKind = renderer.LightKind;
-/// Animation clips an entity plays and their blend; see `Renderer.setPose`.
+/// Animation clips an entity plays and their blend; see `Renderer.entities.setPose`.
 pub const Pose = renderer.Pose;
 /// Per-view quality and look; see `ViewDesc.settings`. May change every frame.
 pub const Settings = renderer.Settings;
@@ -91,26 +91,26 @@ pub const FrameDesc = renderer.FrameDesc;
 /// One camera's picture within a frame; see `FrameDesc.views`.
 pub const ViewDesc = renderer.ViewDesc;
 /// Handle to per-camera state kept between frames. Needed only when several
-/// cameras are drawn in one frame; see `Renderer.createView`.
+/// cameras are drawn in one frame; see `Renderer.views.create`.
 pub const View = renderer.View;
 /// A rectangle of a target, in pixels from the top-left corner.
 pub const Region = renderer.Region;
-/// Custom surface code from `Renderer.createMaterialShader`; its `slot` goes in
+/// Custom surface code from `Renderer.materials.createShader`; its `slot` goes in
 /// `Material.shader`.
 pub const MaterialShader = renderer.MaterialShader;
 /// A box projecting a color or image onto opaque surfaces; see
-/// `Renderer.setDecals`.
+/// `Renderer.scenes.setDecals`.
 pub const DecalDesc = renderer.DecalDesc;
-/// Replacement textures for a material; see `Renderer.setMaterialTextures`.
+/// Replacement textures for a material; see `Renderer.materials.setTextures`.
 pub const MaterialTextures = renderer.MaterialTextures;
-/// A layer of volumetric clouds over a scene; see `Renderer.setClouds`.
+/// A layer of volumetric clouds over a scene; see `Renderer.scenes.setClouds`.
 pub const CloudDesc = renderer.CloudDesc;
-/// Handle to a box of simulated smoke and fire; see `Renderer.createFluid`.
+/// Handle to a box of simulated smoke and fire; see `Renderer.fluids.create`.
 pub const Fluid = renderer.Fluid;
-/// See `Renderer.createFluid` and `Renderer.setFluid`.
+/// See `Renderer.fluids.create` and `Renderer.fluids.set`.
 pub const FluidDesc = renderer.FluidDesc;
 /// Frames recorded from a fluid as a sprite sheet; see
-/// `Renderer.recordFluidFlipbook`.
+/// `Renderer.fluids.recordFlipbook`.
 pub const FluidFlipbookDesc = renderer.FluidFlipbookDesc;
 /// Where smoke, heat or fuel enters a fluid; see `FluidDesc.sources`.
 pub const FluidSource = renderer.FluidSource;
@@ -119,47 +119,47 @@ pub const FluidWalls = renderer.FluidWalls;
 /// A solid inside a fluid's box, in box coordinates 0..1; see
 /// `FluidDesc.obstacles`.
 pub const FluidObstacle = renderer.FluidObstacle;
-/// How an entity's lightmap is baked; see `Renderer.bakeLightmap`.
+/// How an entity's lightmap is baked; see `Renderer.entities.bakeLightmap`.
 pub const LightmapDesc = renderer.LightmapDesc;
 /// How far copies of an instance group are drawn as cards; see
-/// `Renderer.setInstancesImpostor`.
+/// `Renderer.instances.setImpostor`.
 pub const ImpostorDesc = renderer.ImpostorDesc;
-/// Handle to strands of hair, fur or grass; see `Renderer.createHair`.
+/// Handle to strands of hair, fur or grass; see `Renderer.hairs.create`.
 pub const Hair = renderer.Hair;
 /// Strands as rows of points, drawn as camera-facing ribbons.
 pub const HairDesc = renderer.HairDesc;
-/// Handle to a shape hair is kept out of; see `Renderer.createCollisionField`.
+/// Handle to a shape hair is kept out of; see `Renderer.hairs.createCollisionField`.
 pub const CollisionField = renderer.CollisionField;
 /// Hair strand dynamics; see `HairDesc.simulation`.
 pub const HairSimulation = renderer.HairSimulation;
-/// Handle to a sheet of simulated water; see `Renderer.createWater`.
+/// Handle to a sheet of simulated water; see `Renderer.waters.create`.
 pub const Water = renderer.Water;
-/// A height-simulated sheet of water; see `Renderer.createWater`.
+/// A height-simulated sheet of water; see `Renderer.waters.create`.
 pub const WaterDesc = renderer.WaterDesc;
 /// Handle to a volume of particle-simulated liquid; see
-/// `Renderer.createLiquid`.
+/// `Renderer.liquids.create`.
 pub const Liquid = renderer.Liquid;
 /// A particle-simulated liquid volume; far costlier than a `WaterDesc` sheet.
 pub const LiquidDesc = renderer.LiquidDesc;
 /// A jet pouring into a liquid; see `LiquidDesc.sources`.
 pub const LiquidSource = renderer.LiquidSource;
-/// Handle to many copies of one model; see `Renderer.createInstances`.
+/// Handle to many copies of one model; see `Renderer.instances.create`.
 pub const InstanceGroup = renderer.InstanceGroup;
-/// A procedural clear sky; see `Renderer.createSky` and `Renderer.setSky`.
+/// A procedural clear sky; see `Renderer.environments.createSky` and `Renderer.environments.setSky`.
 pub const SkyDesc = renderer.SkyDesc;
 /// The `Sun` matching a sky, attenuated by the atmosphere; pass it to
-/// `Renderer.setSun`.
+/// `Renderer.scenes.setSun`.
 pub const skySun = renderer.skySun;
-/// Handle to a particle emitter in a scene; see `Renderer.createEmitter`.
+/// Handle to a particle emitter in a scene; see `Renderer.emitters.create`.
 pub const Emitter = renderer.Emitter;
-/// A particle source; see `Renderer.createEmitter`.
+/// A particle source; see `Renderer.emitters.create`.
 pub const EmitterDesc = renderer.EmitterDesc;
-/// A lightning flash in a cloud layer; see `Renderer.cloudFlash`.
+/// A lightning flash in a cloud layer; see `Renderer.scenes.cloudFlash`.
 pub const CloudFlash = renderer.CloudFlash;
 /// The 64 two-group splits of a BC7 block (bit i set: texel i is in the
 /// second group); for tests of the texture encoder.
 pub const bc7_partitions = @import("texture_codec").partitions;
-/// Handle to a local reflection probe; see `Renderer.createReflectionProbe`.
+/// Handle to a local reflection probe; see `Renderer.probes.create`.
 pub const ReflectionProbe = renderer.ReflectionProbe;
 /// A local reflection capture, used inside its box where neither the screen nor
 /// a ray gives a reflection.
@@ -188,10 +188,10 @@ const draw_list = @import("render/draw_list.zig");
 /// Immediate-mode shapes, images and text. CPU data owned by the caller; see
 /// `ViewDesc.draw_lists`. Free with `deinit`.
 pub const DrawList = draw_list.DrawList;
-/// A distance-field font; see `Renderer.loadFont`. Renderer-owned, readable
-/// from any thread until `Renderer.destroyFont`.
+/// A distance-field font; see `Renderer.fonts.load`. Renderer-owned, readable
+/// from any thread until `Renderer.fonts.destroy`.
 pub const Font = draw_list.Font;
-/// A texture usable by draw lists; see `Renderer.createImage`. Copyable; valid
+/// A texture usable by draw lists; see `Renderer.images.create`. Copyable; valid
 /// until the image is destroyed.
 pub const Image = draw_list.Image;
 /// An 8-bit sRGB color with opacity.

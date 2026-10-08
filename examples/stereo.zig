@@ -25,16 +25,16 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     var stage = try Stage.create(init, "Limn stereo", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     const sky = gfx.SkyDesc{ .sun_direction = .{ -0.45, -0.7, -0.4 } };
-    renderer.setSun(scene, gfx.skySun(sky));
-    renderer.setEnvironment(scene, try renderer.createSky(sky), 1);
-    const right_view = try renderer.createView();
+    renderer.scenes.setSun(scene, gfx.skySun(sky));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
+    const right_view = try renderer.views.create();
 
     var positions: [24][3]f32 = undefined;
     var indices: [36]u32 = undefined;
     window.boxMesh(.{ 0.5, 0.5, 0.5 }, &positions, &indices);
-    const block = try renderer.createModel(&.{.{
+    const block = try renderer.models.create(&.{.{
         .positions = &positions,
         .indices = &indices,
         .material = .{ .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 0.7 },
@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
     const ball_indices = try gpa.create([window.sphere_index_count]u32);
     defer gpa.destroy(ball_indices);
     window.sphereMesh(0.5, ball_positions, ball_normals, ball_indices);
-    const ball = try renderer.createModel(&.{.{
+    const ball = try renderer.models.create(&.{.{
         .positions = ball_positions,
         .normals = ball_normals,
         .indices = ball_indices,
@@ -72,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
             try block_colors.append(gpa, .{ 0.75, 0.72, 0.68 });
         }
     }
-    try renderer.setInstanceColors(try renderer.createInstances(scene, block, blocks.items), block_colors.items);
+    try renderer.instances.setColors(try renderer.instances.create(scene, block, blocks.items), block_colors.items);
     var balls: std.ArrayList(math.Mat4) = .empty;
     defer balls.deinit(gpa);
     var ball_colors: std.ArrayList([3]f32) = .empty;
@@ -82,12 +82,12 @@ pub fn main(init: std.process.Init) !void {
         try balls.append(gpa, math.mul(math.translation(.{ @sin(step * 1.9) * 1.5, 1.0 + @cos(step * 1.3) * 0.6, 6.5 - step * 1.6 }), math.uniformScaling(0.45 + 0.25 * @sin(step * 0.7))));
         try ball_colors.append(gpa, .{ 0.55 + 0.4 * @sin(step * 1.1), 0.5 + 0.4 * @sin(step * 1.7 + 2), 0.5 + 0.4 * @sin(step * 2.3 + 4) });
     }
-    try renderer.setInstanceColors(try renderer.createInstances(scene, ball, balls.items), ball_colors.items);
+    try renderer.instances.setColors(try renderer.instances.create(scene, ball, balls.items), ball_colors.items);
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var text: [200]u8 = undefined;
     var separation: f32 = 0.065;
     var convergence: f32 = 6;

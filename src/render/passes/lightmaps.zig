@@ -20,11 +20,11 @@ pub fn bakeLightmaps(renderer: *Renderer, p: *const ScenePass) !void {
     if (scene.tlas_hash == 0 or scene.tlas_hash != p.scene_frame.tlas_hash) return;
     var baking: u32 = 0;
     for (scene.entities.items) |handle| {
-        const entity = renderer.entities.get(handle) orelse continue;
+        const entity = renderer.entities.table.get(handle) orelse continue;
         const lightmap = if (entity.lightmap) |*state| state else continue;
         if (lightmap.rounds >= lightmap.wanted) continue;
         baking += 1;
-        const model = renderer.models.get(entity.model) orelse continue;
+        const model = renderer.models.table.get(entity.model) orelse continue;
         if (model.state != .ready or !model.geometry_resident) continue;
         const source = &model.source.?;
         const from = lightmap.gathered[lightmap.rounds & 1];

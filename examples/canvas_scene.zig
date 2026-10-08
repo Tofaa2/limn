@@ -21,15 +21,15 @@ pub const Assets = struct {
             const color: [4]u8 = if (edge) .{ 30, 30, 40, 255 } else if (light) .{ 255, 214, 92, 255 } else .{ 240, 120, 60, 255 };
             pixels[(y * 8 + x) * 4 ..][0..4].* = color;
         };
-        try renderer.prepareText(renderer.defaultFont(), hebrew ++ arabic ++ mixed ++ "→·\u{301}\u{308}\u{303}\u{302}");
-        try renderer.prepareLigatures(renderer.defaultFont());
-        try renderer.prepareTextWith(renderer.defaultFont(), "бгдпт i\u{30a} j\u{303}", "SRB ".*, &.{});
-        try renderer.prepareTextWith(renderer.defaultFont(), "ag", null, &.{"salt".*});
-        return .{ .checker = try renderer.createImage(8, 8, &pixels, true) };
+        try renderer.fonts.prepareText(renderer.fonts.default(), hebrew ++ arabic ++ mixed ++ "→·\u{301}\u{308}\u{303}\u{302}");
+        try renderer.fonts.prepareLigatures(renderer.fonts.default());
+        try renderer.fonts.prepareTextWith(renderer.fonts.default(), "бгдпт i\u{30a} j\u{303}", "SRB ".*, &.{});
+        try renderer.fonts.prepareTextWith(renderer.fonts.default(), "ag", null, &.{"salt".*});
+        return .{ .checker = try renderer.images.create(8, 8, &pixels, true) };
     }
 
     pub fn deinit(self: Assets, renderer: *gfx.Renderer) void {
-        renderer.destroyImage(self.checker);
+        renderer.images.destroy(self.checker);
     }
 };
 

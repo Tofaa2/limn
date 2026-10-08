@@ -1,5 +1,6 @@
 //! Environments: loaded panoramas and computed skies, filtered for image-based lighting. Internal to the renderer.
 const std = @import("std");
+const handle = @import("../../handle.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
 const gpu = @import("../gpu.zig");
@@ -21,50 +22,91 @@ const EnvironmentJob = renderer_state.EnvironmentJob;
 const runEnvironmentJob = renderer_state.runEnvironmentJob;
 const EnvironmentEntry = renderer_state.EnvironmentEntry;
 
-/// Starts loading an environment: an equirectangular `.hdr`, or a KTX2
-/// cube of half floats or BC6H. Radiance is clamped to `max_radiance`.
-/// A BC6H cube's `brightest_direction` stays straight up.
-pub fn loadEnvironment(self: *Renderer, path: []const u8, max_radiance: f32) !Environment {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const job = try self.gpa.create(EnvironmentJob);
-    errdefer self.gpa.destroy(job);
-    job.* = .{ .gpa = self.options.job_allocator orelse std.heap.smp_allocator, .io = self.io, .path = try self.gpa.dupe(u8, path) };
-    errdefer self.gpa.free(job.path);
-    const environment = try self.environments.insert(.{ .job = job, .max_radiance = max_radiance });
-    job.group.concurrent(self.io, runEnvironmentJob, .{job}) catch job.group.async(self.io, runEnvironmentJob, .{job});
-    self.loading_count += 1;
-    return environment;
-}
+/// Skies and their image-based lighting.
+pub const Environments = struct {
+    table: handle.HandleTable(renderer_state.EnvironmentEntry, api.EnvironmentTag),
 
-/// Creates an environment from a computed clear sky; ready on return.
-pub fn createSky(self: *Renderer, desc: SkyDesc) !Environment {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const environment = try self.environments.insert(.{ .max_radiance = 64, .sky_desc = desc });
-    errdefer _ = self.environments.remove(environment);
-    const entry = self.environments.get(environment).?;
-    errdefer freeEnvironment(self, entry);
-    try ensureEnvironmentTextures(self, entry);
-    var cmd = try self.device.beginImmediate();
-    try bakeSky(self, entry, &cmd, true);
-    try self.device.endImmediate();
-    entry.state = .ready;
-    return environment;
-}
+    fn renderer(environments: *Environments) *Renderer {
+        return @alignCast(@fieldParentPtr("environments", environments));
+    }
 
-/// Changes a `createSky` sky; rebuilt during the next frame (about 1 ms
-/// of GPU time).
-pub fn setSky(self: *Renderer, environment: Environment, desc: SkyDesc) void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const entry = self.environments.get(environment) orelse return;
-    if (entry.sky_desc == null) return;
-    if (std.meta.eql(entry.sky_desc.?, desc)) return;
-    entry.sky_desc = desc;
-    entry.sky_dirty = true;
-    self.skies_dirty = true;
-}
+    /// Starts loading an environment: an equirectangular `.hdr`, or a KTX2
+    /// cube of half floats or BC6H. Radiance is clamped to `max_radiance`.
+    /// A BC6H cube's `brightest_direction` stays straight up.
+    pub fn load(environments: *Environments, path: []const u8, max_radiance: f32) !Environment {
+        const self = environments.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const job = try self.gpa.create(EnvironmentJob);
+        errdefer self.gpa.destroy(job);
+        job.* = .{ .gpa = self.options.job_allocator orelse std.heap.smp_allocator, .io = self.io, .path = try self.gpa.dupe(u8, path) };
+        errdefer self.gpa.free(job.path);
+        const environment = try self.environments.table.insert(.{ .job = job, .max_radiance = max_radiance });
+        job.group.concurrent(self.io, runEnvironmentJob, .{job}) catch job.group.async(self.io, runEnvironmentJob, .{job});
+        self.loading_count += 1;
+        return environment;
+    }
+
+    /// Creates an environment from a computed clear sky; ready on return.
+    pub fn createSky(environments: *Environments, desc: SkyDesc) !Environment {
+        const self = environments.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const environment = try self.environments.table.insert(.{ .max_radiance = 64, .sky_desc = desc });
+        errdefer _ = self.environments.table.remove(environment);
+        const entry = self.environments.table.get(environment).?;
+        errdefer freeEnvironment(self, entry);
+        try ensureEnvironmentTextures(self, entry);
+        var cmd = try self.device.beginImmediate();
+        try bakeSky(self, entry, &cmd, true);
+        try self.device.endImmediate();
+        entry.state = .ready;
+        return environment;
+    }
+
+    /// Changes a `createSky` sky; rebuilt during the next frame (about 1 ms
+    /// of GPU time).
+    pub fn setSky(environments: *Environments, environment: Environment, desc: SkyDesc) void {
+        const self = environments.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.environments.table.get(environment) orelse return;
+        if (entry.sky_desc == null) return;
+        if (std.meta.eql(entry.sky_desc.?, desc)) return;
+        entry.sky_desc = desc;
+        entry.sky_dirty = true;
+        self.skies_dirty = true;
+    }
+
+    /// A handle that names no environment reports `.failed`. Safe from any
+    /// thread.
+    pub fn state(environments: *Environments, environment: Environment) AssetState {
+        const self = environments.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return (self.environments.table.get(environment) orelse return .failed).state;
+    }
+
+    /// Null until the environment is ready.
+    pub fn info(environments: *Environments, environment: Environment) ?EnvironmentInfo {
+        const self = environments.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.environments.table.get(environment) orelse return null;
+        return if (entry.state == .ready) .{ .brightest_direction = entry.brightest_direction } else null;
+    }
+
+    /// Frees an environment, cancelling a load under way. Scenes that have it
+    /// set draw as if they had none.
+    pub fn destroy(environments: *Environments, environment: Environment) void {
+        const self = environments.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var removed = self.environments.table.remove(environment) orelse return;
+        if (removed.state == .loading) self.loading_count -= 1;
+        freeEnvironment(self, &removed);
+    }
+};
 
 /// Draws a computed sky's cube and filters its lighting: all at once
 /// with `whole`, else `rebuild_frames` worth per call, resuming.
@@ -121,32 +163,6 @@ pub fn bakeSky(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.CommandEncod
     }
     if (entry.bake_step >= total) entry.bake_step = 0;
     if (entry.bake_step != 0 or entry.sky_dirty) self.skies_dirty = true;
-}
-
-/// A handle that names no environment reports `.failed`. Safe from any
-/// thread.
-pub fn environmentState(self: *Renderer, environment: Environment) AssetState {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    return (self.environments.get(environment) orelse return .failed).state;
-}
-
-/// Null until the environment is ready.
-pub fn environmentInfo(self: *Renderer, environment: Environment) ?EnvironmentInfo {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const entry = self.environments.get(environment) orelse return null;
-    return if (entry.state == .ready) .{ .brightest_direction = entry.brightest_direction } else null;
-}
-
-/// Frees an environment, cancelling a load under way. Scenes that have it
-/// set draw as if they had none.
-pub fn destroyEnvironment(self: *Renderer, environment: Environment) void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    var removed = self.environments.remove(environment) orelse return;
-    if (removed.state == .loading) self.loading_count -= 1;
-    freeEnvironment(self, &removed);
 }
 
 pub fn finalizeEnvironment(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.CommandEncoder) !void {

@@ -28,24 +28,24 @@ pub fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
     const near_enough = if (streaming.coarse_distance > 0) @min(streaming.distance, streaming.coarse_distance * 0.9) else streaming.distance;
     const zone = Zone.start(self.options.profiler, "geometry streaming");
     defer zone.stop();
-    for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
+    for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
         entry.stream_distance = std.math.inf(f32);
     };
     for (desc.views) |view_desc| {
-        const scene = self.scenes.get(view_desc.scene orelse continue) orelse continue;
+        const scene = self.scenes.table.get(view_desc.scene orelse continue) orelse continue;
         const eye = view_desc.camera.position;
         for (scene.entities.items) |item| {
-            const entity = self.entities.get(item) orelse continue;
+            const entity = self.entities.table.get(item) orelse continue;
             if (!entity.visible) continue;
-            const model = self.models.get(entity.model) orelse continue;
+            const model = self.models.table.get(entity.model) orelse continue;
             if (model.state != .ready) continue;
             const center = math.transformPoint(entity.transform, model.info.bounds_center);
             const radius = model.info.bounds_radius * math.maxScale(entity.transform);
             model.stream_distance = @min(model.stream_distance, @max(math.length(math.sub(center, eye)) - radius, 0));
         }
         for (scene.groups.items) |item| {
-            const group = self.instance_groups.get(item) orelse continue;
-            const model = self.models.get(group.model) orelse continue;
+            const group = self.instances.table.get(item) orelse continue;
+            const model = self.models.table.get(group.model) orelse continue;
             if (model.state != .ready) continue;
             for (group.transforms) |transform| {
                 if (model.stream_distance < near_enough) break;
@@ -61,7 +61,7 @@ pub fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
     var released: u32 = 0;
     var released_bytes: u64 = 0;
     var coarse_models: u32 = 0;
-    for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
+    for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
         if (entry.state != .ready) continue;
         const source = &entry.source.?;
         var bytes: u64 = 0;
@@ -110,7 +110,7 @@ pub fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
     self.stats.geometry_models_released = released;
     self.stats.geometry_bytes_released = released_bytes;
     self.stats.geometry_models_coarse = coarse_models;
-    if (changed) for (self.scenes.slots.items) |*slot| if (slot.value) |*scene| {
+    if (changed) for (self.scenes.table.slots.items) |*slot| if (slot.value) |*scene| {
         scene.layout_dirty = true;
     };
 }
@@ -290,11 +290,11 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
     const zone = Zone.start(self.options.profiler, "texture streaming");
     defer zone.stop();
     const device = self.device;
-    for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
+    for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
         for (entry.streams) |*stream| stream.wanted = stream.floor;
     };
     for (desc.views) |view_desc| {
-        const scene = self.scenes.get(view_desc.scene orelse continue) orelse continue;
+        const scene = self.scenes.table.get(view_desc.scene orelse continue) orelse continue;
         const target = switch (view_desc.target) {
             .backbuffer => frame.backbuffer orelse continue,
             .texture => |texture| texture,
@@ -318,14 +318,14 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
         self.seen_round += 1;
         if (seen != null) for (scene.layout.items, 0..) |placed, index| {
             if (!placed.first_of_entity) continue;
-            const entity = self.entities.get(placed.entity) orelse continue;
+            const entity = self.entities.table.get(placed.entity) orelse continue;
             entity.seen_round = self.seen_round;
             entity.seen_first = @intCast(index);
         };
         for (scene.entities.items) |item| {
-            const entity = self.entities.get(item) orelse continue;
+            const entity = self.entities.table.get(item) orelse continue;
             if (!entity.visible) continue;
-            const model = self.models.get(entity.model) orelse continue;
+            const model = self.models.table.get(entity.model) orelse continue;
             if (model.state != .ready or model.streamed == 0) continue;
             const parts: ?[]const u32 = if (seen) |drawn| blk: {
                 if (entity.seen_round != self.seen_round) continue;
@@ -336,8 +336,8 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
             wantModelTextures(model, entity.transform, camera, pixels_at_one_meter, bias, frustum, parts);
         }
         for (scene.groups.items) |item| {
-            const group = self.instance_groups.get(item) orelse continue;
-            const model = self.models.get(group.model) orelse continue;
+            const group = self.instances.table.get(item) orelse continue;
+            const model = self.models.table.get(group.model) orelse continue;
             if (model.state != .ready or model.streamed == 0 or group.transforms.len == 0) continue;
             var nearest: ?usize = null;
             var nearest_distance = std.math.inf(f32);
@@ -368,7 +368,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
         var wanted_bytes: u64 = 0;
         resident_bytes = 0;
         count = 0;
-        for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
+        for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
             for (entry.streams) |*stream| {
                 if (stream.data.len == 0) continue;
                 wanted_bytes += stream.bytesFrom(@min(stream.wanted + extra, stream.floor));
@@ -382,7 +382,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
     var pending: u32 = 0;
     var upload_left = streaming.upload_bytes_per_frame;
     for ([_]bool{ false, true }) |loading| {
-        for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
+        for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
             if (entry.state != .ready) continue;
             for (entry.streams, 0..) |*stream, index| {
                 if (stream.data.len == 0) continue;
@@ -417,12 +417,12 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
             }
         };
     }
-    for (self.models.slots.items) |*slot| if (slot.value) |*entry| {
+    for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
         if (!entry.materials_stale) continue;
         entry.materials_stale = false;
         for (entry.source.?.materials, 0..) |material, index| {
             const encoded = try encodeMaterial(self, entry, material, index);
-            try self.materials.write(device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded));
+            try self.materials.pool.write(device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded));
         }
     };
     self.stats.streamed_textures = count;

@@ -80,8 +80,8 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, desc: ViewDesc, delta_time:
     const load: rhi.LoadOp = if (written) .load else .clear;
 
     if (desc.scene) |scene_handle| {
-        const scene = self.scenes.get(scene_handle) orelse return error.InvalidScene;
-        const view = self.views.get(desc.view orelse self.main_view) orelse return error.InvalidView;
+        const scene = self.scenes.table.get(scene_handle) orelse return error.InvalidScene;
+        const view = self.views.table.get(desc.view orelse self.main_view) orelse return error.InvalidView;
         if (view.last_frame == self.frame_index) return error.ViewUsedTwice;
         var color = target;
         if (!whole) {
@@ -665,7 +665,7 @@ fn renderScene(
     };
 
     const environment: ?*EnvironmentEntry = blk: {
-        const entry = self.environments.get(scene.environment orelse break :blk null) orelse break :blk null;
+        const entry = self.environments.table.get(scene.environment orelse break :blk null) orelse break :blk null;
         break :blk if (entry.state == .ready) entry else null;
     };
 
@@ -776,7 +776,7 @@ fn renderScene(
         .indices = device.bufferAddress(self.indices.buffer),
         .meshlets = device.bufferAddress(self.meshlets.buffer),
         .meshes = device.bufferAddress(self.meshes.buffer),
-        .materials = device.bufferAddress(self.materials.buffer),
+        .materials = device.bufferAddress(self.materials.pool.buffer),
         .instances = scene_frame.instances,
         .previous_transforms = scene_frame.previous_transforms,
         .vsm = vsm_params,

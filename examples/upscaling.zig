@@ -58,15 +58,15 @@ pub fn main(init: std.process.Init) !void {
     }
     var stage = try Stage.create(init, "Limn upscaling", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     const sky = gfx.SkyDesc{ .sun_direction = .{ -0.55, -0.6, -0.35 } };
-    renderer.setSun(scene, gfx.skySun(sky));
-    renderer.setEnvironment(scene, try renderer.createSky(sky), 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
 
     var positions: [24][3]f32 = undefined;
     var indices: [36]u32 = undefined;
     window.boxMesh(.{ 0.5, 0.5, 0.5 }, &positions, &indices);
-    const block = try renderer.createModel(&.{.{
+    const block = try renderer.models.create(&.{.{
         .positions = &positions,
         .indices = &indices,
         .material = .{ .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 0.7 },
@@ -78,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
     const ball_indices = try gpa.create([window.sphere_index_count]u32);
     defer gpa.destroy(ball_indices);
     window.sphereMesh(0.5, ball_positions, ball_normals, ball_indices);
-    const ball = try renderer.createModel(&.{.{
+    const ball = try renderer.models.create(&.{.{
         .positions = ball_positions,
         .normals = ball_normals,
         .indices = ball_indices,
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
             try tile_colors.append(gpa, if (@mod(row + column, 2) == 0) .{ 0.72, 0.68, 0.6 } else .{ 0.3, 0.33, 0.38 });
         }
     }
-    try renderer.setInstanceColors(try renderer.createInstances(scene, block, tiles.items), tile_colors.items);
+    try renderer.instances.setColors(try renderer.instances.create(scene, block, tiles.items), tile_colors.items);
 
     var bars: std.ArrayList(math.Mat4) = .empty;
     defer bars.deinit(gpa);
@@ -118,14 +118,14 @@ pub fn main(init: std.process.Init) !void {
         try balls.append(gpa, math.mul(turn, math.translation(.{ -8, 2.4, -8 })));
     }
     for (bars.items) |_| try bar_colors.append(gpa, .{ 0.2, 0.13, 0.08 });
-    try renderer.setInstanceColors(try renderer.createInstances(scene, block, bars.items), bar_colors.items);
-    _ = try renderer.createInstances(scene, ball, balls.items);
-    _ = try renderer.spawn(scene, .{ .model = ball, .transform = math.mul(math.translation(.{ 0, 1.2, 0 }), math.uniformScaling(2.4)) });
+    try renderer.instances.setColors(try renderer.instances.create(scene, block, bars.items), bar_colors.items);
+    _ = try renderer.instances.create(scene, ball, balls.items);
+    _ = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.mul(math.translation(.{ 0, 1.2, 0 }), math.uniformScaling(2.4)) });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var text: [256]u8 = undefined;
     var orbit: f32 = 0.5;
 

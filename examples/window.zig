@@ -175,7 +175,7 @@ pub const Stage = struct {
             .init = init,
             .window = window,
             .renderer = renderer,
-            .offscreen = if (screenshot != null) try renderer.createTarget(width, height) else null,
+            .offscreen = if (screenshot != null) try renderer.views.createTarget(width, height) else null,
             .screenshot = screenshot,
             .frame_limit = frame_limit,
             .last = if (window) |value| value.time() else 0,
@@ -246,7 +246,7 @@ pub const Stage = struct {
             gpa.free(path);
         }
         const failed = self.renderer.device.validationErrorCount() != 0;
-        if (self.offscreen) |texture| self.renderer.destroyTarget(texture);
+        if (self.offscreen) |texture| self.renderer.views.destroyTarget(texture);
         self.renderer.deinit();
         if (self.window) |window| window.deinit();
         if (failed) return error.ValidationFailed;

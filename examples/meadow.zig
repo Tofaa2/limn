@@ -160,36 +160,36 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     var stage = try Stage.create(init, "Limn meadow", .{ .asset_cache_dir = "zig-out/asset-cache" });
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     var random = std.Random.DefaultPrng.init(7);
     const rng = random.random();
 
     var sun_height: f32 = 0.62;
     var sky = gfx.SkyDesc{ .sun_direction = .{ -0.55 * @cos(sun_height), -@sin(sun_height), -0.5 } };
-    renderer.setSun(scene, gfx.skySun(sky));
-    const environment = try renderer.createSky(sky);
-    renderer.setEnvironment(scene, environment, 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky));
+    const environment = try renderer.environments.createSky(sky);
+    renderer.scenes.setEnvironment(scene, environment, 1);
     var clouds_on = true;
     const clouds = gfx.CloudDesc{ .coverage = 0.42, .cirrus = 0.3 };
-    try renderer.setClouds(scene, clouds);
+    try renderer.scenes.setClouds(scene, clouds);
 
     var ground_shape = Shape{};
     defer ground_shape.deinit(gpa);
     try buildGround(gpa, &ground_shape);
-    const ground = try renderer.createModel(&.{ground_shape.desc(.{ .metallic = 0, .roughness = 0.95 })});
-    _ = try renderer.spawn(scene, .{ .model = ground });
+    const ground = try renderer.models.create(&.{ground_shape.desc(.{ .metallic = 0, .roughness = 0.95 })});
+    _ = try renderer.entities.spawn(scene, .{ .model = ground });
 
     var tuft_shape = Shape{};
     defer tuft_shape.deinit(gpa);
     try buildTuft(gpa, &tuft_shape, rng);
-    const tuft = try renderer.createModel(&.{tuft_shape.desc(.{ .metallic = 0, .roughness = 0.8, .double_sided = true, .sway = 0.9 })});
+    const tuft = try renderer.models.create(&.{tuft_shape.desc(.{ .metallic = 0, .roughness = 0.8, .double_sided = true, .sway = 0.9 })});
 
     var tree_shape = Shape{};
     defer tree_shape.deinit(gpa);
     try tree_shape.taper(gpa, 0, 1.6, 0.16, 0.1, 8, .{ 0.2, 0.13, 0.08 }, .{ 0.24, 0.16, 0.1 });
     for ([_][3]f32{ .{ 1.1, 3.0, 1.25 }, .{ 2.2, 4.1, 0.95 }, .{ 3.3, 5.2, 0.6 } }) |skirt|
         try tree_shape.taper(gpa, skirt[0], skirt[1], skirt[2], 0, 9, .{ 0.05, 0.16, 0.07 }, .{ 0.12, 0.3, 0.12 });
-    const tree = try renderer.createModel(&.{tree_shape.desc(.{ .metallic = 0, .roughness = 0.85, .double_sided = true, .sway = 0.005 })});
+    const tree = try renderer.models.create(&.{tree_shape.desc(.{ .metallic = 0, .roughness = 0.85, .double_sided = true, .sway = 0.005 })});
 
     var ball_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
@@ -198,7 +198,7 @@ pub fn main(init: std.process.Init) !void {
     const Stuff = struct { color: [4]f32, metallic: f32, roughness: f32, clearcoat: f32 = 0 };
     const ball = struct {
         fn of(r: *gfx.Renderer, positions: []const [3]f32, normals: []const [3]f32, indices: []const u32, stuff: Stuff) !gfx.Model {
-            return r.createModel(&.{.{ .positions = positions, .normals = normals, .indices = indices, .material = .{
+            return r.models.create(&.{.{ .positions = positions, .normals = normals, .indices = indices, .material = .{
                 .base_color = stuff.color,
                 .metallic = stuff.metallic,
                 .roughness = stuff.roughness,
@@ -213,10 +213,10 @@ pub fn main(init: std.process.Init) !void {
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
-    const stone = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.6, 0.58, 0.54, 1 }, .metallic = 0, .roughness = 0.8 } }});
+    const stone = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.6, 0.58, 0.54, 1 }, .metallic = 0, .roughness = 0.8 } }});
 
-    const player_model = try renderer.loadModel("examples/assets/world/Rogue_Hooded.glb");
-    const helmet = try renderer.loadModel("examples/assets/DamagedHelmet.glb");
+    const player_model = try renderer.models.load("examples/assets/world/Rogue_Hooded.glb");
+    const helmet = try renderer.models.load("examples/assets/DamagedHelmet.glb");
     try renderer.waitUntilLoaded();
 
     {
@@ -235,8 +235,8 @@ pub fn main(init: std.process.Init) !void {
             colors[placed] = .{ 0.85 + 0.5 * patch, 0.9 + 0.2 * (1 - patch), 0.7 + 0.3 * rng.float(f32) };
             placed += 1;
         }
-        const grass = try renderer.createInstances(scene, tuft, transforms);
-        try renderer.setInstanceColors(grass, colors);
+        const grass = try renderer.instances.create(scene, tuft, transforms);
+        try renderer.instances.setColors(grass, colors);
     }
     {
         const transforms = try gpa.alloc(math.Mat4, tree_count);
@@ -250,7 +250,7 @@ pub fn main(init: std.process.Init) !void {
             transforms[placed] = math.mul(math.translation(.{ x, groundHeight(x, z) - 0.1, z }), math.mul(math.rotationY(rng.float(f32) * std.math.tau), math.uniformScaling(scale)));
             placed += 1;
         }
-        _ = try renderer.createInstances(scene, tree, transforms);
+        _ = try renderer.instances.create(scene, tree, transforms);
     }
     {
         const transforms = try gpa.alloc(math.Mat4, rock_count);
@@ -261,19 +261,19 @@ pub fn main(init: std.process.Init) !void {
             const size = 0.3 + rng.float(f32) * rng.float(f32) * 1.6;
             transform.* = math.mul(math.translation(.{ x, groundHeight(x, z) - size * 0.15, z }), math.mul(math.rotationY(rng.float(f32) * std.math.tau), math.scaling(.{ size * (0.8 + rng.float(f32) * 0.7), size * (0.45 + rng.float(f32) * 0.4), size })));
         }
-        _ = try renderer.createInstances(scene, rock, transforms);
+        _ = try renderer.instances.create(scene, rock, transforms);
     }
     const display = [2]f32{ 3.5, -4.5 };
     const display_height = groundHeight(display[0], display[1]);
-    _ = try renderer.spawn(scene, .{ .model = stone, .transform = math.mul(math.translation(.{ display[0], display_height + 0.45, display[1] }), math.scaling(.{ 0.9, 1.0, 0.9 })) });
-    _ = try renderer.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ display[0], display_height + 1.55, display[1] }), math.mul(math.rotationY(2.4), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.6)))) });
+    _ = try renderer.entities.spawn(scene, .{ .model = stone, .transform = math.mul(math.translation(.{ display[0], display_height + 0.45, display[1] }), math.scaling(.{ 0.9, 1.0, 0.9 })) });
+    _ = try renderer.entities.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ display[0], display_height + 1.55, display[1] }), math.mul(math.rotationY(2.4), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.6)))) });
     for ([_]gfx.Model{ gold, chrome, lacquer }, 0..) |model, index| {
         const x = display[0] + 1.6 + @as(f32, @floatFromInt(index)) * 1.3;
         const z = display[1] + 0.6 * @as(f32, @floatFromInt(index));
-        _ = try renderer.spawn(scene, .{ .model = model, .transform = math.translation(.{ x, groundHeight(x, z) + 0.5, z }) });
+        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{ x, groundHeight(x, z) + 0.5, z }) });
     }
 
-    _ = try renderer.createWater(scene, .{
+    _ = try renderer.waters.create(scene, .{
         .transform = math.mul(math.translation(.{ pond_center[0], hillsAt(pond_center[0], pond_center[1]) + pond_level, pond_center[1] }), math.scaling(.{ pond_radius * 2.2, 1, pond_radius * 2.2 })),
         .color = .{ 0.03, 0.09, 0.07 },
         .murk = 0.9,
@@ -296,18 +296,18 @@ pub fn main(init: std.process.Init) !void {
         .color_end = .{ 1.0, 0.95, 0.7, 0 },
         .softness = 0.1,
     };
-    const motes = try renderer.createEmitter(scene, motes_desc);
+    const motes = try renderer.emitters.create(scene, motes_desc);
 
-    const player_info = renderer.modelInfo(player_model).?;
+    const player_info = renderer.models.info(player_model).?;
     const player_scale = 2.0 / @max(player_info.bounds_max[1] - player_info.bounds_min[1], 1e-3);
-    const player = try renderer.spawn(scene, .{ .model = player_model });
-    const clip_idle = renderer.findAnimation(player_model, "Idle") orelse 0;
-    const clip_run = renderer.findAnimation(player_model, "Running_A") orelse clip_idle;
-    const clip_jump = renderer.findAnimation(player_model, "Jump_Idle") orelse clip_idle;
+    const player = try renderer.entities.spawn(scene, .{ .model = player_model });
+    const clip_idle = renderer.models.findAnimation(player_model, "Idle") orelse 0;
+    const clip_run = renderer.models.findAnimation(player_model, "Running_A") orelse clip_idle;
+    const clip_jump = renderer.models.findAnimation(player_model, "Jump_Idle") orelse clip_idle;
 
     var list = gfx.DrawList.init(gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var hud_buffer: [160]u8 = undefined;
 
     var position = [2]f32{ 0, 0 };
@@ -330,12 +330,12 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_T)) {
             sun_height = @mod(sun_height + tick.dt * 0.2, std.math.pi);
             sky.sun_direction = .{ -0.55 * @cos(sun_height), -@max(@sin(sun_height), -0.05), -0.5 };
-            renderer.setSky(environment, sky);
-            renderer.setSun(scene, gfx.skySun(sky));
+            renderer.environments.setSky(environment, sky);
+            renderer.scenes.setSun(scene, gfx.skySun(sky));
         }
         if (stage.keyPressed(glfw.GLFW_KEY_C)) {
             clouds_on = !clouds_on;
-            try renderer.setClouds(scene, if (clouds_on) clouds else null);
+            try renderer.scenes.setClouds(scene, if (clouds_on) clouds else null);
         }
 
         if (stage.window) |window| {
@@ -400,10 +400,10 @@ pub fn main(init: std.process.Init) !void {
         if (airborne > 0.01) pose.layers[0] = .{ .animation = clip_jump, .time = clock_idle, .weight = airborne };
         const floor = groundHeight(position[0], position[1]);
         const feet = math.Vec3{ position[0], floor + height, position[1] };
-        renderer.setTransform(player, math.mul(math.translation(feet), math.mul(math.rotationY(heading), math.uniformScaling(player_scale))));
-        renderer.setPose(player, pose);
+        renderer.entities.setTransform(player, math.mul(math.translation(feet), math.mul(math.rotationY(heading), math.uniformScaling(player_scale))));
+        renderer.entities.setPose(player, pose);
         motes_desc.position = .{ feet[0], feet[1] + 1.5, feet[2] };
-        renderer.setEmitter(motes, motes_desc);
+        renderer.emitters.set(motes, motes_desc);
 
         list.clear();
         const stats = renderer.getStats();

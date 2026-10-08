@@ -1,5 +1,6 @@
 //! Images and light profiles. Internal to the renderer.
 const std = @import("std");
+const renderer_state = @import("../state.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const gltf = @import("../../asset/gltf.zig");
 const ktx2 = @import("../../asset/ktx2.zig");
@@ -11,67 +12,145 @@ const render = @import("../renderer.zig");
 const Renderer = render.Renderer;
 const Image = api.Image;
 
-/// As `createImage`, but stored as BC7 with a full mip chain. Falls back
-/// to `createImage` on a device without block compression.
-pub fn createImageCompressed(self: *Renderer, width: u32, height: u32, pixels: []const u8, srgb: bool) !Image {
-    if (!self.device.bc_textures) return self.createImage(width, height, pixels, srgb);
-    if (pixels.len != @as(usize, width) * height * 4) return error.InvalidTextureData;
-    const chain = try texture_codec.encodeBc7Chain(self.gpa, pixels, width, height, srgb);
-    defer self.gpa.free(chain);
-    return createImageFromLevels(self, .{
-        .width = width,
-        .height = height,
-        .format = .bc7,
-        .srgb = srgb,
-        .levels = texture_codec.mipCount(width, height),
-        .data = chain,
-    });
-}
+/// Textures usable by draw lists and materials.
+pub const Images = struct {
+    list: std.ArrayList(renderer_state.ImageEntry) = .empty,
 
-/// Creates an image for draw lists from tightly packed RGBA8 pixels.
-/// `srgb`: true for color, false for data.
-pub fn createImage(self: *Renderer, width: u32, height: u32, pixels: []const u8, srgb: bool) !Image {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const device = self.device;
-    const texture = try device.createTexture(.{
-        .name = "image",
-        .width = width,
-        .height = height,
-        .format = if (srgb) .rgba8_srgb else .rgba8_unorm,
-        .usage = .{ .sampled = true, .copy_dst = true },
-        .mip_levels = rhi.TextureDesc.fullMipCount(width, height),
-    });
-    errdefer device.destroyTexture(texture);
-    try device.uploadTexture(texture, 0, 0, pixels);
-    try device.generateMips(texture);
-    const index = device.textureIndex(texture);
-    try self.images.append(self.gpa, .{ .texture = texture, .index = index });
-    return .{ .index = index, .width = width, .height = height };
-}
-
-/// Decodes an image file to RGBA8. The pixels belong to `gpa`.
-pub fn readImageFile(self: *Renderer, gpa: std.mem.Allocator, path: []const u8) !png.Image {
-    var decoded = try gltf.loadImage(self.gpa, self.io, path);
-    defer decoded.deinit();
-    return .{ .width = decoded.width, .height = decoded.height, .pixels = try gpa.dupe(u8, decoded.data) };
-}
-
-/// Decodes a PNG/JPEG/TGA/BMP file into an sRGB image with full mips, or
-/// loads a KTX2 file as is. Blocks until it is on the GPU. Fails with
-/// `error.UnsupportedTextureFormat` for a KTX2 cube, array or missing BC.
-pub fn loadImage(self: *Renderer, path: []const u8) !Image {
-    const bytes = try gltf.readFile(self.gpa, self.io, path);
-    defer self.gpa.free(bytes);
-    if (ktx2.isKtx2(bytes)) {
-        const texture = try ktx2.read(self.gpa, bytes);
-        defer self.gpa.free(texture.data);
-        return createImageFromLevels(self, texture);
+    fn renderer(images: *Images) *Renderer {
+        return @alignCast(@fieldParentPtr("images", images));
     }
-    var decoded = try gltf.loadImage(self.gpa, self.io, path);
-    defer decoded.deinit();
-    return self.createImage(decoded.width, decoded.height, decoded.data, true);
-}
+
+    /// As `images.create`, but stored as BC7 with a full mip chain. Falls back
+    /// to `images.create` on a device without block compression.
+    pub fn createCompressed(images: *Images, width: u32, height: u32, pixels: []const u8, srgb: bool) !Image {
+        const self = images.renderer();
+        if (!self.device.bc_textures) return self.images.create(width, height, pixels, srgb);
+        if (pixels.len != @as(usize, width) * height * 4) return error.InvalidTextureData;
+        const chain = try texture_codec.encodeBc7Chain(self.gpa, pixels, width, height, srgb);
+        defer self.gpa.free(chain);
+        return createImageFromLevels(self, .{
+            .width = width,
+            .height = height,
+            .format = .bc7,
+            .srgb = srgb,
+            .levels = texture_codec.mipCount(width, height),
+            .data = chain,
+        });
+    }
+
+    /// Creates an image for draw lists from tightly packed RGBA8 pixels.
+    /// `srgb`: true for color, false for data.
+    pub fn create(images: *Images, width: u32, height: u32, pixels: []const u8, srgb: bool) !Image {
+        const self = images.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const device = self.device;
+        const texture = try device.createTexture(.{
+            .name = "image",
+            .width = width,
+            .height = height,
+            .format = if (srgb) .rgba8_srgb else .rgba8_unorm,
+            .usage = .{ .sampled = true, .copy_dst = true },
+            .mip_levels = rhi.TextureDesc.fullMipCount(width, height),
+        });
+        errdefer device.destroyTexture(texture);
+        try device.uploadTexture(texture, 0, 0, pixels);
+        try device.generateMips(texture);
+        const index = device.textureIndex(texture);
+        try self.images.list.append(self.gpa, .{ .texture = texture, .index = index });
+        return .{ .index = index, .width = width, .height = height };
+    }
+
+    /// Decodes an image file to RGBA8. The pixels belong to `gpa`.
+    pub fn readFile(images: *Images, gpa: std.mem.Allocator, path: []const u8) !png.Image {
+        const self = images.renderer();
+        var decoded = try gltf.loadImage(self.gpa, self.io, path);
+        defer decoded.deinit();
+        return .{ .width = decoded.width, .height = decoded.height, .pixels = try gpa.dupe(u8, decoded.data) };
+    }
+
+    /// Decodes a PNG/JPEG/TGA/BMP file into an sRGB image with full mips, or
+    /// loads a KTX2 file as is. Blocks until it is on the GPU. Fails with
+    /// `error.UnsupportedTextureFormat` for a KTX2 cube, array or missing BC.
+    pub fn load(images: *Images, path: []const u8) !Image {
+        const self = images.renderer();
+        const bytes = try gltf.readFile(self.gpa, self.io, path);
+        defer self.gpa.free(bytes);
+        if (ktx2.isKtx2(bytes)) {
+            const texture = try ktx2.read(self.gpa, bytes);
+            defer self.gpa.free(texture.data);
+            return createImageFromLevels(self, texture);
+        }
+        var decoded = try gltf.loadImage(self.gpa, self.io, path);
+        defer decoded.deinit();
+        return self.images.create(decoded.width, decoded.height, decoded.data, true);
+    }
+
+    /// Compresses an RGBA8 picture to BC7 with full mips and writes it as a
+    /// KTX2 file.
+    pub fn writeKtx2(images: *Images, path: []const u8, width: u32, height: u32, pixels: []const u8, srgb: bool) !void {
+        const self = images.renderer();
+        const chain = try texture_codec.encodeBc7Chain(self.gpa, pixels, width, height, srgb);
+        defer self.gpa.free(chain);
+        const file = try ktx2.write(self.gpa, .{
+            .width = width,
+            .height = height,
+            .format = .bc7,
+            .srgb = srgb,
+            .levels = texture_codec.mipCount(width, height),
+            .data = chain,
+        });
+        defer self.gpa.free(file);
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = file });
+    }
+
+    /// Makes a light profile from relative brightness values spread evenly
+    /// from along the light's direction (first) to straight behind (last).
+    /// Normalized so the brightest is 1.
+    pub fn createLightProfile(images: *Images, values: []const f32) !Image {
+        const self = images.renderer();
+        if (values.len == 0) return error.EmptyProfile;
+        var peak: f32 = 0;
+        for (values) |value| peak = @max(peak, value);
+        if (peak <= 0) return error.EmptyProfile;
+        const width = 256;
+        var pixels: [width * 4]u8 = undefined;
+        for (0..width) |x| {
+            const position = @as(f32, @floatFromInt(x)) / (width - 1) * @as(f32, @floatFromInt(values.len - 1));
+            const low: usize = @intFromFloat(@floor(position));
+            const high = @min(low + 1, values.len - 1);
+            const value = (values[low] + (values[high] - values[low]) * (position - @floor(position))) / peak;
+            const level: u8 = @intFromFloat(std.math.clamp(value, 0, 1) * 255 + 0.5);
+            pixels[x * 4 ..][0..4].* = .{ level, level, level, 255 };
+        }
+        return self.images.create(width, 1, &pixels, false);
+    }
+
+    /// Loads an IES LM-63 light distribution: brightness by angle from the
+    /// fixture's axis, averaged around it.
+    pub fn loadLightProfile(images: *Images, path: []const u8) !Image {
+        const self = images.renderer();
+        const bytes = try gltf.readFile(self.gpa, self.io, path);
+        defer self.gpa.free(bytes);
+        const values = try parseIes(self.gpa, bytes);
+        defer self.gpa.free(values);
+        return self.images.createLightProfile(values);
+    }
+
+    /// Frees an image. It must not be used in any later frame. Images the
+    /// renderer does not own (such as a `views.targetImage`) are ignored.
+    pub fn destroy(images: *Images, image: Image) void {
+        const self = images.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.images.list.items, 0..) |entry, index| {
+            if (entry.index != image.index) continue;
+            self.device.destroyTexture(entry.texture);
+            _ = self.images.list.swapRemove(index);
+            return;
+        }
+    }
+};
 
 /// Makes an image from mip levels already in a GPU format.
 fn createImageFromLevels(self: *Renderer, source: ktx2.Texture) !Image {
@@ -101,76 +180,8 @@ fn createImageFromLevels(self: *Renderer, source: ktx2.Texture) !Image {
     errdefer device.destroyTexture(texture);
     try device.uploadTextureLevels(texture, 0, 0, source.data);
     const index = device.textureIndex(texture);
-    try self.images.append(self.gpa, .{ .texture = texture, .index = index });
+    try self.images.list.append(self.gpa, .{ .texture = texture, .index = index });
     return .{ .index = index, .width = source.width, .height = source.height };
-}
-
-/// Deletes the oldest-written cache files until at most `max_bytes`
-/// remain; returns the bytes freed.
-pub fn trimAssetCache(self: *Renderer, max_bytes: u64) !u64 {
-    const directory = self.options.asset_cache_dir orelse return 0;
-    return gltf.trimCache(self.gpa, self.io, directory, max_bytes);
-}
-
-/// Compresses an RGBA8 picture to BC7 with full mips and writes it as a
-/// KTX2 file.
-pub fn writeKtx2(self: *Renderer, path: []const u8, width: u32, height: u32, pixels: []const u8, srgb: bool) !void {
-    const chain = try texture_codec.encodeBc7Chain(self.gpa, pixels, width, height, srgb);
-    defer self.gpa.free(chain);
-    const file = try ktx2.write(self.gpa, .{
-        .width = width,
-        .height = height,
-        .format = .bc7,
-        .srgb = srgb,
-        .levels = texture_codec.mipCount(width, height),
-        .data = chain,
-    });
-    defer self.gpa.free(file);
-    try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = file });
-}
-
-/// Makes a light profile from relative brightness values spread evenly
-/// from along the light's direction (first) to straight behind (last).
-/// Normalized so the brightest is 1.
-pub fn createLightProfile(self: *Renderer, values: []const f32) !Image {
-    if (values.len == 0) return error.EmptyProfile;
-    var peak: f32 = 0;
-    for (values) |value| peak = @max(peak, value);
-    if (peak <= 0) return error.EmptyProfile;
-    const width = 256;
-    var pixels: [width * 4]u8 = undefined;
-    for (0..width) |x| {
-        const position = @as(f32, @floatFromInt(x)) / (width - 1) * @as(f32, @floatFromInt(values.len - 1));
-        const low: usize = @intFromFloat(@floor(position));
-        const high = @min(low + 1, values.len - 1);
-        const value = (values[low] + (values[high] - values[low]) * (position - @floor(position))) / peak;
-        const level: u8 = @intFromFloat(std.math.clamp(value, 0, 1) * 255 + 0.5);
-        pixels[x * 4 ..][0..4].* = .{ level, level, level, 255 };
-    }
-    return self.createImage(width, 1, &pixels, false);
-}
-
-/// Loads an IES LM-63 light distribution: brightness by angle from the
-/// fixture's axis, averaged around it.
-pub fn loadLightProfile(self: *Renderer, path: []const u8) !Image {
-    const bytes = try gltf.readFile(self.gpa, self.io, path);
-    defer self.gpa.free(bytes);
-    const values = try parseIes(self.gpa, bytes);
-    defer self.gpa.free(values);
-    return self.createLightProfile(values);
-}
-
-/// Frees an image. It must not be used in any later frame. Images the
-/// renderer does not own (such as a `targetImage`) are ignored.
-pub fn destroyImage(self: *Renderer, image: Image) void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    for (self.images.items, 0..) |entry, index| {
-        if (entry.index != image.index) continue;
-        self.device.destroyTexture(entry.texture);
-        _ = self.images.swapRemove(index);
-        return;
-    }
 }
 
 /// Reads an IES LM-63 photometric file and returns brightness at 181

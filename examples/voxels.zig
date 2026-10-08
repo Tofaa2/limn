@@ -334,7 +334,7 @@ const World = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.built.append(self.gpa, result) catch {
-            if (result.model) |model| self.renderer.destroyModel(model) catch {};
+            if (result.model) |model| self.renderer.models.destroy(model) catch {};
         };
     }
 
@@ -362,7 +362,7 @@ const World = struct {
         }
         if (mesh_count == 0) return;
         result.triangles = @intCast((land.indices.items.len + sea.indices.items.len) / 3);
-        result.model = try self.renderer.createModel(meshes[0..mesh_count]);
+        result.model = try self.renderer.models.create(meshes[0..mesh_count]);
     }
 
     fn start(self: *World, index: u32, meshed: bool) void {
@@ -371,8 +371,8 @@ const World = struct {
     }
 
     fn unload(self: *World, chunk: *Chunk) void {
-        if (chunk.entity) |entity| self.renderer.despawn(entity);
-        if (chunk.model) |model| self.renderer.destroyModel(model) catch {};
+        if (chunk.entity) |entity| self.renderer.entities.despawn(entity);
+        if (chunk.model) |model| self.renderer.models.destroy(model) catch {};
         chunk.entity = null;
         chunk.model = null;
         chunk.state = .absent;
@@ -402,7 +402,7 @@ const World = struct {
                 continue;
             };
             chunk.model = model;
-            chunk.entity = try self.renderer.spawn(self.scene, .{ .model = model, .transform = math.translation(chunk.origin()) });
+            chunk.entity = try self.renderer.entities.spawn(self.scene, .{ .model = model, .transform = math.translation(chunk.origin()) });
             chunk.state = .loaded;
             self.loaded += 1;
             self.triangles += result.triangles;
@@ -460,16 +460,16 @@ pub fn main(init: std.process.Init) !void {
     }
     var stage = try Stage.create(init, "Limn voxel planet", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
-    const environment = try renderer.createSky(.{ .sun_direction = .{ 0, 1, 0 }, .stars = 40 });
-    renderer.setEnvironment(scene, environment, 0.6);
+    const scene = try renderer.scenes.create();
+    const environment = try renderer.environments.createSky(.{ .sun_direction = .{ 0, 1, 0 }, .stars = 40 });
+    renderer.scenes.setEnvironment(scene, environment, 0.6);
 
     var world = try World.create(gpa, init.io, renderer, scene);
     defer world.deinit();
 
     var list = gfx.DrawList.init(gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var text: [320]u8 = undefined;
     var by_hand = false;
     var edges = false;
@@ -536,7 +536,7 @@ pub fn main(init: std.process.Init) !void {
         const waiting = try world.stream(eye, streaming);
 
         const toward_sun = math.normalize(math.Vec3{ @cos(day), 0.25, @sin(day) });
-        renderer.setSun(scene, .{ .direction = math.scale(toward_sun, -1), .color = .{ 1, 0.95, 0.88 }, .intensity = 4 });
+        renderer.scenes.setSun(scene, .{ .direction = math.scale(toward_sun, -1), .color = .{ 1, 0.95, 0.88 }, .intensity = 4 });
 
         list.clear();
         if (edges) for (world.chunks) |chunk| {

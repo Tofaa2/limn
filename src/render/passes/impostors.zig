@@ -40,10 +40,10 @@ pub fn bakeImpostors(renderer: *Renderer, p: *const ScenePass) !void {
     const cmd = p.cmd;
     const scene = p.scene;
     for (scene.groups.items) |group_handle| {
-        const group = renderer.instance_groups.get(group_handle) orelse continue;
+        const group = renderer.instances.table.get(group_handle) orelse continue;
         const impostor = if (group.impostor) |*state| state else continue;
         if (impostor.baked) continue;
-        const model = renderer.models.get(group.model) orelse continue;
+        const model = renderer.models.table.get(group.model) orelse continue;
         if (model.state != .ready or !model.geometry_resident) continue;
         const source = &model.source.?;
         if (source.instances.len != 1) continue;

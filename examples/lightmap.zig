@@ -77,10 +77,10 @@ pub fn main(init: std.process.Init) !void {
     }
     var stage = try Stage.create(init, "Limn lightmap", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     const sky = gfx.SkyDesc{ .sun_direction = .{ 0.25, -0.8, -0.55 } };
-    renderer.setSun(scene, gfx.skySun(sky));
-    renderer.setEnvironment(scene, try renderer.createSky(sky), 1);
+    renderer.scenes.setSun(scene, gfx.skySun(sky));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
 
     var positions: [24][3]f32 = undefined;
     var patches: [24][2]f32 = undefined;
@@ -88,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
     lightmappedBox(&positions, &patches, &indices);
     const colors = [_][4]f32{ .{ 0.85, 0.85, 0.85, 1 }, .{ 0.8, 0.12, 0.1, 1 }, .{ 0.15, 0.7, 0.18, 1 }, .{ 0.2, 0.3, 0.8, 1 } };
     var models: [colors.len]gfx.Model = undefined;
-    for (colors, &models) |color, *model| model.* = try renderer.createModel(&.{.{
+    for (colors, &models) |color, *model| model.* = try renderer.models.create(&.{.{
         .positions = &positions,
         .uvs1 = &patches,
         .indices = &indices,
@@ -96,14 +96,14 @@ pub fn main(init: std.process.Init) !void {
     }});
     try renderer.waitUntilLoaded();
     var entities: [slabs.len]gfx.Entity = undefined;
-    for (slabs, &entities) |slab, *entity| entity.* = try renderer.spawn(scene, .{
+    for (slabs, &entities) |slab, *entity| entity.* = try renderer.entities.spawn(scene, .{
         .model = models[@intFromEnum(slab.color)],
         .transform = math.mul(math.translation(slab.center), math.mul(math.rotationY(slab.turn), math.scaling(slab.size))),
     });
 
     var list = gfx.DrawList.init(gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var text: [256]u8 = undefined;
     var wanted = baked;
     var applied = false;
@@ -117,13 +117,13 @@ pub fn main(init: std.process.Init) !void {
         side = std.math.clamp(side, -3, 3);
         if (wanted != applied) {
             applied = wanted;
-            for (entities) |entity| renderer.bakeLightmap(entity, if (wanted) .{ .resolution = 192, .frames = 300, .rays = 24, .reach = 60 } else null) catch |failure| switch (failure) {
+            for (entities) |entity| renderer.entities.bakeLightmap(entity, if (wanted) .{ .resolution = 192, .frames = 300, .rays = 24, .reach = 60 } else null) catch |failure| switch (failure) {
                 error.RayTracingUnavailable => unavailable = true,
                 else => return failure,
             };
         }
         var progress: f32 = 1;
-        for (entities) |entity| progress = @min(progress, renderer.lightmapProgress(entity) orelse 1);
+        for (entities) |entity| progress = @min(progress, renderer.entities.lightmapProgress(entity) orelse 1);
 
         list.clear();
         try list.rect(.{ .x = 12, .y = 12, .width = 520, .height = 96 }, gfx.Color.rgba(8, 10, 18, 190));

@@ -230,8 +230,8 @@ pub fn main(init: std.process.Init) !void {
         .surface = if (window) |value| try value.surface(false) else null,
     });
     defer renderer.deinit();
-    const target: ?gfx.rhi.Texture = if (offscreen) try renderer.createTarget(1280, 720) else null;
-    defer if (target) |texture| renderer.destroyTarget(texture);
+    const target: ?gfx.rhi.Texture = if (offscreen) try renderer.views.createTarget(1280, 720) else null;
+    defer if (target) |texture| renderer.views.destroyTarget(texture);
 
     var positions: [5][24][3]f32 = undefined;
     var indices: [5][36]u32 = undefined;
@@ -242,29 +242,29 @@ pub fn main(init: std.process.Init) !void {
     boxMesh(.{ 0.35, 2.0, 0.35 }, &positions[4], &indices[4]);
     const placements = [5]math.Vec3{ .{ 0, -0.1, 0 }, .{ -4, 0.1, 0 }, .{ 1.5, 0.2, 0 }, .{ -1.2, 2, -4.5 }, .{ 3.2, 2, -3.6 } };
     const colors = [5][4]f32{ .{ 0.09, 0.095, 0.11, 1 }, .{ 0.08, 0.07, 0.07, 1 }, .{ 0.45, 0.47, 0.5, 1 }, .{ 0.55, 0.5, 0.45, 1 }, .{ 0.55, 0.5, 0.45, 1 } };
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     for (0..5) |index| {
-        const model = try renderer.createModel(&.{.{
+        const model = try renderer.models.create(&.{.{
             .positions = &positions[index],
             .indices = &indices[index],
             .material = .{ .base_color = colors[index], .metallic = 0, .roughness = 0.8 },
         }});
-        _ = try renderer.spawn(scene, .{ .model = model, .transform = math.translation(placements[index]) });
+        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(placements[index]) });
     }
     var shard_positions: [24][3]f32 = undefined;
     var shard_indices: [36]u32 = undefined;
     boxMesh(.{ 0.5, 0.3, 0.4 }, &shard_positions, &shard_indices);
-    const shard = try renderer.createModel(&.{.{ .positions = &shard_positions, .indices = &shard_indices, .material = .{} }});
+    const shard = try renderer.models.create(&.{.{ .positions = &shard_positions, .indices = &shard_indices, .material = .{} }});
     try renderer.waitUntilLoaded();
-    renderer.setSun(scene, .{ .direction = .{ -0.55, -0.6, -0.45 }, .color = .{ 0.75, 0.82, 1.0 }, .intensity = 2.5 });
+    renderer.scenes.setSun(scene, .{ .direction = .{ -0.55, -0.6, -0.45 }, .color = .{ 0.75, 0.82, 1.0 }, .intensity = 2.5 });
 
     for (&effects) |*effect| {
-        for (effect.emitters, 0..) |desc, index| effect.handles[index] = try renderer.createEmitter(scene, desc);
+        for (effect.emitters, 0..) |desc, index| effect.handles[index] = try renderer.emitters.create(scene, desc);
     }
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var keys_down: [effects.len]bool = @splat(false);
     var orbit: f32 = 0.6;
     var auto_orbit = true;
@@ -309,11 +309,11 @@ pub fn main(init: std.process.Init) !void {
                 if (!effect.on) desc.rate = 0;
                 if (effect_index == 4) desc.position = orbPosition(time);
                 if (effect_index == debris_effect) desc.mesh = shard;
-                renderer.setEmitter(effect.handles[index], desc);
+                renderer.emitters.set(effect.handles[index], desc);
             }
         }
         const flicker = 0.85 + 0.15 * @sin(time * 17) * @sin(time * 7.3);
-        try renderer.setLights(scene, if (effects[0].on) &.{.{
+        try renderer.scenes.setLights(scene, if (effects[0].on) &.{.{
             .position = math.add(fire_position, .{ 0, 0.6, 0 }),
             .color = .{ 1.0, 0.5, 0.18 },
             .intensity = 30 * flicker,

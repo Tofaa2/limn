@@ -32,43 +32,43 @@ pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn animation", .{ .asset_cache_dir = "zig-out/asset-cache" });
     const renderer = stage.renderer;
 
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
     var positions: [24][3]f32 = undefined;
     var indices: [36]u32 = undefined;
     boxMesh(.{ 9, 0.1, 5 }, &positions, &indices);
-    const floor = try renderer.createModel(&.{.{
+    const floor = try renderer.models.create(&.{.{
         .positions = &positions,
         .indices = &indices,
         .material = .{ .base_color = .{ 0.22, 0.23, 0.26, 1 }, .metallic = 0, .roughness = 0.7 },
     }});
-    _ = try renderer.spawn(scene, .{ .model = floor, .transform = math.translation(.{ 0, -0.1, 0 }) });
+    _ = try renderer.entities.spawn(scene, .{ .model = floor, .transform = math.translation(.{ 0, -0.1, 0 }) });
 
-    const robot = try renderer.loadModel("examples/assets/world/RobotExpressive.glb");
-    const environment = try renderer.loadEnvironment("examples/assets/world/venice_sunset_1k.hdr", 24);
+    const robot = try renderer.models.load("examples/assets/world/RobotExpressive.glb");
+    const environment = try renderer.environments.load("examples/assets/world/venice_sunset_1k.hdr", 24);
     try renderer.waitUntilLoaded();
-    renderer.setEnvironment(scene, environment, 0.5);
-    renderer.setSun(scene, .{ .direction = .{ -0.5, -0.8, -0.4 }, .color = .{ 1.0, 0.93, 0.82 }, .intensity = 5 });
+    renderer.scenes.setEnvironment(scene, environment, 0.5);
+    renderer.scenes.setSun(scene, .{ .direction = .{ -0.5, -0.8, -0.4 }, .color = .{ 1.0, 0.93, 0.82 }, .intensity = 5 });
 
     var robots: [4]gfx.Entity = undefined;
     for (&robots, 0..) |*entity, index| {
         const x = (@as(f32, @floatFromInt(index)) - 1.5) * 3.2;
-        entity.* = try renderer.spawn(scene, .{
+        entity.* = try renderer.entities.spawn(scene, .{
             .model = robot,
             .transform = math.mul(math.translation(.{ x, 0, 0 }), math.uniformScaling(0.5)),
         });
     }
     const clips = Clips{
-        .idle = renderer.findAnimation(robot, "Idle") orelse 0,
-        .walk = renderer.findAnimation(robot, "Walking") orelse 0,
-        .run = renderer.findAnimation(robot, "Running") orelse 0,
-        .wave = renderer.findAnimation(robot, "Wave") orelse 0,
-        .nod = renderer.findAnimation(robot, "Yes") orelse 0,
-        .spine = renderer.findNode(robot, "Abdomen"),
+        .idle = renderer.models.findAnimation(robot, "Idle") orelse 0,
+        .walk = renderer.models.findAnimation(robot, "Walking") orelse 0,
+        .run = renderer.models.findAnimation(robot, "Running") orelse 0,
+        .wave = renderer.models.findAnimation(robot, "Wave") orelse 0,
+        .nod = renderer.models.findAnimation(robot, "Yes") orelse 0,
+        .spine = renderer.models.findNode(robot, "Abdomen"),
     };
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var paused = false;
     var layers_on = true;
     var clock: f32 = 0;
@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
             both.layers[0] = wave;
             both.layers[1] = nod;
         }
-        for (robots, [4]gfx.Pose{ crossfade, masked, additive, both }) |entity, pose| renderer.setPose(entity, pose);
+        for (robots, [4]gfx.Pose{ crossfade, masked, additive, both }) |entity, pose| renderer.entities.setPose(entity, pose);
 
         list.clear();
         for (labels, 0..) |label, index| {

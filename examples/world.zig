@@ -151,14 +151,14 @@ pub fn main(init: std.process.Init) !void {
     if (hdr) std.log.info("hdr output: {s}", .{if (renderer.hdrActive()) "active (HDR10)" else "not available on this display, using sRGB"});
     std.log.info("device: {s}", .{renderer.device.name()});
 
-    const scene = try renderer.createScene();
-    const environment = try renderer.loadEnvironment("examples/assets/world/venice_sunset_2k.hdr", 24);
-    const sponza = try renderer.loadModel("examples/assets/world/Sponza.glb");
-    const robot = try renderer.loadModel("examples/assets/world/RobotExpressive.glb");
-    renderer.setEnvironment(scene, environment, 1.0);
-    renderer.setSun(scene, .{ .direction = .{ -0.42, -1.0, 0.18 }, .color = .{ 1.0, 0.93, 0.82 }, .intensity = 28 });
-    _ = try renderer.spawn(scene, .{ .model = sponza });
-    const player_entity = try renderer.spawn(scene, .{ .model = robot });
+    const scene = try renderer.scenes.create();
+    const environment = try renderer.environments.load("examples/assets/world/venice_sunset_2k.hdr", 24);
+    const sponza = try renderer.models.load("examples/assets/world/Sponza.glb");
+    const robot = try renderer.models.load("examples/assets/world/RobotExpressive.glb");
+    renderer.scenes.setEnvironment(scene, environment, 1.0);
+    renderer.scenes.setSun(scene, .{ .direction = .{ -0.42, -1.0, 0.18 }, .color = .{ 1.0, 0.93, 0.82 }, .intensity = 28 });
+    _ = try renderer.entities.spawn(scene, .{ .model = sponza });
+    const player_entity = try renderer.entities.spawn(scene, .{ .model = robot });
 
     var player = Player{};
     var camera = OrbitCamera{};
@@ -209,8 +209,8 @@ pub fn main(init: std.process.Init) !void {
         .color_start = .{ 0.55, 0.55, 0.6, 0.35 },
         .color_end = .{ 0.7, 0.7, 0.75, 0 },
     };
-    const fire = try renderer.createEmitter(scene, fire_desc);
-    const smoke = try renderer.createEmitter(scene, smoke_desc);
+    const fire = try renderer.emitters.create(scene, fire_desc);
+    const smoke = try renderer.emitters.create(scene, smoke_desc);
     var fire_on = true;
     var waving = false;
     var wave_weight: f32 = 0;
@@ -232,7 +232,7 @@ pub fn main(init: std.process.Init) !void {
         if (keys.pressed(window, glfw.GLFW_KEY_T)) settings.temporal_antialiasing = !settings.temporal_antialiasing;
         if (keys.pressed(window, glfw.GLFW_KEY_H)) show_hud = !show_hud;
         if (keys.pressed(window, glfw.GLFW_KEY_F5)) {
-            if (renderer.reloadShaders()) |count| {
+            if (renderer.shaders.reload()) |count| {
                 std.log.info("reloaded {d} shaders", .{count});
             } else |err| std.log.err("shader reload failed: {s}", .{@errorName(err)});
         }
@@ -242,13 +242,13 @@ pub fn main(init: std.process.Init) !void {
             var stopped_smoke = smoke_desc;
             stopped_fire.rate = 0;
             stopped_smoke.rate = 0;
-            renderer.setEmitter(fire, if (fire_on) fire_desc else stopped_fire);
-            renderer.setEmitter(smoke, if (fire_on) smoke_desc else stopped_smoke);
+            renderer.emitters.set(fire, if (fire_on) fire_desc else stopped_fire);
+            renderer.emitters.set(smoke, if (fire_on) smoke_desc else stopped_smoke);
         }
         if (keys.pressed(window, glfw.GLFW_KEY_G)) settings.global_illumination = !settings.global_illumination;
         if (keys.pressed(window, glfw.GLFW_KEY_L)) {
             lanterns = !lanterns;
-            try renderer.setLights(scene, if (lanterns) &.{
+            try renderer.scenes.setLights(scene, if (lanterns) &.{
                 .{
                     .kind = .spot,
                     .position = .{ 7.0, 3.5, 0.6 },
@@ -270,17 +270,17 @@ pub fn main(init: std.process.Init) !void {
             renderer.device.setVsync(vsync);
         }
 
-        if (!bounds_known) if (renderer.modelInfo(sponza)) |info| {
+        if (!bounds_known) if (renderer.models.info(sponza)) |info| {
             bounds = .{ math.add(info.bounds_min, .{ 2.2, 0, 2.2 }), math.sub(info.bounds_max, .{ 2.2, 0, 2.2 }) };
             bounds_known = true;
         };
-        if (clips == null and renderer.modelState(robot) == .ready) clips = .{
-            .idle = renderer.findAnimation(robot, "Idle") orelse 0,
-            .walk = renderer.findAnimation(robot, "Walking") orelse 0,
-            .run = renderer.findAnimation(robot, "Running") orelse 0,
-            .jump = renderer.findAnimation(robot, "Jump") orelse 0,
-            .wave = renderer.findAnimation(robot, "Wave") orelse 0,
-            .torso = renderer.findNode(robot, "Abdomen"),
+        if (clips == null and renderer.models.state(robot) == .ready) clips = .{
+            .idle = renderer.models.findAnimation(robot, "Idle") orelse 0,
+            .walk = renderer.models.findAnimation(robot, "Walking") orelse 0,
+            .run = renderer.models.findAnimation(robot, "Running") orelse 0,
+            .jump = renderer.models.findAnimation(robot, "Jump") orelse 0,
+            .wave = renderer.models.findAnimation(robot, "Wave") orelse 0,
+            .torso = renderer.models.findNode(robot, "Abdomen"),
         };
         if (!announced_ready and !renderer.isLoading()) {
             announced_ready = true;
@@ -288,7 +288,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         player.update(window, camera.yaw, bounds, dt);
-        renderer.setTransform(player_entity, player.transform());
+        renderer.entities.setTransform(player_entity, player.transform());
         if (clips) |clip| {
             animation_time += dt;
             var pose: gfx.Pose = if (!player.grounded)
@@ -300,7 +300,7 @@ pub fn main(init: std.process.Init) !void {
             waving = window.keyDown(glfw.GLFW_KEY_E);
             wave_weight += ((if (waving) @as(f32, 1) else 0) - wave_weight) * (1 - @exp(-10 * dt));
             if (wave_weight > 0.01) pose.layers[0] = .{ .animation = clip.wave, .time = animation_time, .weight = wave_weight, .root = clip.torso };
-            renderer.setPose(player_entity, pose);
+            renderer.entities.setPose(player_entity, pose);
         }
 
         if (resize_test and frames == 40) glfw.glfwSetWindowSize(window.handle, 1000, 620);
@@ -316,7 +316,7 @@ pub fn main(init: std.process.Init) !void {
         }
         const focus = math.add(player.position, .{ 0, 1.0, 0 });
         list.clear();
-        const font = renderer.defaultFont();
+        const font = renderer.fonts.default();
         if (show_hud) {
             const Toggle = struct { key: []const u8, label: []const u8, state: []const u8, on: bool };
             const on_off = struct {

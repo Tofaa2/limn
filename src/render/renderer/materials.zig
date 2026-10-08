@@ -42,95 +42,110 @@ fn materialSampler(self: *Renderer, data: gltf.SamplerData, anisotropic: bool) !
     return sampler;
 }
 
-/// Registers a custom material. `spirv` is a fragment shader that defines
-/// `CUSTOM_MATERIAL`, includes "shade.glsl" and defines
-/// `customMaterial()`; see `examples/shaders/lava.frag`.
-pub fn createMaterialShader(self: *Renderer, spirv: []const u8) !MaterialShader {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    for (self.material_shaders[1..], 1..) |*slot, index| {
-        if (slot.* != null) continue;
-        const plain = try self.device.createGraphicsPipeline(.{
-            .name = "custom material",
-            .vertex = shaderCode("fullscreen.vert.spv"),
-            .fragment = spirv,
-            .color_targets = &.{ .{ .format = hdr_format }, .{ .format = .rg16_float } },
-            .cull = .none,
-        });
-        errdefer self.device.destroyPipeline(plain);
-        slot.* = .{
-            .plain = plain,
-            .reflective = try self.device.createGraphicsPipeline(.{
-                .name = "custom material (reflective)",
+/// Material records, textures and custom material shaders.
+pub const Materials = struct {
+    pool: renderer_state.Pool,
+    shaders: [32]?renderer_state.MaterialPipelines = @splat(null),
+    shader_users: [32]u32 = @splat(0),
+
+    fn renderer(materials: *Materials) *Renderer {
+        return @alignCast(@fieldParentPtr("materials", materials));
+    }
+
+    /// Registers a custom material. `spirv` is a fragment shader that defines
+    /// `CUSTOM_MATERIAL`, includes "shade.glsl" and defines
+    /// `customMaterial()`; see `examples/shaders/lava.frag`.
+    pub fn createShader(materials: *Materials, spirv: []const u8) !MaterialShader {
+        const self = materials.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.materials.shaders[1..], 1..) |*slot, index| {
+            if (slot.* != null) continue;
+            const plain = try self.device.createGraphicsPipeline(.{
+                .name = "custom material",
                 .vertex = shaderCode("fullscreen.vert.spv"),
                 .fragment = spirv,
-                .color_targets = &shade_reflective_targets,
+                .color_targets = &.{ .{ .format = hdr_format }, .{ .format = .rg16_float } },
                 .cull = .none,
-            }),
-        };
-        return .{ .slot = @intCast(index) };
+            });
+            errdefer self.device.destroyPipeline(plain);
+            slot.* = .{
+                .plain = plain,
+                .reflective = try self.device.createGraphicsPipeline(.{
+                    .name = "custom material (reflective)",
+                    .vertex = shaderCode("fullscreen.vert.spv"),
+                    .fragment = spirv,
+                    .color_targets = &shade_reflective_targets,
+                    .cull = .none,
+                }),
+            };
+            return .{ .slot = @intCast(index) };
+        }
+        return error.TooManyMaterialShaders;
     }
-    return error.TooManyMaterialShaders;
-}
 
-/// Materials still using the shader fall back to the standard material.
-pub fn destroyMaterialShader(self: *Renderer, shader: MaterialShader) void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    if (shader.slot == 0 or shader.slot >= self.material_shaders.len) return;
-    if (self.material_shaders[shader.slot]) |pipelines| {
-        self.device.destroyPipeline(pipelines.plain);
-        self.device.destroyPipeline(pipelines.reflective);
+    /// Materials still using the shader fall back to the standard material.
+    pub fn destroyShader(materials: *Materials, shader: MaterialShader) void {
+        const self = materials.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (shader.slot == 0 or shader.slot >= self.materials.shaders.len) return;
+        if (self.materials.shaders[shader.slot]) |pipelines| {
+            self.device.destroyPipeline(pipelines.plain);
+            self.device.destroyPipeline(pipelines.reflective);
+        }
+        self.materials.shaders[shader.slot] = null;
     }
-    self.material_shaders[shader.slot] = null;
-}
 
-/// Sets a loaded model's material shader and parameters. `material` null
-/// applies to all materials; `shader` null restores the standard one. The
-/// model must have finished loading.
-pub fn setMaterialShader(self: *Renderer, model: Model, material: ?u32, shader: ?MaterialShader, params: [4]f32) !void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const entry = self.models.get(model) orelse return error.InvalidModel;
-    if (entry.state != .ready) return error.ModelNotReady;
-    const materials = entry.source.?.materials;
-    if (material) |index| if (index >= materials.len) return error.InvalidMaterial;
-    for (materials, 0..) |*item, index| {
-        if (material) |only| if (only != index) continue;
-        self.material_shader_users[if (item.shader < self.material_shaders.len) item.shader else 0] -= 1;
-        item.shader = if (shader) |value| value.slot else 0;
-        item.params = params;
-        const encoded = try encodeMaterial(self, entry, item.*, index);
-        self.material_shader_users[encoded.shader] += 1;
-        try self.materials.write(self.device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded));
+    /// Sets a loaded model's material shader and parameters. `material` null
+    /// applies to all materials; `shader` null restores the standard one. The
+    /// model must have finished loading.
+    pub fn setShader(materials: *Materials, model: Model, material: ?u32, shader: ?MaterialShader, params: [4]f32) !void {
+        const self = materials.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.models.table.get(model) orelse return error.InvalidModel;
+        if (entry.state != .ready) return error.ModelNotReady;
+        const records = entry.source.?.materials;
+        if (material) |index| if (index >= records.len) return error.InvalidMaterial;
+        for (records, 0..) |*item, index| {
+            if (material) |only| if (only != index) continue;
+            self.materials.shader_users[if (item.shader < self.materials.shaders.len) item.shader else 0] -= 1;
+            item.shader = if (shader) |value| value.slot else 0;
+            item.params = params;
+            const encoded = try encodeMaterial(self, entry, item.*, index);
+            self.materials.shader_users[encoded.shader] += 1;
+            try self.materials.pool.write(self.device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded));
+        }
     }
-}
 
-/// Sets a model material's textures from images. `material` null applies
-/// to all. Color images should be sRGB, data images linear. The images
-/// must outlive the model's use of them.
-pub fn setMaterialTextures(self: *Renderer, model: Model, material: ?u32, textures: MaterialTextures) !void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const entry = self.models.get(model) orelse return error.InvalidModel;
-    const source = entry.source orelse return error.ModelNotReady;
-    const count = source.materials.len;
-    if (material) |index| if (index >= count) return error.InvalidMaterial;
-    if (entry.material_images.len == 0) {
-        entry.material_images = try self.gpa.alloc(MaterialTextures, count);
-        @memset(entry.material_images, .{});
+    /// Sets a model material's textures from images. `material` null applies
+    /// to all. Color images should be sRGB, data images linear. The images
+    /// must outlive the model's use of them.
+    pub fn setTextures(materials: *Materials, model: Model, material: ?u32, textures: MaterialTextures) !void {
+        const self = materials.renderer();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.models.table.get(model) orelse return error.InvalidModel;
+        const source = entry.source orelse return error.ModelNotReady;
+        const count = source.materials.len;
+        if (material) |index| if (index >= count) return error.InvalidMaterial;
+        if (entry.material_images.len == 0) {
+            entry.material_images = try self.gpa.alloc(MaterialTextures, count);
+            @memset(entry.material_images, .{});
+        }
+        for (entry.material_images, 0..) |*images, index| {
+            if (material) |only| if (only != index) continue;
+            images.* = textures;
+        }
+        if (entry.state != .ready) return;
+        for (source.materials, 0..) |item, index| {
+            if (material) |only| if (only != index) continue;
+            const encoded = try encodeMaterial(self, entry, item, index);
+            try self.materials.pool.write(self.device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded));
+        }
     }
-    for (entry.material_images, 0..) |*images, index| {
-        if (material) |only| if (only != index) continue;
-        images.* = textures;
-    }
-    if (entry.state != .ready) return;
-    for (source.materials, 0..) |item, index| {
-        if (material) |only| if (only != index) continue;
-        const encoded = try encodeMaterial(self, entry, item, index);
-        try self.materials.write(self.device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded));
-    }
-}
+};
 
 pub fn encodeMaterial(self: *Renderer, entry: *ModelEntry, material: gltf.Material, index: usize) !gpu.Material {
     const device = self.device;
@@ -164,7 +179,7 @@ pub fn encodeMaterial(self: *Renderer, entry: *ModelEntry, material: gltf.Materi
         .sampler_index = device.samplerIndex(try materialSampler(self, if (sampler_source) |ref| ref.sampler else .{}, true)),
         .detail_sampler = device.samplerIndex(try materialSampler(self, if (sampler_source) |ref| ref.sampler else .{}, false)),
         .flags = flags,
-        .shader = if (material.specular_glossiness) 0 else if (material.shader < self.material_shaders.len) material.shader else 0,
+        .shader = if (material.specular_glossiness) 0 else if (material.shader < self.materials.shaders.len) material.shader else 0,
         .params = if (material.specular_glossiness) .{ material.specular[0], material.specular[1], material.specular[2], 0 } else material.params,
         .uv_transform = uvMatrix(material.uv_scale, material.uv_rotation),
         .texture_transforms = transformSlot(entry, index),

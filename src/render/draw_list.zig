@@ -132,7 +132,7 @@ pub const TextOptions = struct {
     /// OpenType language tag (`"ROM "`, `"SRB "`, ...).
     language: ?[4]u8 = null,
     /// Extra OpenType features (`"smcp"`, `"salt"`, ...). Their glyphs must be
-    /// in the atlas: see `Renderer.prepareTextWith`.
+    /// in the atlas: see `Renderer.fonts.prepareTextWith`.
     features: []const [4]u8 = &.{},
 };
 
@@ -871,7 +871,7 @@ pub const DrawList = struct {
 
     /// Draws text in upright columns running right to left, as for vertical
     /// CJK. `position` is the top middle of the first column. Uses the font's
-    /// `vert` forms (once baked with `Renderer.prepareTextWith`) and vertical
+    /// `vert` forms (once baked with `Renderer.fonts.prepareTextWith`) and vertical
     /// advances when present; otherwise each character takes a `size` square.
     /// Of `options`, `size`, `color`, `shadow`, `fallback`, `language` apply.
     pub fn textVertical(self: *DrawList, font: *const Font, string: []const u8, position: [2]f32, options: TextOptions) !void {

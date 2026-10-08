@@ -6,6 +6,9 @@
 
 // The pipeline cache the SDK compiles its shaders into; set by limn_ffx.cpp.
 extern VkPipelineCache limnFfxPipelineCache;
+#ifdef __cplusplus
+#include <mutex>
+#endif
 #ifndef _WIN32
 #ifdef __cplusplus
 #include <codecvt>

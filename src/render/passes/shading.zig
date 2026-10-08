@@ -29,7 +29,7 @@ pub fn reflectionProbeList(renderer: *Renderer, p: *const ScenePass) !ProbeList 
     if (scene.probes.items.len != 0) {
         const list = try arena.alloc(device, gpu.ReflectionProbe, scene.probes.items.len);
         for (scene.probes.items) |probe_handle| {
-            const probe = renderer.probes.get(probe_handle) orelse continue;
+            const probe = renderer.probes.table.get(probe_handle) orelse continue;
             if (!probe.captured or probe.capturing) continue;
             list.items[probe_count] = .{
                 .center = probe.desc.position,
@@ -270,7 +270,7 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
         else
             gpu.invalid_id,
     };
-    for (renderer.material_shaders, renderer.material_shader_users, 0..) |shader, users, slot| {
+    for (renderer.materials.shaders, renderer.materials.shader_users, 0..) |shader, users, slot| {
         if (shader != null and users != 0) shade_push.material_shader |= @as(u32, 1) << @intCast(slot);
     }
     const custom_shaders = shade_push.material_shader;
@@ -293,7 +293,7 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
     cmd.bindPipeline(try shadePipeline(renderer, reflections != null, shade_features));
     cmd.pushConstants(shade_push);
     cmd.drawFullscreen();
-    for (renderer.material_shaders, 0..) |shader, slot| {
+    for (renderer.materials.shaders, 0..) |shader, slot| {
         if ((custom_shaders >> @intCast(slot)) & 1 == 0) continue;
         shade_push.material_shader = @intCast(slot);
         cmd.bindPipeline(if (reflections != null) shader.?.reflective else shader.?.plain);

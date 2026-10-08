@@ -19,20 +19,20 @@ const Stage = helpers.Stage;
 pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn custom material", .{});
     const renderer = stage.renderer;
-    const scene = try renderer.createScene();
+    const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.3, -0.6 } };
-    renderer.setEnvironment(scene, try renderer.createSky(sky_desc), 0.6);
-    renderer.setSun(scene, gfx.skySun(sky_desc));
+    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 0.6);
+    renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
-    const lava = try renderer.createMaterialShader(@embedFile("lava.frag.spv"));
+    const lava = try renderer.materials.createShader(@embedFile("lava.frag.spv"));
 
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(1.0, &sphere_positions, &sphere_normals, &sphere_indices);
     var glow: f32 = 3;
-    const molten = try renderer.createModel(&.{.{
+    const molten = try renderer.models.create(&.{.{
         .positions = &sphere_positions,
         .normals = &sphere_normals,
         .indices = &sphere_indices,
@@ -41,14 +41,14 @@ pub fn main(init: std.process.Init) !void {
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
-    const ground = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.12, 0.11, 0.1, 1 }, .metallic = 0, .roughness = 0.6 } }});
-    _ = try renderer.spawn(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 30, 0.5, 30 })) });
+    const ground = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.12, 0.11, 0.1, 1 }, .metallic = 0, .roughness = 0.6 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 30, 0.5, 30 })) });
 
     const count = 5;
     var balls: [count]gfx.Entity = undefined;
     for (&balls, 0..) |*ball, index| {
         const cooled = @as(f32, @floatFromInt(index)) / (count - 1);
-        ball.* = try renderer.spawn(scene, .{
+        ball.* = try renderer.entities.spawn(scene, .{
             .model = molten,
             .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - (count - 1) * 0.5) * 2.6, 1.0, 0 }),
             .params = .{ cooled, 0, 0, 0 },
@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
-    const font = renderer.defaultFont();
+    const font = renderer.fonts.default();
     var orbit: f32 = 0.3;
     var hud_buffer: [96]u8 = undefined;
 
@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
             glow = @max(glow - 1, 0);
             changed = true;
         }
-        if (changed) try renderer.setMaterialShader(molten, null, lava, .{ 2.5, glow, 0, 0 });
+        if (changed) try renderer.materials.setShader(molten, null, lava, .{ 2.5, glow, 0, 0 });
 
         list.clear();
         try list.text3d(font, "molten", .{ -(count - 1) * 0.5 * 2.6, 2.4, 0 }, .{ .size = 0.2 });
