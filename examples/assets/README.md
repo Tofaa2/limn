@@ -65,8 +65,8 @@ lower resolution.
 
 `panel/` holds a small textured panel generated for this repository's tests,
 in three encodings: PNG, and
-Basis Universal ETC1S and UASTC in KTX2 files. The unit tests and the
-headless example read them to check texture transcoding.
+Basis Universal ETC1S and UASTC in KTX2 files. The unit tests read them to
+check texture transcoding.
 
 `fonts/` holds fonts from the Noto project for the `text` example and the
 text shaping tests; see `fonts/README.md`.

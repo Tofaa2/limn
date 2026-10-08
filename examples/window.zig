@@ -148,7 +148,11 @@ pub const Stage = struct {
         var args = try init.minimal.args.iterateAllocator(init.gpa);
         defer args.deinit();
         _ = args.skip();
+        var own_value = false;
         while (args.next()) |arg| {
+            const value = own_value and !std.mem.startsWith(u8, arg, "--");
+            own_value = false;
+            if (value) continue;
             if (std.mem.eql(u8, arg, "--frames")) {
                 frame_limit = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArgument, 10);
             } else if (std.mem.eql(u8, arg, "--screenshot")) {
@@ -158,7 +162,7 @@ pub const Stage = struct {
             } else if (std.mem.eql(u8, arg, "--validation")) {
                 validation = true;
             } else if (std.mem.startsWith(u8, arg, "--")) {
-                _ = args.next();
+                own_value = true;
             } else return error.InvalidArgument;
         }
         if (screenshot != null and frame_limit == null) frame_limit = 240;

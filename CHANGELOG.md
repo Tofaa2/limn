@@ -7,10 +7,25 @@
 
 ### Changed
 - Breaking: handles are 64 bits, so a reused slot no longer revives a stale handle.
+- Breaking: `views.targetImage` fails with `error.InvalidTarget` for a destroyed target.
+- Breaking: `shaders.reload` needs `-Dshader_reload` outside Debug builds.
+- Breaking: `materials.createShader` takes a second shader, compiled with `PLAIN`, or null.
+- Only the FidelityFX shader permutations in use are compiled.
+
+### Removed
+- The verification scene and `zig build scene`.
 
 ### Fixed
 - Tint, params, `receive_decals` and `rays_only` on skinned entities.
 - Global illumination restarting when a scene has a reflection probe or several views.
+- Shadows of local lights and virtual shadow maps with several views or skipped frames.
+- Swapchain rebuilds that fail, and minimised windows.
+- Particle collision without temporal antialiasing.
+- Texture streaming with an empty or unbounded view.
+- Malformed font, KTX2 and DDS files, and glTF image names with percent escapes.
+- The model cache missing a changed `.bin` file or `normal_maps_bc5`.
+- A leak when a streamed model runs out of memory while loading.
+- Example flags that take no value, such as `--vrs`.
 
 ## 0.1.3
 

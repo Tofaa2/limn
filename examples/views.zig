@@ -89,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
         const height: f32 = @floatFromInt(size[1]);
         try overlay.rect(.{ .x = @as(f32, @floatFromInt(half)) - 1, .y = 0, .width = 2, .height = height }, gfx.Color.white);
         try overlay.rect(.{ .x = 14, .y = height - 288, .width = 484, .height = 274 }, gfx.Color.white);
-        try overlay.image(renderer.views.targetImage(chase_target), .{ .x = 16, .y = height - 286, .width = 480, .height = 270 }, .{});
+        try overlay.image(try renderer.views.targetImage(chase_target), .{ .x = 16, .y = height - 286, .width = 480, .height = 270 }, .{});
         try overlay.text(font, "a third camera, rendered to a texture", .{ 24, height - 280 }, .{ .size = 13, .shadow = gfx.Color.rgba(0, 0, 0, 200) });
         try overlay.rect(.{ .x = 12, .y = 12, .width = 330, .height = 58 }, gfx.Color.rgba(10, 12, 20, 180));
         try overlay.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · 3 views", .{ stage.fps, stage.gpu_ms }), .{ 24, 20 }, .{ .size = 16 });

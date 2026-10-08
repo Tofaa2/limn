@@ -22,6 +22,8 @@ pub const Glyph = struct {
 
 /// Maximum nesting of contextual lookups; deeper nesting is cut short.
 const max_depth = 6;
+/// Glyphs a run may grow to by substitution.
+const max_glyphs = 1 << 16;
 /// Most glyphs one rule's input may span.
 const max_input = 32;
 
@@ -508,6 +510,7 @@ pub const Layout = struct {
             _ = glyphs.orderedRemove(at);
             return 0;
         }
+        if (glyphs.items.len + count > max_glyphs) return null;
         glyphs.items[at].id = try reader.u16At(sequence + 2);
         try glyphs.ensureUnusedCapacity(gpa, count - 1);
         for (1..count) |part| glyphs.insertAssumeCapacity(at + part, .{ .id = try reader.u16At(sequence + 2 + part * 2), .cluster = cluster, .mask = mask });

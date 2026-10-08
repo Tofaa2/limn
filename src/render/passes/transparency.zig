@@ -206,7 +206,7 @@ pub fn forwardPeelPipeline(renderer: *Renderer) !rhi.Pipeline {
     const made = try renderer.device.createGraphicsPipeline(.{
         .name = "forward transparent (peel)",
         .vertex = shaderCode("forward.vert.spv"),
-        .fragment = shaderCode("forward.frag.spv"),
+        .fragment = shaderCode("forward_peel.frag.spv"),
         .color_targets = &.{.{ .format = hdr_format }},
         .depth = .{ .write = true, .compare = .greater },
         .cull = .none,

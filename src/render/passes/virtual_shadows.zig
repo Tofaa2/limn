@@ -32,6 +32,10 @@ pub const State = struct {
     origin: [3]f64 = .{ 0, 0, 0 },
     extent: f32 = 0,
     frame: u32 = 0,
+    /// Renderer frame and scene of the last `prepare`; pages do not survive
+    /// a gap or another scene.
+    drawn_frame: u64 = 0,
+    scene: ?render.Scene = null,
     /// Pages were reset this frame: clear the atlas before drawing.
     fresh: bool = true,
 
@@ -71,7 +75,11 @@ pub fn prepare(renderer: *Renderer, p: *const ScenePass, sun_travel: Vec3) !u64 
     const state = &view_data.vsm.?;
     const extent = 2 * @max(p.settings.shadow_distance, 1) / @as(f32, @floatFromInt(@as(u32, 1) << (gpu.vsm_levels - 1)));
     const moved_sun = math.length(math.sub(state.sun, sun_travel)) > 1e-5;
-    const reset = state.frame == 0 or moved_sun or !std.meta.eql(state.origin, scene.origin) or state.extent != extent;
+    const scene_handle: ?render.Scene = p.scene_handle;
+    const reset = state.frame == 0 or moved_sun or !std.meta.eql(state.origin, scene.origin) or state.extent != extent or
+        state.drawn_frame +% 1 != renderer.frame_index or !std.meta.eql(state.scene, scene_handle);
+    state.drawn_frame = renderer.frame_index;
+    state.scene = scene_handle;
     state.sun = sun_travel;
     state.origin = scene.origin;
     state.extent = extent;

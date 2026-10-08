@@ -20,8 +20,10 @@ pub const Shaders = struct {
 
     /// Recompiles the built-in shaders from source with `glslc` and rebuilds
     /// every pipeline. On a compile error nothing changes. Returns the number
-    /// of shaders compiled.
+    /// of shaders compiled. `error.ShaderReloadDisabled` unless built with
+    /// `-Dshader_reload`, which Debug builds are.
     pub fn reload(shaders: *Shaders) !u32 {
+        if (!shader_sources.reload) return error.ShaderReloadDisabled;
         const self = shaders.renderer();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -34,17 +36,16 @@ pub const Shaders = struct {
         }
         const include = try std.fmt.allocPrint(gpa, "-I{s}", .{shader_sources.include_dir});
         defer gpa.free(include);
-        for (shader_sources.sources, shader_sources.defines, shader_sources.names) |source, define, name| {
-            var argv: [8][]const u8 = undefined;
+        for (shader_sources.sources, shader_sources.defines, shader_sources.names) |source, defines, name| {
+            var argv: [12][]const u8 = undefined;
             var count: usize = 0;
             for ([_][]const u8{ "glslc", "--target-env=vulkan1.3", "-O", include }) |arg| {
                 argv[count] = arg;
                 count += 1;
             }
-            const define_arg = try std.fmt.allocPrint(gpa, "-D{s}", .{define});
-            defer gpa.free(define_arg);
-            if (define.len != 0) {
-                argv[count] = define_arg;
+            var define_args = std.mem.tokenizeScalar(u8, defines, ' ');
+            while (define_args.next()) |arg| {
+                argv[count] = arg;
                 count += 1;
             }
             for ([_][]const u8{ source, "-o", "-" }) |arg| {
@@ -67,11 +68,7 @@ pub const Shaders = struct {
         }
 
         dropShadeVariants(self);
-        for (shader_sources.names, compiled.items) |name, *code| {
-            const previous = try shader_overrides.fetchPut(gpa, name, code.*);
-            if (previous) |old| gpa.free(old.value);
-            code.* = &.{};
-        }
+        for (shader_sources.names, compiled.items) |name, code| try overrideShader(name, code);
         try device.waitIdle();
         const pipelines = try createPipelines(device);
         inline for (@typeInfo(Pipelines).@"struct".fields) |field| {
@@ -453,12 +450,58 @@ pub fn createGiPipelines(device: *rhi.Device) !GiPipelines {
     };
 }
 
-/// Shaders that `shaders.reload` has compiled, by name.
-pub var shader_overrides: std.StringHashMapUnmanaged([]u8) = .empty;
+/// Shaders that `shaders.reload` has compiled, by name. Every renderer in
+/// the process shares them; `releaseOverrides` frees them with the last one.
+var shader_overrides: std.StringHashMapUnmanaged([]u8) = .empty;
+/// Code a reload replaced, kept because pipelines may still be compiling it.
+var retired_overrides: std.ArrayList([]u8) = .empty;
+var override_users: u32 = 0;
+var overrides_locked: std.atomic.Value(bool) = .init(false);
+const override_allocator = std.heap.page_allocator;
+
+fn lockOverrides() void {
+    while (overrides_locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+
+fn unlockOverrides() void {
+    overrides_locked.store(false, .release);
+}
+
+/// Counts a renderer in; pair with `releaseOverrides`.
+pub fn acquireOverrides() void {
+    lockOverrides();
+    defer unlockOverrides();
+    override_users += 1;
+}
+
+pub fn releaseOverrides() void {
+    lockOverrides();
+    defer unlockOverrides();
+    override_users -= 1;
+    if (override_users != 0) return;
+    var overrides = shader_overrides.valueIterator();
+    while (overrides.next()) |code| override_allocator.free(code.*);
+    shader_overrides.deinit(override_allocator);
+    shader_overrides = .empty;
+    for (retired_overrides.items) |code| override_allocator.free(code);
+    retired_overrides.deinit(override_allocator);
+    retired_overrides = .empty;
+}
+
+fn overrideShader(name: []const u8, code: []const u8) !void {
+    const copy = try override_allocator.dupe(u8, code);
+    errdefer override_allocator.free(copy);
+    lockOverrides();
+    defer unlockOverrides();
+    try retired_overrides.ensureUnusedCapacity(override_allocator, 1);
+    if (try shader_overrides.fetchPut(override_allocator, name, copy)) |old| retired_overrides.appendAssumeCapacity(old.value);
+}
 
 /// Shader code by name: what `shaders.reload` last compiled, or else what
 /// was built into the program.
 pub fn shaderCode(comptime name: []const u8) []const u8 {
+    lockOverrides();
+    defer unlockOverrides();
     if (shader_overrides.get(name)) |code| return code;
     return @embedFile(name);
 }

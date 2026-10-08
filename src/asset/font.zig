@@ -844,7 +844,10 @@ const Tables = struct {
                     high = mid;
                 } else if (codepoint > end) {
                     low = mid + 1;
-                } else return (try reader.u32At(group + 8)) + (codepoint - start);
+                } else {
+                    const glyph = @as(u64, try reader.u32At(group + 8)) + (codepoint - start);
+                    return if (glyph < self.glyph_count) @intCast(glyph) else 0;
+                }
             }
             return 0;
         }
@@ -940,7 +943,11 @@ fn appendQuad(gpa: std.mem.Allocator, segments: *std.ArrayList(Segment), a: [2]f
     }
 }
 
-/// Appends a glyph's outline, in font units, as line segments.
+/// Components one glyph may be put together from, counting nested ones.
+const max_components = 256;
+
+/// Appends a glyph's outline, in font units, as line segments. `components`
+/// counts the parts of a composite glyph; start it at 0.
 fn appendOutline(
     gpa: std.mem.Allocator,
     tables: *const Tables,
@@ -948,6 +955,7 @@ fn appendOutline(
     transform: Affine,
     segments: *std.ArrayList(Segment),
     depth: u32,
+    components: *u32,
 ) !void {
     if (depth > 8) return error.InvalidFont;
     const data = (try tables.glyphData(glyph_index)) orelse return;
@@ -994,7 +1002,9 @@ fn appendOutline(
                 };
                 cursor += 8;
             }
-            try appendOutline(gpa, tables, component, transform.concat(local), segments, depth + 1);
+            components.* += 1;
+            if (components.* > max_components) return error.InvalidFont;
+            try appendOutline(gpa, tables, component, transform.concat(local), segments, depth + 1, components);
             if (flags & 0x20 == 0) break;
         }
         return;
@@ -1248,7 +1258,8 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
             const glyph_index = try tables.glyphIndex(codepoint);
             if (glyph_index == 0 and codepoint != ' ') continue;
             const segment_start = segments.items.len;
-            try appendOutline(gpa, tables, glyph_index, .{}, &segments, 0);
+            var components: u32 = 0;
+            try appendOutline(gpa, tables, glyph_index, .{}, &segments, 0, &components);
             const outline = segments.items[segment_start..];
             try glyphs.append(gpa, .{ .codepoint = codepoint, .id = @intCast(glyph_index), .advance = (try tables.advance(glyph_index)) / tables.units_per_em, .advance_down = (try tables.advanceDown(glyph_index)) / tables.units_per_em });
             try glyph_indices.append(gpa, glyph_index);
@@ -2750,4 +2761,113 @@ test "marks on a ligature go on the part they were typed after" {
     try std.testing.expectApproxEqAbs(@as(f32, 450.0 / 2048.0), on_lam[1], 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, -362.0 / 2048.0), on_alef[0], 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, 300.0 / 2048.0), on_alef[1], 1e-3);
+}
+
+/// A TrueType file of `glyphs` (each a `glyf` record; the first is the
+/// missing glyph) whose character map sends 'A' to `mapped`.
+fn testFont(gpa: std.mem.Allocator, units_per_em: u16, glyphs: []const []const u8, mapped: u32) ![]u8 {
+    var head: [54]u8 = @splat(0);
+    std.mem.writeInt(u16, head[18..20], units_per_em, .big);
+    std.mem.writeInt(i16, head[50..52], 1, .big);
+    var maxp: [6]u8 = @splat(0);
+    std.mem.writeInt(u16, maxp[4..6], @intCast(glyphs.len), .big);
+    var hhea: [36]u8 = @splat(0);
+    std.mem.writeInt(u16, hhea[34..36], 1, .big);
+    const hmtx = [4]u8{ 0, 100, 0, 0 };
+    var cmap: [40]u8 = @splat(0);
+    std.mem.writeInt(u16, cmap[2..4], 1, .big);
+    std.mem.writeInt(u32, cmap[8..12], 12, .big);
+    std.mem.writeInt(u16, cmap[12..14], 12, .big);
+    std.mem.writeInt(u32, cmap[24..28], 1, .big);
+    std.mem.writeInt(u32, cmap[28..32], 'A', .big);
+    std.mem.writeInt(u32, cmap[32..36], 'A', .big);
+    std.mem.writeInt(u32, cmap[36..40], mapped, .big);
+
+    var loca: std.ArrayList(u8) = .empty;
+    defer loca.deinit(gpa);
+    var glyf: std.ArrayList(u8) = .empty;
+    defer glyf.deinit(gpa);
+    var word: [4]u8 = undefined;
+    for (glyphs) |glyph| {
+        std.mem.writeInt(u32, &word, @intCast(glyf.items.len), .big);
+        try loca.appendSlice(gpa, &word);
+        try glyf.appendSlice(gpa, glyph);
+    }
+    std.mem.writeInt(u32, &word, @intCast(glyf.items.len), .big);
+    try loca.appendSlice(gpa, &word);
+
+    const names = [_]*const [4]u8{ "head", "maxp", "hhea", "hmtx", "cmap", "loca", "glyf" };
+    const tables = [_][]const u8{ &head, &maxp, &hhea, &hmtx, &cmap, loca.items, glyf.items };
+    var file: std.ArrayList(u8) = .empty;
+    errdefer file.deinit(gpa);
+    try file.appendSlice(gpa, &.{ 0, 1, 0, 0, 0, names.len, 0, 0, 0, 0, 0, 0 });
+    var offset: usize = 12 + names.len * 16;
+    for (names, tables) |name, table| {
+        try file.appendSlice(gpa, name);
+        try file.appendSlice(gpa, &.{ 0, 0, 0, 0 });
+        std.mem.writeInt(u32, &word, @intCast(offset), .big);
+        try file.appendSlice(gpa, &word);
+        std.mem.writeInt(u32, &word, @intCast(table.len), .big);
+        try file.appendSlice(gpa, &word);
+        offset += table.len;
+    }
+    for (tables) |table| try file.appendSlice(gpa, table);
+    return file.toOwnedSlice(gpa);
+}
+
+/// The `glyf` record of a right triangle with legs of `size` font units.
+fn testTriangle(size: i16) [29]u8 {
+    var glyph: [29]u8 = @splat(0);
+    std.mem.writeInt(i16, glyph[0..2], 1, .big);
+    std.mem.writeInt(u16, glyph[10..12], 2, .big);
+    @memset(glyph[14..17], 1);
+    std.mem.writeInt(i16, glyph[19..21], size, .big);
+    std.mem.writeInt(i16, glyph[21..23], -size, .big);
+    std.mem.writeInt(i16, glyph[27..29], size, .big);
+    return glyph;
+}
+
+/// The `glyf` record of a glyph put together from `count` copies of `part`.
+fn testComposite(comptime count: usize, part: u16) [10 + count * 6]u8 {
+    var glyph: [10 + count * 6]u8 = @splat(0);
+    std.mem.writeInt(i16, glyph[0..2], -1, .big);
+    for (0..count) |index| {
+        const record = glyph[10 + index * 6 ..][0..6];
+        std.mem.writeInt(u16, record[0..2], if (index + 1 == count) 0 else 0x20, .big);
+        std.mem.writeInt(u16, record[2..4], part, .big);
+    }
+    return glyph;
+}
+
+test "a glyph too large for the atlas is refused" {
+    if (!build_features.validate_input) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fits = try testFont(gpa, 1000, &.{ "", &testTriangle(700) }, 1);
+    defer gpa.free(fits);
+    var font = try load(gpa, fits, &.{.{ 'A', 'A' }});
+    font.deinit();
+    const huge = try testFont(gpa, 16, &.{ "", &testTriangle(30000) }, 1);
+    defer gpa.free(huge);
+    try std.testing.expectError(error.GlyphTooLarge, load(gpa, huge, &.{.{ 'A', 'A' }}));
+}
+
+test "a glyph made of itself or of too many parts is refused" {
+    const gpa = std.testing.allocator;
+    const few = try testFont(gpa, 1000, &.{ "", &testComposite(4, 2), &testTriangle(700) }, 1);
+    defer gpa.free(few);
+    var font = try load(gpa, few, &.{.{ 'A', 'A' }});
+    font.deinit();
+    const itself = try testFont(gpa, 1000, &.{ "", &testComposite(1, 1) }, 1);
+    defer gpa.free(itself);
+    try std.testing.expectError(error.InvalidFont, load(gpa, itself, &.{.{ 'A', 'A' }}));
+    const many = try testFont(gpa, 1000, &.{ "", &testComposite(max_components + 1, 2), &testTriangle(700) }, 1);
+    defer gpa.free(many);
+    try std.testing.expectError(error.InvalidFont, load(gpa, many, &.{.{ 'A', 'A' }}));
+}
+
+test "a character mapped past the last glyph has no glyph" {
+    const gpa = std.testing.allocator;
+    const bytes = try testFont(gpa, 1000, &.{ "", &testTriangle(700) }, 1000);
+    defer gpa.free(bytes);
+    try std.testing.expectError(error.EmptyFont, load(gpa, bytes, &.{.{ 'A', 'A' }}));
 }

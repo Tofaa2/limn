@@ -19,8 +19,10 @@ layout(location = 0) in vec2 in_uv;
 
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec2 out_motion;
+#ifndef PLAIN
 layout(location = 2) out vec4 out_reflection;
 layout(location = 3) out vec4 out_surface;
+#endif
 
 struct MaterialSurface {
     vec3 base_color;
@@ -120,8 +122,10 @@ void main() {
         if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
             sky = textureLod(TEX_CUBE(frame.env_sky, frame.sampler_linear_clamp), direction, 0.0).rgb * frame.env_intensity;
         out_color = vec4(sky, 1.0);
+#ifndef PLAIN
         out_reflection = vec4(0.0);
         out_surface = vec4(0.0);
+#endif
         out_motion = (current.xy / current.w - previous.xy / previous.w) * 0.5;
         return;
     }
@@ -375,8 +379,10 @@ void main() {
         default: debug = hashColor(id); break;
         }
         out_color = vec4(debug, 1.0);
+#ifndef PLAIN
         out_reflection = vec4(0.0);
         out_surface = vec4(0.0);
+#endif
         return;
     }
 
@@ -431,6 +437,8 @@ void main() {
         lit = lit * air_through + air * (1.0 - air_through);
     }
     out_color = vec4(lit, soft_shadow_visibility);
+#ifndef PLAIN
     out_reflection = vec4(deferred_reflection.rgb, roughness);
     out_surface = vec4(encodeNormal(normal), deferred_reflection.a, 1.0);
+#endif
 }

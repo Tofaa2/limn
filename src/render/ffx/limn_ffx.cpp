@@ -215,7 +215,7 @@ static bool createGeneration(LimnFfx* ffx, const LimnFfxGenerate* frame) {
     FfxFrameInterpolationContextDescription interpolation = {};
     interpolation.backendInterface = ffx->backend;
     interpolation.flags = FFX_FRAMEINTERPOLATION_ENABLE_DEPTH_INVERTED | FFX_FRAMEINTERPOLATION_ENABLE_DEPTH_INFINITE;
-    interpolation.maxRenderSize = {frame->shown.width, frame->shown.height};
+    interpolation.maxRenderSize = {ffx->render_width, ffx->render_height};
     interpolation.displaySize = {frame->shown.width, frame->shown.height};
     interpolation.backBufferFormat = ffxGetSurfaceFormatVK(static_cast<VkFormat>(frame->shown.format));
     interpolation.previousInterpolationSourceFormat = interpolation.backBufferFormat;

@@ -136,8 +136,8 @@ pub const Upscaler = struct {
 
     /// FSR 3 frame generation: writes to `output` the picture between the
     /// last `shown` and this one. After `dispatch` in the same frame; both
-    /// textures in `shader_read`. False when there is none to show.
-    pub fn generate(self: Upscaler, device: *rhi.Device, cmd: *rhi.CommandEncoder, shown: rhi.Texture, output: rhi.Texture, reset: bool) bool {
+    /// textures in `shader_read`. False when there is none to show yet.
+    pub fn generate(self: Upscaler, device: *rhi.Device, cmd: *rhi.CommandEncoder, shown: rhi.Texture, output: rhi.Texture, reset: bool) error{FrameGenerationFailed}!bool {
         if (!available) return false;
         const result = c.limnFfxGenerateFrame(self.handle, &.{
             .command_buffer = @intFromEnum(cmd.command),
@@ -147,6 +147,7 @@ pub const Upscaler = struct {
             .reset = @intFromBool(reset),
         });
         cmd.bindGlobals();
+        if (result < 0) return error.FrameGenerationFailed;
         return result == 1;
     }
 

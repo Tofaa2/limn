@@ -89,20 +89,22 @@ fn resolveWithFidelityFx(renderer: *Renderer, p: *const ScenePass, output: rhi.T
     }
     var fresh = false;
     if (view_data.upscaler == null) {
-        if (view_data.upscaler_refused) return false;
+        if (view_data.upscaler_refused == generation) return false;
         view_data.upscaler = ffx.Upscaler.create(device, generation, render_size, output_size) orelse {
             std.log.warn("FidelityFX Super Resolution would not start; temporal upscaling stands in", .{});
-            view_data.upscaler_refused = true;
+            view_data.upscaler_refused = generation;
             return false;
         };
         fresh = true;
     }
+    const reset = fresh or !view.history_valid or view_data.upscaler_frame +% 1 != renderer.frame_index;
+    view_data.upscaler_frame = renderer.frame_index;
     cmd.beginScope("fidelityfx super resolution");
     cmd.transition(view.hdr, .shader_read);
     cmd.transition(view.depth, .shader_read);
     cmd.transition(view.motion, .shader_read);
     cmd.transition(output, .shader_read);
-    try view_data.upscaler.?.dispatch(device, cmd, .{
+    view_data.upscaler.?.dispatch(device, cmd, .{
         .color = view.hdr,
         .depth = view.depth,
         .motion = view.motion,
@@ -112,12 +114,17 @@ fn resolveWithFidelityFx(renderer: *Renderer, p: *const ScenePass, output: rhi.T
         .delta_time = p.delta_time,
         .near = p.desc.camera.near,
         .fov_y = p.desc.camera.fov_y,
-        .reset = fresh or !view.history_valid,
-    });
+        .reset = reset,
+    }) catch {
+        cmd.endScope();
+        std.log.warn("FidelityFX Super Resolution failed; temporal upscaling stands in", .{});
+        view_data.upscaler_refused = generation;
+        return false;
+    };
     cmd.endScope();
     if (generating) {
         renderer.generating = view_data.upscaler;
-        renderer.generating_reset = fresh or !view.history_valid;
+        renderer.generating_reset = reset;
     }
     return true;
 }

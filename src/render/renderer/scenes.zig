@@ -208,6 +208,7 @@ pub const Scenes = struct {
 pub fn freeScene(self: *Renderer, scene: *SceneData) void {
     scene.entities.deinit(self.gpa);
     scene.lights.deinit(self.gpa);
+    scene.shadow_grants.deinit(self.gpa);
     for (scene.emitters.items) |emitter| if (self.emitters.table.remove(emitter)) |removed| {
         self.device.destroyBuffer(removed.buffer);
         if (removed.order) |order| self.device.destroyBuffer(order);

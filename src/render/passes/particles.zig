@@ -25,7 +25,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
     for (scene.emitters.items) |handle_value| {
         const emitter = renderer.emitters.table.get(handle_value) orelse continue;
         const desc = emitter.desc;
-        const steps: u32 = if (emitter.warmed or desc.prewarm <= 0 or delta_time <= 0) 1 else @min(@as(u32, @intFromFloat(desc.prewarm / delta_time)) + 1, 600);
+        const steps: u32 = if (emitter.warmed or desc.prewarm <= 0 or delta_time <= 0) 1 else @as(u32, @intFromFloat(@min(desc.prewarm / delta_time, 599))) + 1;
         emitter.warmed = true;
         var step: u32 = 0;
         while (step < steps) : (step += 1) {

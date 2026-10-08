@@ -1,10 +1,15 @@
 {
-  outputs = {self, ...}: {
+  inputs.devshells.url = "github:Tofaa2/devshells";
+
+  outputs = {
+    self,
+    devshells,
+    ...
+  }: {
     devShells.x86_64-linux.default = let
-      flake = builtins.getFlake "github:Tofaa2/devshells";
       system = "x86_64-linux";
-      pkgs = flake.inputs.nixpkgs.legacyPackages.${system};
-      base = flake.devShells.${system}.zig;
+      pkgs = devshells.inputs.nixpkgs.legacyPackages.${system};
+      base = devshells.devShells.${system}.zig;
     in
       pkgs.mkShell {
         inputsFrom = [base];

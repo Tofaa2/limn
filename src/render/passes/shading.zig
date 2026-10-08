@@ -159,7 +159,7 @@ pub fn plainShadePipeline(renderer: *Renderer) !rhi.Pipeline {
     const made = try renderer.device.createGraphicsPipeline(.{
         .name = "shading",
         .vertex = shaderCode("fullscreen.vert.spv"),
-        .fragment = if (renderer.device.ray_tracing) shaderCode("shade_rt.frag.spv") else shaderCode("shade.frag.spv"),
+        .fragment = if (renderer.device.ray_tracing) shaderCode("shade_rt_plain.frag.spv") else shaderCode("shade_plain.frag.spv"),
         .color_targets = &.{ .{ .format = hdr_format }, .{ .format = .rg16_float } },
         .cull = .none,
     });

@@ -67,6 +67,9 @@ fn supportsRequiredFeatures(instance: dispatch.Instance, physical: vk.PhysicalDe
         features.features.draw_indirect_first_instance == .true and
         features.features.sampler_anisotropy == .true and
         features.features.depth_clamp == .true and
+        features.features.depth_bias_clamp == .true and
+        features.features.independent_blend == .true and
+        features.features.image_cube_array == .true and
         features.features.shader_int_64 == .true and
         features.features.geometry_shader == .true and
         features.features.shader_clip_distance == .true and
@@ -74,6 +77,7 @@ fn supportsRequiredFeatures(instance: dispatch.Instance, physical: vk.PhysicalDe
         features12.descriptor_indexing == .true and
         features12.runtime_descriptor_array == .true and
         features12.descriptor_binding_partially_bound == .true and
+        features12.descriptor_binding_update_unused_while_pending == .true and
         features12.descriptor_binding_sampled_image_update_after_bind == .true and
         features12.shader_sampled_image_array_non_uniform_indexing == .true and
         features12.scalar_block_layout == .true and

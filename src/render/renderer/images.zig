@@ -15,6 +15,7 @@ const Image = api.Image;
 /// Textures usable by draw lists and materials.
 pub const Images = struct {
     list: std.ArrayList(renderer_state.ImageEntry) = .empty,
+    next_id: u32 = 1,
 
     fn renderer(images: *Images) *Renderer {
         return @alignCast(@fieldParentPtr("images", images));
@@ -57,8 +58,7 @@ pub const Images = struct {
         try device.uploadTexture(texture, 0, 0, pixels);
         try device.generateMips(texture);
         const index = device.textureIndex(texture);
-        try self.images.list.append(self.gpa, .{ .texture = texture, .index = index });
-        return .{ .index = index, .width = width, .height = height };
+        return own(self, texture, index, width, height);
     }
 
     /// Decodes an image file to RGBA8. The pixels belong to `gpa`.
@@ -144,13 +144,22 @@ pub const Images = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.images.list.items, 0..) |entry, index| {
-            if (entry.index != image.index) continue;
+            if (entry.index != image.index or entry.id != image.id) continue;
             self.device.destroyTexture(entry.texture);
             _ = self.images.list.swapRemove(index);
             return;
         }
     }
 };
+
+/// Lists `texture` as an image of the renderer's own.
+fn own(self: *Renderer, texture: rhi.Texture, index: u32, width: u32, height: u32) !Image {
+    const id = self.images.next_id;
+    try self.images.list.append(self.gpa, .{ .texture = texture, .index = index, .id = id });
+    self.images.next_id +%= 1;
+    if (self.images.next_id == 0) self.images.next_id = 1;
+    return .{ .index = index, .width = width, .height = height, .id = id };
+}
 
 /// Makes an image from mip levels already in a GPU format.
 fn createImageFromLevels(self: *Renderer, source: ktx2.Texture) !Image {
@@ -180,8 +189,7 @@ fn createImageFromLevels(self: *Renderer, source: ktx2.Texture) !Image {
     errdefer device.destroyTexture(texture);
     try device.uploadTextureLevels(texture, 0, 0, source.data);
     const index = device.textureIndex(texture);
-    try self.images.list.append(self.gpa, .{ .texture = texture, .index = index });
-    return .{ .index = index, .width = source.width, .height = source.height };
+    return own(self, texture, index, source.width, source.height);
 }
 
 /// Reads an IES LM-63 photometric file and returns brightness at 181

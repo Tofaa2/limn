@@ -134,14 +134,18 @@ pub fn closeFailedFrame(self: *Device) void {
     while (self.encoder.scope_depth > 0) self.encoder.endScope();
 }
 
+/// `vkDeviceWaitIdle` with the queue held, since presenting may run on
+/// another thread.
+pub fn waitQueue(self: *Device) !void {
+    self.queue_mutex.lockUncancelable(self.io);
+    defer self.queue_mutex.unlock(self.io);
+    try self.vkd.deviceWaitIdle();
+}
+
 /// Blocks until every submitted frame has finished on the GPU.
 pub fn waitIdle(self: *Device) !void {
     finishPacedPresent(self);
-    {
-        self.queue_mutex.lockUncancelable(self.io);
-        defer self.queue_mutex.unlock(self.io);
-        try self.vkd.deviceWaitIdle();
-    }
+    try waitQueue(self);
     if (!self.in_frame) collectGarbage(self, true);
 }
 

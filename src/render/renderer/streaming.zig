@@ -264,7 +264,7 @@ fn wantModelTextures(
                 if (stream.data.len != 0) {
                     const texels = uv_per_pixel * @as(f32, @floatFromInt(@max(stream.width, stream.height)));
                     const level = @log2(@max(texels, 1e-6)) + bias;
-                    const wanted: u32 = if (level <= 0) 0 else @min(@as(u32, @intFromFloat(level)), stream.floor);
+                    const wanted: u32 = if (!(level > 0)) 0 else if (level >= @as(f32, @floatFromInt(stream.floor))) stream.floor else @intFromFloat(level);
                     stream.wanted = @min(stream.wanted, wanted);
                 }
             }
@@ -299,6 +299,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
             .backbuffer => frame.backbuffer orelse continue,
             .texture => |texture| texture,
         };
+        if (!device.textureExists(target)) continue;
         const height = if (view_desc.region) |region| region.height else device.textureInfo(target).height;
         const camera = view_desc.camera;
         const pixels_at_one_meter = @as(f32, @floatFromInt(height)) * 0.5 / @tan(camera.fov_y * 0.5) *
