@@ -1,14 +1,11 @@
 #version 460
 #include "common.glsl"
 
-// Separable bilateral blur of the liquid's sphere depths into one surface.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;
-    // Source is a depth buffer (first pass) or view distance (second).
     uint raw;
     vec2 direction;
-    // Blur width in world units and depth rejection threshold.
     float width;
     float edge;
 } push;

@@ -82,7 +82,6 @@ fn resolveWithFidelityFx(renderer: *Renderer, p: *const ScenePass, output: rhi.T
     if (!generating and output_size[0] <= render_size[0] and output_size[1] <= render_size[1]) return false;
     if (view_data.upscaler) |upscaler| {
         if (upscaler.generation != generation or !std.meta.eql(upscaler.render_size, render_size) or !std.meta.eql(upscaler.output_size, output_size)) {
-            // Frames using it may still be in flight.
             try device.waitIdle();
             upscaler.destroy();
             view_data.upscaler = null;
@@ -109,7 +108,6 @@ fn resolveWithFidelityFx(renderer: *Renderer, p: *const ScenePass, output: rhi.T
         .motion = view.motion,
         .output = output,
         .jitter = p.jitter,
-        // Sharpening happens in tone mapping.
         .sharpness = 0,
         .delta_time = p.delta_time,
         .near = p.desc.camera.near,
@@ -274,8 +272,6 @@ pub fn bloomAndExposure(renderer: *Renderer, p: *const ScenePass, resolved: rhi.
     }
     cmd.endScope();
 
-    // The smallest level is the luminance meter; the upsample chain never
-    // writes it.
     cmd.beginScope("exposure");
     cmd.bindPipeline(renderer.pipelines.exposure);
     cmd.pushConstants(extern struct {
@@ -297,7 +293,7 @@ pub fn bloomAndExposure(renderer: *Renderer, p: *const ScenePass, resolved: rhi.
         .compensation = std.math.pow(f32, 2, settings.exposure_compensation),
         .min_luminance = 0.002,
         .max_luminance = 64,
-        .speed = 1.6,
+        .speed = @max(settings.exposure_speed, 0.01),
         .reset = @intFromBool(view_data.exposure_reset),
         .depth = device.textureIndex(view.depth),
         .focus_speed = @max(settings.dof_autofocus_speed, 0.01),
@@ -343,8 +339,6 @@ pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textu
     if (view.upscaled) |upscaled| {
         cmd.beginScope("upscale");
         if (view.upscaled_edges) |edges| {
-            // FidelityFX Super Resolution 1: constants as in `FsrEasuCon` and
-            // `FsrRcasCon`.
             const from = [2]f32{ @floatFromInt(p.width), @floatFromInt(p.height) };
             const to = [2]f32{ @floatFromInt(p.output_width), @floatFromInt(p.output_height) };
             const Bits = struct {
@@ -365,7 +359,6 @@ pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textu
             cmd.drawFullscreen();
             cmd.endRendering();
             cmd.transition(edges, .shader_read);
-            // RCAS sharpness: 2 stops down at `sharpen` 0, none at 1.
             const sharpness = std.math.pow(f32, 2, -2 * (1 - std.math.clamp(settings.sharpen, 0, 1)));
             try cmd.beginRendering(.{ .color = &.{.{ .texture = upscaled, .load = .discard }} });
             cmd.bindPipeline(renderer.pipelines.fsr_rcas);

@@ -33,7 +33,6 @@ fn groundHeight(x: f32, z: f32) f32 {
     const dx = x - pond_center[0];
     const dz = z - pond_center[1];
     const distance = dx * dx + dz * dz;
-    // Level around the pond, so the water lies flat in its hollow.
     const level = @exp(-distance / (pond_radius * pond_radius * 6.25));
     const hills = hillsAt(x, z) * (1 - level) + hillsAt(pond_center[0], pond_center[1]) * level;
     return hills - 2.8 * @exp(-distance / (pond_radius * pond_radius));
@@ -165,8 +164,6 @@ pub fn main(init: std.process.Init) !void {
     var random = std.Random.DefaultPrng.init(7);
     const rng = random.random();
 
-    // The sky lights everything: the sun it holds, and the rest of it as
-    // the surroundings every surface mirrors and is filled in by.
     var sun_height: f32 = 0.62;
     var sky = gfx.SkyDesc{ .sun_direction = .{ -0.55 * @cos(sun_height), -@sin(sun_height), -0.5 } };
     renderer.setSun(scene, gfx.skySun(sky));
@@ -176,20 +173,17 @@ pub fn main(init: std.process.Init) !void {
     const clouds = gfx.CloudDesc{ .coverage = 0.42, .cirrus = 0.3 };
     try renderer.setClouds(scene, clouds);
 
-    // Ground.
     var ground_shape = Shape{};
     defer ground_shape.deinit(gpa);
     try buildGround(gpa, &ground_shape);
     const ground = try renderer.createModel(&.{ground_shape.desc(.{ .metallic = 0, .roughness = 0.95 })});
     _ = try renderer.spawn(scene, .{ .model = ground });
 
-    // Grass: one tuft, drawn many times over.
     var tuft_shape = Shape{};
     defer tuft_shape.deinit(gpa);
     try buildTuft(gpa, &tuft_shape, rng);
     const tuft = try renderer.createModel(&.{tuft_shape.desc(.{ .metallic = 0, .roughness = 0.8, .double_sided = true, .sway = 0.9 })});
 
-    // A tree: a trunk and three skirts of needles.
     var tree_shape = Shape{};
     defer tree_shape.deinit(gpa);
     try tree_shape.taper(gpa, 0, 1.6, 0.16, 0.1, 8, .{ 0.2, 0.13, 0.08 }, .{ 0.24, 0.16, 0.1 });
@@ -197,7 +191,6 @@ pub fn main(init: std.process.Init) !void {
         try tree_shape.taper(gpa, skirt[0], skirt[1], skirt[2], 0, 9, .{ 0.05, 0.16, 0.07 }, .{ 0.12, 0.3, 0.12 });
     const tree = try renderer.createModel(&.{tree_shape.desc(.{ .metallic = 0, .roughness = 0.85, .double_sided = true, .sway = 0.005 })});
 
-    // Rocks, a plinth and three balls of different stuff.
     var ball_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_indices: [helpers.sphere_index_count]u32 = undefined;
@@ -226,7 +219,6 @@ pub fn main(init: std.process.Init) !void {
     const helmet = try renderer.loadModel("examples/assets/DamagedHelmet.glb");
     try renderer.waitUntilLoaded();
 
-    // The grass, everywhere but in the pond.
     {
         const transforms = try gpa.alloc(math.Mat4, grass_count);
         defer gpa.free(transforms);
@@ -239,7 +231,6 @@ pub fn main(init: std.process.Init) !void {
             if (nearPond(x, z, 0.6)) continue;
             const scale = 0.7 + rng.float(f32) * 0.9;
             transforms[placed] = math.mul(math.translation(.{ x, groundHeight(x, z) - 0.02, z }), math.mul(math.rotationY(rng.float(f32) * std.math.tau), math.scaling(.{ scale, scale * (0.8 + rng.float(f32) * 0.6), scale })));
-            // Drier and greener patches drift across the field.
             const patch = 0.5 + 0.5 * @sin(x * 0.19 + @sin(z * 0.13) * 2.5) * @cos(z * 0.17);
             colors[placed] = .{ 0.85 + 0.5 * patch, 0.9 + 0.2 * (1 - patch), 0.7 + 0.3 * rng.float(f32) };
             placed += 1;
@@ -247,8 +238,6 @@ pub fn main(init: std.process.Init) !void {
         const grass = try renderer.createInstances(scene, tuft, transforms);
         try renderer.setInstanceColors(grass, colors);
     }
-    // Trees and rocks, kept clear of where the player starts and out of the
-    // water.
     {
         const transforms = try gpa.alloc(math.Mat4, tree_count);
         defer gpa.free(transforms);
@@ -274,7 +263,6 @@ pub fn main(init: std.process.Init) !void {
         }
         _ = try renderer.createInstances(scene, rock, transforms);
     }
-    // What the materials can do, set out beside the start.
     const display = [2]f32{ 3.5, -4.5 };
     const display_height = groundHeight(display[0], display[1]);
     _ = try renderer.spawn(scene, .{ .model = stone, .transform = math.mul(math.translation(.{ display[0], display_height + 0.45, display[1] }), math.scaling(.{ 0.9, 1.0, 0.9 })) });
@@ -285,7 +273,6 @@ pub fn main(init: std.process.Init) !void {
         _ = try renderer.spawn(scene, .{ .model = model, .transform = math.translation(.{ x, groundHeight(x, z) + 0.5, z }) });
     }
 
-    // The pond.
     _ = try renderer.createWater(scene, .{
         .transform = math.mul(math.translation(.{ pond_center[0], hillsAt(pond_center[0], pond_center[1]) + pond_level, pond_center[1] }), math.scaling(.{ pond_radius * 2.2, 1, pond_radius * 2.2 })),
         .color = .{ 0.03, 0.09, 0.07 },
@@ -294,7 +281,6 @@ pub fn main(init: std.process.Init) !void {
         .ripple_detail = 0.7,
     });
 
-    // Motes drifting in the light around the player.
     var motes_desc = gfx.EmitterDesc{
         .radius = 9,
         .capacity = 600,
@@ -312,7 +298,6 @@ pub fn main(init: std.process.Init) !void {
     };
     const motes = try renderer.createEmitter(scene, motes_desc);
 
-    // The player: scaled to a person's height, with the clips it moves by.
     const player_info = renderer.modelInfo(player_model).?;
     const player_scale = 2.0 / @max(player_info.bounds_max[1] - player_info.bounds_min[1], 1e-3);
     const player = try renderer.spawn(scene, .{ .model = player_model });
@@ -325,8 +310,6 @@ pub fn main(init: std.process.Init) !void {
     const font = renderer.defaultFont();
     var hud_buffer: [160]u8 = undefined;
 
-    // Where the player stands and how it is moving. `height` is above the
-    // ground under it.
     var position = [2]f32{ 0, 0 };
     var velocity = [2]f32{ 0, 0 };
     var height: f32 = 0;
@@ -335,8 +318,6 @@ pub fn main(init: std.process.Init) !void {
     var airborne: f32 = 0;
     var clock_idle: f32 = 0;
     var clock_run: f32 = 0;
-    // The camera circles the player at the end of an arm; the mouse turns
-    // the arm.
     var yaw: f32 = 0.6;
     var pitch: f32 = 0.22;
     var arm: f32 = 4.6;
@@ -357,7 +338,6 @@ pub fn main(init: std.process.Init) !void {
             try renderer.setClouds(scene, if (clouds_on) clouds else null);
         }
 
-        // Looking: the mouse turns the camera about the player.
         if (stage.window) |window| {
             const cursor = window.cursor();
             if (last_cursor) |last| {
@@ -367,9 +347,6 @@ pub fn main(init: std.process.Init) !void {
             last_cursor = cursor;
         }
 
-        // Moving: the keys point where to go as the camera sees it. The
-        // player speeds up and slows down rather than starting and
-        // stopping, and turns to face where it is going.
         var want = [2]f32{ 0, 0 };
         if (stage.keyDown(glfw.GLFW_KEY_W)) want[1] += 1;
         if (stage.keyDown(glfw.GLFW_KEY_S)) want[1] -= 1;
@@ -377,7 +354,6 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_A)) want[0] -= 1;
         var top_speed: f32 = if (stage.keyDown(glfw.GLFW_KEY_LEFT_SHIFT)) 8.0 else 5.0;
         if (stage.window == null) {
-            // Nobody at the keys (a screenshot): run a wide circle.
             want = .{ 0.35, 1 };
             yaw -= tick.dt * 0.25;
             top_speed = 4.5;
@@ -387,7 +363,6 @@ pub fn main(init: std.process.Init) !void {
         var goal = [2]f32{ ahead[0] * want[1] + aside[0] * want[0], ahead[1] * want[1] + aside[1] * want[0] };
         const goal_length = @sqrt(goal[0] * goal[0] + goal[1] * goal[1]);
         if (goal_length > 1e-3) goal = .{ goal[0] / goal_length * top_speed, goal[1] / goal_length * top_speed };
-        // Less say over the direction while in the air.
         const grip: f32 = if (height > 0) 3 else 12;
         const ease = 1 - @exp(-tick.dt * grip);
         velocity = .{ velocity[0] + (goal[0] - velocity[0]) * ease, velocity[1] + (goal[1] - velocity[1]) * ease };
@@ -398,13 +373,11 @@ pub fn main(init: std.process.Init) !void {
             std.math.clamp(position[1] + velocity[1] * tick.dt, -half, half),
         };
         if (speed > 0.3) {
-            // The shorter way round to the direction of travel.
             const facing = std.math.atan2(velocity[0], velocity[1]);
             const turn = @mod(facing - heading + std.math.pi, std.math.tau) - std.math.pi;
             heading += turn * (1 - @exp(-tick.dt * 14));
         }
 
-        // Jumping.
         if (height <= 0 and stage.keyPressed(glfw.GLFW_KEY_SPACE)) rising = 6.2;
         if (height > 0 or rising > 0) {
             rising -= 18 * tick.dt;
@@ -417,8 +390,6 @@ pub fn main(init: std.process.Init) !void {
         const in_air: f32 = if (height > 0.05) 1 else 0;
         airborne += (in_air - airborne) * (1 - @exp(-tick.dt * 14));
 
-        // The pose: standing blended into running by how fast the player
-        // goes, and the jump laid over both while it is off the ground.
         clock_idle += tick.dt;
         clock_run += tick.dt * (0.35 + speed / 5.0);
         var pose = gfx.Pose{
@@ -440,8 +411,6 @@ pub fn main(init: std.process.Init) !void {
         try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · {d} instances · {d} of {d} meshlets drawn", .{ stage.fps, stage.gpu_ms, stats.instances, stats.meshlets_drawn, stats.meshlets }), .{ 24, 22 }, .{ .size = 16 });
         try list.text(font, "Mouse look · WASD move · Shift sprint · Space jump · Z/X zoom · hold T sun · C clouds", .{ 24, 48 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
 
-        // The camera looks past the player's shoulder, from the end of its
-        // arm, and stays above the ground.
         const target = math.Vec3{ feet[0] + aside[0] * 0.45, floor + height * 0.6 + 1.55, feet[2] + aside[1] * 0.45 };
         var eye = math.Vec3{
             target[0] + @sin(yaw) * @cos(pitch) * arm,

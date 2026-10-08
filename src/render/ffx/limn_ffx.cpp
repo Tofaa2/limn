@@ -1,4 +1,3 @@
-// See limn_ffx.h.
 #include "limn_ffx.h"
 
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
@@ -11,10 +10,11 @@
 #include <cstdlib>
 #include <new>
 
-// Referenced by the backend; only the SDK's own swapchain uses it.
 FfxErrorCode ffxSetFrameGenerationConfigToSwapchainVK(FfxFrameGenerationConfig const*) {
     return FFX_ERROR_BACKEND_API_ERROR;
 }
+
+VkPipelineCache limnFfxPipelineCache = VK_NULL_HANDLE;
 
 struct LimnFfx {
     uint32_t generation = 0;
@@ -36,7 +36,6 @@ struct LimnFfx {
     uint32_t shown_height = 0;
     int32_t shown_format = 0;
     uint64_t frame_id = 0;
-    // Of the last upscale.
     uint32_t render_width = 0;
     uint32_t render_height = 0;
     float frame_milliseconds = 0;
@@ -44,7 +43,6 @@ struct LimnFfx {
     float camera_fov_y = 0;
 };
 
-// One for the upscaler, one each for optical flow and interpolation.
 static const size_t max_contexts = 3;
 
 static FfxResource imageResource(const LimnFfxImage& image, const wchar_t* name, bool written) {
@@ -62,8 +60,6 @@ static FfxResource imageResource(const LimnFfxImage& image, const wchar_t* name,
     return ffxGetResourceVK(reinterpret_cast<void*>(image.image), description, name, FFX_RESOURCE_STATE_COMPUTE_READ);
 }
 
-// The SDK samples depth as SHADER_READ_ONLY_OPTIMAL; the renderer keeps it
-// in READ_ONLY_OPTIMAL.
 static void moveDepth(const LimnFfxFrame* frame, VkImageLayout from, VkImageLayout to) {
     const VkFormat format = static_cast<VkFormat>(frame->depth.format);
     const bool stencil = format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D32_SFLOAT_S8_UINT || format == VK_FORMAT_D16_UNORM_S8_UINT;
@@ -97,6 +93,7 @@ LimnFfx* limnFfxCreate(const LimnFfxCreate* desc) {
     ffx->output_height = desc->output_height;
 
     volkLoadDevice(static_cast<VkDevice>(desc->device));
+    limnFfxPipelineCache = reinterpret_cast<VkPipelineCache>(desc->pipeline_cache);
 
     VkDeviceContext device_context = {};
     device_context.vkDevice = static_cast<VkDevice>(desc->device);

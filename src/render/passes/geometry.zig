@@ -38,7 +38,6 @@ pub fn resetCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total
     const fresh_scene = p.fresh_scene;
     const view_data = p.view_data;
     const mark_seen = p.mark_seen;
-    // One extra word for the count.
     if (instance_total + 1 > scene.seen_capacity or (mark_seen and scene.seen_readback[0] == null)) {
         if (scene.seen) |buffer| device.destroyBuffer(buffer);
         scene.seen = null;
@@ -86,7 +85,6 @@ pub fn resetCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total
     view_data.visibility_scene = scene_handle;
     view_data.visibility_layout = scene.layout_version;
 
-    // Last frame's draws must finish reading these buffers first.
     cmd.sync(.all_to_transfer);
     cmd.fillBuffer(renderer.cull_counts, 0, view_count * 2 * @sizeOf(u32), 0);
     const dispatches = try p.arena.alloc(device, gpu.CullDispatch, view_count);
@@ -113,8 +111,6 @@ pub fn resetCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total
     if (fresh_scene and scene_frame.staged_size != 0)
         cmd.copyBuffer(scene_frame.staged_buffer, scene.instance_slots[0].buffer.?, scene_frame.staged_instances, 0, scene_frame.staged_size);
     if (visibility_reset) {
-        // New layout or view: start from all visible, so the first frame draws
-        // in a single phase.
         if (view_data.visibility) |buffer| cmd.fillBuffer(buffer, 0, @as(u64, view_data.visibility_capacity) * @sizeOf(u32), 1);
         if (view_data.instance_visibility) |buffer| cmd.fillBuffer(buffer, 0, @as(u64, view_data.instance_visibility_capacity) * @sizeOf(u32), 1);
     }
@@ -157,7 +153,6 @@ pub fn skinScene(renderer: *Renderer, p: *const ScenePass) !void {
             @memset(group_jobs.items[job.first_group..][0 .. (job.vertex_count + 63) / 64], @intCast(index));
         }
         cmd.bindPipeline(renderer.pipelines.skin);
-        // Never empty, so the shader always has a list.
         const weights = try arena.alloc(device, f32, @max(renderer.skin_weights.items.len, 1));
         weights.items[0] = 0;
         @memcpy(weights.items[0..renderer.skin_weights.items.len], renderer.skin_weights.items);
@@ -171,7 +166,6 @@ pub fn skinScene(renderer: *Renderer, p: *const ScenePass) !void {
             .group_jobs = group_jobs.address,
             .group_count = group_count,
         });
-        // Rows of 1024 groups, as in skin.comp.
         cmd.dispatch(@min(group_count, 1024), (group_count + 1023) / 1024, 1);
     }
     if (fresh_scene and renderer.bounds_jobs.items.len != 0) {
@@ -272,7 +266,6 @@ pub fn cullScene(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadow
     var cull_push: CullPush = undefined;
     var cull_views_address: u64 = 0;
     var receiver_culled: [gpu.cascade_count]bool = @splat(false);
-    // Bucket 1 holds alpha-tested materials and, with cross-fade, any meshlet.
     const masked_wanted = if (p.lod_band > 1) scene.ref_count else scene.masked_ref_count;
     if (renderer.cull_commands == null or scene.ref_count > renderer.cull_capacity or masked_wanted > renderer.cull_masked_capacity or views_wanted > renderer.cull_views) {
         if (renderer.cull_commands) |buffer| device.destroyBuffer(buffer);
@@ -350,7 +343,6 @@ pub fn cullScene(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadow
         cull.receiver_planes[4] = .{ -view_matrix[2], -view_matrix[6], -view_matrix[10], -view_matrix[14] - starts };
         cull.receiver_planes[5] = .{ view_matrix[2], view_matrix[6], view_matrix[10], view_matrix[14] + cascades.splits[cascade] };
     };
-    // Only the camera's passes cross-fade; shadows draw both levels.
     cull_views.items[0].lod_band = lod_band;
     cull_views.items[main_late_view].lod_band = lod_band;
     if (settings.transparent_shadows) for (cull_views.items, 0..) |*cull, index| {
@@ -369,7 +361,6 @@ pub fn cullScene(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadow
         .phase = 0,
         .hiz_texture = device.textureIndex(view.hiz),
         .hiz_size = .{ @floatFromInt(view.hiz_width), @floatFromInt(view.hiz_height) },
-        // Any readable buffer when nothing has bounds.
         .skin_bounds = device.bufferAddress(scene.skin_bounds orelse renderer.cull_counts),
         .seen = device.bufferAddress(scene.seen orelse renderer.cull_counts),
         .entity_refs = scene.entity_ref_count,
@@ -561,7 +552,6 @@ pub fn recordPick(renderer: *Renderer, p: *const ScenePass) void {
         const slot: usize = @intCast(frame.index % rhi.frames_in_flight);
         if (request.pixel[0] < output_width and request.pixel[1] < output_height) {
             cmd.beginScope("pick");
-            // The previous readback copy must finish first.
             cmd.sync(.transfer_to_all);
             cmd.bindPipeline(renderer.pipelines.pick);
             cmd.pushConstants(extern struct { frame: u64, result: u64, visibility: u32, depth: u32, pixel: [2]i32 }{

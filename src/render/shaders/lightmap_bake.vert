@@ -2,15 +2,11 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #include "common.glsl"
 
-// Lightmap bake: rasterizes a mesh in its second UV set so each texel maps to a
-// surface point.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint64_t tlas;
-    // Model to world.
     mat4 transform;
     uint vertex_offset;
-    // Accumulated result and its round count.
     uint gathered_texture;
     uint rounds;
     uint rays;

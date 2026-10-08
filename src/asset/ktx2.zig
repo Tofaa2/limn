@@ -117,7 +117,6 @@ pub fn read(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     return .{ .width = width, .height = height, .format = format, .srgb = srgb, .levels = levels, .faces = faces, .layers = layers, .data = data };
 }
 
-// The Basis Universal transcoder (src/third_party/basisu/rnd_basis.cpp).
 extern fn rnd_basis_open(data: [*]const u8, size: u32, info: *[8]u32) ?*anyopaque;
 extern fn rnd_basis_level(handle: *anyopaque, level: u32, layer: u32, face: u32, out: [*]u8, blocks: u32, hdr: c_int) c_int;
 extern fn rnd_basis_close(handle: *anyopaque) void;
@@ -216,13 +215,13 @@ pub fn write(gpa: std.mem.Allocator, texture: Texture) ![]u8 {
         .rgba8 => if (texture.srgb) vk_r8g8b8a8_srgb else vk_r8g8b8a8_unorm,
     };
     std.mem.writeInt(u32, out[12..16], vk_format, .little);
-    std.mem.writeInt(u32, out[16..20], if (texture.format == .rgba16f) 2 else 1, .little); // type size
+    std.mem.writeInt(u32, out[16..20], if (texture.format == .rgba16f) 2 else 1, .little);
     std.mem.writeInt(u32, out[20..24], texture.width, .little);
     std.mem.writeInt(u32, out[24..28], texture.height, .little);
     std.mem.writeInt(u32, out[32..36], if (texture.layers > 1) texture.layers else 0, .little);
     std.mem.writeInt(u32, out[36..40], texture.faces, .little);
     std.mem.writeInt(u32, out[40..44], levels, .little);
-    std.mem.writeInt(u32, out[48..52], @intCast(header_length), .little); // dfd offset
+    std.mem.writeInt(u32, out[48..52], @intCast(header_length), .little);
     std.mem.writeInt(u32, out[52..56], dfd_length, .little);
     std.mem.writeInt(u32, out[header_length..][0..4], dfd_length, .little);
     std.mem.writeInt(u16, out[header_length + 4 + 4 ..][0..2], 2, .little);

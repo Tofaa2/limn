@@ -3641,7 +3641,7 @@ FfxErrorCode CreatePipelineVK(FfxInterface* backendInterface,
     pipelineCreateInfo.layout = pPipelineLayout->pipelineLayout;
 
     VkPipeline computePipeline = VK_NULL_HANDLE;
-    if (backendContext->vkFunctionTable.vkCreateComputePipelines(backendContext->device, nullptr, 1, &pipelineCreateInfo, nullptr, &computePipeline) != VK_SUCCESS) {
+    if (backendContext->vkFunctionTable.vkCreateComputePipelines(backendContext->device, limnFfxPipelineCache /* Limn: was null */, 1, &pipelineCreateInfo, nullptr, &computePipeline) != VK_SUCCESS) {
         return FFX_ERROR_BACKEND_API_ERROR;
     }
 

@@ -1,7 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// Bicubic resample to the output resolution.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;
@@ -13,7 +12,6 @@ layout(location = 0) out vec4 out_color;
 void main() {
     uint s = push.frame.sampler_linear_clamp;
     vec2 size = vec2(textureSize(TEX(push.source_texture, s), 0));
-    // 5-tap approximation of bicubic Catmull-Rom (Jimenez, SIGGRAPH 2016).
     vec2 position = in_uv * size;
     vec2 center = floor(position - 0.5) + 0.5;
     vec2 f = position - center;

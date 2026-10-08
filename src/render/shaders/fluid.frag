@@ -4,11 +4,8 @@
 #include "media.glsl"
 #include "fluid.glsl"
 
-// Ray-marches the scene's fluid volumes. Smoke scatters sun, local and ambient
-// light; hot gas emits. Output: radiance in rgb, transmittance in a.
 const uint MAX_FLUIDS = 8u;
 
-// Maximum local lights per fluid.
 const uint MAX_FLUID_LAMPS = 16u;
 
 layout(push_constant, scalar) uniform Push {
@@ -17,7 +14,6 @@ layout(push_constant, scalar) uniform Push {
     uint count;
     int steps;
     int light_steps;
-    // 1 to output motion vectors.
     uint motion;
     uint motion_pad;
     FluidRef fluids[MAX_FLUIDS];
@@ -25,7 +21,6 @@ layout(push_constant, scalar) uniform Push {
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_fluid;
-// Screen motion of the fluid (xy) and its coverage (a).
 layout(location = 1) out vec4 out_motion;
 
 void main() {
@@ -36,11 +31,9 @@ void main() {
     float scene_distance = depth > 0.0 ? length(end - camera) : 1e30;
     vec3 direction = normalize(end - camera);
 
-    // Ray span in each box, sorted near to far.
     float enter[MAX_FLUIDS];
     float leave[MAX_FLUIDS];
     uint order[MAX_FLUIDS];
-    // Initialised: helper invocations may read it past their own box count.
     for (uint i = 0u; i < MAX_FLUIDS; i++) order[i] = 0u;
     uint hits = 0u;
     for (uint i = 0u; i < push.count; i++) {
@@ -94,7 +87,6 @@ void main() {
         int light_steps = push.light_steps;
         float self_shadow = fluid.data.shadow;
 
-        // Ambient is sampled once, at the box center.
         vec3 middle = (fluid.data.box_to_world * vec4(0.5, 0.5, 0.5, 1.0)).xyz;
         vec3 ambient = sky_ambient;
         if ((frame.flags & FRAME_GI) != 0u) {
@@ -103,7 +95,6 @@ void main() {
         }
         ambient *= fluid.data.ambient;
         vec3 sun = frame.sun_radiance * henyeyGreenstein(dot(direction, frame.sun_direction), fluid.data.anisotropy);
-        // Sun march covers about half the box height.
         float light_reach = 0.5 * length(fluid.data.box_to_world[1].xyz);
         float light_step = light_reach / float(max(light_steps, 1));
         vec3 sun_in_box = (world_to_box * vec4(frame.sun_direction * light_step, 0.0)).xyz;

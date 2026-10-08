@@ -2,14 +2,12 @@
 #include "common.glsl"
 #include "particles.glsl"
 
-// Simulates one emitter's particles and spawns this frame's share.
 layout(local_size_x = 64) in;
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     EmitterRef emitter;
     Particles particles;
-    // Trail positions; unused without trails.
     TrailPoints trail;
 } push;
 
@@ -49,7 +47,6 @@ void main() {
         offset *= emitter.radius * pow(random(state), 1.0 / 3.0) / max(length(offset), 1e-4);
         particle.velocity = direction * mix(emitter.speed.x, emitter.speed.y, random(state));
         particle.lifetime = mix(emitter.lifetime.x, emitter.lifetime.y, random(state));
-        // Spread spawn times over the frame.
         particle.age = dt * random(state);
         particle.position = emitter.position + offset + particle.velocity * particle.age;
         for (uint point = 0u; point < emitter.trail_count; point++)
@@ -76,7 +73,6 @@ void main() {
             }
         }
         vec3 next = particle.position + emitter.shift + particle.velocity * dt;
-        // Collide against last frame's depth buffer.
         if ((emitter.flags & EMITTER_COLLIDE) != 0u) {
             FrameConstants frame = push.frame;
             uint nearest = frame.sampler_nearest_clamp;

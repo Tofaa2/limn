@@ -1,24 +1,20 @@
 #version 460
 #include "common.glsl"
 
-// Depth of field: gathers over a disc sized by the circle of confusion.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint color_texture;
     uint depth_texture;
     float focus_distance;
-    // Blur radius in pixels at infinity.
     float strength;
     float max_radius;
     int tap_count;
-    // Aperture blade count; fewer than 3 for a round bokeh.
     uint blades;
 } push;
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
 
-// Focus distance; negative in the push constant selects autofocus.
 float focus_distance;
 
 float blurRadius(float view_depth) {
@@ -35,7 +31,6 @@ void main() {
     float center_radius = blurRadius(center_depth);
     vec3 total = textureLod(TEX(push.color_texture, linear), in_uv, 0.0).rgb;
     float weight_total = 1.0;
-    // Golden-angle spiral.
     float spin = interleavedGradientNoise(gl_FragCoord.xy, frame.frame_index) * 6.2831853;
     for (int i = 0; i < push.tap_count; i++) {
         float distance_pixels = push.max_radius * sqrt((float(i) + 0.5) / float(push.tap_count));
@@ -49,12 +44,10 @@ void main() {
         vec2 uv = in_uv + vec2(cos(angle), sin(angle)) * distance_pixels * frame.inv_resolution;
         float tap_depth = linearDepth(textureLod(TEX(push.depth_texture, nearest), uv, 0.0).r, frame.near);
         float tap_radius = blurRadius(tap_depth);
-        // Background taps are limited to this pixel's own blur radius.
         if (tap_depth > center_depth) tap_radius = min(tap_radius, center_radius);
         float weight = smoothstep(reach - 1.0, reach + 1.0, tap_radius);
         total += textureLod(TEX(push.color_texture, linear), uv, 0.0).rgb * weight;
         weight_total += weight;
     }
-    // Alpha: normalized blur radius, for the composite.
     out_color = vec4(total / weight_total, clamp(center_radius / max(push.max_radius, 1e-3), 0.0, 1.0));
 }

@@ -105,6 +105,9 @@ pub const VsmParams = extern struct {
 };
 /// `Material.flags`: alpha blend or transmission; transparent pass.
 pub const material_blend: u32 = 4;
+/// `Material.roughness` is a glossiness factor, `params` the specular factor,
+/// and the metallic-roughness texture holds specular and glossiness.
+pub const material_specular_glossiness: u32 = 8;
 
 /// Cascades of the sun's shadow map. Shaders hard-code 4.
 pub const cascade_count = 4;
@@ -844,7 +847,6 @@ pub const TextureTransform = extern struct {
 pub const texture_transform_slots = (material_texture_count * @sizeOf(TextureTransform) + @sizeOf(Material) - 1) / @sizeOf(Material);
 
 comptime {
-    // Shaders read transform blocks as 16-byte material buffer entries.
     std.debug.assert(@sizeOf(Material) % 16 == 0);
     std.debug.assert(@sizeOf(TextureTransform) == 32);
 }

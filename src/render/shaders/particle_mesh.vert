@@ -3,14 +3,11 @@
 #include "shading.glsl"
 #include "particles.glsl"
 
-// Particles drawn as mesh instances, one per particle slot.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     EmitterRef emitter;
     Particles particles;
-    // First vertex of the mesh.
     uint vertex_offset;
-    // Tumble rate in radians per second.
     float spin;
 } push;
 
@@ -28,7 +25,6 @@ uint hashSlot(uint value) {
     return value;
 }
 
-// Rotates `v` about unit `axis`.
 vec3 turn(vec3 v, vec3 axis, float angle) {
     float s = sin(angle);
     float c = cos(angle);
@@ -41,7 +37,6 @@ void main() {
     uint slot = uint(gl_InstanceIndex);
     Particle particle = push.particles.data[slot];
     if (particle.age >= particle.lifetime) {
-        // Dead: degenerate.
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         out_color = vec4(0.0);
         out_uv = vec2(0.0);

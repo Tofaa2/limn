@@ -22,7 +22,6 @@ pub fn main(init: std.process.Init) !void {
     const renderer = stage.renderer;
     const scene = try renderer.createScene();
 
-    // Night: a faint sky and a dim moon, so the lamps do the work.
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.3, -0.25, -0.5 } };
     renderer.setEnvironment(scene, try renderer.createSky(sky_desc), 0.02);
     renderer.setSun(scene, .{ .direction = sky_desc.sun_direction, .color = .{ 0.6, 0.7, 1.0 }, .intensity = 0.05 });
@@ -34,7 +33,6 @@ pub fn main(init: std.process.Init) !void {
     const polished = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.3, 0.3, 0.32, 1 }, .metallic = 0, .roughness = 0.25 } }});
     _ = try renderer.spawn(scene, .{ .model = polished, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 40, 0.5, 30 })) });
     _ = try renderer.spawn(scene, .{ .model = stone, .transform = math.mul(math.translation(.{ 0, 3.5, -13 }), math.scaling(.{ 40, 7, 0.5 })) });
-    // Pillars, placed as one group.
     var pillars: [5 * 8]math.Mat4 = undefined;
     for (&pillars, 0..) |*pillar, index| {
         const x = (@as(f32, @floatFromInt(index % 8)) - 3.5) * 4.0;
@@ -73,8 +71,6 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_D)) orbit += tick.dt * 0.7;
         if (moving) clock += tick.dt;
 
-        // The whole set of lights is handed over each frame; moving one is
-        // just giving it a new position.
         list.clear();
         var count: usize = 0;
         for (0..drifting) |index| {
@@ -88,7 +84,6 @@ pub fn main(init: std.process.Init) !void {
             const color = math.Vec3{ 0.55 + 0.45 * @sin(hue * std.math.tau), 0.55 + 0.45 * @sin((hue + 0.33) * std.math.tau), 0.55 + 0.45 * @sin((hue + 0.66) * std.math.tau) };
             lights[count] = .{ .position = position, .color = color, .intensity = 5, .range = 4.5, .source_radius = 0.05 };
             count += 1;
-            // A dot where each light is.
             try list.billboard(dot, position, .{ 0.07, 0.07 }, gfx.Color.rgb(@intFromFloat(color[0] * 255), @intFromFloat(color[1] * 255), @intFromFloat(color[2] * 255)));
         }
         lights[count] = .{
@@ -104,7 +99,6 @@ pub fn main(init: std.process.Init) !void {
         };
         count += 1;
         if (panel) {
-            // A rectangle that glows: light with a width and a height.
             lights[count] = .{ .kind = .rectangle, .position = .{ 0, 3, -12.6 }, .direction = .{ 0, -0.1, 1 }, .color = .{ 0.4, 0.75, 1.0 }, .intensity = 30, .range = 16, .source_length = 6, .source_height = 2.5 };
             count += 1;
             try list.quad3d(.{ .{ -3, 1.75, -12.7 }, .{ 3, 1.75, -12.7 }, .{ 3, 4.25, -12.7 }, .{ -3, 4.25, -12.7 } }, gfx.Color.rgb(140, 210, 255));

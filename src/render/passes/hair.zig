@@ -139,7 +139,6 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
             .strand_count = hair.strands,
             .points_per_strand = hair.desc.points_per_strand,
             .collider_count = hair.collider_count,
-            // Two reset steps fill both point buffers.
             .reset = @intFromBool(moving.steps < 2),
             .field_texture = if (field) |state| device.textureIndex(state.texture) else gpu.invalid_id,
             .field_size = if (field) |state| state.size else 1,

@@ -7,6 +7,7 @@ const zstbi = @import("zstbi");
 const texture_codec = @import("texture_codec");
 const model_cache = @import("model_cache.zig");
 const ktx2 = @import("ktx2.zig");
+const dds = @import("dds.zig");
 const math = @import("../math.zig");
 const gltf = zmesh.io.zcgltf;
 
@@ -173,6 +174,13 @@ pub const Material = struct {
     alpha_cutoff: f32 = 0.5,
     alpha_mode: AlphaMode = .@"opaque",
     double_sided: bool = false,
+    /// `KHR_materials_pbrSpecularGlossiness`: `base_color` and its texture are
+    /// the diffuse color, `roughness` is the glossiness factor, and
+    /// `metallic_roughness_texture` holds specular in RGB (sRGB) and glossiness
+    /// in alpha.
+    specular_glossiness: bool = false,
+    /// Linear RGB specular factor of a `specular_glossiness` material.
+    specular: [3]f32 = .{ 1, 1, 1 },
     base_color_texture: ?TextureRef = null,
     normal_texture: ?TextureRef = null,
     metallic_roughness_texture: ?TextureRef = null,
@@ -499,8 +507,6 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: LoadO
 
     model.images = try arena.alloc(Image, data.images_count);
     for (model.images) |*image| image.* = .{};
-    // Materials first: they decide which images are sRGB, which the image
-    // tasks need for correct mips.
     try loadMaterials(arena, data, &model);
     const jobs = try gpa.alloc(ImageJob, data.images_count);
     defer gpa.free(jobs);
@@ -566,6 +572,7 @@ fn decodeImage(job: *ImageJob) std.Io.Cancelable!void {
 }
 
 fn decodeImageInner(job: *ImageJob) !void {
+    if (job.output.uses == 0) return;
     var owned: ?[]u8 = null;
     defer if (owned) |bytes| job.gpa.free(bytes);
     const encoded: []const u8 = if (job.source.buffer_view) |view| blk: {
@@ -606,6 +613,22 @@ fn decodeImageInner(job: *ImageJob) !void {
         job.output.height = texture.height;
         job.output.mip_levels = texture.levels;
         job.output.compressed = texture.data;
+        return;
+    }
+    if (dds.isDds(encoded)) {
+        const texture = try dds.read(encoded);
+        switch (texture.format) {
+            .bc7 => {},
+            .bc1 => job.output.block = .bc1,
+            .bc3 => job.output.block = .bc3,
+            .bc6h => job.output.block = .bc6h,
+            .bc4 => job.output.one_channel = true,
+            .bc5 => job.output.two_channel = true,
+        }
+        job.output.width = texture.width;
+        job.output.height = texture.height;
+        job.output.mip_levels = texture.levels;
+        job.output.compressed = try job.gpa.dupe(u8, texture.data);
         return;
     }
     if (!job.options.compress_textures and job.options.raw_mips) {
@@ -652,6 +675,58 @@ fn decodeImageInner(job: *ImageJob) !void {
         writeCacheFile(job.io, job.options.cache_dir.?, path, &.{ &header, data }) catch |err|
             std.log.warn("texture cache: could not write {s}: {s}", .{ path, @errorName(err) });
     }
+}
+
+/// A `KHR_lights_punctual` light, placed by its node.
+pub const SceneLight = struct {
+    kind: enum { directional, point, spot },
+    position: [3]f32,
+    /// Unit vector the light shines along.
+    direction: [3]f32,
+    /// Linear RGB.
+    color: [3]f32,
+    /// Candela for point and spot lights, lux for directional.
+    intensity: f32,
+    /// 0 for unlimited.
+    range: f32,
+    /// Spot cone half-angles, in radians.
+    inner_angle: f32,
+    outer_angle: f32,
+};
+
+/// The lights of a glTF file. Reads only its JSON. Caller frees the result.
+pub fn loadLights(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]SceneLight {
+    const bytes = try readFile(gpa, io, path);
+    defer gpa.free(bytes);
+    const data = try gltf.parse(.{ .memory = .{
+        .alloc_func = zmesh.mem.zmeshAllocUser,
+        .free_func = zmesh.mem.zmeshFreeUser,
+    } }, bytes);
+    defer gltf.free(data);
+    var lights: std.ArrayList(SceneLight) = .empty;
+    errdefer lights.deinit(gpa);
+    if (data.nodes_count == 0) return lights.toOwnedSlice(gpa);
+    for (data.nodes.?[0..data.nodes_count]) |node| {
+        const light = node.light orelse continue;
+        const world = node.transformWorld();
+        const axis = [3]f32{ -world[8], -world[9], -world[10] };
+        const length = @sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+        try lights.append(gpa, .{
+            .kind = switch (light.type) {
+                .directional => .directional,
+                .spot => .spot,
+                else => .point,
+            },
+            .position = .{ world[12], world[13], world[14] },
+            .direction = if (length > 0) .{ axis[0] / length, axis[1] / length, axis[2] / length } else .{ 0, -1, 0 },
+            .color = light.color,
+            .intensity = light.intensity,
+            .range = light.range,
+            .inner_angle = light.spot_inner_cone_angle,
+            .outer_angle = light.spot_outer_cone_angle,
+        });
+    }
+    return lights.toOwnedSlice(gpa);
 }
 
 pub const LoadOptions = struct {
@@ -927,7 +1002,7 @@ pub fn equirectDirection(u: f32, v: f32) [3]f32 {
 fn textureRef(data: *gltf.Data, model: *Model, view: gltf.TextureView, srgb: bool) ?TextureRef {
     const texture = view.texture orelse return null;
     const image = (if (texture.has_basisu != 0) texture.basisu_image else null) orelse texture.image orelse return null;
-    const index = elementIndex(gltf.Image, data.images, image);
+    const index = ddsImage(data, texture) orelse elementIndex(gltf.Image, data.images, image);
     if (srgb) model.images[index].srgb = true;
     model.images[index].uses += 1;
     var sampler: SamplerData = .{};
@@ -943,6 +1018,22 @@ fn textureRef(data: *gltf.Data, model: *Model, view: gltf.TextureView, srgb: boo
         if (view.transform.has_texcoord != 0) uv_set = if (view.transform.texcoord == 1) 1 else 0;
     }
     return .{ .image = index, .sampler = sampler, .uv_set = uv_set, .transform = transform };
+}
+
+/// The image `MSFT_texture_dds` names for a texture.
+fn ddsImage(data: *gltf.Data, texture: *const gltf.Texture) ?u32 {
+    const extensions = texture.extensions orelse return null;
+    for (extensions[0..texture.extensions_count]) |extension| {
+        if (!std.mem.eql(u8, std.mem.span(extension.name orelse continue), "MSFT_texture_dds")) continue;
+        const json = std.mem.span(extension.data orelse continue);
+        const key = std.mem.indexOf(u8, json, "\"source\"") orelse continue;
+        const digits = std.mem.trimStart(u8, json[key + 8 ..], ": \t\r\n");
+        var end: usize = 0;
+        while (end < digits.len and std.ascii.isDigit(digits[end])) end += 1;
+        const index = std.fmt.parseInt(u32, digits[0..end], 10) catch continue;
+        if (index < data.images_count) return index;
+    }
+    return null;
 }
 
 fn addressMode(mode: gltf.WrapMode) SamplerData.AddressMode {
@@ -966,6 +1057,15 @@ fn loadMaterials(arena: std.mem.Allocator, data: *gltf.Data, model: *Model) !voi
             material.roughness = pbr.roughness_factor;
             material.base_color_texture = textureRef(data, model, pbr.base_color_texture, true);
             material.metallic_roughness_texture = textureRef(data, model, pbr.metallic_roughness_texture, false);
+        }
+        if (source.has_pbr_specular_glossiness != 0) {
+            const pbr = source.pbr_specular_glossiness;
+            material.specular_glossiness = true;
+            material.base_color = pbr.diffuse_factor;
+            material.specular = pbr.specular_factor;
+            material.roughness = pbr.glossiness_factor;
+            material.base_color_texture = textureRef(data, model, pbr.diffuse_texture, true);
+            material.metallic_roughness_texture = textureRef(data, model, pbr.specular_glossiness_texture, true);
         }
         material.normal_texture = textureRef(data, model, source.normal_texture, false);
         if (material.normal_texture) |ref| model.images[ref.image].normal_map = true;
@@ -1051,7 +1151,6 @@ const MeshoptBounds = extern struct {
     cone_cutoff_s8: i8,
 };
 
-// From the newer simplifier in src/third_party/meshoptimizer.
 extern fn rnd_meshopt_simplifyWithAttributes(
     destination: [*]u32,
     indices: [*]const u32,

@@ -293,7 +293,6 @@ const World = struct {
         var chunks: std.ArrayList(Chunk) = .empty;
         errdefer chunks.deinit(gpa);
         var buried: u64 = 0;
-        // Half the diagonal of a chunk: how far its corners are from its middle.
         const reach = chunk_size * 0.5 * @sqrt(3.0);
         for (0..span) |z| for (0..span) |y| for (0..span) |x| {
             const chunk = Chunk{ .cell = .{ @intCast(x), @intCast(y), @intCast(z) } };
@@ -422,7 +421,6 @@ const World = struct {
                 .building => waiting += 1,
                 .absent => if (overHorizon(chunk.*, eye, 0.15)) {
                     waiting += 1;
-                    // Kept as the nearest few, nearest first.
                     var distance = math.length(math.sub(chunk.center(), eye));
                     var candidate: ?u32 = @intCast(index);
                     for (&nearest, &nearest_distance) |*slot, *slot_distance| {
@@ -440,8 +438,6 @@ const World = struct {
             self.chunks[index].state = .building;
             self.start(index, true);
         }
-        // With nothing in view left to do, the rest of the planet is
-        // counted a chunk at a time.
         if (waiting == 0) for (self.chunks, 0..) |*chunk, index| {
             if (self.in_flight >= jobs_at_once) break;
             if (chunk.voxels != null or chunk.counting or chunk.state == .building) continue;
@@ -465,7 +461,6 @@ pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn voxel planet", .{});
     const renderer = stage.renderer;
     const scene = try renderer.createScene();
-    // Space round the planet: a sky without a sun in it, only stars.
     const environment = try renderer.createSky(.{ .sun_direction = .{ 0, 1, 0 }, .stars = 40 });
     renderer.setEnvironment(scene, environment, 0.6);
 
@@ -486,7 +481,6 @@ pub fn main(init: std.process.Init) !void {
     var forward = math.Vec3{ 1, 0, 0 };
     var cursor: ?[2]f64 = null;
 
-    // What is in view at the start is there before the first frame.
     eye = flight(round, altitude)[0];
     while (try world.stream(eye, true) != 0) try init.io.sleep(std.Io.Duration.fromMilliseconds(2), .awake);
     try renderer.waitUntilLoaded();
@@ -529,7 +523,6 @@ pub fn main(init: std.process.Init) !void {
             if (stage.keyDown(glfw.GLFW_KEY_E)) move = math.add(move, up);
             if (stage.keyDown(glfw.GLFW_KEY_Q)) move = math.sub(move, up);
             eye = math.add(eye, math.scale(move, speed * tick.dt));
-            // Not into the ground, and not out of sight of it.
             const from_middle = std.math.clamp(math.length(eye), planet_radius + highest + 3, planet_radius * 4);
             eye = math.scale(math.normalize(eye), from_middle);
         } else {
@@ -542,7 +535,6 @@ pub fn main(init: std.process.Init) !void {
 
         const waiting = try world.stream(eye, streaming);
 
-        // The sun goes round the planet's axis, a little above its equator.
         const toward_sun = math.normalize(math.Vec3{ @cos(day), 0.25, @sin(day) });
         renderer.setSun(scene, .{ .direction = math.scale(toward_sun, -1), .color = .{ 1, 0.95, 0.88 }, .intensity = 4 });
 
@@ -592,7 +584,6 @@ pub fn main(init: std.process.Init) !void {
             .delta_time = tick.dt,
         }));
     }
-    // The workers still hold the renderer: they finish before it goes.
     world.group.await(init.io) catch {};
     try stage.finish();
 }
@@ -605,7 +596,6 @@ fn flight(round: f32, height: ?f32) [2]math.Vec3 {
     const outward = math.normalize(math.Vec3{ @cos(round), 0.45 * @sin(round * 0.6), @sin(round) });
     const ahead = math.normalize(math.Vec3{ @cos(round + 0.05), 0.45 * @sin((round + 0.05) * 0.6), @sin(round + 0.05) });
     const along = math.normalize(math.sub(ahead, outward));
-    // The higher, the further down the ground is.
     const down = 0.8 + 2.5 * (altitude - planet_radius) / planet_radius;
     return .{ math.scale(outward, altitude), math.normalize(math.sub(along, math.scale(outward, down))) };
 }

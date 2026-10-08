@@ -23,7 +23,6 @@ pub fn main(init: std.process.Init) !void {
     var helmet = false;
     var lights = false;
     var glass = false;
-    // {x, y, width, height} of the frame to write.
     var crop: ?[4]u32 = null;
     var overlay = false;
     var canvas = false;
@@ -31,7 +30,6 @@ pub fn main(init: std.process.Init) !void {
     var stereo = false;
     var hair = false;
     var mesh_shaders = true;
-    // 0 none, 1 a box lit by the probes, 2 the same with a baked lightmap.
     var lightmap_box: u32 = 0;
     var custom_pass = false;
     var sky = false;
@@ -177,7 +175,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--no-compress")) {
             compression = .none;
         } else if (std.mem.eql(u8, arg, "--stream")) {
-            // Budget in MiB; 0 means no limit.
             const megabytes = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArgument, 10);
             streaming = .{ .budget_bytes = megabytes * 1024 * 1024, .evict_delay_frames = 8 };
         } else if (std.mem.eql(u8, arg, "--stream-visible")) {
@@ -233,10 +230,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--morph-row")) {
             morph_row = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--ktx2-bc1")) {
-            // With --decals.
             decal_bc1 = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--decal-count")) {
-            // With --decals.
             decal_count = try std.fmt.parseInt(usize, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--decals")) {
             decals = true;
@@ -269,11 +264,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--lightmap-box")) {
             lightmap_box = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--pane-row")) {
-            // With --glass: "group" or "entities".
             const how = args.next() orelse return error.MissingValue;
             pane_row = if (std.mem.eql(u8, how, "group")) .group else if (std.mem.eql(u8, how, "entities")) .entities else return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--lens-pane")) {
-            // With --glass.
             lens_pane = true;
         } else if (std.mem.eql(u8, arg, "--layered-refraction")) {
             settings.layered_refraction = true;
@@ -350,7 +343,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--quality")) {
             settings = gfx.Settings.preset(std.meta.stringToEnum(gfx.Quality, args.next() orelse return error.MissingArgument) orelse return error.InvalidArgument);
         } else if (std.mem.eql(u8, arg, "--lut")) {
-            // "identity" or "warm".
             lut = args.next() orelse return error.MissingArgument;
         } else if (std.mem.eql(u8, arg, "--autofocus")) {
             settings.dof_aperture = 1;
@@ -362,7 +354,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--gi-coarse-interval")) {
             settings.gi_coarse_interval = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--sheen")) {
-            // With --coat.
             sheen = true;
         } else if (std.mem.eql(u8, arg, "--contact-shadows")) {
             settings.contact_shadows = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
@@ -371,7 +362,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--tube")) {
             tube = true;
         } else if (std.mem.eql(u8, arg, "--aniso")) {
-            // With --coat.
             aniso = true;
         } else if (std.mem.eql(u8, arg, "--bc7-normals")) {
             bc7_normals = true;
@@ -394,7 +384,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--lod-uv-weight")) {
             lod_uv_weight = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--panel-basis")) {
-            // etc1s or uastc.
             transform_panel = true;
             const kind = args.next() orelse return error.MissingArgument;
             panel_model = if (std.mem.eql(u8, kind, "etc1s")) "examples/assets/panel/panel_etc1s.gltf" else "examples/assets/panel/panel_uastc.gltf";
@@ -413,7 +402,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--aerial")) {
             settings.aerial_perspective = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--wax")) {
-            // With --coat.
             wax = true;
         } else if (std.mem.eql(u8, arg, "--sort-test")) {
             sort_test = true;
@@ -422,7 +410,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--no-shader-variants")) {
             shader_variants = false;
         } else if (std.mem.eql(u8, arg, "--instance-params")) {
-            // With --material.
             instance_params = true;
         } else if (std.mem.eql(u8, arg, "--refits")) {
             gi_dynamic_refits = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
@@ -435,7 +422,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--transform-panel")) {
             transform_panel = true;
         } else if (std.mem.eql(u8, arg, "--coat-maps")) {
-            // With --coat.
             coat_maps = true;
         } else if (std.mem.eql(u8, arg, "--geometry-distance")) {
             geometry_distance = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
@@ -450,12 +436,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--text-fallback")) {
             text_fallback = true;
         } else if (std.mem.eql(u8, arg, "--light-size")) {
-            // With --lights.
             light_size = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--fire-size")) {
             fire_size = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArgument);
         } else if (std.mem.eql(u8, arg, "--tube-shadows")) {
-            // With --tube.
             tube_shadows = true;
         } else if (std.mem.eql(u8, arg, "--fluid-lamp")) {
             fluid_lamp = true;
@@ -472,16 +456,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--fluid-sharp")) {
             fluid_sharp = true;
         } else if (std.mem.eql(u8, arg, "--fluid-flipbook")) {
-            // With --fluid.
             fluid_flipbook = args.next() orelse return error.MissingArgument;
         } else if (std.mem.eql(u8, arg, "--fluid-frame")) {
-            // With --fluid.
             fluid_frame = args.next() orelse return error.MissingArgument;
         } else if (std.mem.eql(u8, arg, "--compress-images")) {
-            // With --decals.
             compress_images = true;
         } else if (std.mem.eql(u8, arg, "--bumps")) {
-            // With --decals.
             bumps = true;
         } else if (std.mem.eql(u8, arg, "--tints")) {
             tints = true;
@@ -508,7 +488,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--spatial-upscaling")) {
             settings.upscaling = .spatial;
         } else if (std.mem.eql(u8, arg, "--sky-spread")) {
-            // With --sky-sweep.
             sky_spread = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--flat-panes")) {
             flat_panes = true;
@@ -663,7 +642,6 @@ pub fn main(init: std.process.Init) !void {
         cube_environment = try renderer.loadEnvironment(path, 24);
         try renderer.waitUntilLoaded();
         const info = renderer.environmentInfo(cube_environment.?) orelse return error.CubeEnvironmentNotLoaded;
-        // Texel (20, 8) of +X: (1, -py, -px) with px, py from its center.
         const expected = math.normalize(.{ 1, -((8.5 / 32.0) * 2 - 1), -((20.5 / 32.0) * 2 - 1) });
         if (math.dot(info.brightest_direction, expected) < 0.9999) return error.CubeEnvironmentBrightestWrong;
         renderer.setEnvironment(scene, cube_environment, environment_intensity);
@@ -981,7 +959,6 @@ pub fn main(init: std.process.Init) !void {
     const sorted_emitter: ?gfx.Emitter = if (sort_test) try renderer.createEmitter(scene, .{
         .position = .{ 2.5, 1.0, 0.5 },
         .radius = 0.6,
-        // Not a power of two, to exercise the padding.
         .capacity = 300,
         .rate = 240,
         .lifetime = .{ 0.6, 1.0 },
@@ -1010,7 +987,6 @@ pub fn main(init: std.process.Init) !void {
             var blocks: [16 * 16 * 8]u8 = undefined;
             for (0..16) |by| for (0..16) |bx| {
                 const yellow = (bx / 2 + by / 2) % 2 == 0;
-                // RGB565, little-endian.
                 const color: u16 = if (yellow) 0xfe60 else 0x18ca;
                 const block = blocks[(by * 16 + bx) * 8 ..][0..8];
                 std.mem.writeInt(u16, block[0..2], color, .little);
@@ -1452,9 +1428,7 @@ pub fn main(init: std.process.Init) !void {
             }},
             .delta_time = 1.0 / 60.0,
         });
-        // Variants compile in the background; wait so timing cannot matter.
         try renderer.waitForShaderVariants();
-        // Skip warm-up frames.
         if (index >= frames / 2) cpu_ns += @intCast(frame_start.untilNow(init.io).raw.nanoseconds);
     }
     worker_state.stop.store(true, .release);
@@ -1633,7 +1607,6 @@ fn compaction(gpa: std.mem.Allocator, renderer: *gfx.Renderer, scene: gfx.Scene,
 /// tears it all down.
 fn soak(renderer: *gfx.Renderer, scene: gfx.Scene, target: gfx.rhi.Texture, settings: gfx.Settings, cycles: u32) !void {
     const camera = gfx.Camera.lookAt(.{ 6, 2, 3 }, .{ 0, 1, 0 });
-    // Measured after the first cycle, once render targets and pools exist.
     var before: u64 = 0;
     for (0..cycles) |cycle| {
         const fox = try renderer.loadModel("examples/assets/world/Fox.glb");
@@ -1933,7 +1906,6 @@ fn outOfMemory(
         if (loaded) |model| {
             renderer.waitUntilLoaded() catch |err| if (err != error.OutOfMemory) return err;
             failing.fail_index.store(std.math.maxInt(usize), .monotonic);
-            // A wait cut short leaves the load unfinished.
             try renderer.waitUntilLoaded();
             switch (renderer.modelState(model)) {
                 .ready => {},
@@ -1972,7 +1944,6 @@ fn outOfGpuMemory(
         const outcome: anyerror!void = blk: {
             const view = renderer.createView() catch |err| break :blk err;
             defer renderer.destroyView(view);
-            // A size of its own each round, so the view's targets are new.
             const small = device.createTexture(.{
                 .name = "small output",
                 .width = @intCast(192 + round * 2),
@@ -1989,7 +1960,6 @@ fn outOfGpuMemory(
             defer renderer.despawn(entity);
             _ = renderer.render(.{ .views = &.{.{ .view = view, .scene = scene, .camera = camera, .target = .{ .texture = small }, .settings = settings }} }) catch |err| break :blk err;
         };
-        // Some failures are absorbed, so count the ones that were injected.
         if (!device.gpuAllocationFailurePending()) failures += 1;
         device.failGpuAllocation(null);
         if (outcome) |_| {} else |err| {
@@ -2029,7 +1999,6 @@ fn measureFlicker(
                 const b: i32 = previous[pixel * 4 + channel];
                 difference = @max(difference, @abs(a - b));
             }
-            // A change of one level is the output dither.
             if (difference >= 2) sum.* += @floatFromInt(difference);
         }
         init.gpa.free(previous);
@@ -2070,7 +2039,6 @@ fn compareReference(
     tolerance: f32,
     update: bool,
 ) !void {
-    // Strict on the GPU the references were made on, loose on any other.
     const device_name = renderer.device.name();
     var device_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const device_path = try std.fmt.bufPrint(&device_path_buffer, "{s}/device.txt", .{std.fs.path.dirname(path) orelse "."});
@@ -2081,7 +2049,6 @@ fn compareReference(
             same_device = std.mem.eql(u8, std.mem.trim(u8, recorded, " \n"), device_name);
         } else |_| {}
     }
-    // The references include ray-traced global illumination.
     if (!renderer.device.ray_tracing and !update) {
         std.log.info("reference {s}: skipped, this device has no ray tracing", .{path});
         return;

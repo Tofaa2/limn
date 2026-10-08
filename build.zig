@@ -20,6 +20,7 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/cluster.comp", .name = "cluster.comp.spv" },
     .{ .src = shader_dir ++ "/forward.vert", .name = "forward.vert.spv" },
     .{ .src = shader_dir ++ "/forward.frag", .name = "forward.frag.spv" },
+    .{ .src = shader_dir ++ "/forward.frag", .name = "forward_weighted.frag.spv", .defines = &.{"WEIGHTED"} },
     .{ .src = shader_dir ++ "/hiz.frag", .name = "hiz.frag.spv" },
     .{ .src = shader_dir ++ "/gi_trace.comp", .name = "gi_trace.comp.spv" },
     .{ .src = shader_dir ++ "/gi_relocate.frag", .name = "gi_relocate.frag.spv" },
@@ -280,6 +281,12 @@ const examples: []const Example = &.{
         .windowed = true,
     },
     .{
+        .name = "bistro",
+        .root = "examples/bistro.zig",
+        .description = "Amazon Lumberyard Bistro: a full street scene by day and by night",
+        .windowed = true,
+    },
+    .{
         .name = "upscaling",
         .root = "examples/upscaling.zig",
         .description = "Drawing fewer pixels: bicubic, temporal and FidelityFX upscaling, and coarse shading",
@@ -322,24 +329,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const thread_sanitizer = b.option(bool, "tsan", "Build with the thread sanitizer (for the threaded stress test)") orelse false;
-    // The Vulkan headers and the registry the bindings are generated from
-    // are fetched with the package rather than looked for on the machine,
-    // so that every build sees the same version of both.
     const vulkan_headers = b.dependency("vulkan_headers", .{});
     const vulkan_include = vulkan_headers.path("include");
     const vulkan = b.lazyDependency("vulkan", .{
         .registry = vulkan_headers.path("registry/vk.xml"),
     }) orelse return;
 
-    // Asset decoding and mesh optimization are always built optimized; they
-    // dominate load time and are not what you are debugging.
     const asset_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseFast else optimize;
     const zmesh = b.dependency("zmesh", .{ .target = target, .optimize = asset_optimize });
     const zstbi = b.dependency("zstbi", .{ .target = target, .optimize = asset_optimize });
 
     const shaders_step = b.step("shaders", "Compile all shaders to SPIR-V");
-    // Shader headers (`common.glsl` and friends) for applications that write
-    // their own passes: `dependency.namedLazyPath("shader_include")`.
     b.addNamedLazyPath("shader_include", b.path(shader_dir));
 
     const renderer = b.addModule("limn", .{
@@ -349,14 +349,11 @@ pub fn build(b: *std.Build) void {
         .sanitize_thread = thread_sanitizer,
     });
     renderer.addImport("vulkan", vulkan.module("vulkan-zig"));
-    // The Vulkan loader, built from its one source file.
     const volk = b.dependency("volk", .{});
     renderer.addImport("volk", volkModule(b, target, optimize, vulkan_include, volk));
     renderer.addImport("zmesh", zmesh.module("root"));
     renderer.linkLibrary(zmesh.artifact("zmesh"));
     renderer.addImport("zstbi", zstbi.module("root"));
-    // A newer mesh simplifier than the one zmesh carries (see
-    // src/third_party/meshoptimizer), its names prefixed so both link.
     const simplifier = b.addLibrary(.{
         .name = "renderer_simplifier",
         .root_module = b.createModule(.{ .target = target, .optimize = asset_optimize, .link_libcpp = true }),
@@ -373,8 +370,6 @@ pub fn build(b: *std.Build) void {
         },
     });
     renderer.linkLibrary(simplifier);
-    // Basis Universal's transcoder, for KTX2 files that hold its formats
-    // (see src/third_party/basisu).
     const basis = b.addLibrary(.{
         .name = "renderer_basis",
         .root_module = b.createModule(.{ .target = target, .optimize = asset_optimize, .link_libcpp = true }),
@@ -385,16 +380,12 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-DBASISD_SUPPORT_KTX2=1", "-DBASISD_SUPPORT_KTX2_ZSTD=1", "-fno-strict-aliasing", "-w" },
     });
     renderer.linkLibrary(basis);
-    // Texture compression runs over every texel; like the C libraries, it
-    // is always built optimized.
     const texture_codec = b.createModule(.{
         .root_source_file = b.path("src/asset/texture.zig"),
         .target = target,
         .optimize = asset_optimize,
     });
     renderer.addImport("texture_codec", texture_codec);
-    // Likewise the font baker: a debug build of it takes most of a second
-    // to bake a few hundred glyphs.
     const font_baker = b.createModule(.{
         .root_source_file = b.path("src/font_baker.zig"),
         .target = target,
@@ -402,8 +393,6 @@ pub fn build(b: *std.Build) void {
     });
     renderer.addImport("font_baker", font_baker);
     addShaders(b, renderer, renderer_shaders, shaders_step);
-    // The renderer knows where its shader sources are, so development
-    // builds can recompile them while running (`Renderer.reloadShaders`).
     const shader_options = b.addOptions();
     var shader_names: [renderer_shaders.len][]const u8 = undefined;
     var shader_sources: [renderer_shaders.len][]const u8 = undefined;
@@ -418,22 +407,15 @@ pub fn build(b: *std.Build) void {
     shader_options.addOption([]const []const u8, "defines", &shader_defines);
     shader_options.addOption([]const u8, "include_dir", b.pathFromRoot(shader_dir));
     renderer.addOptions("shader_sources", shader_options);
-    // AMD's FidelityFX SDK, for FidelityFX Super Resolution 2 and 3. It is
-    // C++ and a thousand compiled shaders; `-Dfidelityfx=false` leaves it
-    // out, and with it `Upscaling.fsr2` and `.fsr3`.
     const fidelityfx = b.option(bool, "fidelityfx", "Build AMD's FidelityFX SDK in, for FSR 2 and FSR 3 upscaling (default: true)") orelse true;
     const features = b.addOptions();
     features.addOption(bool, "fidelityfx", fidelityfx);
     renderer.addOptions("build_features", features);
     if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk);
 
-    // Everything is compiled with LLVM, also in debug builds.
     const library = b.addLibrary(.{ .name = "limn", .root_module = renderer, .linkage = .static, .use_llvm = true });
     b.installArtifact(library);
 
-    // The compiler emits the reference with the sources of every module
-    // the library was built with, the standard library among them. Only
-    // this library's own are kept, so the page has little to fetch.
     const docs_trim = b.addExecutable(.{
         .name = "docs_trim",
         .root_module = b.createModule(.{
@@ -466,10 +448,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // The windowing library, used by the examples only. Windows has no
-    // system copy of it, so there it is fetched and built from source;
-    // elsewhere the system's is linked, since building it wants the
-    // window system's own development files in any case.
     glfw.addSystemIncludePath(vulkan_include);
     glfw.addSystemIncludePath(volk.path(""));
     const glfw_source = if (target.result.os.tag == .windows) (b.lazyDependency("glfw", .{}) orelse return) else null;
@@ -492,8 +470,6 @@ pub fn build(b: *std.Build) void {
     window_module.addImport("limn", renderer);
     window_module.addImport("glfw", glfw_module);
 
-    // The scene every rendering check draws: `src/verify.zig`, run by the
-    // `verify` step below and by hand as `zig build scene -- --output x.png`.
     const canvas_scene = b.createModule(.{
         .root_source_file = b.path("examples/canvas_scene.zig"),
         .target = target,
@@ -526,7 +502,6 @@ pub fn build(b: *std.Build) void {
     var liquid_example: ?*std.Build.Step.Compile = null;
     var pathtrace_example: ?*std.Build.Step.Compile = null;
     var rtx_example: ?*std.Build.Step.Compile = null;
-    // Examples that `verify` only runs for a moment and photographs.
     const pictured = [_][]const u8{ "meadow", "materials", "lights", "decals", "text", "views", "post", "shader" };
     var pictured_examples: [pictured.len]?*std.Build.Step.Compile = @splat(null);
     for (examples) |example| {
@@ -570,8 +545,6 @@ pub fn build(b: *std.Build) void {
     const verify_render = b.addRunArtifact(headless);
     verify_render.addArgs(&.{ "--validation", "--peel", "--sort-test", "--tube", "--tube-shadows", "--flare", "--width", "640", "--height", "360", "--frames", "48", "--motion", "--soak", "3", "--threads", "4", "--crowd", "120", "--render-scale", "0.67", "--refits", "100", "--overlay", "--lights", "--glass", "--flat-panes", "--pane-row", "group", "--relocate", "--gi-spacing", "0.3", "--gi-middle-ratio", "2", "--lod-fade", "0.25", "--clouds", "--morph-row", ".zig-cache/renderer-morph-row", "--colored-shadows", "--decals", "--ktx2-bc1", ".zig-cache/renderer-bc1.ktx2", "--ktx2-model", ".zig-cache/renderer-ktx2-model", "--cube-env", ".zig-cache/renderer-cube-env.ktx2", "--fog", "0.012", "--output" });
     _ = verify_render.addOutputFileArg("verify.png");
-    // What these check depends on the GPU and driver in use, not only on
-    // the program, so a pass with one driver must not stand for another.
     verify_render.has_side_effects = true;
     const verify_views = b.addRunArtifact(headless);
     verify_views.has_side_effects = true;
@@ -595,7 +568,6 @@ pub fn build(b: *std.Build) void {
         _ = run.addOutputFileArg(name);
         verify_step.dependOn(&run.step);
     }
-    // A volume of liquid: a block let go in a tank and a jet pouring in.
     const verify_liquid = b.addRunArtifact(liquid_example.?);
     verify_liquid.has_side_effects = true;
     verify_liquid.addArgs(&.{ "--frames", "90", "--screenshot" });
@@ -608,20 +580,16 @@ pub fn build(b: *std.Build) void {
         _ = verify_example.addOutputFileArg(b.fmt("verify_{s}.png", .{name}));
         verify_step.dependOn(&verify_example.step);
     }
-    // A gap made in the geometry pools and closed again.
     const verify_compaction = b.addRunArtifact(headless);
     verify_compaction.has_side_effects = true;
     verify_compaction.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "8", "--compact-test", "--output" });
     _ = verify_compaction.addOutputFileArg("verify_compaction.png");
     verify_step.dependOn(&verify_compaction.step);
-    // A far model kept at its coarse levels of detail, and whole again
-    // when it comes near.
     const verify_coarse = b.addRunArtifact(headless);
     verify_coarse.has_side_effects = true;
     verify_coarse.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "8", "--coarse-test", "--coarse-near", "--geometry-distance", "500", "--geometry-coarse", "6", "--output" });
     _ = verify_coarse.addOutputFileArg("verify_coarse.png");
     verify_step.dependOn(&verify_coarse.step);
-    // The ray tracing example, with its features and path traced.
     for ([_][]const []const u8{ &.{}, &.{ "--path", "1" } }, [_][]const u8{ "verify_rtx.png", "verify_rtx_path.png" }) |extra, picture| {
         const verify_rtx = b.addRunArtifact(rtx_example.?);
         verify_rtx.has_side_effects = true;
@@ -631,8 +599,6 @@ pub fn build(b: *std.Build) void {
         _ = verify_rtx.addOutputFileArg(picture);
         verify_step.dependOn(&verify_rtx.step);
     }
-    // Path tracing both ways: by the GPU's ray tracing where the device
-    // has it, and by the shader that stands in where it has not.
     for ([_][]const []const u8{ &.{}, &.{ "--software", "1" } }, [_][]const u8{ "verify_pathtrace.png", "verify_pathtrace_software.png" }) |extra, picture| {
         const verify_pathtrace = b.addRunArtifact(pathtrace_example.?);
         verify_pathtrace.has_side_effects = true;
@@ -642,46 +608,36 @@ pub fn build(b: *std.Build) void {
         _ = verify_pathtrace.addOutputFileArg(picture);
         verify_step.dependOn(&verify_pathtrace.step);
     }
-    // The water example again, from under the surface.
     const verify_dive = b.addRunArtifact(water_example.?);
     verify_dive.has_side_effects = true;
     verify_dive.addArgs(&.{ "--dive", "1", "--frames", "60", "--screenshot" });
     _ = verify_dive.addOutputFileArg("verify_dive.png");
     verify_step.dependOn(&verify_dive.step);
-    // The clouds example again, as a storm with lightning.
     const verify_storm = b.addRunArtifact(clouds_example.?);
     verify_storm.has_side_effects = true;
     verify_storm.addArgs(&.{ "--storm", "1", "--frames", "60", "--screenshot" });
     _ = verify_storm.addOutputFileArg("verify_storm.png");
     verify_step.dependOn(&verify_storm.step);
-    // Uncompressed textures, streamed.
     const verify_raw_stream = b.addRunArtifact(headless);
     verify_raw_stream.has_side_effects = true;
     verify_raw_stream.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "12", "--no-compress", "--stream", "64", "--output" });
     _ = verify_raw_stream.addOutputFileArg("verify_raw_stream.png");
     verify_step.dependOn(&verify_raw_stream.step);
-    // Levels of detail chosen cluster by cluster, with a landscape that is
-    // near and far at once (that every cut is whole is a unit test).
     const verify_cluster_lods = b.addRunArtifact(headless);
     verify_cluster_lods.has_side_effects = true;
     verify_cluster_lods.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "48", "--cache", ".zig-cache/renderer-assets", "--cluster-lods", "--terrain", "--lod-fade", "0.25", "--output" });
     _ = verify_cluster_lods.addOutputFileArg("verify_cluster_lods.png");
     verify_step.dependOn(&verify_cluster_lods.step);
-    // Every sun cascade drawn each frame, so that all four leave out the
-    // casters whose shadows the camera cannot see.
     const verify_receiver_culling = b.addRunArtifact(headless);
     verify_receiver_culling.has_side_effects = true;
     verify_receiver_culling.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "48", "--cache", ".zig-cache/renderer-assets", "--no-cascade-stagger", "--output" });
     _ = verify_receiver_culling.addOutputFileArg("verify_receiver_culling.png");
     verify_step.dependOn(&verify_receiver_culling.step);
-    // Geometry by distance: the building's geometry is released while the
-    // camera is out at the landscape and brought back when it returns.
     const verify_geometry_streaming = b.addRunArtifact(headless);
     verify_geometry_streaming.has_side_effects = true;
     verify_geometry_streaming.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "40", "--cache", ".zig-cache/renderer-assets", "--terrain", "--geometry-distance", "20", "--camera", "62", "4", "0", "160", "-4", "0", "--teleport", "16", "-9", "1.6", "0", "4", "1.6", "0", "--output" });
     _ = verify_geometry_streaming.addOutputFileArg("verify_geometry_streaming.png");
     verify_step.dependOn(&verify_geometry_streaming.step);
-    // Streamed textures whose large levels are read from the asset cache.
     const verify_cache_stream = b.addRunArtifact(headless);
     verify_cache_stream.has_side_effects = true;
     verify_cache_stream.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "24", "--cache", ".zig-cache/renderer-assets", "--stream", "64", "--stream-from-cache", "--stream-skip-occluded", "--output" });

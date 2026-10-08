@@ -2,21 +2,16 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Solver step 1: semi-Lagrangian advection of velocity, smoke, heat and fuel,
-// then combustion, dissipation and sources.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;
     uint scalars_texture;
-    // Forward guess from fluid_carry.frag, or INVALID_ID for no correction.
     uint carried_texture;
-    // Same for velocity.
     uint carried_velocity_texture;
 } push;
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_velocity;
-// x smoke, y temperature, z fuel.
 layout(location = 1) out vec4 out_scalars;
 
 void main() {
@@ -26,7 +21,6 @@ void main() {
     out_velocity = vec4(0.0);
     out_scalars = vec4(0.0);
     if (cell.z >= size.z) return;
-    // Obstacle cells are cleared; velocity.w flags them for later passes.
     if (fluidObstacle(fluid, cell)) {
         out_velocity = vec4(0.0, 0.0, 0.0, 1.0);
         return;
@@ -41,7 +35,6 @@ void main() {
     velocity = fluidSample(fluid, push.velocity_texture, source).xyz;
     vec4 scalars = fluidSample(fluid, push.scalars_texture, source);
     if (push.carried_texture != INVALID_ID) {
-        // MacCormack correction, clamped to the upstream neighbourhood.
         vec4 guess = fluidFetch(fluid, push.carried_texture, cell);
         vec3 ahead = position + velocity_here * dt;
         if (size.z == 1) ahead.z = 0.5;
@@ -57,7 +50,6 @@ void main() {
         }
         scalars = clamp(corrected, low, high);
         if (push.carried_velocity_texture != INVALID_ID) {
-            // Same for velocity, except next to obstacles.
             vec3 guess_velocity = fluidFetch(fluid, push.carried_velocity_texture, cell).xyz;
             vec3 returned_velocity = fluidSample(fluid, push.carried_velocity_texture, ahead).xyz;
             vec3 corrected_velocity = guess_velocity + 0.5 * (velocity_here - returned_velocity);
@@ -73,7 +65,6 @@ void main() {
             if (solid == 0.0) velocity = clamp(corrected_velocity, slowest, fastest);
         }
     }
-    // Inflow through open sides is clear, still air.
     ivec3 from = ivec3(floor(source));
     if (!fluidInside(fluid, from) && !fluidWall(fluid, from)) {
         scalars = vec4(0.0);

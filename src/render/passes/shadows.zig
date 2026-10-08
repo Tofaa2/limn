@@ -149,8 +149,6 @@ pub fn planLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *con
     const shadow_key = shadow_key_hasher.final() | 1;
     const same_atlas = renderer.local_shadow_key == shadow_key and
         renderer.local_shadow_scene != null and std.meta.eql(renderer.local_shadow_scene.?, scene_handle);
-    // A tile is redrawn only if a mover is in its light's view now or was when
-    // last drawn.
     var tile_dirty: [max_local_shadow_views]bool = @splat(true);
     var any_tile_dirty = lighting.tile_count != 0;
     if (same_atlas and !local_shadows_current) {

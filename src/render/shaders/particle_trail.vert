@@ -3,7 +3,6 @@
 #include "shading.glsl"
 #include "particles.glsl"
 
-// Particle trails: one camera-facing quad per segment between recorded points.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     EmitterRef emitter;
@@ -20,15 +19,12 @@ layout(location = 2) out float out_view_depth;
 layout(location = 3) out vec4 out_clip;
 layout(location = 4) out vec4 out_previous_clip;
 
-// Ribbon point `k`: 0 is the particle, then recorded positions newest first.
 vec3 ribbonPoint(EmitterData emitter, uint slot, vec3 head, uint k) {
     if (k == 0u) return head;
     uint count = emitter.trail_count;
     uint index = (emitter.trail_head + count - (k - 1u)) % count;
     vec3 point = push.trail.data[slot * count + index].xyz;
     if (k == count && count > 1u) {
-        // The oldest point slides toward the next so the tail shortens
-        // smoothly.
         uint newer = (emitter.trail_head + count - (k - 2u)) % count;
         point = mix(point, push.trail.data[slot * count + newer].xyz, emitter.trail_fraction);
     }
@@ -51,7 +47,6 @@ void main() {
         out_previous_clip = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
-    // x: side of the ribbon, y: end of the segment.
     const vec2 corners[6] = vec2[](vec2(-1, 0), vec2(1, 0), vec2(1, 1), vec2(-1, 0), vec2(1, 1), vec2(-1, 1));
     vec2 corner = corners[gl_VertexIndex % 6];
     uint k = segment + uint(corner.y);

@@ -1,7 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// Writes a liquid's smoothed surface into the scene's depth and motion buffers.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint distance_texture;
@@ -13,10 +12,8 @@ void main() {
     FrameConstants frame = push.frame;
     float here = texelFetch(TEX(push.distance_texture, frame.sampler_nearest_clamp), ivec2(gl_FragCoord.xy), 0).r;
     if (here <= 0.0) discard;
-    // Reverse-Z, infinite far plane.
     float depth = frame.near / here;
     gl_FragDepth = depth;
-    // Motion from camera movement only; the flow is ignored.
     vec3 position = worldPositionFromDepth(gl_FragCoord.xy * frame.inv_resolution, depth, frame.inv_view_proj);
     vec4 clip = frame.view_proj_unjittered * vec4(position, 1.0);
     vec4 previous = frame.prev_view_proj_unjittered * vec4(position, 1.0);

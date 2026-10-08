@@ -116,7 +116,6 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             {
                 sky_entry.clouds = params.items[0];
                 sky_entry.cloud_bake_time = renderer.time;
-                // A loaded environment has no sun: its clouds use the scene's.
                 sky_entry.cloud_to_sun = math.scale(math.normalize(scene.sun.direction), -1);
                 sky_entry.cloud_sunlight = math.scale(scene.sun.color, scene.sun.intensity);
                 sky_entry.sky_dirty = true;
@@ -224,8 +223,6 @@ pub fn drawFluids(renderer: *Renderer, p: *const ScenePass) !void {
             push.count += 1;
         }
         if (push.count == 0) break :fluids;
-        // Unused slots hold a valid fluid: helper invocations may dereference
-        // them.
         for (push.fluids[push.count..]) |*slot| slot.* = push.fluids[0];
         cmd.beginScope("fluids");
         const fluid_motion = view.fluid_motion.?;

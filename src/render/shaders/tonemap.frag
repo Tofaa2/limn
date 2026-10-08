@@ -1,36 +1,26 @@
 #version 460
 #include "common.glsl"
 
-// Final composite: exposure, bloom, AgX tone mapping and output encoding.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint color_texture;
     uint bloom_texture;
     float bloom_strength;
-    // 0: no encoding (sRGB target format), 1: sRGB, 2: HDR10 (PQ, Rec.2020).
     uint encode_srgb;
     float sharpen;
-    // 1 / number of bloom levels accumulated into the bloom texture.
     float bloom_scale;
-    // Debug views are display-referred: skip grading.
     uint passthrough;
-    // Top-left of the written area, in target pixels.
     ivec2 origin;
-    // Grading; neutral at vignette 0, grain 0, saturation 1, contrast 1, filter
-    // white, aberration 0.
     float vignette;
     float grain;
     float saturation;
     float contrast;
     vec3 color_filter;
     float aberration;
-    // HDR10: white level and display peak, in nits.
     float hdr_paper_white;
     float hdr_peak;
-    // Color LUT (a strip of slices) or INVALID_ID, and its blend.
     uint lut_texture;
     float lut_strength;
-    // Lens flare strength.
     float flare;
     uint flare_pad;
 } push;
@@ -38,7 +28,6 @@ layout(push_constant, scalar) uniform Push {
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
 
-// Minimal AgX by Benjamin Wrensch (iolite), after Troy Sobotka.
 vec3 agxDefaultContrast(vec3 x) {
     vec3 x2 = x * x;
     vec3 x4 = x2 * x2;
@@ -73,7 +62,6 @@ vec3 agxEotf(vec3 color) {
         -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
         -0.0990297440797205, -0.0989611768448433, 1.15107367264116);
     color = outset * color;
-    // AgX output is sRGB-like; linearize.
     return pow(max(color, vec3(0.0)), vec3(2.2));
 }
 
@@ -99,7 +87,6 @@ void main() {
         color.b = texelFetch(TEX(push.color_texture, nearest), clamp(pixel - shift, ivec2(0), limit), 0).b;
     }
 
-    // Contrast-adaptive sharpening.
     if (push.sharpen > 0.0) {
         vec3 n = texelFetch(TEX(push.color_texture, nearest), clamp(pixel + ivec2(0, -1), ivec2(0), limit), 0).rgb;
         vec3 s = texelFetch(TEX(push.color_texture, nearest), clamp(pixel + ivec2(0, 1), ivec2(0), limit), 0).rgb;
@@ -146,8 +133,6 @@ void main() {
     color *= frame.exposure.exposure * push.color_filter;
 
     if (push.encode_srgb == 2u) {
-        // HDR: values up to 1 map to paper white; above, a roll-off to the
-        // display peak.
         float peak = max(push.hdr_peak / max(push.hdr_paper_white, 1.0), 1.0);
         color = color * (1.0 + color / (peak * peak)) / (1.0 + color);
         color *= min(peak, 2.0) * 0.5 + 0.5;
@@ -161,7 +146,6 @@ void main() {
     color *= 1.0 - push.vignette * smoothstep(0.35, 1.0, corner);
 
     if (push.lut_texture != INVALID_ID && push.encode_srgb != 2u) {
-        // The LUT is indexed by, and holds, sRGB-encoded color.
         vec3 encoded = linearToSrgb(clamp(color, 0.0, 1.0));
         float n = float(textureSize(TEX(push.lut_texture, frame.sampler_linear_clamp), 0).y);
         float slice = encoded.b * (n - 1.0);
@@ -174,7 +158,6 @@ void main() {
     }
     if (push.encode_srgb == 1u) color = linearToSrgb(clamp(color, 0.0, 1.0));
     if (push.encode_srgb == 2u) color = hdr10Encode(max(color, vec3(0.0)) * push.hdr_paper_white);
-    // Half-LSB dither against banding.
     float dither = interleavedGradientNoise(vec2(pixel) + 0.5, frame.frame_index) - 0.5;
     float grain = (fract(sin(dot(vec2(pixel) + float(frame.frame_index % 61u) * 7.31, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) * push.grain * 0.12;
     grain *= 1.0 - 0.6 * clamp(luminance(color), 0.0, 1.0);

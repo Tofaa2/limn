@@ -1,0 +1,77 @@
+//! Views and the targets they draw into. Internal to the renderer.
+const std = @import("std");
+const rhi = @import("../../rhi/rhi.zig");
+const gpu = @import("../gpu.zig");
+const api = @import("../api.zig");
+const render = @import("../renderer.zig");
+
+const Renderer = render.Renderer;
+const View = api.View;
+const Image = api.Image;
+
+/// Creates persistent state for an extra camera. Its render targets are
+/// allocated on first use and follow the size it is drawn at.
+pub fn createView(self: *Renderer) !View {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    return insertView(self);
+}
+
+/// The main view cannot be destroyed.
+pub fn destroyView(self: *Renderer, view: View) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    if (std.meta.eql(view, self.main_view)) return;
+    var removed = self.views.remove(view) orelse return;
+    removed.deinit(self.device);
+}
+
+pub fn insertView(self: *Renderer) !View {
+    const device = self.device;
+    const exposure = try device.createBuffer(.{ .name = "exposure", .size = @sizeOf(gpu.Exposure), .usage = .{ .storage = true } });
+    errdefer device.destroyBuffer(exposure);
+    try device.uploadBuffer(exposure, 0, std.mem.asBytes(&gpu.Exposure{ .exposure = 1, .average_luminance = 0, .focus = 0 }));
+    return self.views.insert(.{ .exposure = exposure });
+}
+
+/// Creates a texture views can draw into (`Target.texture`) and draw
+/// lists can show (`targetImage`).
+pub fn createTarget(self: *Renderer, width: u32, height: u32) !rhi.Texture {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const texture = try self.device.createTexture(.{
+        .name = "view target",
+        .width = width,
+        .height = height,
+        .format = .rgba8_srgb,
+        .usage = .{ .sampled = true, .color_attachment = true, .copy_src = true },
+    });
+    errdefer self.device.destroyTexture(texture);
+    var cmd = try self.device.beginImmediate();
+    try cmd.beginRendering(.{ .color = &.{.{ .texture = texture, .load = .clear, .clear = .{ 0, 0, 0, 1 } }} });
+    cmd.endRendering();
+    cmd.transition(texture, .shader_read);
+    try self.device.endImmediate();
+    return texture;
+}
+
+/// Its `targetImage` images must not be drawn afterwards.
+pub fn destroyTarget(self: *Renderer, target: rhi.Texture) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    self.device.destroyTexture(target);
+}
+
+/// A target texture as an image for a `DrawList`. Views listed earlier in
+/// the same frame have already drawn into it.
+pub fn targetImage(self: *Renderer, target: rhi.Texture) Image {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const info = self.device.textureInfo(target);
+    return .{ .index = self.device.textureIndex(target), .width = info.width, .height = info.height };
+}
+
+pub fn targetWritten(self: *const Renderer, target: rhi.Texture) bool {
+    for (self.frame_targets[0..self.frame_target_count]) |written| if (std.meta.eql(written, target)) return true;
+    return false;
+}

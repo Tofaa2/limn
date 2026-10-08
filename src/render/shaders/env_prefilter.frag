@@ -3,7 +3,6 @@
 #include "brdf.glsl"
 #include "environment.glsl"
 
-// GGX-prefiltered specular radiance for one roughness level.
 layout(push_constant, scalar) uniform Push {
     uint source_texture;
     uint sampler_index;
@@ -32,7 +31,6 @@ void main() {
         float n_dot_l = dot(n, l);
         if (n_dot_l <= 0.0) continue;
         float n_dot_h = max(dot(n, h), 0.0);
-        // With V = N, pdf = D * NoH / (4 VoH) = D / 4.
         float pdf = distributionGgx(n_dot_h, alpha) * 0.25;
         float sample_solid_angle = 1.0 / (float(sample_count) * pdf + 1e-4);
         float texel_solid_angle = 4.0 * PI / (6.0 * push.source_size * push.source_size);

@@ -2,8 +2,6 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Sums a fluid's fire emission over a coarse grid and writes its color and
-// centroid into one of the frame's light records.
 layout(local_size_x = 1) in;
 
 layout(buffer_reference, scalar) buffer LightsOut { Light data[]; };
@@ -12,9 +10,7 @@ layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     LightsOut lights;
     uint index;
-    // Light intensity per unit of emission per cubic world unit.
     float scale;
-    // 1 makes the light as tall as the flames, 0 a point.
     float tall;
 } push;
 
@@ -45,7 +41,6 @@ void main() {
     vec3 mean_glow = total / float(samples.x * samples.y * samples.z);
     vec3 where = weight > 1e-6 ? center / weight : vec3(0.5);
     push.lights.data[push.index].position = (box_to_world * vec4(where, 1.0)).xyz;
-    // Tube along the box, two standard deviations to each side.
     float mean_height = weight > 1e-6 ? height_sum / weight : 0.5;
     float spread = weight > 1e-6 ? sqrt(max(height_squared / weight - mean_height * mean_height, 0.0)) : 0.0;
     push.lights.data[push.index].direction = normalize(box_to_world[1].xyz);

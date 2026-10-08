@@ -2,8 +2,6 @@
 #include "common.glsl"
 #include "vsm.glsl"
 
-// Clears virtual shadow map pages about to be redrawn: a far-depth rectangle
-// over each.
 layout(push_constant, scalar) uniform Push {
     VsmPageViews page_views;
 } push;

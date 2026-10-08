@@ -2,7 +2,6 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// One Jacobi pressure iteration. The second channel flags solid cells.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint pressure_texture;

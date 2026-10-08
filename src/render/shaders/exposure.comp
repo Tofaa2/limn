@@ -1,20 +1,17 @@
 #version 460
 #include "common.glsl"
 
-// Auto exposure: eases stored exposure toward mapping the log-average luminance
-// of a small bloom level to middle grey. Single invocation.
 layout(local_size_x = 1) in;
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;
     uint automatic;
-    float compensation;   // exposure multiplier, 2^EV
+    float compensation;
     float min_luminance;
     float max_luminance;
     float speed;
     uint reset;
-    // Autofocus: depth buffer and focus speed per second.
     uint depth_texture;
     float focus_speed;
 } push;
@@ -40,7 +37,6 @@ void main() {
     for (int y = 0; y < size.y; y++) {
         for (int x = 0; x < size.x; x++) {
             vec3 color = texelFetch(TEX(push.source_texture, frame.sampler_nearest_clamp), ivec2(x, y), 0).rgb;
-            // Center-weighted metering.
             vec2 centered = (vec2(x, y) + 0.5) / vec2(size) * 2.0 - 1.0;
             float weight = 1.0 - 0.6 * clamp(dot(centered, centered), 0.0, 1.0);
             total += log2(max(luminance(color), 1e-5)) * weight;
@@ -50,9 +46,7 @@ void main() {
     float average = clamp(exp2(total / max(weight_total, 1e-5)), push.min_luminance, push.max_luminance);
     float previous = frame.exposure.average_luminance;
     if (push.reset != 0u || !(previous > 0.0)) previous = average;
-    // Adapt in log space, faster when brightening.
     float rate = average > previous ? push.speed * 1.6 : push.speed;
-    // Dead band against metering noise.
     const float dead_band = 0.04;
     float stops = log2(average) - log2(previous);
     stops = sign(stops) * max(abs(stops) - dead_band, 0.0);

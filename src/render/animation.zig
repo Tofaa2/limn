@@ -1,4 +1,5 @@
-//! Skeletal animation sampling: clip and time to node world matrices.
+//! Animation sampling for skeletons and plain nodes: clip and time to node
+//! world matrices.
 const std = @import("std");
 const math = @import("../math.zig");
 const gltf = @import("../asset/gltf.zig");
@@ -12,6 +13,10 @@ pub const Pose = struct {
     time: f32,
     /// True wraps `time`; false clamps it to the clip's first and last frame.
     loop: bool = true,
+    /// Plays every clip of the model at `time`, each over the nodes it moves
+    /// and at its own length, as a scene with one clip per moving thing needs.
+    /// `animation` is ignored.
+    every_clip: bool = false,
     /// Second clip cross-faded on top.
     blend: ?Blend = null,
     /// Further clips applied in order on top of the base and `blend`.
@@ -55,7 +60,6 @@ pub fn topologicalOrder(gpa: std.mem.Allocator, nodes: []const gltf.Node) ![]u32
     defer gpa.free(placed);
     @memset(placed, false);
     var count: usize = 0;
-    // The sweep limit breaks malformed parent cycles.
     var sweeps: usize = 0;
     while (count < nodes.len and sweeps <= nodes.len) : (sweeps += 1) {
         for (nodes, 0..) |node, index| {
@@ -79,6 +83,11 @@ fn sampleClip(model: *const gltf.Model, locals: []Local, clip_index: u32, time_i
         .rotation = node.rotation,
         .scale = node.scale,
     };
+    applyClip(model, locals, clip_index, time_in, loop);
+}
+
+/// Overwrites the locals a clip has channels for.
+fn applyClip(model: *const gltf.Model, locals: []Local, clip_index: u32, time_in: f32, loop: bool) void {
     if (clip_index >= model.animations.len) return;
     const clip = model.animations[clip_index];
     const time = if (clip.duration <= 0)
@@ -182,6 +191,9 @@ pub fn evaluate(
     const count = model.nodes.len;
     const locals = scratch[0..count];
     sampleClip(model, locals, if (pose) |p| p.animation else std.math.maxInt(u32), if (pose) |p| p.time else 0, if (pose) |p| p.loop else true);
+    if (pose) |p| if (p.every_clip) {
+        for (0..model.animations.len) |clip| applyClip(model, locals, @intCast(clip), p.time, p.loop);
+    };
     if (pose) |p| {
         const other = scratch[count .. count * 2];
         const reference = scratch[count * 2 .. count * 3];
@@ -219,7 +231,6 @@ pub fn sampleWeights(model: *const gltf.Model, clip_index: u32, node: u32, time_
         const next = @min(low + 1, channel.times.len - 1);
         const span = channel.times[next] - channel.times[low];
         const t: f32 = if (channel.step or span <= 0) 0 else std.math.clamp((time - channel.times[low]) / span, 0, 1);
-        // Cubic keys hold in-tangent, value, out-tangent; only the value is used.
         const stride: usize = channel.width * @as(usize, if (channel.cubic) 3 else 1);
         const skip: usize = if (channel.cubic) channel.width else 0;
         for (weights[0..@min(weights.len, channel.width)], 0..) |*weight, target| {
@@ -333,6 +344,25 @@ test "pose sampling interpolates keys and composes the hierarchy" {
     try std.testing.expectApproxEqAbs(@as(f32, 0), world[0][12], 1e-6);
 }
 
+test "every clip plays at once, each on its own nodes and at its own length" {
+    var times = [_]f32{ 0, 1 };
+    var long_times = [_]f32{ 0, 4 };
+    var slide = [_]f32{ 0, 0, 0, 2, 0, 0 };
+    var rise = [_]f32{ 0, 0, 0, 0, 8, 0 };
+    var first = [_]gltf.Channel{.{ .node = 0, .path = .translation, .step = false, .times = &times, .values = &slide }};
+    var second = [_]gltf.Channel{.{ .node = 1, .path = .translation, .step = false, .times = &long_times, .values = &rise }};
+    var animations = [_]gltf.Animation{ .{ .name = "slide", .duration = 1, .channels = &first }, .{ .name = "rise", .duration = 4, .channels = &second } };
+    var nodes = [_]gltf.Node{ .{}, .{} };
+    const model = gltf.Model{ .arena = .init(std.testing.allocator), .nodes = &nodes, .animations = &animations };
+    const order = [_]u32{ 0, 1 };
+    var scratch: [6]Local = undefined;
+    var world: [2][16]f32 = undefined;
+
+    evaluate(&model, &order, .{ .animation = 0, .time = 1.5, .every_clip = true }, &scratch, &world);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), world[0][12], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3), world[1][13], 1e-6);
+}
+
 test "cubic spline keys pass through their values and follow their tangents" {
     var nodes = [_]gltf.Node{.{}};
     var times = [_]f32{ 0, 1 };
@@ -347,13 +377,11 @@ test "cubic spline keys pass through their values and follow their tangents" {
     try std.testing.expectApproxEqAbs(@as(f32, 0), world[0][12], 1e-5);
     evaluate(&model, &order, .{ .animation = 0, .time = 1, .loop = false }, &scratch, &world);
     try std.testing.expectApproxEqAbs(@as(f32, 1), world[0][12], 1e-5);
-    // Hermite at t = 0.5: 0.5 * p1 + 0.125 * m0 = 0.5 + 0.25.
     evaluate(&model, &order, .{ .animation = 0, .time = 0.5, .loop = false }, &scratch, &world);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), world[0][12], 1e-5);
 }
 
 test "layers can be masked to a subtree and added on top" {
-    // root -> spine -> arm, and a leg under the root.
     var nodes = [_]gltf.Node{ .{}, .{ .parent = 0 }, .{ .parent = 1 }, .{ .parent = 0 } };
     var times = [_]f32{ 0, 1 };
     var raise_values = [_]f32{ 0, 0, 0, 0, 1, 0 };

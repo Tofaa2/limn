@@ -3,21 +3,16 @@
 #include "cull_view.glsl"
 #include "impostor.glsl"
 
-// Culls instance-group instances by bounding sphere against one view and lists
-// the meshlets of survivors for cull.comp. Same two phases as cull.comp.
 layout(local_size_x = 64) in;
 
-// Must match `gpu.StaticCull`.
 struct StaticCull {
     vec4 sphere;
     uint first_ref;
     uint ref_count;
-    // Impostor index + 1, or 0.
     uint impostor;
     uint pad;
 };
 
-// Impostor draw (`gpu.DrawIndirect`); culling writes its instance count.
 layout(buffer_reference, scalar) buffer ImpostorDraw {
     uint vertex_count;
     uint instance_count;
@@ -39,7 +34,6 @@ layout(push_constant, scalar) uniform Push {
     uint instance_count;
     uint phase;
     uint hiz_texture;
-    // Entity pairs cull.comp tests before the listed ones.
     uint entity_refs;
     vec2 hiz_size;
     Impostors impostors;
@@ -60,7 +54,6 @@ void main() {
 
     vec3 center = instance.sphere.xyz;
     float radius = instance.sphere.w;
-    // Impostors are emitted once, not in the early phase.
     bool as_impostor = false;
     if (push.impostor_view != 0u && instance.impostor != 0u) {
         float across = radius * abs(push.view.p11) * push.frame.resolution.y / max(distance(push.view.camera_position, center), push.view.near);

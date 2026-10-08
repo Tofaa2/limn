@@ -23,8 +23,6 @@ const helpers = @import("window");
 const Stage = helpers.Stage;
 
 pub fn main(init: std.process.Init) !void {
-    // Without this, a GPU that cannot trace rays would have no way to
-    // follow them, and the example nothing to show.
     var options = gfx.Options{ .path_tracing_fallback = true };
     var traced = true;
     var orbiting = false;
@@ -34,8 +32,6 @@ pub fn main(init: std.process.Init) !void {
         while (arguments.next()) |argument| {
             if (std.mem.eql(u8, argument, "--software")) options.ray_tracing = false;
             if (std.mem.eql(u8, argument, "--raster")) traced = false;
-            // `--orbit 1`: the camera keeps circling, to see the picture hold
-            // together while it moves.
             if (std.mem.eql(u8, argument, "--orbit")) orbiting = true;
         }
     }
@@ -47,9 +43,6 @@ pub fn main(init: std.process.Init) !void {
     renderer.setEnvironment(scene, try renderer.createSky(sky_desc), 1);
     renderer.setSun(scene, gfx.skySun(sky_desc));
 
-    // A room open to the sky: a floor, a red wall, a green wall and a
-    // white one behind, so that the color each throws on the others
-    // shows.
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
@@ -59,16 +52,13 @@ pub fn main(init: std.process.Init) !void {
         .{ .color = .{ 0.75, 0.1, 0.08, 1 }, .at = .{ -4.4, 1.6, 0 }, .size = .{ 0.2, 3.2, 7 } },
         .{ .color = .{ 0.1, 0.6, 0.12, 1 }, .at = .{ 4.4, 1.6, 0 }, .size = .{ 0.2, 3.2, 7 } },
         .{ .color = .{ 0.78, 0.78, 0.76, 1 }, .at = .{ 0, 1.6, -3.4 }, .size = .{ 9, 3.2, 0.2 } },
-        // A slab overhead that keeps the sun off half the room.
         .{ .color = .{ 0.78, 0.78, 0.76, 1 }, .at = .{ 1.6, 3.3, -0.8 }, .size = .{ 5.8, 0.2, 5.4 } },
-        // A block to cast a shadow and catch the walls' colors.
         .{ .color = .{ 0.8, 0.8, 0.8, 1 }, .at = .{ 2.4, 0.75, -1.4 }, .size = .{ 1.2, 1.5, 1.2 } },
     };
     for (walls) |wall| {
         const model = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = wall.color, .metallic = 0, .roughness = wall.roughness } }});
         _ = try renderer.spawn(scene, .{ .model = model, .transform = math.mul(math.translation(wall.at), math.scaling(wall.size)) });
     }
-    // A glowing bar under the slab: light from a shape rather than a point.
     const bar = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0, 0, 0, 1 }, .emissive = .{ 9, 6.5, 3.5 }, .metallic = 0, .roughness = 0.5 } }});
     _ = try renderer.spawn(scene, .{ .model = bar, .transform = math.mul(math.translation(.{ 2.6, 3.0, -1.2 }), math.scaling(.{ 2.4, 0.08, 0.3 })) });
 

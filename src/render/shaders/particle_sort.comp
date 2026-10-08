@@ -2,14 +2,11 @@
 #include "common.glsl"
 #include "particles.glsl"
 
-// One compare-and-swap round of a bitonic sort; the CPU issues the rounds in
-// order.
 layout(local_size_x = 64) in;
 
 layout(push_constant, scalar) uniform Push {
     ParticleOrder order;
     uint count;
-    // Run size being merged and partner distance.
     uint run;
     uint stride;
 } push;

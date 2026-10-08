@@ -18,9 +18,7 @@ layout(location = 0) in vec3 in_normal;
 layout(location = 1) in vec2 in_uv;
 layout(location = 2) in vec4 in_vertex_color;
 
-// Unlit base color; alpha is coverage.
 layout(location = 0) out vec4 out_color;
-// Model-space normal, as 0..1.
 layout(location = 1) out vec4 out_normal;
 
 void main() {

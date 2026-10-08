@@ -126,7 +126,6 @@ fn combHair(gpa: std.mem.Allocator, strand_count: usize) ![][3]f32 {
     const rng = random.random();
     const skull = body[0];
     for (0..strand_count) |strand| {
-        // From the crown down to a little under the widest part.
         const height = 1 - rng.float(f32) * 1.15;
         const turn = rng.float(f32) * std.math.tau;
         const ring = @sqrt(@max(1 - height * height, 0));
@@ -219,7 +218,6 @@ pub fn main(init: std.process.Init) !void {
     }});
     _ = try renderer.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.05, 0 }) });
 
-    // The hair and the head it was combed on, or ones made here.
     var from_file = true;
     const points = loadHair(gpa, init.io, hair_path) catch |failure| made: {
         std.log.info("{s}: {}; combing a head of hair instead", .{ hair_path, failure });
@@ -232,8 +230,6 @@ pub fn main(init: std.process.Init) !void {
     const head = head: {
         if (from_file) if (loadObj(gpa, init.io, head_path)) |mesh| {
             defer mesh.deinit(gpa);
-            // The hair is kept out of the head itself, not of a few
-            // spheres about its size.
             head_field = try renderer.createCollisionField(mesh.positions, mesh.indices, 64);
             break :head try renderer.createModel(&.{.{ .positions = mesh.positions, .indices = mesh.indices, .material = skin }});
         } else |failure| std.log.info("{s}: {}; a ball for a head instead", .{ head_path, failure });
@@ -249,7 +245,6 @@ pub fn main(init: std.process.Init) !void {
     };
     try renderer.waitUntilLoaded();
 
-    // The files have z up; the world has y up.
     const upright = math.mul(math.rotationX(-std.math.pi * 0.5), math.uniformScaling(scale));
     var placement = math.mul(math.translation(.{ 0, head_height, 0 }), upright);
     const head_entity = try renderer.spawn(scene, .{ .model = head, .transform = placement });
@@ -283,8 +278,6 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_A)) orbit -= tick.dt * 0.9;
         if (stage.keyDown(glfw.GLFW_KEY_D)) orbit += tick.dt * 0.9;
 
-        // The head looks from side to side, quickly enough for the hair
-        // to be left behind and swing after it.
         if (turning) turn_time += tick.dt;
         turned = @sin(turn_time * 1.6) * 0.9;
         placement = math.mul(math.translation(.{ 0, head_height, 0 }), math.mul(math.rotationY(turned), upright));
@@ -293,10 +286,8 @@ pub fn main(init: std.process.Init) !void {
         var colliders: [body.len][4]f32 = undefined;
         for (body, &colliders) |sphere, *collider| {
             const center = math.transformPoint(placement, sphere[0..3].*);
-            // A little room, for the width of a strand.
             collider.* = .{ center[0], center[1], center[2], sphere[3] * scale * 1.03 };
         }
-        // The spheres only where there is no head to make a field of.
         simulation.colliders = if (head_field == null) &colliders else &.{};
         simulation.field = head_field;
         simulation.field_transform = placement;

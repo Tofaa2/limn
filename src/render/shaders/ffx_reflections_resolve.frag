@@ -2,22 +2,17 @@
 #include "common.glsl"
 #include "ffx_reflections.glsl"
 
-// Temporal resolve: blends the prefiltered reflection with history clipped to
-// the local neighbourhood (ffx_denoiser_reflections_resolve_temporal.h).
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
-    // Prefiltered reflections (rgb) and variance (a).
     uint prefiltered_texture;
     uint reprojected_texture;
     uint samples_texture;
     uint surface_texture;
     uint average_texture;
-    // Scale of the history clip box.
     float history_clip_weight;
 } push;
 
 layout(location = 0) in vec2 in_uv;
-// Denoised reflection (rgb) and variance (a); also next frame's history.
 layout(location = 0) out vec4 out_resolved;
 
 void main() {
@@ -55,7 +50,6 @@ void main() {
     mean = mix(mean, average, 0.2);
     vec3 clipped_old_signal = ffxClipAabb(mean - spread, mean + spread, old_signal);
     float weight = 1.0 - 1.0 / max(samples, 1.0);
-    // Bias toward the 8x8 average while few samples are accumulated.
     new_signal = mix(new_signal, average, 1.0 / max(samples + 1.0, 1.0));
     new_signal = ffxClipAabb(average - spread, average + spread, new_signal);
     new_signal = mix(new_signal, clipped_old_signal, weight);

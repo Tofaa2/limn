@@ -157,7 +157,6 @@ pub fn main(init: std.process.Init) !void {
     _ = try renderer.spawn(scene, .{ .model = hearth, .transform = math.translation(.{ 0, 0.12, 0 }) });
     _ = try renderer.spawn(scene, .{ .model = pillar, .transform = math.translation(.{ -3.2, 1.4, -1.5 }) });
     _ = try renderer.spawn(scene, .{ .model = pillar, .transform = math.translation(.{ 3.0, 1.4, -2.2 }) });
-    // A ball hung in the flames; the fluid is told about it below.
     const helpers = @import("window");
     var ball_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
@@ -167,11 +166,7 @@ pub fn main(init: std.process.Init) !void {
     const ball_entity = try renderer.spawn(scene, .{ .model = ball, .transform = math.translation(ballAt(.hung, 0)) });
     try renderer.waitUntilLoaded();
 
-    // The fire: a box 4 wide and 6 tall standing on the hearth.
-    // `--scene-obstacles 1`: instead of describing the ball to the fluid,
-    // let it find the scene's geometry by itself.
     var scene_obstacles = false;
-    // `--sharp-velocity 1`: error-corrected advection for the flow too.
     var sharp_velocity = false;
     var act = Act.hung;
     var arguments = try init.minimal.args.iterateAllocator(init.gpa);
@@ -194,23 +189,17 @@ pub fn main(init: std.process.Init) !void {
         .sharp_velocity = sharp_velocity,
     };
     if (scene_obstacles) desc.obstacles = &.{};
-    // The corrected flow keeps its own swirls; it needs far less put back.
     desc.vorticity = if (sharp_velocity) 4 else act.swirl();
     const fluid = try renderer.createFluid(scene, desc);
-    // The same solver in 2D, shown as a picture.
     const flat = try renderer.createFluid(scene, .{
         .resolution = .{ 128, 128, 1 },
-        // Out of sight below the ground: only its picture is used.
         .transform = math.mul(math.translation(.{ 0, -50, 0 }), math.scaling(.{ 1, 1, 0.3 })),
         .sources = &.{.{ .position = .{ 0.5, 0.06, 0.5 }, .radius = 0.06, .velocity = .{ 0, 0.6, 0 }, .fuel = 6, .temperature = 6 }},
         .vorticity = 20,
         .absorption = 14,
-        // Only its picture is shown; it need not light anything.
         .light = 0,
     });
     const flat_picture = try renderer.fluidImage(flat);
-    // Embers: particles that ride the fire's flow, streak, and bounce off
-    // the ground when they fall out of it.
     var ember_desc = gfx.EmitterDesc{
         .position = .{ 0, 0.5, 0 },
         .radius = 0.25,
@@ -291,7 +280,6 @@ pub fn main(init: std.process.Init) !void {
         try list.text(font, if (desc.walls == .closed) "sealed" else "open", .{ 222, 66 }, .{ .size = 14, .color = if (desc.walls == .closed) on else off });
         try list.text(font, act.title(), .{ 290, 66 }, .{ .size = 14, .color = on });
         try list.text(font, "1-5 acts · F fire · G smoke · B box · R empty · arrows wind and swirl · A/D orbit", .{ 24, 88 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
-        // The 2D fluid, as a picture.
         const panel = gfx.Rect{ .x = @as(f32, @floatFromInt(tick.size[0])) - 268, .y = 12, .width = 256, .height = 256 };
         try list.rect(panel, gfx.Color.rgba(6, 7, 12, 230));
         try list.image(flat_picture, panel, .{});

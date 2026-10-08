@@ -1,5 +1,3 @@
-// Lighting helpers for participating media (fog, smoke): phase function and sun
-// and lamp visibility.
 #ifndef MEDIA_GLSL
 #define MEDIA_GLSL
 #include "clouds.glsl"
@@ -29,7 +27,6 @@ float sunVisibility(FrameConstants frame, vec3 position) {
     return cascadeVisibility(frame, position) * cloudShadow(frame, position) * fluidShadow(frame, position);
 }
 
-// Local light visibility at a point: one shadow map tap (1 without a shadow).
 float lampVisibility(FrameConstants frame, Light light, vec3 position, vec3 to_light) {
     uint first = light.flags >> 8;
     if (first == 0u) return 1.0;

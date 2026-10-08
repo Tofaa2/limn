@@ -516,7 +516,6 @@ pub const DrawList = struct {
     fn setClip(self: *DrawList, clip: ?Rect) !void {
         self.clip = clip;
         const first: u32 = @intCast(self.screen.indices.items.len);
-        // Replace a range nothing was drawn in rather than leaving it empty.
         if (self.screen.clips.items.len != 0 and self.screen.clips.items[self.screen.clips.items.len - 1].first_index == first) {
             self.screen.clips.items[self.screen.clips.items.len - 1].rect = clip;
         } else {
@@ -556,7 +555,6 @@ pub const DrawList = struct {
     pub fn roundedRect(self: *DrawList, r: Rect, color: Color, options: RoundedOptions) !void {
         const half = [2]f32{ r.width * 0.5, r.height * 0.5 };
         const radius = std.math.clamp(options.radius, 0, @min(half[0], half[1]));
-        // Radius and stroke are packed into the texture bits, in quarter pixels.
         const packed_radius: u32 = @intFromFloat(@min(radius * 4, 4095));
         const packed_stroke: u32 = @intFromFloat(std.math.clamp(options.stroke * 4, 0, 4095));
         const mode = pack(.rounded, packed_radius | packed_stroke << 12);
@@ -600,7 +598,6 @@ pub const DrawList = struct {
             var miter = [2]f32{ n0[0] + n1[0], n0[1] + n1[1] };
             const length_squared = miter[0] * miter[0] + miter[1] * miter[1];
             if (length_squared > 1e-6) {
-                // Capped so a needle-sharp corner does not shoot off.
                 const scale = @min(2 / length_squared, 4.0);
                 miter = .{ miter[0] * scale, miter[1] * scale };
             } else miter = n0;
@@ -687,7 +684,6 @@ pub const DrawList = struct {
         if (points.len < 2) return;
         const segments = if (closed) points.len else points.len - 1;
         for (0..segments) |index| try self.line(points[index], points[(index + 1) % points.len], thickness, color);
-        // Joint discs overlap the segments, which shows in translucent strokes.
         if (thickness > 1.5) for (points) |p| try self.circle(p, thickness * 0.5, color);
     }
 
@@ -929,7 +925,6 @@ pub const DrawList = struct {
         var mark_below: ?u21 = null;
         var component: u8 = 0;
         var mark_at: [2]f32 = .{ 0, 0 };
-        // Height of the letters above the baseline, in ems (cursive scripts).
         var rise: f32 = 0;
         for (glyphs) |codepoint| {
             if (font_module.spacingOf(codepoint)) |ems| {
@@ -976,7 +971,6 @@ pub const DrawList = struct {
             previous = codepoint;
             component = 0;
             if (glyph.plane[2] > glyph.plane[0]) {
-                // Glyph planes are y-up from the baseline; the screen is y-down.
                 try self.screenQuad(.{
                     .x = pen + glyph.plane[0] * size,
                     .y = pen_start[1] - (rise + glyph.plane[3]) * size,
@@ -1102,8 +1096,6 @@ pub const DrawList = struct {
     /// Line between two world points, `thickness` pixels wide on screen.
     pub fn line3d(self: *DrawList, a: math.Vec3, b: math.Vec3, thickness: f32, color: Color) !void {
         const mode = pack(.line3d, 0);
-        // Each vertex carries the far endpoint in `offset`+`uv.x` and its
-        // side (signed half thickness) in `uv.y`.
         const half = thickness * 0.5;
         try self.world.quad(self.gpa, .{
             .{ .position = a, .offset = .{ b[0], b[1] }, .uv = .{ b[2], half }, .color = color, .texture_mode = mode },

@@ -2,7 +2,6 @@
 #include "common.glsl"
 #include "brdf.glsl"
 
-// Split-sum DFG lookup: x = N.V, y = perceptual roughness.
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
 

@@ -1,23 +1,16 @@
 #version 460
 #include "common.glsl"
 
-// Visibility and shadow passes: vertices are pulled from the global buffers by
-// the draw's meshlet reference.
 #include "visibility_page.glsl"
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
-    // 1 in a shadow pass whose translucent casters go into the tint pass.
     uint tinted;
-    // Nonzero when `page` supplies the view.
     uint paged;
     mat4 view_proj;
-    // LOD cross-fade, main camera pass only: LOD camera (xyz), error-to-pixels
-    // scale (w), band width (1 for none) and near plane.
     vec4 lod;
     float lod_band;
     float lod_near;
-    // Used by the mesh shader path (visibility.task).
     uvec2 list;
     uvec2 count;
     VisibilityPage page;

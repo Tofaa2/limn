@@ -31,8 +31,6 @@ pub fn main(init: std.process.Init) !void {
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
     const block = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.6, 0.6, 0.62, 1 }, .metallic = 0, .roughness = 0.45 } }});
     _ = try renderer.spawn(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 60, 0.5, 60 })), .tint = .{ 0.5, 0.5, 0.52 } });
-    // A long row of posts into the distance: something near, something
-    // far, for the lens to choose between.
     var posts: [40]math.Mat4 = undefined;
     for (&posts, 0..) |*post, index| {
         const along: f32 = @floatFromInt(index / 2);
@@ -40,7 +38,6 @@ pub fn main(init: std.process.Init) !void {
         post.* = math.mul(math.translation(.{ side * 2.2, 1, 4 - along * 2.6 }), math.scaling(.{ 0.3, 2, 0.3 }));
     }
     _ = try renderer.createInstances(scene, block, &posts);
-    // Lamps bright enough to bloom, circling so that they blur.
     const lamp_colors = [_][3]f32{ .{ 14, 3, 1 }, .{ 1.5, 10, 4 }, .{ 2, 5, 16 }, .{ 14, 10, 1 } };
     var lamps: [lamp_colors.len]gfx.Entity = undefined;
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
@@ -107,8 +104,6 @@ pub fn main(init: std.process.Init) !void {
             renderer.setTransform(lamp, math.translation(.{ @cos(angle) * 1.6, 1.3 + 0.5 * @sin(angle * 0.7), @sin(angle) * 1.6 }));
         }
 
-        // Every effect is a field of the view's settings; nothing else
-        // needs setting up.
         const settings = gfx.Settings{
             .shadow_distance = 60,
             .bloom = if (on.get(.bloom)) 0.08 else 0,

@@ -2,14 +2,6 @@
 #include "common.glsl"
 #include "liquid.glsl"
 
-// One stage of a liquid step, by `mode`:
-//   0 predict positions from velocity and gravity; spawn new particles
-//   1 bin predictions into the grid
-//   2 density and lambda
-//   3 position correction; box and obstacle collision
-//   4 velocity from the position change, with viscosity
-//   5 commit predictions as positions
-// Stages 2 and 3 are iterated.
 layout(local_size_x = 64) in;
 
 layout(push_constant, scalar) uniform Push {
@@ -18,13 +10,11 @@ layout(push_constant, scalar) uniform Push {
     LiquidCells counts;
     LiquidCells cells;
     uint mode;
-    // Which predicted-position buffer to read.
     uint flip;
 } push;
 
 const float PI_ = 3.14159265;
 
-// Fields are read individually; copying the whole record per particle is slow.
 #define LIQUID push.liquid.data
 
 uint hash(uint value) {
@@ -53,7 +43,6 @@ vec3 guessOf(LiquidParticle particle, uint flip) {
     return flip == 0u ? particle.guess_a : particle.guess_b;
 }
 
-// Clamps a point into the box and out of the obstacles.
 vec3 contained(vec3 position) {
     for (uint i = 0u; i < LIQUID.sphere_count; i++) {
         vec3 away = position - LIQUID.spheres[i].xyz;
@@ -65,7 +54,6 @@ vec3 contained(vec3 position) {
 }
 
 void main() {
-
     uint index = gl_GlobalInvocationID.x;
     if (index >= LIQUID.live) return;
 
@@ -81,8 +69,6 @@ void main() {
                 vec3 jitter = (vec3(random(state), random(state), random(state)) - 0.5) * 0.05;
                 particle.position = LIQUID.block_origin + (vec3(column, layer, row) + 0.5 + jitter) * LIQUID.spacing;
             } else {
-                // Sources emit layers of evenly spread discs, one particle
-                // width apart.
                 LiquidSource source = LIQUID.sources[0];
                 uint which = 0u;
                 for (uint i = 1u; i < LIQUID.source_count; i++) {
@@ -106,7 +92,6 @@ void main() {
             particle.position = contained(particle.position);
         }
         particle.velocity += LIQUID.gravity * LIQUID.dt;
-        // Jitter, so particles do not stack into a film on walls.
         uint shake = hash(index * 0x85ebca6bu + LIQUID.seed);
         vec3 nudge = (vec3(random(shake), random(shake), random(shake)) - 0.5) * LIQUID.h * 0.004;
         particle.guess_a = contained(particle.position + particle.velocity * LIQUID.dt + nudge);
@@ -128,7 +113,6 @@ void main() {
         return;
     }
 
-    // Neighbour stages: lengths are in units of h from here on.
     vec3 own = push.flip == 0u ? push.particles.data[index].guess_a : push.particles.data[index].guess_b;
     float own_lambda = push.particles.data[index].lambda;
     vec3 own_position = push.particles.data[index].position;
@@ -139,7 +123,6 @@ void main() {
     vec3 correction = vec3(0.0);
     vec3 own_velocity = (own - own_position) / LIQUID.dt;
     vec3 drift = vec3(0.0);
-    // Read once: the stage writes the buffer it loops over.
     float inverse_h = 1.0 / LIQUID.h;
     float inverse_dt = 1.0 / LIQUID.dt;
     float inverse_rest = 1.0 / LIQUID.rest_density;
@@ -161,7 +144,6 @@ void main() {
             float q = sqrt(q2);
             float w = 1.0 - q2;
             float weight = (315.0 / (64.0 * PI_)) * w * w * w;
-            // Spiky kernel gradient.
             vec3 slope = q > 1.0e-5 ? apart * (-(45.0 / PI_) * (1.0 - q) * (1.0 - q) / q) : vec3(0.0);
             if (mode == 2u) {
                 density += weight;
@@ -173,12 +155,10 @@ void main() {
             } else if (mode == 3u) {
                 if (other != index) correction += (own_lambda + push.particles.data[other].lambda) * slope;
             } else if (other != index) {
-                // XSPH viscosity.
                 drift += ((there - push.particles.data[other].position) * inverse_dt - own_velocity) * weight;
             }
         }
     }
-    // Walls count as liquid: ghost density at the boundary.
     for (int axis = 0; axis < 3; axis++) for (int side = 0; side < 2; side++) {
         float gap = (side == 0 ? own[axis] : LIQUID.extent[axis] - own[axis]) / LIQUID.h;
         if (gap >= 1.0) continue;
@@ -194,7 +174,6 @@ void main() {
         }
     }
     if (push.mode == 2u) {
-        // Only compression is corrected, so the surface does not clump.
         float crowding = max(density / LIQUID.rest_density - 1.0, 0.0);
         push.particles.data[index].lambda = -crowding / (gradient_squares + dot(gradient_sum, gradient_sum) + 0.05);
     } else if (push.mode == 3u) {
@@ -203,7 +182,6 @@ void main() {
         else push.particles.data[index].guess_a = moved;
     } else {
         vec3 velocity = own_velocity + drift * (LIQUID.viscosity / LIQUID.rest_density);
-        // Clamp speed to one cell per step.
         float speed = length(velocity);
         float limit = LIQUID.h / LIQUID.dt;
         if (speed > limit) velocity *= limit / speed;

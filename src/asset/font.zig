@@ -311,7 +311,6 @@ pub const Font = struct {
             if (!listed) try ranges.append(self.gpa, .{ codepoint, codepoint });
         }
         if (ranges.items.len == known) return null;
-        // Room to retire the bake in use, so that `adopt` cannot fail.
         try self.retired.ensureUnusedCapacity(self.gpa, 1);
         const next = try self.gpa.create(Baked);
         errdefer self.gpa.destroy(next);
@@ -775,7 +774,7 @@ const Tables = struct {
     fn init(bytes: []const u8) !Tables {
         const reader = Reader{ .bytes = bytes };
         const version = try reader.u32At(0);
-        if (version != 0x00010000 and version != 0x74727565) return error.UnsupportedFont; // TrueType outlines only
+        if (version != 0x00010000 and version != 0x74727565) return error.UnsupportedFont;
         var self = Tables{ .reader = reader };
         const head = (try findTable(reader, "head")) orelse return error.InvalidFont;
         const maxp = (try findTable(reader, "maxp")) orelse return error.InvalidFont;
@@ -2038,7 +2037,7 @@ test "built-in font parses, bakes and measures" {
     const a = font.glyph('A');
     try std.testing.expectEqual(@as(u21, 'A'), a.codepoint);
     try std.testing.expect(a.advance > 0.4 and a.advance < 0.9);
-    try std.testing.expect(a.plane[3] > 0.6); // capital height
+    try std.testing.expect(a.plane[3] > 0.6);
     const stem = font.glyph('I');
     const u: usize = @intFromFloat((stem.uv[0] + stem.uv[2]) * 0.5 * @as(f32, @floatFromInt(font.baked().atlas_width)));
     const v: usize = @intFromFloat((stem.uv[1] + stem.uv[3]) * 0.5 * @as(f32, @floatFromInt(font.baked().atlas_height)));

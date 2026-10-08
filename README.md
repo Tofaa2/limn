@@ -21,8 +21,8 @@ Path tracing is WIP and contains noise, unfortunately RTX is an oversold concept
 | **instancing** | **views** | **shader** |
 | ![text](.github/images/text.png) | ![canvas](.github/images/canvas.png) | ![triangle](.github/images/triangle.png) |
 | **text** | **canvas** | **triangle** |
-| ![asteroids](.github/images/asteroids.png) | ![voxels](.github/images/voxels.png) | |
-| **asteroids** | **voxels** | |
+| ![asteroids](.github/images/asteroids.png) | ![voxels](.github/images/voxels.png) | ![bistro](.github/images/bistro.png) |
+| **asteroids** | **voxels** | **bistro** |
 
 Every picture is an example in `examples/`: run it with `zig build <name>`.
 

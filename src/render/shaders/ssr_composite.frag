@@ -2,8 +2,6 @@
 #include "common.glsl"
 #include "shading.glsl"
 
-// Adds reflections to the lit image: the traced result where confident, the sky
-// elsewhere.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint depth_texture;
@@ -11,9 +9,7 @@ layout(push_constant, scalar) uniform Push {
     uint surface_texture;
     uint traced_texture;
     float max_roughness;
-    // Roughness blur taps; 0 for none.
     int blur_taps;
-    // 1 when the trace is at reduced resolution.
     uint reduced;
 } push;
 
@@ -56,9 +52,10 @@ void main() {
         float radius = mirror.a * mirror.a * 0.09 * frame.resolution.y;
         float spin = interleavedGradientNoise(gl_FragCoord.xy, frame.frame_index) * 6.2831853;
         float center_depth = linearDepth(depth, frame.near);
-        // Premultiplied by confidence.
-        vec4 total = vec4(traced.rgb * traced.a, traced.a);
-        float weight_total = 1.0;
+        float calm = min(mirror.a * 16.0, 4.0);
+        float center_weight = 1.0 / (1.0 + luminance(traced.rgb) * calm);
+        vec4 total = vec4(traced.rgb * traced.a, traced.a) * center_weight;
+        float weight_total = center_weight;
         for (int i = 0; i < push.blur_taps; i++) {
             float distance_pixels = radius * sqrt((float(i) + 0.5) / float(push.blur_taps));
             float angle = float(i) * 2.39996323 + spin;
@@ -66,6 +63,7 @@ void main() {
             float tap_depth = linearDepth(textureLod(TEX(push.depth_texture, nearest), uv, 0.0).r, frame.near);
             float weight = 1.0 - smoothstep(0.02, 0.1, abs(tap_depth - center_depth) / center_depth);
             vec4 tap = textureLod(TEX(push.traced_texture, frame.sampler_linear_clamp), uv, 0.0);
+            weight /= 1.0 + luminance(tap.rgb) * calm;
             total += vec4(tap.rgb * tap.a, tap.a) * weight;
             weight_total += weight;
         }

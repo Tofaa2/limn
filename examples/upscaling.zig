@@ -85,8 +85,6 @@ pub fn main(init: std.process.Init) !void {
         .material = .{ .base_color = .{ 0.9, 0.85, 0.8, 1 }, .metallic = 1, .roughness = 0.25 },
     }});
 
-    // The yard: tiles of two colors, a lattice fence round it, and posts
-    // with a ball on each.
     var tiles: std.ArrayList(math.Mat4) = .empty;
     defer tiles.deinit(gpa);
     var tile_colors: std.ArrayList([3]f32) = .empty;

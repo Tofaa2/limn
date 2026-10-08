@@ -3,6 +3,9 @@
 #ifndef LIMN_FFX_COMPAT_H
 #define LIMN_FFX_COMPAT_H
 #include <volk.h>
+
+// The pipeline cache the SDK compiles its shaders into; set by limn_ffx.cpp.
+extern VkPipelineCache limnFfxPipelineCache;
 #ifndef _WIN32
 #ifdef __cplusplus
 #include <codecvt>

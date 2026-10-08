@@ -439,7 +439,6 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
         state.params_frame = renderer.frame_index;
         const Push = extern struct { fluid: u64, a: u32 = 0, b: u32 = 0, c: u32 = 0, pad: u32 = 0 };
         params.items[0].solid = device.textureIndex(state.solid);
-        // Scene geometry as obstacles needs the TLAS.
         const scene_tlas: u64 = if (desc.scene_obstacles and device.ray_tracing and scene.tlas_hash != 0)
             (if (scene.tlas) |tlas| device.accelerationAddress(tlas) else 0)
         else

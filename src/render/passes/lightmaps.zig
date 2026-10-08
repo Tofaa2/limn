@@ -30,7 +30,6 @@ pub fn bakeLightmaps(renderer: *Renderer, p: *const ScenePass) !void {
         const from = lightmap.gathered[lightmap.rounds & 1];
         const into = lightmap.gathered[(lightmap.rounds + 1) & 1];
         cmd.beginScope("lightmap");
-        // Uncovered texels keep their value from the other buffer.
         try cmd.beginRendering(.{ .color = &.{.{ .texture = into, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
         cmd.bindPipeline(bake);
         cmd.bindIndexBuffer(renderer.indices.buffer, 0, .uint32);

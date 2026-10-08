@@ -2,8 +2,6 @@
 #include "common.glsl"
 #include "gi.glsl"
 
-// Blends probe rays into the irradiance atlas, or the visibility atlas with
-// VISIBILITY. One fragment per texel; output alpha is the blend weight.
 layout(buffer_reference, scalar) readonly buffer Rays { vec4 data[]; };
 
 layout(push_constant, scalar) uniform Push {
@@ -15,12 +13,11 @@ layout(push_constant, scalar) uniform Push {
     float max_distance;
     uint probe_stride;
     uint probe_phase;
-    // Blend rate of the fast irradiance atlas.
     float fast_hysteresis;
-    // Cells the grid moved this frame.
     ivec3 shift;
-    // Grid updated: 0 main, 1 coarse.
     uint grid_index;
+    float far_distance;
+    uint turn;
 } push;
 
 layout(location = 0) out vec4 out_value;
@@ -42,7 +39,6 @@ vec3 sphericalFibonacci(float i, float n) {
     return vec3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
 }
 
-// Border texels copy interior ones for bilinear wrap across octahedral edges.
 ivec2 interiorTexel(ivec2 t) {
     int last = texels - 1;
     bool border_x = t.x == 0 || t.x == last;
@@ -61,7 +57,6 @@ void main() {
     ivec3 counts = probe_grid.counts;
     int probe = tile.x % counts.x + tile.y * counts.x + (tile.x / counts.x) * counts.x * counts.y;
     if (uint(probe) % push.probe_stride != push.probe_phase) discard;
-    // Probes that scrolled in this frame start over.
     ivec3 grid = giGridCoord(probe_grid, ivec3(tile.x % counts.x, tile.y, tile.x / counts.x));
     bool fresh = false;
     for (int axis = 0; axis < 3; axis++) {
@@ -69,6 +64,7 @@ void main() {
         if (moved > 0 && grid[axis] >= counts[axis] - moved) fresh = true;
         if (moved < 0 && grid[axis] < -moved) fresh = true;
     }
+    if (!giProbeDue(frame, giProbePosition(probe_grid, grid), uint(probe), push.turn, push.far_distance)) discard;
     ivec2 local = interiorTexel(pixel - tile * texels);
     vec3 direction = decodeNormal((vec2(local) - 0.5) / float(texels - 2));
     mat3 rotation = mat3(push.rotation[0].xyz, push.rotation[1].xyz, push.rotation[2].xyz);
@@ -81,7 +77,6 @@ void main() {
         vec3 ray_direction = rotation * sphericalFibonacci(float(i), float(push.rays_per_probe));
         float weight = max(dot(direction, ray_direction), 0.0);
 #ifdef VISIBILITY
-        // Sharp lobe for the Chebyshev test.
         weight = pow(weight, 50.0);
         float distance = min(abs(ray.a), push.max_distance);
         total.rg += vec2(distance, distance * distance) * weight;

@@ -1,8 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// Depth-aware upsample of the half-resolution fog, blended as `scene *
-// transmittance + scattering`.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint fog_texture;
@@ -34,6 +32,5 @@ void main() {
         }
     }
     vec4 fog = total / max(weight_total, 1e-6);
-    // Premultiplied blend: result = rgb + dst * (1 - a).
     out_color = vec4(fog.rgb, 1.0 - fog.a);
 }

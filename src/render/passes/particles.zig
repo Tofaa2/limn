@@ -32,7 +32,6 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
             emitter.pending += @max(desc.rate, 0) * delta_time;
             const births: u32 = @min(@as(u32, @intFromFloat(@min(emitter.pending, 1e9))), emitter.capacity);
             emitter.pending -= @floatFromInt(births);
-            // Fluids are stepped first.
             const carrier: u64 = if (desc.fluid) |fluid| (if (renderer.fluids.get(fluid)) |state| (if (state.params_frame == renderer.frame_index) state.params else 0) else 0) else 0;
             var trail_record = false;
             const trail_interval = @max(desc.trail_seconds, 1e-3) / @as(f32, @floatFromInt(@max(emitter.trail_points, 1)));
@@ -134,7 +133,6 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         });
         cmd.dispatch((count + 63) / 64, 1, 1);
         cmd.sync(.compute_to_all);
-        // Bitonic sort: log2(n) * (log2(n) + 1) / 2 rounds.
         cmd.bindPipeline(renderer.pipelines.particle_sort);
         var run: u32 = 2;
         while (run <= count) : (run *= 2) {
@@ -167,7 +165,6 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     };
     std.mem.sort(Emitter, ordered, Farther{ .renderer = renderer, .camera = camera_position }, Farther.lessThan);
     var mesh_total: u32 = 0;
-    // Mesh particles first: they write depth.
     var mesh_pass = false;
     for (scene.emitters.items) |handle_value| {
         const emitter = renderer.emitters.get(handle_value) orelse continue;

@@ -2,8 +2,6 @@
 #include "common.glsl"
 #include "ffx_reflections.glsl"
 
-// 8x8 luminance-weighted average of the reflections, at 1/8 resolution (end of
-// ffx_denoiser_reflections_reproject.h).
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint radiance_texture;

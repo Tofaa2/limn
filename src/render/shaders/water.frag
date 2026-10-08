@@ -7,8 +7,6 @@
 #include "shading.glsl"
 #include "water.glsl"
 
-// Shades the water surface: refracted, absorbed scene below; reflections
-// (traced or sky) by Fresnel; sun specular.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     WaterRef water;
@@ -55,7 +53,6 @@ void main() {
     vec2 below_uv = clamp(screen_uv + bend, vec2(0.001), vec2(0.999));
     float below_depth = textureLod(TEX(push.depth_texture, nearest), below_uv, 0.0).r;
     float below_distance = below_depth > 0.0 ? linearDepth(below_depth, frame.near) : 1e9;
-    // Never sample something in front of the water.
     if (below_distance < surface_distance) {
         below_uv = screen_uv;
         below_distance = scene_distance;
@@ -91,7 +88,6 @@ void main() {
     if (!found && (frame.flags & FRAME_ENVIRONMENT) != 0u)
         reflected = textureLod(TEX_CUBE(frame.env_specular, linear), mirror, water.data.roughness * (frame.env_specular_mips - 1.0)).rgb * frame.env_intensity;
 
-    // From below: total internal reflection past the critical angle.
     if (dot(flat_normal, view) < 0.0) {
         const float water_index = 1.33;
         float leaves = 1.0 - water_index * water_index * (1.0 - n_dot_v * n_dot_v);

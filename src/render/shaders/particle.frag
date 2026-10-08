@@ -18,7 +18,6 @@ layout(location = 3) in vec4 in_clip;
 layout(location = 4) in vec4 in_previous_clip;
 
 layout(location = 0) out vec4 out_color;
-// Screen motion, weighted by coverage.
 layout(location = 1) out vec4 out_motion;
 
 void main() {
@@ -32,12 +31,10 @@ void main() {
         float falloff = clamp(1.0 - dot(centered, centered), 0.0, 1.0);
         color.a *= falloff * falloff;
     }
-    // Manual depth test, with soft fade near surfaces.
     float scene = linearDepth(texelFetch(TEX(push.depth_texture, frame.sampler_nearest_clamp), ivec2(gl_FragCoord.xy), 0).r, frame.near);
     float fade = emitter.softness > 0.0 ? clamp((scene - in_view_depth) / emitter.softness, 0.0, 1.0) : float(scene > in_view_depth);
     color.a *= fade;
     if (color.a <= 0.0) discard;
-    // Premultiplied; additive particles write zero alpha.
     out_color = vec4(color.rgb * color.a, (emitter.flags & EMITTER_ADDITIVE) != 0u ? 0.0 : color.a);
     out_motion = vec4((in_clip.xy / in_clip.w - in_previous_clip.xy / in_previous_clip.w) * 0.5, 0.0, color.a);
 }

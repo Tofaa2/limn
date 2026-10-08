@@ -1,7 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// Blends reduced-resolution depth of field over the sharp image by blur radius.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint color_texture;

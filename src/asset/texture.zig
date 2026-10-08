@@ -370,7 +370,6 @@ fn encodeTwoGroups(colors: *const [16]Vec, partition: u8) TwoGroups {
             indices[texel] = best_index;
             failure += best_distance;
         }
-        // The anchor index is stored without its top bit.
         const anchor: usize = if (group == 0) 0 else second_anchor[partition];
         if (indices[anchor] >= 4) {
             std.mem.swap([3]u8, &q[group][0], &q[group][1]);
@@ -414,7 +413,6 @@ pub fn encodeBlock(block: *const [16][4]u8) [16]u8 {
         opaque_block = opaque_block and texel[3] == 255;
     }
     mean /= @splat(16);
-    // Alpha 255 needs the p-bit set.
     const force_p: ?u1 = if (opaque_block) 1 else null;
 
     var covariance: [4]Vec = @splat(@splat(0));
@@ -478,7 +476,6 @@ pub fn encodeBlock(block: *const [16][4]u8) [16]u8 {
         }
     }
 
-    // The first index stores only three bits; its top bit must be zero.
     if (indices[0] >= 8) {
         std.mem.swap(Endpoint, &e0, &e1);
         for (&indices) |*index| index.* = 15 - index.*;
@@ -674,13 +671,11 @@ fn encodeBc4(values: *const [16]u8) [8]u8 {
     var out: [8]u8 = @splat(0);
     out[0] = high;
     out[1] = low;
-    // Equal ends would select the six-step mode; all indices stay 0.
     if (high == low) return out;
     var bits: u64 = 0;
     const range: f32 = @floatFromInt(high - low);
     for (values, 0..) |value, texel| {
         const step: u32 = @intFromFloat(@as(f32, @floatFromInt(high - value)) / range * 7 + 0.5);
-        // Index 0 is the high end, 1 the low end, 2..7 the steps between.
         const index: u64 = if (step == 0) 0 else if (step == 7) 1 else step + 1;
         bits |= index << @intCast(texel * 3);
     }

@@ -1,34 +1,25 @@
 #version 460
 #include "common.glsl"
 
-// Ground-truth ambient occlusion (Jimenez et al. 2016): screen-space horizon
-// search with a cosine-weighted analytic integral per slice.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint depth_texture;
-    // Last frame's lit color for bounce gathering, or INVALID_ID.
     uint color_texture;
     float radius;
     float intensity;
-    // Slices per pixel and steps per side.
     int slice_count;
     int step_count;
 } push;
 
 layout(location = 0) in vec2 in_uv;
-// r: occlusion, g: linear view depth.
 layout(location = 0) out vec2 out_ao;
-// Bounce light from the occluders.
 layout(location = 1) out vec4 out_bounce;
-
 
 const float sky_depth = 50000.0;
 
-// View-space position from the linear depth pyramid.
 vec3 viewPosition(FrameConstants frame, vec2 uv, float mip) {
     float z = textureLod(TEX(push.depth_texture, frame.sampler_nearest_clamp), uv, mip).r;
     vec2 ndc = uv * 2.0 - 1.0;
-    // Account for lens shift.
     ndc += vec2(frame.proj[2][0], frame.proj[2][1]);
     return vec3(ndc.x / frame.proj[0][0], ndc.y / frame.proj[1][1], -1.0) * z;
 }
@@ -41,7 +32,6 @@ void main() {
         out_bounce = vec4(0.0);
         return;
     }
-    // Normal from depth: per axis, use the neighbour closer in depth.
     vec2 texel = 1.0 / vec2(textureSize(TEX(push.depth_texture, frame.sampler_nearest_clamp), 0));
     vec3 left = viewPosition(frame, in_uv - vec2(texel.x, 0.0), 0.0);
     vec3 right = viewPosition(frame, in_uv + vec2(texel.x, 0.0), 0.0);
@@ -69,11 +59,11 @@ void main() {
     float visibility = 0.0;
     vec3 bounce = vec3(0.0);
     bool gather = push.color_texture != INVALID_ID;
+    float ceiling = gather ? (luminance(textureLod(TEX(push.color_texture, frame.sampler_linear_clamp), in_uv, 0.0).rgb) + 0.05) * 6.0 : 0.0;
 
     for (int slice = 0; slice < push.slice_count; slice++) {
         float phi = (float(slice) + noise_direction) * PI / float(push.slice_count);
         vec2 omega = vec2(cos(phi), sin(phi));
-        // Screen +y is view -y.
         vec3 direction = vec3(omega.x, -omega.y, 0.0);
         vec3 ortho_direction = direction - dot(direction, view) * view;
         vec3 axis = normalize(cross(direction, view));
@@ -90,25 +80,25 @@ void main() {
                 float t = (float(tap_index) + noise_offset) / float(push.step_count);
                 float reach = t * t + 0.5 / pixel_radius;
                 vec2 sample_uv = in_uv + direction_sign * omega * radius_uv * reach;
-                // Farther samples read coarser mips.
                 float mip = clamp(log2(reach * pixel_radius) - 2.5, 0.0, 4.0);
                 vec3 delta = viewPosition(frame, sample_uv, floor(mip)) - position;
                 float distance_squared = dot(delta, delta);
                 float cos_horizon = dot(delta, view) * inversesqrt(max(distance_squared, 1e-8));
-                // Distance falloff against haloing around thin objects.
                 float falloff = clamp(distance_squared / falloff_end * 2.0 - 1.0, 0.0, 1.0);
                 float candidate = mix(cos_horizon, -1.0, falloff);
                 if (candidate > horizon_cos[side]) {
                     if (gather) {
                         float facing = max(dot(normal, delta) * inversesqrt(max(distance_squared, 1e-8)), 0.0);
                         float slice_width = candidate - max(horizon_cos[side], -0.2);
-                        if (slice_width > 0.0) bounce += textureLod(TEX(push.color_texture, frame.sampler_linear_clamp), sample_uv, 0.0).rgb * (facing * slice_width);
+                        if (slice_width > 0.0) {
+                            vec3 seen = textureLod(TEX(push.color_texture, frame.sampler_linear_clamp), sample_uv, 0.0).rgb;
+                            bounce += seen * min(1.0, ceiling / max(luminance(seen), 1e-6)) * (facing * slice_width);
+                        }
                     }
                     horizon_cos[side] = candidate;
                 }
             }
         }
-        // Clamp horizons to the hemisphere around the projected normal.
         float h0 = n + clamp(-acos(horizon_cos[1]) - n, -PI * 0.5, PI * 0.5);
         float h1 = n + clamp(acos(horizon_cos[0]) - n, -PI * 0.5, PI * 0.5);
         float arc0 = (cos_n + 2.0 * h0 * sin(n) - cos(2.0 * h0 - n)) * 0.25;

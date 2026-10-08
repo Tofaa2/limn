@@ -180,7 +180,6 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass) !bool {
         var content: u64 = 0;
         if (device.ray_tracing) {
             const tlas = scene.tlas orelse break :trace;
-            // The TLAS is built this frame by the GI update.
             if (scene.tlas_hash == 0 or scene.tlas_hash != scene_frame.tlas_hash) break :trace;
             where = device.accelerationAddress(tlas);
             content = scene.tlas_hash;
@@ -246,7 +245,6 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass) !bool {
             .bounces = std.math.clamp(settings.path_tracing_bounces, 1, 16),
             .samples = std.math.clamp(settings.path_tracing_samples, 1, 64),
             .clamp_radiance = @max(settings.path_tracing_clamp, 0.01),
-            // Angular radius of the sun, in radians.
             .sun_radius = 0.0047,
             .light_count = 256,
             .glowing = scene_frame.glowing,

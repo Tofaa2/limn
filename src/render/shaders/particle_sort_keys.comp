@@ -2,8 +2,6 @@
 #include "common.glsl"
 #include "particles.glsl"
 
-// Writes sort keys per particle slot: ascending order puts the farthest first
-// and dead particles last.
 layout(local_size_x = 64) in;
 
 layout(push_constant, scalar) uniform Push {

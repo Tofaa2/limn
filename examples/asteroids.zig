@@ -153,17 +153,14 @@ fn scatter(transforms: []math.Mat4, kind: Kind, seed: u64) void {
     var random = std.Random.DefaultPrng.init(seed);
     const rng = random.random();
     for (transforms) |*transform| {
-        // Many small rocks for each large one.
         const size = kind.size[0] + (kind.size[1] - kind.size[0]) * std.math.pow(f32, rng.float(f32), 3);
         var radius: f32 = 0;
         var angle: f32 = 0;
         var height: f32 = 0;
         while (true) {
-            // Evenly over the area of the ring, thinning toward its faces.
             radius = @sqrt(belt_inner * belt_inner + rng.float(f32) * (belt_outer * belt_outer - belt_inner * belt_inner));
             angle = rng.float(f32) * std.math.tau;
             height = (rng.float(f32) + rng.float(f32) + rng.float(f32) - 1.5) * belt_thickness;
-            // The flight goes through the belt, not through a rock.
             const path = flightPath(angle);
             if (@abs(radius - path[0]) > size * 1.5 + 6 or @abs(height - path[1]) > size * 1.5 + 6) break;
         }
@@ -192,7 +189,6 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.createScene();
     const sun_direction = math.normalize(math.Vec3{ -0.55, -0.35, -0.6 });
     renderer.setSun(scene, .{ .direction = sun_direction, .color = .{ 1, 0.96, 0.9 }, .intensity = 6 });
-    // Space: a sky without air, only stars.
     const environment = try renderer.createSky(.{ .sun_direction = .{ 0, 1, 0 }, .stars = 40 });
     renderer.setEnvironment(scene, environment, 0.35);
 
@@ -256,7 +252,6 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_UP) and count < (memory_limit orelse max_count)) resize = @min(count * 2, memory_limit orelse max_count);
         if (stage.keyPressed(glfw.GLFW_KEY_DOWN) and count > 1000) resize = count / 2;
         if (out_of_memory) {
-            // The GPU had no room for the last belt: try half of it.
             out_of_memory = false;
             memory_limit = count / 2;
             resize = count / 2;
@@ -284,7 +279,6 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_D)) look -= tick.dt * 0.9;
         if (flying) along += tick.dt * 0.012;
 
-        // The flight circles the planet inside the belt, looking ahead.
         const path = flightPath(along);
         const ahead = flightPath(along + 0.02);
         const eye = math.Vec3{ @cos(along) * path[0], path[1], @sin(along) * path[0] };

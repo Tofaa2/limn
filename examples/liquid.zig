@@ -21,7 +21,6 @@ pub fn main(init: std.process.Init) !void {
     const environment = try renderer.createSky(sky);
     renderer.setEnvironment(scene, environment, 1);
 
-    // A floor and the low stone rim the tank stands in.
     var positions: [1][24][3]f32 = undefined;
     var indices: [1][36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &positions[0], &indices[0]);
@@ -34,8 +33,6 @@ pub fn main(init: std.process.Init) !void {
         .{ .model = stone, .at = .{ 0, 0.15, 1.1 }, .size = .{ 4.4, 0.3, 0.2 } },
         .{ .model = stone, .at = .{ -2.1, 0.15, 0 }, .size = .{ 0.2, 0.3, 2.0 } },
         .{ .model = stone, .at = .{ 2.1, 0.15, 0 }, .size = .{ 0.2, 0.3, 2.0 } },
-        // A post behind the tank, to see through the liquid; the mirror
-        // stands on a second one.
         .{ .model = stone, .at = .{ -0.6, 1.0, -1.8 }, .size = .{ 0.3, 2.0, 0.3 } },
         .{ .model = stone, .at = .{ 1.2, 0.5, -2.4 }, .size = .{ 0.3, 1.0, 0.3 } },
     };
@@ -46,18 +43,14 @@ pub fn main(init: std.process.Init) !void {
     helpers.sphereMesh(0.3, &ball_positions, &ball_normals, &ball_indices);
     const ball_model = try renderer.createModel(&.{.{ .positions = &ball_positions, .normals = &ball_normals, .indices = &ball_indices, .material = .{ .base_color = .{ 0.9, 0.3, 0.12, 1 }, .metallic = 0, .roughness = 0.4 } }});
     const ball = try renderer.spawn(scene, .{ .model = ball_model, .transform = math.translation(.{ 0.6, 0.3, 0 }) });
-    // A mirror beside the tank: where the GPU traces rays, the liquid
-    // shows in it, as a box of its color as high as the liquid stands.
     helpers.sphereMesh(0.7, &ball_positions, &ball_normals, &ball_indices);
     const mirror = try renderer.createModel(&.{.{ .positions = &ball_positions, .normals = &ball_normals, .indices = &ball_indices, .material = .{ .base_color = .{ 0.95, 0.95, 0.95, 1 }, .metallic = 1, .roughness = 0.03 } }});
     _ = try renderer.spawn(scene, .{ .model = mirror, .transform = math.translation(.{ 1.2, 1.7, -2.4 }) });
     try renderer.waitUntilLoaded();
 
     const desc = gfx.LiquidDesc{
-        // A tank four meters long, two and a half high, two wide.
         .transform = math.mul(math.translation(.{ 0, 1.25, 0 }), math.scaling(.{ 4, 2.5, 2 })),
         .capacity = 40000,
-        // A block at one end, let go when the example starts.
         .fill = .{ 0.3, 0.55, 1.0 },
         .sources = &.{.{ .position = .{ 1.7, 2.0, 0 }, .velocity = .{ -2.2, -0.3, 0 }, .radius = 0.12 }},
     };
@@ -76,7 +69,6 @@ pub fn main(init: std.process.Init) !void {
             renderer.destroyLiquid(liquid);
             liquid = try renderer.createLiquid(scene, desc);
         }
-        // The ball wades back and forth along the tank.
         renderer.setTransform(ball, math.translation(.{ @sin(tick.time * 0.8) * 1.2, 0.35, 0 }));
 
         list.clear();
@@ -96,7 +88,6 @@ pub fn main(init: std.process.Init) !void {
             .delta_time = tick.dt,
         }));
     }
-    // What the liquid cost in the last frame measured.
     for (renderer.device.passTimings()) |timing| {
         if (std.mem.startsWith(u8, timing.name, "liquid")) std.log.info("gpu: {s} {d:.3} ms", .{ timing.name, timing.milliseconds });
     }

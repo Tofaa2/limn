@@ -1,11 +1,6 @@
 #ifndef FFX_REFLECTIONS_GLSL
 #define FFX_REFLECTIONS_GLSL
 
-// Reflection denoiser of AMD FidelityFX Denoiser 1.2, ported to fragment passes
-// (reproject, average, prefilter, resolve). Originals are in
-// src/third_party/ffx_denoiser. Neighbours are read from textures and the
-// variance neighbourhood is 7 pixels wide instead of 9.
-//
 // Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -27,7 +22,6 @@
 // TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 // SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-// ffx_denoiser_reflections_config.h
 const float FFX_GAUSSIAN_K = 3.0;
 const float FFX_RADIANCE_WEIGHT_BIAS = 0.6;
 const float FFX_RADIANCE_WEIGHT_VARIANCE_K = 0.1;
@@ -46,21 +40,16 @@ float ffxSamplesForRoughness(float roughness) {
     return 1.0 - exp(-roughness * 100.0);
 }
 
-// Radius of the neighbourhood for local mean and variance.
 const int FFX_LOCAL_NEIGHBORHOOD_RADIUS = 3;
 
-// Maximum frames accumulated.
 const float FFX_MAX_SAMPLES = 64.0;
 
-// Roughness at or above which reflections are not denoised here; the path
-// tracer writes this value for such pixels.
 const float FFX_GLOSSY_ROUGHNESS = 0.4;
 
 bool ffxIsGlossy(float roughness) {
     return roughness < FFX_GLOSSY_ROUGHNESS;
 }
 
-// ffx_denoiser_reflections_common.h
 float ffxLuminance(vec3 color) {
     return max(dot(color, vec3(0.299, 0.587, 0.114)), 0.001);
 }
@@ -72,7 +61,6 @@ float ffxTemporalVariance(vec3 history_radiance, vec3 radiance) {
     return difference * difference;
 }
 
-// Clips `previous` toward the center of a color box (Playdead TAA, MIT).
 vec3 ffxClipAabb(vec3 aabb_min, vec3 aabb_max, vec3 previous) {
     vec3 center = 0.5 * (aabb_max + aabb_min);
     vec3 extent = 0.5 * (aabb_max - aabb_min) + 0.001;
@@ -92,8 +80,6 @@ float ffxDisocclusionFactor(vec3 normal, vec3 history_normal, float linear_depth
         exp(-abs(history_linear_depth - linear_depth) / linear_depth * FFX_DISOCCLUSION_DEPTH_WEIGHT);
 }
 
-// Per-pixel surface data from the path tracer: normal (packDirection),
-// roughness, view distance.
 struct FfxSurface {
     vec3 normal;
     float roughness;

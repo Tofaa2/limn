@@ -1,8 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// Dilates covered lightmap texels into uncovered neighbours, against bilinear
-// bleeding at patch edges.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;

@@ -1,16 +1,12 @@
 #ifndef VISIBILITY_VERTEX_GLSL
 #define VISIBILITY_VERTEX_GLSL
 
-// One meshlet vertex for the visibility and shadow passes. Shared by
-// visibility.vert and visibility.mesh; include after their `push` block.
 struct VisibilityVertex {
     vec4 position;
     uint id;
     uint material;
     vec2 uv;
-    // LOD fade: pixels are kept where the noise is under x and not under y.
     vec2 fade;
-    // Distance inside each edge of the page rectangle; negative is clipped.
     vec4 inside;
 };
 
@@ -41,7 +37,6 @@ VisibilityVertex visibilityVertex(uint ref_index, uint vertex_index) {
         vec3 mesh_center = skinned ? instance.bounding_sphere.xyz : (instance.transform * vec4(mesh.center, 1.0)).xyz;
         float mesh_radius = skinned ? instance.bounding_sphere.w : mesh.radius * scale;
         float to_threshold = scale * push.lod.w / max(distance(push.lod.xyz, mesh_center) - mesh_radius, push.lod_near);
-        // With only the coarse part loaded, errors are floored at its error.
         float floor_error = instance.coarse_error;
         float own_error = max(meshlet.lod_error, floor_error);
         float parent_error = max(meshlet.parent_error, floor_error);

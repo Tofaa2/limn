@@ -1,6 +1,3 @@
-// Surface shading shared by the opaque and forward passes: sun with cascaded
-// shadows, clustered local lights with atlas shadows, and ambient light from
-// probes or the environment.
 #ifndef SHADING_GLSL
 #define SHADING_GLSL
 
@@ -16,26 +13,20 @@
 struct Surface {
     vec3 position;
     vec3 normal;
-    vec3 view;          // toward the camera
+    vec3 view;
     vec3 diffuse_color;
     vec3 f0;
     float roughness;
     float ao;
-    // Bounce light from nearby occluders (gtao.frag).
     vec3 bounce;
-    float view_depth;   // distance along the view axis
-    // Clearcoat strength and roughness; 0 for none.
+    float view_depth;
     float clearcoat;
     float clearcoat_roughness;
-    // Clearcoat normal: geometric or from its own map.
     vec3 coat_normal;
-    // Sheen color and roughness; black for none.
     vec3 sheen_color;
     float sheen_roughness;
-    // Anisotropy strength and tangent direction; 0 for none.
     float anisotropy;
     vec3 grain;
-    // Subsurface scattering amount, 0..1.
     float subsurface;
 };
 
@@ -58,7 +49,6 @@ float sampleCascade(FrameConstants frame, uint cascade, vec3 world_position, vec
     #define SHADOW_TAP(index) texture( \
         sampler2DArrayShadow(textures_2d_array[nonuniformEXT(frame.shadow_map)], samplers_shadow[nonuniformEXT(frame.shadow_sampler)]), \
         vec4(coord.xy + rotate * vogel_disk[index] * radius, float(cascade), coord.z))
-    // Four spread taps early-out fully lit and fully shadowed pixels.
     float lit = SHADOW_TAP(3) + SHADOW_TAP(7) + SHADOW_TAP(11) + SHADOW_TAP(15);
     if (lit <= 0.0 || lit >= 4.0) return lit * 0.25;
     if (frame.shadow_taps <= 4u) return lit * 0.25;
@@ -92,8 +82,6 @@ float cascadeShadow(FrameConstants frame, vec3 world_position, vec3 normal, floa
     return lit;
 }
 
-// Sun visibility from the virtual shadow map, or -1 where no page exists: four
-// taps in the finest drawn level covering the point.
 float virtualShadow(FrameConstants frame, vec3 world_position, vec3 normal, float n_dot_l) {
     Vsm vsm = frame.vsm;
     vec2 unmoved = (vsm.light_view * vec4(world_position, 1.0)).xy;
@@ -110,7 +98,6 @@ float virtualShadow(FrameConstants frame, vec3 world_position, vec3 normal, floa
         float lit = 0.0;
         for (int tap = 0; tap < 4; tap++) {
             vec2 offset = vec2((tap & 1) == 0 ? -0.5 : 0.5, (tap & 2) == 0 ? -0.5 : 0.5) / vsm_page_texels;
-            // Clamp taps to the page.
             vec2 inside = clamp(within + offset, vec2(1.0 / vsm_page_texels), vec2(1.0 - 1.0 / vsm_page_texels));
             lit += texture(sampler2DShadow(textures_2d[nonuniformEXT(vsm.atlas_texture)], samplers_shadow[nonuniformEXT(frame.shadow_sampler)]), vec3((corner + inside) / float(vsm_atlas_pages), depth));
         }
@@ -119,7 +106,6 @@ float virtualShadow(FrameConstants frame, vec3 world_position, vec3 normal, floa
     return -1.0;
 }
 
-// Sun visibility: geometry and clouds.
 float sunShadow(FrameConstants frame, vec3 world_position, vec3 normal, float n_dot_l, float view_depth, float noise) {
     float past_geometry = -1.0;
     if ((frame.flags & FRAME_VSM) != 0u) past_geometry = virtualShadow(frame, world_position, normal, n_dot_l);
@@ -127,8 +113,6 @@ float sunShadow(FrameConstants frame, vec3 world_position, vec3 normal, float n_
     return past_geometry * cloudShadow(frame, world_position) * fluidShadow(frame, world_position);
 }
 
-// Tint of sunlight through translucent casters, for points behind the nearest
-// one.
 vec3 sunTint(FrameConstants frame, vec3 world_position, float view_depth) {
     if ((SHADE_FEATURES & FEATURE_COLORED_SHADOWS) == 0u || (frame.flags & FRAME_COLORED_SHADOWS) == 0u) return vec3(1.0);
     uint cascade = 0u;
@@ -140,14 +124,11 @@ vec3 sunTint(FrameConstants frame, vec3 world_position, float view_depth) {
     vec2 uv = clip.xy * 0.5 + 0.5;
     if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return vec3(1.0);
     vec4 tint = textureLod(sampler2DArray(textures_2d_array[nonuniformEXT(frame.shadow_color)], samplers[nonuniformEXT(frame.sampler_linear_clamp)]), vec3(uv, float(cascade)), 0.0);
-    // Alpha is the nearest translucent caster's depth; use the nearest of four
-    // texels rather than a filtered value.
     vec4 depths = textureGather(sampler2DArray(textures_2d_array[nonuniformEXT(frame.shadow_color)], samplers[nonuniformEXT(frame.sampler_linear_clamp)]), vec3(uv, float(cascade)), 3);
     float nearest_caster = min(min(depths.x, depths.y), min(depths.z, depths.w));
     return clip.z > nearest_caster + 0.01 ? tint.rgb : vec3(1.0);
 }
 
-// Screen-space contact shadows: a short depth-buffer march toward the sun.
 float contactShadow(FrameConstants frame, vec3 position, float noise) {
 #ifdef CONTACT_SHADOWS
     if (frame.contact_depth == INVALID_ID || frame.contact_length <= 0.0) return 1.0;
@@ -181,7 +162,6 @@ vec3 directLight(vec3 n, vec3 v, vec3 l, vec3 radiance, vec3 diffuse_color, vec3
     return (diffuse + specular) * radiance * n_dot_l;
 }
 
-// Direct light with anisotropic GGX (KHR_materials_anisotropy).
 vec3 grainLight(Surface surface, vec3 l, vec3 radiance) {
     vec3 n = surface.normal;
     vec3 v = surface.view;
@@ -213,8 +193,6 @@ vec3 surfaceLight(Surface surface, vec3 l, vec3 radiance) {
     vec3 h = normalize(surface.view + l);
     float n_dot_v = max(dot(surface.normal, surface.view), 1e-4);
     if (sheen_strength > 0.0) {
-        // Sheen: Charlie distribution (Estevez and Kulla) with Neubelt
-        // visibility.
         float inverse_alpha = 1.0 / max(surface.sheen_roughness * surface.sheen_roughness, 0.005);
         float n_dot_h = clamp(dot(surface.normal, h), 0.0, 1.0);
         float sin_squared = 1.0 - n_dot_h * n_dot_h;
@@ -230,7 +208,6 @@ vec3 surfaceLight(Surface surface, vec3 l, vec3 radiance) {
     return base * (1.0 - coat_fresnel) + radiance * (coat_n_dot_l * coat);
 }
 
-// Multi-bounce AO (Jimenez et al.).
 vec3 multiBounceAo(float ao, vec3 albedo) {
     vec3 a = 2.0404 * albedo - 0.3324;
     vec3 b = -4.7951 * albedo + 0.6417;
@@ -242,7 +219,6 @@ float specularOcclusion(float n_dot_v, float ao, float roughness) {
     return clamp(pow(n_dot_v + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
 }
 
-// Froxel index of a pixel at a view depth.
 uint clusterIndex(FrameConstants frame, vec2 pixel, float view_depth) {
     uvec2 tile = min(uvec2(pixel * frame.inv_resolution * vec2(CLUSTERS_X, CLUSTERS_Y)), uvec2(CLUSTERS_X - 1u, CLUSTERS_Y - 1u));
     float slice = log2(max(view_depth, 1e-4)) * frame.cluster_z_scale + frame.cluster_z_bias;
@@ -250,22 +226,30 @@ uint clusterIndex(FrameConstants frame, vec2 pixel, float view_depth) {
     return tile.x + tile.y * CLUSTERS_X + z * CLUSTERS_X * CLUSTERS_Y;
 }
 
-// Opens a loop over the decals in the cluster at `position`, in index order;
-// `i` is the decal index. Expects `frame` and `instance`.
 #define DECAL_LOOP_BEGIN(position) \
     uint decal_cluster = clusterIndex(frame, gl_FragCoord.xy, -(frame.view * vec4(position, 1.0)).z); \
     for (uint decal_word = 0u; decal_word < ((SHADE_FEATURES & FEATURE_DECALS) == 0u || (instance.flags & INSTANCE_NO_DECALS) != 0u ? 0u : (frame.decal_count + 31u) >> 5u); decal_word++) \
     for (uint decal_bits = frame.clusters.data[decal_cluster].decals[decal_word]; decal_bits != 0u; decal_bits &= decal_bits - 1u) { \
         uint i = decal_word * 32u + uint(findLSB(decal_bits));
 
-// Ray-traced shadow for lights without a shadow map.
 float tracedShadow(FrameConstants frame, Light light, vec3 position, vec3 normal, vec3 l, float reach, float noise) {
 #ifdef RAY_TRACED
     if ((SHADE_FEATURES & FEATURE_TRACED_LIGHT_SHADOWS) == 0u || (light.flags & LIGHT_TRACED_SHADOW) == 0u || (frame.tlas_low | frame.tlas_high) == 0u) return 1.0;
     uint64_t tlas = uint64_t(frame.tlas_low) | (uint64_t(frame.tlas_high) << 32);
     vec3 origin = position + normal * 0.03;
+    if ((light.flags & LIGHT_DIRECTIONAL) != 0u && light.source_radius > 0.0) {
+        uint rays = max((frame.flags >> 16) & 15u, 1u);
+        vec3 side = normalize(cross(abs(l.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0), l));
+        vec3 up = cross(l, side);
+        float lit = 0.0;
+        for (uint ray = 0u; ray < rays; ray++) {
+            float angle = fract(noise + float(ray) * 0.61803399) * 6.2831853;
+            float reach_out = light.source_radius * sqrt(fract(noise * 7.31 + 0.37 + float(ray) * 0.75487767));
+            lit += rtOccluded(tlas, origin, normalize(l + (side * cos(angle) + up * sin(angle)) * reach_out), reach) ? 0.0 : 1.0;
+        }
+        return lit / float(rays);
+    }
     if ((light.flags & LIGHT_DIRECTIONAL) == 0u && (light.source_radius > 0.0 || light.source_length > 0.0)) {
-        // Area lights: several rays to points that change every frame.
         uint rays = max((frame.flags >> 16) & 15u, 1u);
         float base = noise;
         float lit = 0.0;
@@ -293,7 +277,6 @@ float tracedShadow(FrameConstants frame, Light light, vec3 position, vec3 normal
 #endif
 }
 
-// Maximum soft shadow kernel, in shadow map texels.
 const float LOCAL_SHADOW_MAX_KERNEL = 14.0;
 
 float localShadow(FrameConstants frame, Light light, vec3 world_position, vec3 normal, vec3 to_light, float distance_to_light, float noise) {
@@ -301,7 +284,6 @@ float localShadow(FrameConstants frame, Light light, vec3 world_position, vec3 n
     if (first == 0u) return 1.0;
     uint tile_index = first - 1u;
     if ((light.flags & LIGHT_SPOT) == 0u) {
-        // Point light: six tiles in +X, -X, +Y, -Y, +Z, -Z order.
         vec3 d = -to_light;
         vec3 a = abs(d);
         if (a.x >= a.y && a.x >= a.z) tile_index += d.x > 0.0 ? 0u : 1u;
@@ -323,7 +305,6 @@ float localShadow(FrameConstants frame, Light light, vec3 world_position, vec3 n
     float c = cos(noise * 2.0 * PI);
     float s = sin(noise * 2.0 * PI);
     mat2 rotate = mat2(c, s, -s, c);
-    // PCSS: blocker search sets the kernel size.
     float kernel = 2.5;
     if ((SHADE_FEATURES & FEATURE_SIZED_LIGHTS) != 0u && light.source_radius > 0.0) {
         float texels_per_world = tile.rect.x * atlas_size.x * 0.5 / distance_to_light;
@@ -339,8 +320,6 @@ float localShadow(FrameConstants frame, Light light, vec3 world_position, vec3 n
             }
         }
         if (blockers == 0.0) return 1.0;
-        // Tiles store near / distance, so the ratio of stored values is the
-        // ratio of distances.
         float ratio = (blocker_z / blockers) / ndc.z;
         kernel = clamp(light.source_radius * (ratio - 1.0) * texels_per_world, 2.5, LOCAL_SHADOW_MAX_KERNEL);
         if (kernel > 2.5) {
@@ -360,7 +339,6 @@ float localShadow(FrameConstants frame, Light light, vec3 world_position, vec3 n
     return lit / 12.0;
 }
 
-// Sphere light by representative point (Karis 2013).
 vec3 sphereLight(Surface surface, vec3 to_light, float distance_to_light, float radius, vec3 radiance, vec3 tube_center, vec3 tube_axis, float tube_length) {
     vec3 l = to_light / max(distance_to_light, 1e-5);
     if (radius <= 0.0 && tube_length == 0.0) return surfaceLight(surface, l, radiance);
@@ -368,8 +346,6 @@ vec3 sphereLight(Surface surface, vec3 to_light, float distance_to_light, float 
     vec3 center = to_light;
     float line_normalization = 1.0;
     if (tube_length > 0.0) {
-        // Tube: nearest point of the axis to the reflection ray (Karis, "Real
-        // Shading in Unreal Engine 4").
         vec3 a = tube_center - tube_axis * (0.5 * tube_length);
         vec3 ab = tube_axis * tube_length;
         float along = dot(mirror, ab);
@@ -389,7 +365,6 @@ vec3 sphereLight(Surface surface, vec3 to_light, float distance_to_light, float 
     float alpha = surface.roughness * surface.roughness;
     float widened = clamp(alpha + radius / (2.0 * distance_to_light), 0.0, 1.0);
     float normalization = (alpha / max(widened, 1e-4)) * (alpha / max(widened, 1e-4)) * line_normalization;
-    // Diffuse from the center, specular from the representative point.
     Surface diffuse_only = surface;
     diffuse_only.f0 = vec3(0.0);
     diffuse_only.clearcoat = 0.0;
@@ -398,18 +373,12 @@ vec3 sphereLight(Surface surface, vec3 to_light, float distance_to_light, float 
     return surfaceLight(diffuse_only, l, radiance) + surfaceLight(specular_only, specular_l, radiance) * normalization;
 }
 
-// Temporal filter for soft traced shadows. The opaque pass sets
-// `soft_shadow_history` (negative for none) before shading and stores
-// `soft_shadow_visibility` after.
 float soft_shadow_history = -1.0;
-// 2 where no soft-shadowed light reaches.
 float soft_shadow_visibility = 2.0;
 
 vec3 localLights(FrameConstants frame, Surface surface, vec2 pixel, float noise) {
     if ((SHADE_FEATURES & FEATURE_LOCAL_LIGHTS) == 0u || frame.light_count == 0u) return vec3(0.0);
     vec3 color = vec3(0.0);
-    // Unshadowed light from soft-shadowed sources, and the luminance-weighted
-    // share this frame's rays let through.
     vec3 soft_light = vec3(0.0);
     float soft_weight = 0.0;
     float soft_lit = 0.0;
@@ -419,7 +388,18 @@ vec3 localLights(FrameConstants frame, Surface surface, vec2 pixel, float noise)
         Light light = frame.lights.data[frame.clusters.data[cluster].lights[i]];
         if ((light.flags & LIGHT_DIRECTIONAL) != 0u) {
             vec3 l = -light.direction;
-            if (dot(surface.normal, l) > 0.0) color += surfaceLight(surface, l, light.color) * tracedShadow(frame, light, surface.position, surface.normal, l, 1e4, noise);
+            if (dot(surface.normal, l) > 0.0) {
+                vec3 lit = surfaceLight(surface, l, light.color);
+                float traced = tracedShadow(frame, light, surface.position, surface.normal, l, 1e4, noise);
+                if ((light.flags & LIGHT_TRACED_SHADOW) != 0u && light.source_radius > 0.0) {
+                    float brightness = dot(lit, vec3(0.2126, 0.7152, 0.0722));
+                    soft_light += lit;
+                    soft_weight += brightness;
+                    soft_lit += brightness * traced;
+                } else {
+                    color += lit * traced;
+                }
+            }
             continue;
         }
         vec3 to_light = light.position - surface.position;
@@ -449,7 +429,6 @@ vec3 localLights(FrameConstants frame, Surface surface, vec2 pixel, float noise)
         float distance_squared = dot(to_light, to_light);
         float range_squared = light.range * light.range;
         if (distance_squared > range_squared) continue;
-        // glTF inverse-square falloff, windowed to zero at range.
         float window = clamp(1.0 - (distance_squared * distance_squared) / (range_squared * range_squared), 0.0, 1.0);
         float attenuation = window * window / max(distance_squared, max(light.source_radius * light.source_radius, 1e-4));
         float distance_to_light = sqrt(distance_squared);
@@ -461,7 +440,6 @@ vec3 localLights(FrameConstants frame, Surface surface, vec2 pixel, float noise)
             float cone = clamp(cos_angle * light.cone_scale + light.cone_offset, 0.0, 1.0);
             attenuation *= cone * cone;
             if (light.cookie != INVALID_ID && attenuation > 0.0) {
-                // Cookie: the cone's edge maps to the image's inscribed circle.
                 vec3 axis = light.direction;
                 vec3 side = normalize(abs(axis.y) < 0.99 ? cross(axis, vec3(0.0, 1.0, 0.0)) : cross(axis, vec3(1.0, 0.0, 0.0)));
                 vec3 up = cross(side, axis);
@@ -472,7 +450,6 @@ vec3 localLights(FrameConstants frame, Surface surface, vec2 pixel, float noise)
             }
         }
         if (light.profile != INVALID_ID) {
-            // Profile by angle from the axis: 0 along it, 1 opposite.
             float angle = acos(clamp(dot(-l, light.direction), -1.0, 1.0)) / PI;
             attenuation *= textureLod(TEX(light.profile, frame.sampler_linear_clamp), vec2(angle, 0.5), 0.0).r;
         }
@@ -501,16 +478,12 @@ vec3 localLights(FrameConstants frame, Surface surface, vec2 pixel, float noise)
     return color;
 }
 
-// Environment in the reflection direction, blurred by roughness.
 vec3 environmentReflection(FrameConstants frame, vec3 view, vec3 normal, float roughness) {
     vec3 r = reflect(-view, normal);
     r = normalize(mix(r, normal, roughness * roughness * roughness));
     return textureLod(TEX_CUBE(frame.env_specular, frame.sampler_linear_clamp), r, roughness * (frame.env_specular_mips - 1.0)).rgb * frame.env_intensity;
 }
 
-// Aerial perspective: result = lit * through + air * (1 - through). `view`
-// points from the surface to the eye. Negative `frame.aerial` selects a grey
-// haze fading to the sky; otherwise Rayleigh and Mie scattering.
 void aerialHaze(FrameConstants frame, vec3 view, float distance_seen, out vec3 through, out vec3 air) {
     if (frame.aerial < 0.0) {
         through = vec3(exp(distance_seen * frame.aerial));
@@ -529,9 +502,6 @@ void aerialHaze(FrameConstants frame, vec3 view, float distance_seen, out vec3 t
     air = (frame.sun_radiance * (by_air * phase_air + by_haze * phase_haze) + sky * 0.5 * lost) / lost;
 }
 
-// Fraction of sky or probe light that reaches a surface, from its probe
-// irradiance relative to the unoccluded value. `sky_visibility` is that
-// fraction for the sky.
 float reflectionReach(FrameConstants frame, vec3 position, vec3 normal, vec3 irradiance, float sky_visibility) {
     if (frame.probe_count == 0u) return sky_visibility;
     float reach = 0.0;
@@ -548,8 +518,6 @@ float reflectionReach(FrameConstants frame, vec3 position, vec3 normal, vec3 irr
     return reach + sky_visibility * (1.0 - covered);
 }
 
-// Fallback reflection: the parallax-corrected local probe inside its box, the
-// sky elsewhere. `reach` comes from `reflectionReach`.
 vec3 ambientReflection(FrameConstants frame, vec3 position, vec3 view, vec3 normal, float roughness, float reach) {
     vec3 sky = vec3(0.0);
     if ((frame.flags & FRAME_ENVIRONMENT) != 0u) sky = environmentReflection(frame, view, normal, roughness);
@@ -573,15 +541,10 @@ vec3 ambientReflection(FrameConstants frame, vec3 position, vec3 view, vec3 norm
     return local * mix(1.0, reach, clamp(roughness * 3.0, 0.0, 1.0)) + sky * ((1.0 - covered) * reach);
 }
 
-
 #ifdef DEFER_REFLECTIONS
-// rgb: specular weight, a: sky visibility. Written by ambientLight for the
-// reflection pass.
 vec4 deferred_reflection = vec4(0.0);
 #endif
 
-// Diffuse and specular ambient light. `gathered` is probe irradiance evaluated
-// at reduced resolution (alpha > 0), or zero to evaluate the probes here.
 vec3 ambientLight(FrameConstants frame, Surface surface, vec4 gathered) {
     bool has_environment = (frame.flags & FRAME_ENVIRONMENT) != 0u;
     bool has_gi = (frame.flags & FRAME_GI) != 0u;
@@ -592,7 +555,6 @@ vec3 ambientLight(FrameConstants frame, Surface surface, vec4 gathered) {
         ? textureLod(TEX_CUBE(frame.env_irradiance, s), surface.normal, 0.0).rgb * frame.env_intensity
         : vec3(0.03);
     vec3 irradiance = sky_irradiance;
-    // Fraction of the sky reaching this point, estimated from the probes.
     float sky_visibility = 1.0;
     if (has_gi) {
         float coverage = giCoverage(frame, surface.position);
@@ -610,7 +572,6 @@ vec3 ambientLight(FrameConstants frame, Surface surface, vec4 gathered) {
     vec3 specular_weight = surface.f0 * dfg.x + dfg.y;
     vec3 color = irradiance * surface.diffuse_color * (1.0 - specular_weight) * multiBounceAo(surface.ao, surface.diffuse_color);
     color += surface.bounce * surface.diffuse_color * (1.0 - specular_weight);
-    // Approximate ambient sheen; there is no pre-integrated table.
     color += irradiance * surface.sheen_color * (0.08 + 0.92 * pow(1.0 - n_dot_v, 3.0)) * surface.ao;
     vec3 energy_compensation = 1.0 + surface.f0 * (1.0 / max(dfg.x + dfg.y, 1e-4) - 1.0);
     vec3 reflection_weight = specular_weight * energy_compensation * specularOcclusion(n_dot_v, surface.ao, surface.roughness);
@@ -651,8 +612,6 @@ vec3 shadeSurface(FrameConstants frame, Surface surface, vec2 pixel, float noise
             color += surfaceLight(surface, l, frame.sun_radiance * sunTint(frame, surface.position, surface.view_depth)) * shadow;
     }
     if (surface.subsurface > 0.0 && dot(frame.sun_radiance, vec3(1.0)) > 0.0) {
-        // Subsurface: wrap lighting and back-lit transmission, with the shadow
-        // lookup offset outward.
         float wrap = clamp((dot(surface.normal, l) + surface.subsurface) / (1.0 + surface.subsurface), 0.0, 1.0);
         float through = pow(clamp(dot(surface.view, -l), 0.0, 1.0), 4.0) * surface.subsurface;
         float lit_behind = sunShadow(frame, surface.position + surface.normal * (0.1 + 0.5 * surface.subsurface), l, 1.0, surface.view_depth, noise);

@@ -3,8 +3,6 @@
 #include "shading.glsl"
 #include "particles.glsl"
 
-// Camera-facing particle quads, six vertices each, pulled from the particle
-// buffer.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     EmitterRef emitter;
@@ -17,7 +15,6 @@ layout(push_constant, scalar) uniform Push {
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec2 out_uv;
 layout(location = 2) out float out_view_depth;
-// Clip position now and last frame.
 layout(location = 3) out vec4 out_clip;
 layout(location = 4) out vec4 out_previous_clip;
 
@@ -33,7 +30,6 @@ void main() {
     }
     Particle particle = push.particles.data[slot];
     if (!listed || particle.age >= particle.lifetime) {
-        // Dead: degenerate quad.
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         out_color = vec4(0.0);
         out_uv = vec2(0.0);

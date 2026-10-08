@@ -46,7 +46,6 @@ const Player = struct {
                 (right[0] * input[0] + forward[0] * input[1]) / magnitude * speed,
                 (right[1] * input[0] + forward[1] * input[1]) / magnitude * speed,
             };
-            // Turn toward the direction of travel along the shortest arc.
             const target = std.math.atan2(desired[0], desired[1]);
             const delta = @mod(target - self.facing + std.math.pi * 3.0, std.math.pi * 2.0) - std.math.pi;
             self.facing += std.math.clamp(delta, -12 * dt, 12 * dt);
@@ -93,7 +92,6 @@ const OrbitCamera = struct {
             self.pitch = std.math.clamp(self.pitch + @as(f32, @floatCast(cursor[1] - previous[1])) * 0.0025, -0.35, 1.3);
         }
         self.cursor = cursor;
-        // The camera trails the player slightly instead of being welded on.
         self.target = math.lerp(self.target, focus, 1 - @exp(-10 * dt));
         const forward = math.Vec3{ @cos(self.pitch) * @sin(self.yaw), -@sin(self.pitch), -@cos(self.pitch) * @cos(self.yaw) };
         var position = math.sub(self.target, math.scale(forward, self.distance));
@@ -146,7 +144,6 @@ pub fn main(init: std.process.Init) !void {
         .validation = validation,
         .surface = try window.surface(vsync),
         .pipeline_cache_path = "zig-out/pipeline.cache",
-        // Use an HDR surface when the display has one.
         .hdr_output = hdr,
         .asset_cache_dir = "zig-out/asset-cache",
     });
@@ -160,7 +157,6 @@ pub fn main(init: std.process.Init) !void {
     const robot = try renderer.loadModel("examples/assets/world/RobotExpressive.glb");
     renderer.setEnvironment(scene, environment, 1.0);
     renderer.setSun(scene, .{ .direction = .{ -0.42, -1.0, 0.18 }, .color = .{ 1.0, 0.93, 0.82 }, .intensity = 28 });
-    // Entities can be spawned before their models finish loading.
     _ = try renderer.spawn(scene, .{ .model = sponza });
     const player_entity = try renderer.spawn(scene, .{ .model = robot });
 
@@ -180,11 +176,9 @@ pub fn main(init: std.process.Init) !void {
     defer list.deinit();
     var hud_buffer: [256]u8 = undefined;
     var hud_text: []const u8 = "";
-    // What the middle of the screen is looking at, from the renderer's picking.
     var aim_buffer: [64]u8 = undefined;
     var aim_text: []const u8 = "";
     var show_hud = true;
-    // A small fire with smoke, toggled with P.
     const fire_position = math.Vec3{ 3.4, 0.1, -1.5 };
     const fire_desc = gfx.EmitterDesc{
         .position = fire_position,
@@ -237,7 +231,6 @@ pub fn main(init: std.process.Init) !void {
         }
         if (keys.pressed(window, glfw.GLFW_KEY_T)) settings.temporal_antialiasing = !settings.temporal_antialiasing;
         if (keys.pressed(window, glfw.GLFW_KEY_H)) show_hud = !show_hud;
-        // F5 recompiles the shaders from source; edit one and see it live.
         if (keys.pressed(window, glfw.GLFW_KEY_F5)) {
             if (renderer.reloadShaders()) |count| {
                 std.log.info("reloaded {d} shaders", .{count});
@@ -245,7 +238,6 @@ pub fn main(init: std.process.Init) !void {
         }
         if (keys.pressed(window, glfw.GLFW_KEY_P)) {
             fire_on = !fire_on;
-            // Stopping the flow lets the particles already in the air finish.
             var stopped_fire = fire_desc;
             var stopped_smoke = smoke_desc;
             stopped_fire.rate = 0;
@@ -256,8 +248,6 @@ pub fn main(init: std.process.Init) !void {
         if (keys.pressed(window, glfw.GLFW_KEY_G)) settings.global_illumination = !settings.global_illumination;
         if (keys.pressed(window, glfw.GLFW_KEY_L)) {
             lanterns = !lanterns;
-            // A shadow-casting spot light down the nave and a point light
-            // that follows no one in particular.
             try renderer.setLights(scene, if (lanterns) &.{
                 .{
                     .kind = .spot,
@@ -281,7 +271,6 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (!bounds_known) if (renderer.modelInfo(sponza)) |info| {
-            // Keep the player inside the building's outer walls.
             bounds = .{ math.add(info.bounds_min, .{ 2.2, 0, 2.2 }), math.sub(info.bounds_max, .{ 2.2, 0, 2.2 }) };
             bounds_known = true;
         };
@@ -302,16 +291,12 @@ pub fn main(init: std.process.Init) !void {
         renderer.setTransform(player_entity, player.transform());
         if (clips) |clip| {
             animation_time += dt;
-            // Cross-fade idle -> walk -> run by the eased gait value.
             var pose: gfx.Pose = if (!player.grounded)
                 .{ .animation = clip.jump, .time = animation_time }
             else if (player.gait < 1)
                 .{ .animation = clip.idle, .time = animation_time, .blend = .{ .animation = clip.walk, .time = animation_time, .weight = player.gait } }
             else
                 .{ .animation = clip.walk, .time = animation_time, .blend = .{ .animation = clip.run, .time = animation_time, .weight = player.gait - 1 } };
-            // Holding E waves with the upper body only: a layer limited to
-            // the torso and what hangs off it, eased in and out, while the
-            // legs carry on with whatever they were doing.
             waving = window.keyDown(glfw.GLFW_KEY_E);
             wave_weight += ((if (waving) @as(f32, 1) else 0) - wave_weight) * (1 - @exp(-10 * dt));
             if (wave_weight > 0.01) pose.layers[0] = .{ .animation = clip.wave, .time = animation_time, .weight = wave_weight, .root = clip.torso };
@@ -330,12 +315,9 @@ pub fn main(init: std.process.Init) !void {
                 "\naiming at the sky";
         }
         const focus = math.add(player.position, .{ 0, 1.0, 0 });
-        // The HUD and the name tag are an ordinary draw list: screen-space
-        // text in pixels, world-space text in metres.
         list.clear();
         const font = renderer.defaultFont();
         if (show_hud) {
-            // Every switch with its key and what it is set to right now.
             const Toggle = struct { key: []const u8, label: []const u8, state: []const u8, on: bool };
             const on_off = struct {
                 fn text(value: bool) []const u8 {

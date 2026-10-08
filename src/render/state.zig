@@ -114,7 +114,7 @@ pub const RangeAllocator = struct {
         if (count == 0) return;
         var index: usize = 0;
         while (index < self.free_ranges.items.len and self.free_ranges.items[index].offset < offset) index += 1;
-        self.free_ranges.insert(gpa, index, .{ .offset = offset, .count = count }) catch return; // leak the range
+        self.free_ranges.insert(gpa, index, .{ .offset = offset, .count = count }) catch return;
         if (index + 1 < self.free_ranges.items.len) {
             const next = self.free_ranges.items[index + 1];
             if (offset + count == next.offset) {
@@ -1444,7 +1444,6 @@ pub const FluidState = struct {
     pub fn setSources(self: *FluidState, sources: []const FluidSource) void {
         self.source_count = @intCast(sources.len);
         @memcpy(self.sources[0..sources.len], sources);
-        // The description must not point at the caller's memory.
         self.desc.sources = &.{};
         self.obstacle_count = @intCast(self.desc.obstacles.len);
         @memcpy(self.obstacles[0..self.desc.obstacles.len], self.desc.obstacles);

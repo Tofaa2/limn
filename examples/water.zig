@@ -29,8 +29,6 @@ pub fn main(init: std.process.Init) !void {
     const environment = try renderer.createSky(sky);
     renderer.setEnvironment(scene, environment, 1);
 
-    // A basin: floor, four low walls, a few pillars standing in the water
-    // and a ground around it.
     var positions: [1][24][3]f32 = undefined;
     var indices: [1][36]u32 = undefined;
     boxMesh(.{ 0.5, 0.5, 0.5 }, &positions[0], &indices[0]);
@@ -39,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
     const red = try renderer.createModel(&.{.{ .positions = &positions[0], .indices = &indices[0], .material = .{ .base_color = .{ 0.75, 0.12, 0.08, 1 }, .metallic = 0, .roughness = 0.4 } }});
     const Box = struct { model: gfx.Model, at: math.Vec3, size: math.Vec3 };
     const boxes = [_]Box{
-        .{ .model = tile, .at = .{ 0, -1.6, 0 }, .size = .{ 12, 0.2, 12 } }, // pool floor
+        .{ .model = tile, .at = .{ 0, -1.6, 0 }, .size = .{ 12, 0.2, 12 } },
         .{ .model = stone, .at = .{ 0, -0.9, -6.5 }, .size = .{ 14, 2.2, 1 } },
         .{ .model = stone, .at = .{ 0, -0.9, 6.5 }, .size = .{ 14, 2.2, 1 } },
         .{ .model = stone, .at = .{ -6.5, -0.9, 0 }, .size = .{ 1, 2.2, 12 } },
@@ -47,10 +45,9 @@ pub fn main(init: std.process.Init) !void {
         .{ .model = stone, .at = .{ -2.5, 0.2, -2.0 }, .size = .{ 0.9, 4.0, 0.9 } },
         .{ .model = stone, .at = .{ 2.8, 0.2, -3.0 }, .size = .{ 0.9, 4.0, 0.9 } },
         .{ .model = red, .at = .{ 1.0, -0.2, 1.5 }, .size = .{ 1.2, 1.2, 1.2 } },
-        .{ .model = tile, .at = .{ -3.5, -1.2, 2.5 }, .size = .{ 1.5, 0.6, 1.5 } }, // a step under water
+        .{ .model = tile, .at = .{ -3.5, -1.2, 2.5 }, .size = .{ 1.5, 0.6, 1.5 } },
     };
     for (boxes) |box| _ = try renderer.spawn(scene, .{ .model = box.model, .transform = math.mul(math.translation(box.at), math.scaling(box.size)) });
-    // A ball that swims in circles; the water notices it by itself.
     const helpers = @import("window");
     var ball_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
@@ -61,10 +58,8 @@ pub fn main(init: std.process.Init) !void {
     try renderer.waitUntilLoaded();
 
     var desc = gfx.WaterDesc{
-        // Twelve meters across, the surface a little below the rim.
         .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 12, 1, 12 })),
         .rain = 6,
-        // Whatever is dropped in or swims through throws up spray.
         .splashes = 1,
     };
     const water = try renderer.createWater(scene, desc);
@@ -77,7 +72,6 @@ pub fn main(init: std.process.Init) !void {
     const rng = random.random();
     var hud_buffer: [200]u8 = undefined;
     var since_drop: f32 = 0;
-    // `--dive 1` starts with the camera under the surface (also the U key).
     var dive = false;
     {
         var arguments = try init.minimal.args.iterateAllocator(init.gpa);
@@ -102,7 +96,6 @@ pub fn main(init: std.process.Init) !void {
             renderer.setSky(environment, sky);
             renderer.setSun(scene, gfx.skySun(sky));
         }
-        // Something heavy drops in now and then, and on Space.
         since_drop += tick.dt;
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE) or since_drop > 0.9) {
             since_drop = 0;
@@ -119,7 +112,6 @@ pub fn main(init: std.process.Init) !void {
         }), .{ 24, 20 }, .{ .size = 16 });
         try list.text(font, "Space drop · R rain · U dive · Up/Down swell · hold M murk · A/D orbit · hold T sun", .{ 24, 68 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
 
-        // Above the pool, or in it, looking across under the surface.
         const eye = if (dive) math.Vec3{ @sin(orbit) * 4.5, -1.0, @cos(orbit) * 4.5 } else math.Vec3{ @sin(orbit) * 11, 2.6, @cos(orbit) * 11 };
         try stage.end(try renderer.render(.{
             .views = &.{.{

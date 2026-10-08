@@ -2,7 +2,6 @@
 #include "common.glsl"
 #include "clouds.glsl"
 
-// Ray-marches the cloud layer: rgb = in-scattered light, a = transmittance.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     CloudRef clouds;
@@ -38,8 +37,6 @@ void main() {
         limit = max(limit, distance_there);
     }
     if (limit <= segment.x) {
-        // Transmittance above 1 marks the pixel as hidden for next frame's
-        // history.
         out_clouds = vec4(0.0, 0.0, 0.0, 2.0);
         return;
     }
@@ -78,7 +75,6 @@ void main() {
             travelled += reach_sun;
             reach_sun *= 1.7;
         }
-        // Multiple-scattering approximation: sum over octaves (Wrenninge).
         float sun = 0.0;
         float reach = 1.0;
         float share = 1.0;
@@ -90,7 +86,6 @@ void main() {
             share *= 0.6;
             forward *= 0.5;
         }
-        // Powder effect: thin regions scatter less toward the eye.
         float gathered_here = 1.0 - exp(-(optical_depth + sigma * thickness * 0.06) * 2.0);
         sun *= mix(1.0, gathered_here, 0.65);
         float height = clamp((altitude - clouds.bottom) / thickness, 0.0, 1.0);
@@ -136,7 +131,6 @@ void main() {
         vec2 previous_uv = previous.xy / previous.w * 0.5 + 0.5;
         if (previous.w > 0.0 && all(greaterThan(previous_uv, vec2(0.0))) && all(lessThan(previous_uv, vec2(1.0)))) {
             vec4 history = textureLod(TEX(clouds.history_texture, linear), previous_uv, 0.0);
-            // History alpha above 1 was hidden last frame: no blend.
             if (history.a <= 1.0) out_clouds = mix(history, out_clouds, clouds.history_blend);
         }
     }

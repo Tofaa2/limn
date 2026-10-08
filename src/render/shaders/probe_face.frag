@@ -2,13 +2,11 @@
 #include "common.glsl"
 #include "environment.glsl"
 
-// One cube face of a reflection probe, from a 90 degree capture at the probe.
 layout(push_constant, scalar) uniform Push {
     uint source_texture;
     uint sampler_index;
     uint face;
     float max_radiance;
-    // Camera axes.
     vec3 right;
     vec3 up;
     vec3 forward;

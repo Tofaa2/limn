@@ -1,18 +1,13 @@
 #version 460
 #include "common.glsl"
 
-// Per-meshlet bounds of skinned meshes, for culling. One dispatch for all
-// meshes, laid out as in skin.comp.
 layout(local_size_x = 64) in;
 
 struct BoundsJob {
-    // First skinned vertex of the mesh.
     uint vertex_offset;
     uint meshlet_offset;
     uint meshlet_count;
-    // First output bound, one per meshlet.
     uint bounds_offset;
-    // First work group of this job.
     uint first_group;
     uint job_pad0;
     uint job_pad1;
@@ -20,7 +15,6 @@ struct BoundsJob {
 };
 layout(buffer_reference, scalar) readonly buffer BoundsJobs { BoundsJob data[]; };
 layout(buffer_reference, scalar) readonly buffer BoundsGroups { uint data[]; };
-// Center and radius, in skinned vertex space.
 layout(buffer_reference, scalar) writeonly buffer MeshletBounds { vec4 data[]; };
 
 const uint GROUPS_PER_ROW = 1024u;

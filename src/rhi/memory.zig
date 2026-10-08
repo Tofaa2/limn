@@ -216,7 +216,6 @@ pub const Allocator = struct {
         }
         const offset = std.mem.alignForward(u64, block.cursor, requirements.alignment);
         if (offset + requirements.size > block.size) return null;
-        // Record alignment padding as free so the block coalesces fully.
         if (offset != block.cursor)
             block.free_ranges.appendAssumeCapacity(.{ .offset = block.cursor, .size = offset - block.cursor });
         block.cursor = offset + requirements.size;

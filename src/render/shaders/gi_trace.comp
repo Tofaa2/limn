@@ -4,31 +4,25 @@
 #include "common.glsl"
 #include "rt.glsl"
 
-// Traces a fixed ray set from each irradiance probe and stores radiance and hit
-// distance. Hits are lit by the shadowed sun and last frame's probes.
 layout(local_size_x = 64) in;
-
 
 layout(buffer_reference, scalar) buffer Rays { vec4 data[]; };
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     Rays rays;
-    // TLAS device address.
     uint64_t tlas;
-    // Per-frame random rotation of the ray set.
     vec4 rotation[3];
     uint rays_per_probe;
     uint probe_count;
     uint multibounce;
     float max_distance;
-    // Only probes with index % stride == phase are traced.
     uint probe_stride;
     uint probe_phase;
-    // Grid traced: 0 main, 1 coarse.
     uint grid;
-    // 1 to trace probes inside geometry only every eighth turn.
     uint skip_buried;
+    float far_distance;
+    uint turn;
 } push;
 
 vec3 sphericalFibonacci(float i, float n) {
@@ -47,7 +41,6 @@ void main() {
     uint ray = index % push.rays_per_probe;
     uint slot = probe * push.rays_per_probe + ray;
     if (push.skip_buried != 0u && (frame.frame_index / max(push.probe_stride, 1u) + probe) % 8u != 0u) {
-        // Buried probes (mostly backface hits last time) keep their contents.
         uint backs = 0u;
         uint spread = max(push.rays_per_probe / 8u, 1u);
         for (uint k = 0u; k < 8u; k++) backs += uint(push.rays.data[probe * push.rays_per_probe + min(k * spread, push.rays_per_probe - 1u)].w < 0.0);
@@ -55,6 +48,7 @@ void main() {
     }
     GiGrid grid = giGrid(frame, push.grid);
     vec3 origin = giProbePosition(grid, giGridCoord(grid, giProbeCoord(int(probe), grid.counts)));
+    if (!giProbeDue(frame, origin, probe, push.turn, push.far_distance)) return;
     mat3 rotation = mat3(push.rotation[0].xyz, push.rotation[1].xyz, push.rotation[2].xyz);
     vec3 direction = rotation * sphericalFibonacci(float(ray), float(push.rays_per_probe));
 
@@ -64,12 +58,10 @@ void main() {
     if (met == RT_MISS) {
         vec3 sky = vec3(0.0);
         if ((frame.flags & FRAME_ENVIRONMENT) != 0u) {
-            // Blurred mip, to keep the sun from becoming noise.
             sky = textureLod(TEX_CUBE(frame.env_specular, frame.sampler_linear_clamp), direction, 2.0).rgb * frame.env_intensity;
         }
         push.rays.data[slot] = vec4(rtThroughFluids(frame, origin, direction, push.max_distance, sky), push.max_distance);
     } else if (met == RT_BACK) {
-        // Backface: store a shortened negative distance.
         push.rays.data[slot] = vec4(0.0, 0.0, 0.0, -0.2 * t);
     } else {
         push.rays.data[slot] = vec4(rtThroughFluids(frame, origin, direction, t, radiance), t);

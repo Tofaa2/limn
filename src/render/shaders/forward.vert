@@ -1,7 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// Forward pass for blended materials: one indexed draw per instance.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint instance_index;
@@ -11,7 +10,6 @@ layout(location = 0) out vec3 out_position;
 layout(location = 1) out vec3 out_normal;
 layout(location = 2) out vec4 out_tangent;
 layout(location = 3) out vec2 out_uv;
-// Unjittered clip position, current and previous, for motion vectors.
 layout(location = 4) out vec4 out_clip;
 layout(location = 5) out vec4 out_previous_clip;
 layout(location = 6) out vec4 out_vertex_color;
