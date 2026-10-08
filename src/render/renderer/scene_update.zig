@@ -351,7 +351,9 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena, slot
             .material = mesh.material,
             .vertex_offset = current,
             .previous_vertex_offset = if (entity.history_frames != 0) previous else current,
-            .flags = gpu.instance_skinned | gpu.instance_moving | gpu.instance_previous,
+            .flags = gpu.instance_skinned | gpu.instance_moving | gpu.instance_previous | (if (entity.receive_decals) 0 else gpu.instance_no_decals) | (if (entity.rays_only) gpu.instance_proxy else 0),
+            .tint = entity.tint,
+            .params = entity.params,
             .bounds_offset = if (own_bounds) bounds_cursor else gpu.invalid_id,
         };
         var morph_weights = source.meshes[instance.mesh].morph_weights;

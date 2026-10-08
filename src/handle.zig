@@ -1,13 +1,13 @@
 const std = @import("std");
 
-/// 32-bit generational handle: a slot index plus the slot's generation at
+/// 64-bit generational handle: a slot index plus the slot's generation at
 /// issue. `Tag` only makes handles of different resources distinct types.
 pub fn Handle(comptime Tag: type) type {
-    return packed struct(u32) {
+    return packed struct(u64) {
         /// Low 24 bits.
         index: u24,
-        /// High 8 bits; never 0 for a live handle.
-        generation: u8,
+        /// High 40 bits; never 0 for a live handle.
+        generation: u40,
 
         /// Refers to nothing; never issued.
         pub const invalid: @This() = .{
@@ -26,13 +26,14 @@ pub fn Handle(comptime Tag: type) type {
 
 /// Growable table of `T` addressed by `Handle(Tag)`. Freed slots are reused
 /// with a new generation, so stale handles stop resolving; the generation is
-/// 8 bits and wraps, skipping 0. Up to 2^24 - 1 values. Not thread safe.
+/// 40 bits, so a slot would need 2^40 reuses to repeat one. Up to 2^24 - 1
+/// values. Not thread safe.
 pub fn HandleTable(comptime T: type, comptime Tag: type) type {
     return struct {
         const Self = @This();
         pub const Id = Handle(Tag);
         const Slot = struct {
-            generation: u8 = 1,
+            generation: u40 = 1,
             next_free: u24 = none,
             value: ?T = null,
         };
@@ -122,7 +123,7 @@ test "generational handles reject stale IDs and reuse slots" {
     var table = HandleTable(u32, Tag).init(std.testing.allocator);
     defer table.deinit();
     const first = try table.insert(11);
-    try std.testing.expectEqual(@as(usize, 4), @sizeOf(@TypeOf(first)));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(@TypeOf(first)));
     try std.testing.expectEqual(@as(u32, 11), table.get(first).?.*);
     try std.testing.expectEqual(@as(u32, 11), table.remove(first).?);
     try std.testing.expect(table.get(first) == null);
@@ -135,15 +136,17 @@ test "generational handles reject stale IDs and reuse slots" {
     try std.testing.expectEqual(second, handles[0]);
 }
 
-test "generation wrap never creates an invalid live handle" {
+test "a reused slot never revives a stale handle" {
     const Tag = enum { resource };
     var table = HandleTable(u8, Tag).init(std.testing.allocator);
     defer table.deinit();
-    var handle = try table.insert(1);
+    const first = try table.insert(1);
+    var handle = first;
     for (0..512) |iteration| {
         const stale = handle;
         try std.testing.expectEqual(@as(u8, 1), table.remove(handle).?);
         try std.testing.expect(table.get(stale) == null);
+        try std.testing.expect(table.get(first) == null);
         handle = try table.insert(1);
         try std.testing.expect(handle.isValid());
         try std.testing.expectEqual(@as(u24, 0), handle.index);

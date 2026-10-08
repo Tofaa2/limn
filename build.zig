@@ -336,6 +336,13 @@ pub fn build(b: *std.Build) void {
     }) orelse return;
 
     const asset_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseFast else optimize;
+    const validate_input = b.option(bool, "validate_input", "Check asset files before trusting them and keep safety checks in the asset parsers (default: true)") orelse true;
+    const parser_optimize: std.builtin.OptimizeMode = if (optimize == .Debug and validate_input) .ReleaseSafe else asset_optimize;
+    const fidelityfx = b.option(bool, "fidelityfx", "Build AMD's FidelityFX SDK in, for FSR 2 and FSR 3 upscaling (default: true)") orelse true;
+    const features = b.addOptions();
+    features.addOption(bool, "fidelityfx", fidelityfx);
+    features.addOption(bool, "validate_input", validate_input);
+    const features_module = features.createModule();
     const zmesh = b.dependency("zmesh", .{ .target = target, .optimize = asset_optimize });
     const zstbi = b.dependency("zstbi", .{ .target = target, .optimize = asset_optimize });
 
@@ -383,14 +390,15 @@ pub fn build(b: *std.Build) void {
     const texture_codec = b.createModule(.{
         .root_source_file = b.path("src/asset/texture.zig"),
         .target = target,
-        .optimize = asset_optimize,
+        .optimize = parser_optimize,
     });
     renderer.addImport("texture_codec", texture_codec);
     const font_baker = b.createModule(.{
         .root_source_file = b.path("src/font_baker.zig"),
         .target = target,
-        .optimize = asset_optimize,
+        .optimize = parser_optimize,
     });
+    font_baker.addImport("build_features", features_module);
     renderer.addImport("font_baker", font_baker);
     addShaders(b, renderer, renderer_shaders, shaders_step);
     const shader_options = b.addOptions();
@@ -407,10 +415,7 @@ pub fn build(b: *std.Build) void {
     shader_options.addOption([]const []const u8, "defines", &shader_defines);
     shader_options.addOption([]const u8, "include_dir", b.pathFromRoot(shader_dir));
     renderer.addOptions("shader_sources", shader_options);
-    const fidelityfx = b.option(bool, "fidelityfx", "Build AMD's FidelityFX SDK in, for FSR 2 and FSR 3 upscaling (default: true)") orelse true;
-    const features = b.addOptions();
-    features.addOption(bool, "fidelityfx", fidelityfx);
-    renderer.addOptions("build_features", features);
+    renderer.addImport("build_features", features_module);
     if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk);
 
     const library = b.addLibrary(.{ .name = "limn", .root_module = renderer, .linkage = .static, .use_llvm = true });

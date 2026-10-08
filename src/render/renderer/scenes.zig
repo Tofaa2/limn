@@ -312,7 +312,7 @@ pub const Entities = struct {
         defer self.mutex.unlock(self.io);
         const data = self.entities.table.remove(entity) orelse return;
         if (self.scenes.table.get(data.scene)) |scene| {
-            for (scene.entities.items, 0..) |candidate, index| if (@as(u32, @bitCast(candidate)) == @as(u32, @bitCast(entity))) {
+            for (scene.entities.items, 0..) |candidate, index| if (std.meta.eql(candidate, entity)) {
                 _ = scene.entities.orderedRemove(index);
                 break;
             };

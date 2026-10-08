@@ -4,6 +4,7 @@ const std = @import("std");
 const opentype = @import("opentype.zig");
 const indic = @import("indic.zig");
 const arabic = @import("arabic.zig");
+const build_features = @import("build_features");
 
 /// Pixels per em in the atlas.
 pub const atlas_em: f32 = 40;
@@ -1223,6 +1224,7 @@ pub fn load(gpa: std.mem.Allocator, bytes: []const u8, ranges: []const Range) !F
 fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, previous: ?*const Baked) !Baked {
     const scale = atlas_em / tables.units_per_em;
     const padding: u32 = @intFromFloat(@ceil(sdf_spread));
+    const atlas_width: u32 = 1024;
 
     var glyphs: std.ArrayList(Glyph) = .empty;
     errdefer glyphs.deinit(gpa);
@@ -1263,6 +1265,11 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
                 }
             }
             minimum = .{ @floor(minimum[0]), @floor(minimum[1]) };
+            if (build_features.validate_input) {
+                inline for (0..2) |axis| {
+                    if (!(@ceil(maximum[axis] - minimum[axis]) <= @as(f32, @floatFromInt(atlas_width)))) return error.GlyphTooLarge;
+                }
+            }
             try cells.append(gpa, .{
                 .glyph = glyphs.items.len - 1,
                 .segment_start = segment_start,
@@ -1275,7 +1282,6 @@ fn bake(gpa: std.mem.Allocator, tables: *const Tables, ranges: []const Range, pr
     }
     if (glyphs.items.len == 0) return error.EmptyFont;
 
-    const atlas_width: u32 = 1024;
     var pen_x: u32 = if (previous) |old| old.pen[0] else 1;
     var pen_y: u32 = if (previous) |old| old.pen[1] else 1;
     var shelf_height: u32 = if (previous) |old| old.shelf_height else 0;
