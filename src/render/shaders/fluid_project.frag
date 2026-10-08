@@ -2,8 +2,6 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Final solver step: subtracts the pressure gradient and enforces solid
-// boundaries.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;

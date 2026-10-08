@@ -46,12 +46,8 @@ pub fn main(init: std.process.Init) !void {
     const run = renderer.findAnimation(fox_model, "Run") orelse 0;
     const run_length = if (renderer.animationInfo(fox_model, run)) |clip| clip.duration else 1;
 
-    // A view owns what carries over from frame to frame (the previous
-    // picture, exposure, and so on). The window's main view is built in;
-    // every further camera needs one of its own.
     const right_view = try renderer.createView();
     const chase_view = try renderer.createView();
-    // Somewhere other than the window to render to, usable as a picture.
     const chase_target = try renderer.createTarget(480, 270);
 
     var list = gfx.DrawList.init(init.gpa);
@@ -74,7 +70,6 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE)) moving = !moving;
         if (moving) clock += tick.dt;
 
-        // The fox runs a circle between the towers.
         const angle = clock * 0.5;
         const place = math.Vec3{ @sin(angle) * 15.2, 0, @cos(angle) * 15.2 };
         renderer.setTransform(fox, math.mul(math.translation(place), math.mul(math.rotationY(angle + std.math.pi * 0.5), math.uniformScaling(0.02))));
@@ -103,7 +98,6 @@ pub fn main(init: std.process.Init) !void {
 
         try stage.end(try renderer.render(.{
             .views = &.{
-                // First the texture, so the inset shows this frame's picture.
                 .{ .view = chase_view, .scene = scene, .camera = chase, .target = .{ .texture = chase_target }, .settings = .{ .shadow_distance = 50 } },
                 .{
                     .scene = scene,
@@ -122,7 +116,6 @@ pub fn main(init: std.process.Init) !void {
                     .region = .{ .x = half, .y = 0, .width = size[0] - half, .height = size[1] },
                     .settings = .{ .shadow_distance = 70, .debug_view = modes[mode].view },
                 },
-                // No scene: only the 2D layer, over the whole window.
                 .{ .draw_lists = &.{&overlay}, .target = stage.target() },
             },
             .delta_time = tick.dt,

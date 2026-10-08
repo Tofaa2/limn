@@ -70,8 +70,6 @@ pub const Window = struct {
             .instance = @ptrCast(glfw.GetModuleHandleW(null)),
             .window = @ptrCast(glfw.glfwGetWin32Window(self.handle) orelse return error.NativeWindowUnavailable),
         } };
-        // GLFW before 3.4 is built for one window system and cannot be asked
-        // which; the libraries distributions ship of it are X11 ones.
         if (comptime !@hasDecl(glfw, "glfwGetPlatform")) return .{ .xlib = .{
             .display = @ptrCast(glfw.glfwGetX11Display() orelse return error.NativeWindowUnavailable),
             .window = @intCast(glfw.glfwGetX11Window(self.handle)),
@@ -160,7 +158,6 @@ pub const Stage = struct {
             } else if (std.mem.eql(u8, arg, "--validation")) {
                 validation = true;
             } else if (std.mem.startsWith(u8, arg, "--")) {
-                // An option of the example itself, with its value.
                 _ = args.next();
             } else return error.InvalidArgument;
         }
@@ -172,8 +169,6 @@ pub const Stage = struct {
         renderer_options.surface = if (window) |value| try value.surface(false) else null;
         if (screenshot != null or validation) renderer_options.validation = true;
         if (debug_names) renderer_options.debug_names = true;
-        // Compiled shaders are kept between runs; the first run of a build
-        // pays for compiling them, later ones start at once.
         if (renderer_options.pipeline_cache_path == null) renderer_options.pipeline_cache_path = "zig-out/pipeline.cache";
         const renderer = try gfx.Renderer.init(init.gpa, init.io, renderer_options);
         return .{

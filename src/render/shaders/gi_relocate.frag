@@ -2,9 +2,6 @@
 #include "common.glsl"
 #include "gi.glsl"
 
-// Probe relocation from this frame's ray hits (Majercik et al., "Scaling
-// Probe-Based Real-Time Dynamic Global Illumination"). One texel per probe:
-// offset from the grid position (rgb), cell mark (a).
 layout(buffer_reference, scalar) readonly buffer Rays { vec4 data[]; };
 
 layout(push_constant, scalar) uniform Push {
@@ -19,7 +16,8 @@ layout(push_constant, scalar) uniform Push {
     float fast_hysteresis;
     ivec3 shift;
     uint grid_index;
-    // Previous offsets.
+    float far_distance;
+    uint turn;
     uint previous_offsets;
 } push;
 
@@ -47,7 +45,6 @@ void main() {
     float apart = abs(before.w - mark);
     vec3 offset = min(apart, 1.0 - apart) < 0.004 ? before.xyz : vec3(0.0);
     out_offset = vec4(offset, mark);
-    // Only probes traced this frame are updated.
     if (uint(probe) % push.probe_stride != push.probe_phase) return;
 
     mat3 rotation = mat3(push.rotation[0].xyz, push.rotation[1].xyz, push.rotation[2].xyz);
@@ -63,7 +60,6 @@ void main() {
         float met = push.rays.data[uint(probe) * push.rays_per_probe + ray].w;
         vec3 way = rotation * sphericalFibonacci(float(ray), count);
         if (met < 0.0) {
-            // Backface hit: the tracer stored -0.2 * distance.
             backs += 1.0;
             float distance_met = -met * 5.0;
             if (distance_met < nearest_back) {
@@ -85,18 +81,14 @@ void main() {
     float room = grid.spacing * 0.2;
     vec3 moved = offset;
     if (backs / count > 0.25 && nearest_back < 1e29) {
-        // Inside geometry: move out through the nearest backface.
         moved = offset + nearest_back_way * (nearest_back + room * 0.5);
     } else if (nearest_front < room) {
-        // Too close to a surface: move away unless the open side is the same
-        // way.
         if (dot(nearest_front_way, farthest_front_way) <= 0.0)
             moved = offset + farthest_front_way * min(farthest_front, room);
     } else if (dot(offset, offset) > 1e-8) {
         float back = min(nearest_front - room, length(offset));
         moved = offset - normalize(offset) * back;
     }
-    // Offsets stay within the probe's cell.
     if (all(lessThan(abs(moved), vec3(grid.spacing * 0.45)))) offset = moved;
     out_offset = vec4(offset, mark);
 }

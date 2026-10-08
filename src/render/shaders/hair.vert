@@ -2,19 +2,15 @@
 #include "common.glsl"
 #include "hair.glsl"
 
-// Hair: each strand segment is a camera-facing ribbon. Strands narrower than a
-// pixel are drawn one pixel wide and faded.
 layout(push_constant, scalar) uniform Push {
     HAIR_PUSH
 } push;
 
 layout(location = 0) out vec3 out_position;
 layout(location = 1) out vec3 out_tangent;
-// x: distance along the strand, y: sub-pixel coverage.
 layout(location = 2) out vec2 out_along;
 layout(location = 3) out vec4 out_clip;
 layout(location = 4) out vec4 out_previous_clip;
-// Per-strand brightness variation.
 layout(location = 5) flat out float out_shade;
 
 vec3 worldPoint(uint index) {

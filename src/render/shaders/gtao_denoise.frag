@@ -1,16 +1,12 @@
 #version 460
 #include "common.glsl"
 
-// Joint bilateral upsample of half-resolution GTAO with temporal accumulation.
-// BOUNCE filters the gathered light with the same taps.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint ao_texture;
     uint depth_texture;
-    // Last frame's result, or INVALID_ID for spatial filtering only.
     uint history_texture;
     float history_blend;
-    // BOUNCE: gathered light and its history, or INVALID_ID.
     uint bounce_texture;
     uint bounce_history_texture;
 } push;

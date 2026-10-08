@@ -1,7 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// Resolves weighted blended OIT over the opaque image.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint accumulation_texture;

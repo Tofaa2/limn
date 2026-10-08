@@ -6,7 +6,7 @@ const std = @import("std");
 /// True if `text` contains anything `shapeLine` would change.
 pub fn needsShaping(text: []const u8) bool {
     for (text, 0..) |byte, index| {
-        if (byte >= 0xd6) return true; // Hebrew starts at U+0590 (0xD6 0x90)
+        if (byte >= 0xd6) return true;
         if (byte == 'f' and index + 1 < text.len) switch (text[index + 1]) {
             'f', 'i', 'l' => return true,
             else => {},
@@ -75,10 +75,7 @@ fn classOf(c: u21) Class {
         0x200f => .right,
         '0'...'9' => .number,
         0x0660...0x0669, 0x066b, 0x066c => .arabic_number,
-        // 0x100000 and up: `font.glyph_codepoints_rtl`.
-        // 0xc8000 and up: `font.spacing_codepoints`.
         0x0590...0x05ff, 0xfb1d...0xfb4f, 0x100000...0x10ffff, 0xc8000...0xcffff => .right,
-        // 0xe1100 and up: `font.component_codepoints`.
         0x0600...0x065f, 0x066d...0x06ff, 0x0750...0x077f, 0xfb50...0xfdff, 0xfe70...0xfeff, 0xd0000...0xdffff, 0xe1100...0xe11ff => .arabic,
         0...0x2f, 0x3a...0x40, 0x5b...0x60, 0x7b...0xbf, 0x2000...0x200d, 0x2010...0x206f => .neutral,
         else => .left,
@@ -116,9 +113,7 @@ const arabic_letters = [_]Joining{
     .{ .base = 0xfea1, .forms = 4 }, .{ .base = 0xfea5, .forms = 4 }, .{ .base = 0xfea9, .forms = 2 }, .{ .base = 0xfeab, .forms = 2 },
     .{ .base = 0xfead, .forms = 2 }, .{ .base = 0xfeaf, .forms = 2 }, .{ .base = 0xfeb1, .forms = 4 }, .{ .base = 0xfeb5, .forms = 4 },
     .{ .base = 0xfeb9, .forms = 4 }, .{ .base = 0xfebd, .forms = 4 }, .{ .base = 0xfec1, .forms = 4 }, .{ .base = 0xfec5, .forms = 4 },
-    .{ .base = 0xfec9, .forms = 4 }, .{ .base = 0xfecd, .forms = 4 },
-    // U+063B..U+063F are not basic letters; U+0640 is the tatweel.
-    .{ .base = 0, .forms = 0 },      .{ .base = 0, .forms = 0 },
+    .{ .base = 0xfec9, .forms = 4 }, .{ .base = 0xfecd, .forms = 4 }, .{ .base = 0, .forms = 0 },      .{ .base = 0, .forms = 0 },
     .{ .base = 0, .forms = 0 },      .{ .base = 0, .forms = 0 },      .{ .base = 0, .forms = 0 },      .{ .base = 0x0640, .forms = 0 },
     .{ .base = 0xfed1, .forms = 4 }, .{ .base = 0xfed5, .forms = 4 }, .{ .base = 0xfed9, .forms = 4 }, .{ .base = 0xfedd, .forms = 4 },
     .{ .base = 0xfee1, .forms = 4 }, .{ .base = 0xfee5, .forms = 4 }, .{ .base = 0xfee9, .forms = 4 }, .{ .base = 0xfeed, .forms = 2 },
@@ -137,7 +132,6 @@ fn isTatweel(c: u21) bool {
 
 /// Marks sit on a letter and do not interrupt joining.
 fn isArabicMark(c: u21) bool {
-    // 0xd0000 and up: `font.glyph_codepoints_rtl_mark`.
     return (c >= 0x064b and c <= 0x065f) or c == 0x0670 or (c >= 0xd0000 and c <= 0xdffff);
 }
 
@@ -310,7 +304,7 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
     if (has_arabic) {
         write = 0;
         read = 0;
-        var previous: u21 = 0; // last letter written, in its original code
+        var previous: u21 = 0;
         while (read < shaped.len) {
             const c = shaped[read];
             read += 1;
@@ -331,7 +325,7 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
                     shaped[write] = glyph;
                     write += 1;
                     read = next_index + 1;
-                    previous = next; // an alef: nothing joins after it
+                    previous = next;
                     continue;
                 }
             };
@@ -399,7 +393,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
     const Frame = struct { level: u8, override: ?Class, isolate: bool, run: u16 };
     var stack: [max_embedding + 1]Frame = undefined;
     var depth: usize = 0;
-    // Openers past the depth limit, so that their closers are ignored too.
     var ignored: u32 = 0;
     var run_count: u16 = 1;
     stack[0] = .{ .level = base, .override = null, .isolate = false, .run = 0 };
@@ -550,8 +543,6 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
             index = end;
         }
     }
-    // Reversing a right-to-left run put marks before their letter: move each
-    // letter's marks back behind it, in typing order.
     index = 0;
     while (index < shaped.len) {
         if (levels[index] % 2 == 0 or !isCombiningMark(shaped[index])) {

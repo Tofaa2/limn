@@ -69,9 +69,7 @@ fn reflect(gpa: std.mem.Allocator, bytes: []const u8) ![]Resource {
         if (length == 0 or at + length > words.len) return error.InvalidSpirv;
         const operands = words[at + 1 .. at + length];
         switch (opcode) {
-            // OpName
             5 => decorations[operands[0]].name = std.mem.sliceTo(std.mem.sliceAsBytes(operands[1..]), 0),
-            // OpDecorate
             71 => switch (operands[1]) {
                 2 => decorations[operands[0]].block = true,
                 3 => decorations[operands[0]].buffer_block = true,
@@ -80,7 +78,6 @@ fn reflect(gpa: std.mem.Allocator, bytes: []const u8) ![]Resource {
                 34 => decorations[operands[0]].set = operands[2],
                 else => {},
             },
-            // OpMemberDecorate; one read-only member marks the whole block.
             72 => if (operands[2] == 24) {
                 decorations[operands[0]].read_only = true;
             },
@@ -92,9 +89,7 @@ fn reflect(gpa: std.mem.Allocator, bytes: []const u8) ![]Resource {
             30 => types[operands[0]] = .structure,
             32 => types[operands[0]] = .{ .pointer = operands[2] },
             5341 => types[operands[0]] = .acceleration_structure,
-            // OpConstant
             43 => constants[operands[1]] = operands[2],
-            // OpVariable
             59 => try variables.append(gpa, .{ .id = operands[1], .pointer = operands[0], .storage = operands[2] }),
             else => {},
         }
@@ -121,7 +116,6 @@ fn reflect(gpa: std.mem.Allocator, bytes: []const u8) ![]Resource {
             .image => |storage| if (storage) .storage_texture else .sampled_texture,
             .sampler => .sampler,
             .acceleration_structure => .acceleration_structure,
-            // 12 is StorageBuffer; older SPIR-V marks a Uniform as BufferBlock.
             .structure => if (variable.storage == 12 or decorations[pointee].buffer_block)
                 (if (decorations[pointee].read_only or decoration.read_only) Kind.read_buffer else Kind.written_buffer)
             else
@@ -152,8 +146,6 @@ fn withoutSource(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
         const length = (first >> 16) * 4;
         if (length == 0 or at + length > bytes.len) return error.InvalidSpirv;
         switch (first & 0xffff) {
-            // OpSourceContinued, OpSource, OpSourceExtension, OpString,
-            // OpLine, OpNoLine, OpModuleProcessed.
             2, 3, 4, 7, 8, 317, 330 => {},
             else => try kept.appendSlice(gpa, bytes[at..][0..length]),
         }
@@ -266,7 +258,6 @@ pub fn main(init: std.process.Init) !void {
     var folder = try std.Io.Dir.cwd().openDir(init.io, directory, .{});
     defer folder.close(init.io);
     try folder.writeFile(init.io, .{ .sub_path = try std.fmt.allocPrint(gpa, "{s}_permutations.h", .{pass}), .data = text.written() });
-    // Variants this build does not make alias the plain one.
     for ([_][]const u8{ "wave64", "16bit", "wave64_16bit" }) |kind| {
         const alias = try std.fmt.allocPrint(gpa,
             \\// {s}_{s}_permutations.h.

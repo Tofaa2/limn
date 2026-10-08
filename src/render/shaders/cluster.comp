@@ -1,13 +1,10 @@
 #version 460
 #include "common.glsl"
 
-// Builds per-froxel light and decal lists: one invocation per cluster tests
-// each light's bounding sphere against the cluster's view-space box.
 layout(local_size_x = 64) in;
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
-    // View depth at the near edge of slice 0 and the ratio between slices.
     float z_near;
     float z_ratio;
 } push;
@@ -20,7 +17,6 @@ void main() {
 
     float z0 = push.z_near * pow(push.z_ratio, float(cell.z));
     float z1 = z0 * push.z_ratio;
-    // First slice extends to the camera, the last to infinity.
     if (cell.z == 0u) z0 = 0.0;
     if (cell.z == CLUSTERS_Z - 1u) z1 = 1e30;
     vec2 ndc0 = vec2(cell.xy) / vec2(CLUSTERS_X, CLUSTERS_Y) * 2.0 - 1.0;
@@ -43,7 +39,6 @@ void main() {
         if (depth + light.range < z0 || depth - light.range > z1) continue;
         float z = clamp(depth, max(z0, 1e-4), max(min(z1, depth + light.range), 1e-4));
         vec3 closest = vec3(clamp(center.x, slope_min.x * z, slope_max.x * z), clamp(center.y, slope_min.y * z, slope_max.y * z), -z);
-        // Conservative: the box grows with depth.
         float slack = light.range * max(max(abs(slope_min.x), abs(slope_max.x)), max(abs(slope_min.y), abs(slope_max.y)));
         vec3 delta = closest - center;
         if (dot(delta, delta) > (light.range + slack) * (light.range + slack)) continue;
@@ -52,7 +47,6 @@ void main() {
     }
     frame.clusters.data[index].count = count;
 
-    // Decals: same test on each box's bounding sphere.
     uint masks[CLUSTER_DECAL_WORDS];
     for (uint word = 0u; word < CLUSTER_DECAL_WORDS; word++) masks[word] = 0u;
     for (uint i = 0u; i < min(frame.decal_count, CLUSTER_DECAL_WORDS * 32u); i++) {

@@ -3,8 +3,6 @@
 #include "shading.glsl"
 #include "hair.glsl"
 
-// Shades a hair strand like other surfaces, with a camera-facing normal and
-// anisotropic highlights across the strand.
 layout(push_constant, scalar) uniform Push {
     HAIR_PUSH
 } push;
@@ -23,7 +21,6 @@ void main() {
     FrameConstants frame = push.frame;
     vec3 tangent = normalize(in_tangent);
     vec3 view = normalize(frame.camera_position - in_position);
-    // Normal: view direction projected off the tangent.
     vec3 facing = view - tangent * dot(view, tangent);
     float facing_length = length(facing);
     vec3 normal = facing_length > 1e-4 ? facing / facing_length : view;

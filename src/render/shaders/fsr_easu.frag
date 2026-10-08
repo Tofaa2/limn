@@ -1,14 +1,10 @@
 #version 460
 #include "common.glsl"
 
-// AMD FidelityFX Super Resolution 1 upscaling pass (EASU), from
-// src/third_party/ffx_fsr1. Input is HDR: each channel is compressed to 0..1
-// here and expanded again in fsr_rcas.frag.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;
     uint pad;
-    // Constants from `FsrEasuCon`.
     uvec4 con0;
     uvec4 con1;
     uvec4 con2;

@@ -2,10 +2,6 @@
 #define CUSTOM_MATERIAL
 #include "shade.glsl"
 
-// Example custom material: animated molten rock. The material's `params.x` scales the
-// pattern, `params.y` the glow, and each entity's own `params.x` cools it
-// (0 molten, 1 solid). Everything else (lighting, shadows, global
-// illumination, antialiasing) is the renderer's.
 float hash(vec3 p) {
     p = fract(p * 0.3183099 + 0.1);
     p *= 17.0;
@@ -36,7 +32,6 @@ float fbm(vec3 p) {
 void customMaterial(inout MaterialSurface surface, MaterialContext context, FrameConstants frame) {
     vec3 p = context.position * context.params.x;
     float flow = fbm(p + vec3(0.0, -context.time * 0.15, 0.0) + fbm(p * 0.5 + context.time * 0.05));
-    // Cracks glow where the pattern is low; crust elsewhere.
     float heat = smoothstep(0.44, 0.28, flow) * (1.0 - clamp(context.instance_params.x, 0.0, 1.0));
     surface.base_color = mix(vec3(0.05, 0.045, 0.04), vec3(0.3, 0.05, 0.01), heat);
     surface.roughness = mix(0.9, 0.35, heat);

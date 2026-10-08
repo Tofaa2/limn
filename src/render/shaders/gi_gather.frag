@@ -2,15 +2,12 @@
 #include "common.glsl"
 #include "gi.glsl"
 
-// Probe irradiance at reduced resolution, using the geometric normal
-// reconstructed from depth. The shading pass upsamples it by depth.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint depth_texture;
 } push;
 
 layout(location = 0) in vec2 in_uv;
-// rgb: irradiance, a: linear view depth.
 layout(location = 0) out vec4 out_gi;
 
 vec3 worldAt(FrameConstants frame, vec2 uv, out float depth) {
@@ -21,14 +18,12 @@ vec3 worldAt(FrameConstants frame, vec2 uv, out float depth) {
 void main() {
     FrameConstants frame = push.frame;
     float depth;
-    // Snap to a full-resolution texel centre.
     vec2 uv = (floor(in_uv * frame.resolution) + 0.5) * frame.inv_resolution;
     vec3 position = worldAt(frame, uv, depth);
     if (depth == 0.0) {
         out_gi = vec4(0.0, 0.0, 0.0, 1e9);
         return;
     }
-    // Per axis, use the neighbour closer in depth.
     float dl, dr, du, dd;
     vec3 left = worldAt(frame, uv - vec2(frame.inv_resolution.x, 0.0), dl);
     vec3 right = worldAt(frame, uv + vec2(frame.inv_resolution.x, 0.0), dr);

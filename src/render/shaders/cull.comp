@@ -2,10 +2,6 @@
 #include "common.glsl"
 #include "cull_view.glsl"
 
-// Culls (instance, meshlet) pairs against one view and appends a draw per
-// survivor. Bucket 0: opaque single-sided; bucket 1: alpha-tested or two-sided.
-// Two-phase occlusion: early draws last frame's visible set, late tests the
-// rest against the depth pyramid and records visibility.
 layout(local_size_x = 64) in;
 
 struct DrawCommand {
@@ -18,7 +14,6 @@ struct DrawCommand {
 
 layout(buffer_reference, scalar) writeonly buffer DrawCommands { DrawCommand data[]; };
 layout(buffer_reference, scalar) writeonly buffer DrawLists { uint data[]; };
-// Mesh shader draw arguments per list (`gpu.MeshDraw`).
 struct MeshDraw {
     uint x;
     uint y;
@@ -26,16 +21,11 @@ struct MeshDraw {
     uint pad;
 };
 layout(buffer_reference, scalar) buffer MeshDraws { MeshDraw data[2]; };
-// Must match visibility.task.
 const uint meshlets_per_task = 32u;
 layout(buffer_reference, scalar) buffer DrawCounts { uint data[]; };
 layout(buffer_reference, scalar) buffer Visibility { uint data[]; };
-// Per-meshlet bounds of skinned meshes (center, radius); see skin_bounds.comp.
 layout(buffer_reference, scalar) readonly buffer MeshletBounds { vec4 data[]; };
-// Per-instance seen flag for texture streaming, followed by one word counting
-// the flags set.
 layout(buffer_reference, scalar) buffer InstanceSeen { uint data[]; };
-// Indices of instance-group pairs to test.
 layout(buffer_reference, scalar) readonly buffer Candidates { uint data[]; };
 
 layout(push_constant, scalar) uniform Push {
@@ -49,27 +39,18 @@ layout(push_constant, scalar) uniform Push {
     uint phase;
     uint hiz_texture;
     vec2 hiz_size;
-    // Always a valid buffer.
     MeshletBounds skin_bounds;
-    // Always a valid buffer; written only with `mark_seen`.
     InstanceSeen seen;
     uint mark_seen;
-    // Entity pairs and entity instances come first: counts of each.
     uint entity_refs;
-    // Listed pairs and their count.
     Candidates candidates;
     CullDispatch dispatch;
     InstanceVisibility instance_visibility;
     uint entity_instances;
-    // Capacity of bucket 1; bucket 0 has `bucket_capacity`.
     uint masked_capacity;
-    // Instance count: index of the counter in `seen`.
     uint seen_total;
-    // Nonzero with mesh shaders: survivors are written as bare references (4
-    // bytes) and `mesh_draws` receives the task group counts.
     uint mesh_lists;
     MeshDraws mesh_draws;
-    // `commands` viewed as a reference list.
     DrawLists lists;
 } push;
 
@@ -80,8 +61,6 @@ void markSeen(uint instance) {
 
 #include "cull_occlusion.glsl"
 
-// Shadow views: true when the caster's bounds swept along the light miss every
-// visible receiver.
 bool shadowUnseen(vec3 center, float radius) {
     radius += push.view.receiver_margin;
     vec3 travel = push.view.light_travel;
@@ -127,22 +106,18 @@ void main() {
     bool skinned = (instance.flags & INSTANCE_SKINNED) != 0u;
     bool blended = (material.flags & MATERIAL_BLEND) != 0u;
     if (blended && push.view.blended_casters == 0u) {
-        // Drawn by the transparent pass, which does not cull.
         markSeen(ref.instance);
         return;
     }
 
     bool fading = false;
-    // LOD: exactly one level passes (two inside the cross-fade band).
     if (push.view.lod_scale > 0.0) {
         float scale = max(length(instance.transform[0].xyz), max(length(instance.transform[1].xyz), length(instance.transform[2].xyz)));
         vec3 mesh_center = skinned ? instance.bounding_sphere.xyz : (instance.transform * vec4(mesh.center, 1.0)).xyz;
         float mesh_radius = skinned ? instance.bounding_sphere.w : mesh.radius * scale;
         float distance_to_mesh = max(distance(push.view.lod_camera, mesh_center) - mesh_radius, push.view.near);
-        // Errors below 1 after scaling are under the pixel threshold.
         float to_threshold = scale * push.view.lod_scale / distance_to_mesh;
         float band = max(push.view.lod_band, 1.0);
-        // With only the coarse part loaded, errors are floored at its error.
         float floor_error = instance.coarse_error;
         float own_error = max(meshlet.lod_error, floor_error);
         float parent_error = max(meshlet.parent_error, floor_error);
@@ -155,13 +130,11 @@ void main() {
             coarser = lodProjected(parent_error, meshlet.parent_sphere, instance.transform, scale, push.view.lod_camera, push.view.lod_scale, push.view.near);
         }
         if ((own > band && !at_floor) || coarser <= 1.0) return;
-        // Cross-fading levels go to the alpha-tested bucket.
         fading = band > 1.0 && ((own > 1.0 && !at_floor) || coarser < band);
     } else if (instance.coarse_error > 0.0 ? max(meshlet.parent_error, instance.coarse_error) <= instance.coarse_error || meshlet.lod_error > instance.coarse_error : meshlet.lod_error > 0.0) {
         return;
     }
     bool was_visible = push.phase != PHASE_SINGLE && push.visibility.data[ref_index] != 0u;
-    // Instances culled last frame drew nothing early.
     if (was_visible && push.phase == PHASE_LATE && ref.instance >= push.entity_instances)
         was_visible = (push.instance_visibility.data[ref.instance - push.entity_instances] & 2u) != 0u;
     if (push.phase == PHASE_EARLY && !was_visible) return;
@@ -185,7 +158,6 @@ void main() {
 
     bool visible = true;
     if (push.view.min_radius > 0.0) {
-        // Size cull by the whole object, not the meshlet.
         float whole = skinned ? instance.bounding_sphere.w : mesh.radius * max(length(instance.transform[0].xyz), max(length(instance.transform[1].xyz), length(instance.transform[2].xyz)));
         visible = whole >= push.view.min_radius;
     }

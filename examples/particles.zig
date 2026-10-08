@@ -30,7 +30,6 @@ var effects = [_]Effect{
         .name = "campfire",
         .label = .{ -4, 2.0, 0 },
         .emitters = &.{
-            // Flames: bright, short-lived, rising, additive.
             .{
                 .position = fire_position,
                 .radius = 0.22,
@@ -46,7 +45,6 @@ var effects = [_]Effect{
                 .blend = .additive,
                 .lit = false,
             },
-            // Embers: thrown wide, pulled back down.
             .{
                 .position = fire_position,
                 .radius = 0.1,
@@ -60,7 +58,6 @@ var effects = [_]Effect{
                 .size = .{ 0.035, 0.01 },
                 .color_start = .{ 12, 6, 1.5, 1 },
                 .color_end = .{ 6, 1, 0.1, 0 },
-                // Each ember draws a short glowing arc behind it.
                 .trail = 10,
                 .trail_seconds = 0.35,
                 .blend = .additive,
@@ -72,12 +69,10 @@ var effects = [_]Effect{
     .{
         .name = "smoke",
         .label = .{ -1.5, 3.4, -2.5 },
-        // Lit: it takes the sun, its shadows and the ambient light.
         .emitters = &.{.{
             .position = smoke_position,
             .radius = 0.2,
             .capacity = 512,
-            // Overlapping puffs layer correctly only drawn farthest first.
             .sorted = true,
             .rate = 40,
             .lifetime = .{ 4, 6 },
@@ -104,14 +99,11 @@ var effects = [_]Effect{
             .gravity = .{ 0, -9.8, 0 },
             .drag = 0.05,
             .size = .{ 0.05, 0.03 },
-            // Droplets streak along their fall and splash off the basin.
             .collide = true,
             .bounce = 0.3,
             .stretch = 0.02,
             .color_start = .{ 0.9, 1.6, 3.0, 0.9 },
             .color_end = .{ 0.4, 0.8, 2.0, 0.2 },
-            // Five color keys over a droplet's life: bright at the jet, deep
-            // blue at the top, foam white as it lands. Four size keys.
             .color_curve = .init(&.{ .{ 1.4, 2.0, 3.2, 0.9 }, .{ 0.25, 0.6, 3.0, 0.9 }, .{ 0.3, 1.4, 2.6, 0.8 }, .{ 2.2, 2.6, 2.8, 0.7 }, .{ 0.4, 0.8, 2.0, 0.0 } }),
             .size_curve = .init(&.{ 0.05, 0.03, 0.045, 0.03 }),
             .blend = .additive,
@@ -122,7 +114,6 @@ var effects = [_]Effect{
     .{
         .name = "snow",
         .label = .{ 0, 4.6, 3 },
-        // One large, slow emitter high above the whole stage.
         .emitters = &.{.{
             .position = .{ 0, 7, 0 },
             .radius = 8,
@@ -135,9 +126,7 @@ var effects = [_]Effect{
             .gravity = .{ 0.05, -0.15, 0.02 },
             .drag = 0.4,
             .size = .{ 0.035, 0.035 },
-            // The air is already full of snow when the scene opens.
             .prewarm = 6,
-            // Flakes stop where they land.
             .collide = true,
             .bounce = 0,
             .color_start = .{ 1, 1, 1, 0.9 },
@@ -148,7 +137,6 @@ var effects = [_]Effect{
     .{
         .name = "orbiting spark",
         .label = .{ 4.5, 3.2, -1 },
-        // The emitter itself moves every frame; see `orbPosition`.
         .emitters = &.{.{
             .position = orb_center,
             .radius = 0.05,
@@ -160,7 +148,6 @@ var effects = [_]Effect{
             .drag = 1.5,
             .size = .{ 0.12, 0.01 },
             .color_start = .{ 3.0, 0.8, 5.0, 1 },
-            // A third key: the trail flares yellow and swells partway along.
             .color_mid = .{ 6.0, 5.0, 0.6, 1 },
             .size_mid = 0.3,
             .mid = 0.35,
@@ -172,11 +159,8 @@ var effects = [_]Effect{
     .{
         .name = "debris",
         .label = .{ -2.5, 3.2, 3.0 },
-        // Each particle is a small tumbling block rather than a sprite; the
-        // mesh is filled in once the model exists (see `debris_effect`).
         .emitters = &.{.{
             .position = .{ -2.5, 0.2, 3.0 },
-            // Each block leaves a streak of dust along its arc.
             .trail = 12,
             .trail_seconds = 0.5,
             .radius = 0.15,
@@ -190,7 +174,6 @@ var effects = [_]Effect{
             .collide = true,
             .bounce = 0.45,
             .spin = 7,
-            // Hot when thrown, cooling to stone, shrinking away at the end.
             .color_curve = .init(&.{ .{ 6.0, 2.0, 0.4, 1 }, .{ 1.2, 0.7, 0.45, 1 }, .{ 0.6, 0.56, 0.52, 1 }, .{ 0.6, 0.56, 0.52, 1 } }),
             .size_curve = .init(&.{ 0.16, 0.16, 0.16, 0.14, 0.0 }),
         }},
@@ -243,7 +226,6 @@ pub fn main(init: std.process.Init) !void {
     const renderer = try gfx.Renderer.init(init.gpa, init.io, .{
         .application_name = "particles",
         .pipeline_cache_path = "zig-out/pipeline.cache",
-        // The offscreen mode doubles as a self-check.
         .validation = offscreen,
         .surface = if (window) |value| try value.surface(false) else null,
     });
@@ -251,8 +233,6 @@ pub fn main(init: std.process.Init) !void {
     const target: ?gfx.rhi.Texture = if (offscreen) try renderer.createTarget(1280, 720) else null;
     defer if (target) |texture| renderer.destroyTarget(texture);
 
-    // The stage: a floor, a fire pit, a fountain basin and two pillars for
-    // the smoke and snow to pass behind.
     var positions: [5][24][3]f32 = undefined;
     var indices: [5][36]u32 = undefined;
     boxMesh(.{ 12, 0.1, 12 }, &positions[0], &indices[0]);
@@ -271,13 +251,11 @@ pub fn main(init: std.process.Init) !void {
         }});
         _ = try renderer.spawn(scene, .{ .model = model, .transform = math.translation(placements[index]) });
     }
-    // A block one unit across for the debris; it is never spawned itself.
     var shard_positions: [24][3]f32 = undefined;
     var shard_indices: [36]u32 = undefined;
     boxMesh(.{ 0.5, 0.3, 0.4 }, &shard_positions, &shard_indices);
     const shard = try renderer.createModel(&.{.{ .positions = &shard_positions, .indices = &shard_indices, .material = .{} }});
     try renderer.waitUntilLoaded();
-    // Moonlight from the side, so lit particles show a bright and a dark side.
     renderer.setSun(scene, .{ .direction = .{ -0.55, -0.6, -0.45 }, .color = .{ 0.75, 0.82, 1.0 }, .intensity = 2.5 });
 
     for (&effects) |*effect| {
@@ -325,8 +303,6 @@ pub fn main(init: std.process.Init) !void {
         if (auto_orbit) orbit += dt * 0.12;
         time += dt;
 
-        // Emitters are plain data: switching one off is a rate of zero (the
-        // particles in the air finish), and moving one is a new position.
         for (&effects, 0..) |*effect, effect_index| {
             for (effect.emitters, 0..) |base, index| {
                 var desc = base;
@@ -336,7 +312,6 @@ pub fn main(init: std.process.Init) !void {
                 renderer.setEmitter(effect.handles[index], desc);
             }
         }
-        // The fire lights its surroundings, flickering a little.
         const flicker = 0.85 + 0.15 * @sin(time * 17) * @sin(time * 7.3);
         try renderer.setLights(scene, if (effects[0].on) &.{.{
             .position = math.add(fire_position, .{ 0, 0.6, 0 }),
@@ -370,7 +345,6 @@ pub fn main(init: std.process.Init) !void {
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.6, -0.5 }),
                 .draw_lists = &.{&list},
                 .target = if (target) |texture| .{ .texture = texture } else .backbuffer,
-                // A night scene: without this the meter would brighten it to grey.
                 .settings = .{ .shadow_distance = 40, .bloom = 0.06, .exposure_compensation = -1.6 },
             }},
             .delta_time = dt,

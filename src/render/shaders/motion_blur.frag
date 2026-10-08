@@ -1,17 +1,13 @@
 #version 460
 #include "common.glsl"
 
-// Motion blur along each pixel's motion vector.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint color_texture;
     uint motion_texture;
-    // Shutter-open fraction of the frame.
     float shutter;
-    // Maximum blur length, as a fraction of the screen.
     float max_length;
     int tap_count;
-    // 1 lets fast neighbours blur over this pixel.
     uint spread;
 } push;
 
@@ -55,8 +51,6 @@ void main() {
         vec2 uv = in_uv - motion * t;
         float weight = 1.0;
         if (push.spread != 0u) {
-            // A tap counts if its motion reaches this pixel or this pixel's
-            // reaches it.
             float distance_pixels = length(motion * t * pixels);
             float tap_reach = length(textureLod(TEX(push.motion_texture, nearest), uv, 0.0).rg * push.shutter * pixels) * 0.5;
             weight = clamp(max(tap_reach, own_reach) - distance_pixels + 1.0, 0.0, 1.0);

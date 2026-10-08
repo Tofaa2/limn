@@ -3,8 +3,6 @@
 #include "gi.glsl"
 #include "media.glsl"
 
-// Half-resolution volumetric fog: ray-marches camera to surface with shadowed
-// sun and ambient light. Output: in-scattering in rgb, transmittance in a.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint depth_texture;
@@ -18,7 +16,6 @@ layout(push_constant, scalar) uniform Push {
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_fog;
-
 
 void main() {
     FrameConstants frame = push.frame;
@@ -54,7 +51,6 @@ void main() {
             }
         }
         vec3 light = sun * sunVisibility(frame, position) + ambient;
-        // Analytic integration of in-scattering over the step (Hillaire).
         float step_transmittance = exp(-sigma * step_length);
         scattered += transmittance * light * (1.0 - step_transmittance);
         transmittance *= step_transmittance;

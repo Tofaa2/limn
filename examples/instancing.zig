@@ -42,7 +42,6 @@ pub fn main(init: std.process.Init) !void {
     var stage = try Stage.create(init, "Limn instancing", .{});
     const renderer = stage.renderer;
     const scene = try renderer.createScene();
-    // A computed sky and the sun that goes with it; T moves the time of day.
     var sun_height: f32 = 0.55;
     var sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -@sin(sun_height), -0.45 } };
     renderer.setSun(scene, gfx.skySun(sky_desc));
@@ -54,7 +53,6 @@ pub fn main(init: std.process.Init) !void {
     boxMesh(.{ field * 0.6, 0.1, field * 0.6 }, &positions[0], &indices[0]);
     boxMesh(.{ 0.07, 0.5, 0.07 }, &positions[1], &indices[1]);
     boxMesh(.{ 0.32, 0.42, 0.32 }, &positions[2], &indices[2]);
-    // Lift the trunk and the crown so the tree's origin is at its foot.
     for (&positions[1]) |*p| p[1] += 0.5;
     for (&positions[2]) |*p| p[1] += 1.3;
     const ground = try renderer.createModel(&.{.{
@@ -112,15 +110,12 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_D)) orbit += tick.dt * 0.8;
         orbit += tick.dt * 0.05;
         if (stage.keyDown(glfw.GLFW_KEY_T)) {
-            // Hold T: the sun travels down to the horizon and back.
             sun_height = @mod(sun_height + tick.dt * 0.25, std.math.pi);
             sky_desc.sun_direction = .{ -0.5 * @cos(sun_height), -@max(@sin(sun_height), -0.05), -0.45 };
             renderer.setSky(environment, sky_desc);
             renderer.setSun(scene, gfx.skySun(sky_desc));
         }
 
-        // A group only costs CPU time when it is told to change. Swaying
-        // rewrites all of them every frame to show what that costs.
         if (changed or sway) {
             for (trees[0..count], transforms[0..count]) |item, *out| {
                 const lean = if (sway) @sin(tick.time * 1.6 + item.position[0] * 0.25 + item.position[2] * 0.18) * 0.12 else 0;
@@ -152,7 +147,6 @@ pub fn main(init: std.process.Init) !void {
         try list.text(font, if (sway) "on" else "off", .{ 300, 66 }, .{ .size = 14, .color = if (sway) gfx.Color.hex(0x3ddc97) else gfx.Color.hex(0x7c8499) });
         try list.text(font, if (picked) |copy| try std.fmt.bufPrint(&pick_buffer, "aiming at tree #{d}", .{copy}) else "aiming at no tree", .{ 24, 86 }, .{ .size = 14 });
         try list.text(font, "Up/Down count · R scatter · A/D orbit · hold T time of day", .{ 24, 106 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
-        // A mark at the middle of the screen, where the pick is taken.
         const center = [2]f32{ @floatFromInt(tick.size[0] / 2), @floatFromInt(tick.size[1] / 2) };
         try list.circle(center, 3, gfx.Color.rgba(255, 255, 255, 200));
 

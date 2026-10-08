@@ -5,12 +5,8 @@
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint instance_index;
-    // 0: ordered blend. 1: weighted order-independent. 2: depth peel layer.
     uint mode;
-    // Opaque scene color for refraction, or INVALID_ID.
     uint scene_texture;
-    // Peeling: opaque depth and the previous layer's depth (INVALID_ID for the
-    // first).
     uint opaque_depth;
     uint peel_depth;
 } push;
@@ -24,18 +20,15 @@ layout(location = 5) in vec4 in_previous_clip;
 layout(location = 6) in vec4 in_vertex_color;
 layout(location = 7) in vec2 in_uv1;
 
-// Premultiplied alpha.
 layout(location = 0) out vec4 out_color;
-// Screen motion, weighted by coverage.
 layout(location = 1) out vec4 out_motion;
-// Weighted mode only: revealage.
+#ifdef WEIGHTED
 layout(location = 2) out float out_reveal;
+#endif
 
 void main() {
     FrameConstants frame = push.frame;
     if (push.mode == 2u) {
-        // Keep fragments in front of the opaque scene and strictly behind the
-        // previous layer (reverse-Z).
         ivec2 at = ivec2(gl_FragCoord.xy);
         if (gl_FragCoord.z < texelFetch(TEX(push.opaque_depth, frame.sampler_nearest_clamp), at, 0).r) discard;
         if (push.peel_depth != INVALID_ID && gl_FragCoord.z >= texelFetch(TEX(push.peel_depth, frame.sampler_nearest_clamp), at, 0).r) discard;
@@ -53,8 +46,11 @@ void main() {
     base_color *= in_vertex_color;
     float roughness = material.roughness;
     float metallic = material.metallic;
-    if (material.metallic_roughness_texture != INVALID_ID) {
-        vec4 mr = texture(TEX(material.metallic_roughness_texture, s), UV_OF(2));
+    vec4 mr = vec4(1.0);
+    if (material.metallic_roughness_texture != INVALID_ID) mr = texture(TEX(material.metallic_roughness_texture, s), UV_OF(2));
+    if ((material.flags & MATERIAL_SPECULAR_GLOSSINESS) != 0u) {
+        specularGlossiness(material, mr, base_color.rgb, roughness, metallic);
+    } else {
         roughness *= mr.g;
         metallic *= mr.b;
     }
@@ -104,7 +100,6 @@ void main() {
         if (decal.image != INVALID_ID) tint *= texture(TEX(decal.image, frame.sampler_linear_clamp), vec2(local.x + 0.5, 0.5 - local.y));
         weight *= tint.a;
         base_color.rgb = mix(base_color.rgb, tint.rgb, weight);
-        // Decals are opaque.
         base_color.a = mix(base_color.a, 1.0, weight);
         emissive += tint.rgb * (decal.emissive * weight);
         if (decal.roughness >= 0.0) roughness = mix(roughness, clamp(decal.roughness, 0.045, 1.0), weight);
@@ -135,7 +130,6 @@ void main() {
         surface.anisotropy = material.anisotropy;
     }
 
-    // Opacity scales diffuse only; specular stays at full strength.
     Surface specular_only = surface;
     specular_only.diffuse_color = vec3(0.0);
     float noise = interleavedGradientNoise(gl_FragCoord.xy, frame.frame_index);
@@ -167,7 +161,6 @@ void main() {
         coverage += through;
     }
     if (frame.aerial != 0.0 && (frame.flags & FRAME_ENVIRONMENT) != 0u) {
-        // Aerial perspective on the covered share of the pixel.
         vec3 air_through;
         vec3 air;
         aerialHaze(frame, surface.view, length(in_position - frame.camera_position), air_through, air);
@@ -175,12 +168,12 @@ void main() {
     }
     out_motion = vec4((in_clip.xy / in_clip.w - in_previous_clip.xy / in_previous_clip.w) * 0.5, 0.0, coverage);
     if (push.mode == 1u) {
-        // Weighted blended OIT (McGuire and Bavoil 2013).
         float weight = clamp(pow(min(1.0, coverage * 10.0) + 0.01, 3.0) * 1e8 * pow(gl_FragCoord.z * 0.9 + 0.1, 3.0), 1e-2, 3e3);
         out_color = vec4(color, coverage) * weight;
+#ifdef WEIGHTED
         out_reveal = coverage;
+#endif
         return;
     }
     out_color = vec4(color, coverage);
-    out_reveal = 0.0;
 }

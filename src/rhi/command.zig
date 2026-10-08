@@ -75,7 +75,6 @@ pub const CommandEncoder = struct {
             .compute_shader_bit = true,
             .draw_indirect_bit = true,
             .vertex_input_bit = true,
-            // Acceleration-structure builds read buffers at their own stage.
             .acceleration_structure_build_bit_khr = self.device.ray_tracing,
         };
         const shader_access = vk.AccessFlags2{
@@ -367,7 +366,6 @@ pub const CommandEncoder = struct {
             },
             .mips => |texture| self.generateMips(texture),
             .copy => |copy| {
-                // Earlier uploads into the source must land before it is read.
                 self.sync(.transfer_to_all);
                 self.copyBuffer(copy.source, copy.destination, 0, 0, copy.size);
                 device.destroyBuffer(copy.source);

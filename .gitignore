@@ -5,3 +5,4 @@ zig-pkg/
 *.o
 /world.png
 examples/assets/hair/
+examples/assets/bistro/

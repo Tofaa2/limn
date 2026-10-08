@@ -2,9 +2,6 @@
 #include "common.glsl"
 #include "volume.glsl"
 
-// Fills the cloud noise volume: tiling Perlin-Worley in r, three scales of
-// tiling Worley in gba (Schneider, "The Real-time Volumetric Cloudscapes of
-// Horizon Zero Dawn").
 layout(push_constant, scalar) uniform Push {
     ivec3 size;
     int tiles_x;
@@ -22,7 +19,6 @@ vec3 hash3(ivec3 cell, int period) {
     return vec3(v) * (1.0 / 4294967296.0);
 }
 
-// 1 at a feature point, falling to 0 a cell away.
 float worley(vec3 uvw, int period) {
     vec3 p = uvw * float(period);
     ivec3 cell = ivec3(floor(p));

@@ -3,18 +3,14 @@
 #include "environment.glsl"
 #include "clouds.glsl"
 
-// Fills one sky cube face from an equirectangular panorama or a cube map,
-// optionally with the cloud layer on top.
 layout(push_constant, scalar) uniform Push {
     uint source_texture;
     uint sampler_index;
     uint face;
     float max_radiance;
     uint from_cube;
-    // Sun direction and its radiance at the ground, for the clouds.
     vec3 to_sun;
     vec3 sunlight;
-    // Density 0 for none. `depth_texture` holds a linear sampler here.
     CloudData clouds;
 } push;
 

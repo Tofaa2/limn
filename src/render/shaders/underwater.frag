@@ -3,8 +3,6 @@
 #include "shading.glsl"
 #include "water.glsl"
 
-// Underwater view: absorption by distance through the water, and caustics on
-// submerged surfaces.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     WaterRef water;

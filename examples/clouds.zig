@@ -26,9 +26,6 @@ pub fn main(init: std.process.Init) !void {
     const environment = try renderer.createSky(sky_desc);
     renderer.setEnvironment(scene, environment, 1);
 
-    // Land for the sky to stand over: rolling hills that rise to a ridge
-    // of mountains, colored by height and slope, with firs on the slopes
-    // near the camera to give it scale.
     const cells = 360;
     const extent = 9000.0;
     const land_positions = try init.gpa.alloc([3]f32, (cells + 1) * (cells + 1));
@@ -48,7 +45,6 @@ pub fn main(init: std.process.Init) !void {
         const slope = 1 - normal[1];
         const patch = 0.5 + 0.5 * @sin(x * 0.011 + @sin(z * 0.007) * 2.0) * @cos(z * 0.009);
         var color = math.Vec3{ 0.10 + 0.05 * patch, 0.19 + 0.06 * patch, 0.06 };
-        // Bare rock where it is steep, snow where it is high.
         color = math.lerp(color, .{ 0.27, 0.25, 0.23 }, std.math.clamp(slope * 5 - 0.6, 0, 1));
         color = math.lerp(color, .{ 0.85, 0.87, 0.9 }, std.math.clamp((height - 520 + 160 * slope) / 120, 0, 1));
         const index = row * (cells + 1) + column;
@@ -63,7 +59,6 @@ pub fn main(init: std.process.Init) !void {
     const land = try renderer.createModel(&.{.{ .positions = land_positions, .normals = land_normals, .colors = land_colors, .indices = land_indices, .material = .{ .metallic = 0, .roughness = 0.95 } }});
     _ = try renderer.spawn(scene, .{ .model = land });
 
-    // A fir: a trunk and three skirts, each a ring of triangles to a point.
     var fir_positions: [4 * 9][3]f32 = undefined;
     var fir_normals: [4 * 9][3]f32 = undefined;
     var fir_colors: [4 * 9][4]f32 = undefined;
@@ -93,7 +88,6 @@ pub fn main(init: std.process.Init) !void {
         const x = (rng.float(f32) - 0.5) * 3600;
         const z = 200 - rng.float(f32) * 3200;
         const height = landHeight(x, z);
-        // In stands, below the tree line, and not where the camera is.
         const stand = @sin(x * 0.013 + 1.0) * @cos(z * 0.011) + 0.4 * @sin(x * 0.041 + z * 0.037);
         if (stand < 0.15 or height > 430 or (@abs(x) < 40 and @abs(z - 60) < 60)) continue;
         const size = 9 + rng.float(f32) * 9;
@@ -103,22 +97,17 @@ pub fn main(init: std.process.Init) !void {
     _ = try renderer.createInstances(scene, fir, firs);
     try renderer.waitUntilLoaded();
 
-    // A veil of high cloud over the main layer.
     var clouds = gfx.CloudDesc{ .cirrus = 0.35, .coverage = 0.42, .density = 0.03, .thickness = 2200, .variation = 0.9, .detail = 0.5 };
-    // A little haze, so the mountains fade toward the sky.
     var settings = gfx.Settings{ .shadow_distance = 900, .global_illumination = false, .aerial_perspective = 0.0006 };
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
     const font = renderer.defaultFont();
     var altitude: f32 = 30;
-    // `--altitude N` and `--sun N` (radians above the horizon) set the start.
     var arguments = try init.minimal.args.iterateAllocator(init.gpa);
     defer arguments.deinit();
     while (arguments.next()) |argument| {
         if (std.mem.eql(u8, argument, "--altitude")) altitude = try std.fmt.parseFloat(f32, arguments.next() orelse "30");
         if (std.mem.eql(u8, argument, "--sun")) sun_height = try std.fmt.parseFloat(f32, arguments.next() orelse "0.75");
-        // `--clear 1`: no clouds at all, to look at the sky by itself.
-        // `--pane 1`: a sheet of red glass above the plain, with tinted shadows on.
         if (std.mem.eql(u8, argument, "--pane")) {
             const corners = [_][3]f32{ .{ -30, 0, -20 }, .{ 30, 0, -20 }, .{ 30, 0, 20 }, .{ -30, 0, 20 } };
             const pane = try renderer.createModel(&.{.{
@@ -133,8 +122,6 @@ pub fn main(init: std.process.Init) !void {
             clouds.coverage = 0;
             clouds.cirrus = 0;
         }
-        // `--storm 1`: a tall layer with storm cells that tower and spread,
-        // and lightning in them.
         if (std.mem.eql(u8, argument, "--storm")) {
             clouds.thickness = 5000;
             clouds.coverage = 0.55;
@@ -143,7 +130,6 @@ pub fn main(init: std.process.Init) !void {
             clouds.lightning = 40;
             clouds.cirrus = 0;
         }
-        // `--night 1`: the sun is down, with stars and a moon ahead.
         if (std.mem.eql(u8, argument, "--night")) {
             sun_height = -0.3;
             sky_desc.stars = 1;

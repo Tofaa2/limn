@@ -8,9 +8,6 @@
 #include "rt.glsl"
 #endif
 
-// Screen-space reflections: marches the reflection ray through the depth buffer
-// and outputs the hit color with a confidence; zero confidence falls back to
-// the sky.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint depth_texture;
@@ -21,11 +18,9 @@ layout(push_constant, scalar) uniform Push {
     float thickness;
     float max_distance;
     int step_count;
-    // Last frame's result, or INVALID_ID.
     uint history_texture;
     float history_blend;
 #ifdef RAY_TRACED
-    // TLAS: rays are traced where the screen has no answer.
     uint64_t tlas;
 #endif
 } push;
@@ -52,7 +47,6 @@ void main() {
     vec3 origin = position + normal * (0.01 + view_depth * 0.004);
     float reach = min(push.max_distance, view_depth * 6.0 + 2.0);
 
-    // Fixed jitter: a temporal pattern makes thin reflections sparkle.
     float jitter = interleavedGradientNoise(gl_FragCoord.xy, 0u);
     float previous_t = 0.0;
     float hit_t = -1.0;
@@ -73,8 +67,6 @@ void main() {
     }
     vec4 result = vec4(0.0);
     if (hit_t >= 0.0) {
-
-    // Binary search refinement.
     float low = previous_t;
     float high = hit_t;
     for (int i = 0; i < 5; i++) {
@@ -88,7 +80,6 @@ void main() {
     vec2 hit_uv = clip.xy / clip.w * 0.5 + 0.5;
     float scene = linearDepth(textureLod(TEX(push.depth_texture, nearest), hit_uv, 0.0).r, frame.near);
     if (abs(clip.w - scene) <= push.thickness) {
-
     vec2 border = min(hit_uv, 1.0 - hit_uv);
     float confidence = smoothstep(0.0, 0.08, min(border.x, border.y));
     confidence *= 1.0 - smoothstep(push.max_roughness * 0.6, push.max_roughness, roughness);
@@ -115,12 +106,14 @@ void main() {
         }
     }
 #endif
+    float own = luminance(textureLod(TEX(push.color_texture, frame.sampler_linear_clamp), in_uv, 0.0).rgb);
+    float ceiling = (own + 0.02) * mix(256.0, 3.0, smoothstep(0.08, 0.35, roughness));
+    result.rgb *= min(1.0, ceiling / max(luminance(result.rgb), 1e-6));
     if (push.history_texture != INVALID_ID) {
         vec4 previous = frame.prev_view_proj_unjittered * vec4(position, 1.0);
         vec2 previous_uv = previous.xy / previous.w * 0.5 + 0.5;
         if (previous.w > 0.0 && all(greaterThanEqual(previous_uv, vec2(0.0))) && all(lessThanEqual(previous_uv, vec2(1.0)))) {
             vec4 history = textureLod(TEX(push.history_texture, frame.sampler_linear_clamp), previous_uv, 0.0);
-            // Premultiplied by confidence.
             vec4 blended = mix(vec4(history.rgb * history.a, history.a), vec4(result.rgb * result.a, result.a), push.history_blend);
             result = vec4(blended.a > 1e-4 ? blended.rgb / blended.a : vec3(0.0), blended.a);
         }

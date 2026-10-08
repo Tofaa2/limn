@@ -34,9 +34,6 @@ pub fn main(init: std.process.Init) !void {
     renderer.setEnvironment(scene, sky, 1);
     renderer.setSun(scene, gfx.skySun(sky_desc));
 
-    // The floor: two kinds of polished tile, each placed as one instance
-    // group. Polished means low roughness; that is all a mirror-like
-    // surface needs.
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ tile * 0.5, 0.05, tile * 0.5 }, &box_positions, &box_indices);
@@ -71,9 +68,6 @@ pub fn main(init: std.process.Init) !void {
     _ = try renderer.createInstances(scene, dark_tile, dark[0..dark_count]);
     _ = try renderer.createInstances(scene, light_tile, light[0..light_count]);
 
-    // Spheres. Front row: the same grey from roughness 0.03 to 0.6. Back
-    // row: gold and copper metal, and red paint with and without a clear
-    // coat.
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_indices: [helpers.sphere_index_count]u32 = undefined;
@@ -108,7 +102,6 @@ pub fn main(init: std.process.Init) !void {
         _ = try renderer.spawn(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - 2) * 2.0, 0.6, -1.6 }) });
     }
 
-    // Glowing blocks that circle the stage; watch them in the floor.
     helpers.boxMesh(.{ 0.25, 0.9, 0.25 }, &box_positions, &box_indices);
     const glow_colors = [_][3]f32{ .{ 6, 0.6, 0.3 }, .{ 0.3, 5, 1.2 }, .{ 0.5, 1.2, 7 }, .{ 6, 4, 0.4 } };
     var glow: [glow_colors.len]gfx.Entity = undefined;
@@ -122,8 +115,6 @@ pub fn main(init: std.process.Init) !void {
     }
     try renderer.waitUntilLoaded();
 
-    // Lights with a size, a projected image and an angular profile.
-    // The cookie is a window frame drawn here; `loadImage` works too.
     var cookie_pixels: [64 * 64 * 4]u8 = undefined;
     for (0..64) |y| for (0..64) |x| {
         const bar = x % 21 < 3 or y % 21 < 3;
@@ -131,7 +122,6 @@ pub fn main(init: std.process.Init) !void {
         cookie_pixels[(y * 64 + x) * 4 ..][0..4].* = .{ level, level, level, 255 };
     };
     const cookie = try renderer.createImage(64, 64, &cookie_pixels, false);
-    // Bright in a ring around the axis, dim along it: a lampshade.
     const profile = try renderer.createLightProfile(&.{ 0.25, 0.4, 1.0, 0.7, 0.15, 0.0, 0.0 });
     var lights_on = true;
 
@@ -139,7 +129,6 @@ pub fn main(init: std.process.Init) !void {
     defer list.deinit();
     const font = renderer.defaultFont();
     var settings = gfx.Settings{ .shadow_distance = 40, .bloom = 0.06, .dof_focus_distance = 9 };
-    // `--half 1` starts with the reflections traced at half resolution.
     {
         var arguments = try init.minimal.args.iterateAllocator(init.gpa);
         defer arguments.deinit();
@@ -161,7 +150,6 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_DOWN)) settings.reflection_max_roughness = @max(settings.reflection_max_roughness - 0.1, 0.1);
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE)) moving = !moving;
         if (stage.keyPressed(glfw.GLFW_KEY_L)) lights_on = !lights_on;
-        // Depth of field focused on the front row; motion blur at a film shutter.
         if (stage.keyPressed(glfw.GLFW_KEY_O)) settings.dof_aperture = if (settings.dof_aperture > 0) 0 else 0.8;
         if (stage.keyPressed(glfw.GLFW_KEY_M)) settings.motion_blur = if (settings.motion_blur > 0) 0 else 0.5;
         if (stage.keyDown(glfw.GLFW_KEY_A)) orbit -= tick.dt * 0.8;
@@ -183,14 +171,9 @@ pub fn main(init: std.process.Init) !void {
         }
 
         try renderer.setLights(scene, if (lights_on) &.{
-            // A paper lantern: a glowing sphere, so its highlight in the
-            // floor is a soft disc instead of a pinpoint.
             .{ .position = .{ -4.5, 1.6, 3.2 }, .color = .{ 1.0, 0.75, 0.45 }, .intensity = 14, .range = 9, .source_radius = 0.45 },
-            // A spot light through a window frame.
             .{ .kind = .spot, .position = .{ 5.0, 4.5, 3.5 }, .direction = .{ -0.35, -1.0, -0.15 }, .color = .{ 0.8, 0.9, 1.0 }, .intensity = 160, .range = 12, .inner_angle = 0.45, .outer_angle = 0.5, .cookie = cookie, .cast_shadows = true },
-            // A lamp whose shade throws a ring of light.
             .{ .kind = .spot, .position = .{ 0, 3.2, -4.2 }, .direction = .{ 0, -1, 0 }, .color = .{ 1.0, 0.95, 0.85 }, .intensity = 60, .range = 9, .inner_angle = 1.3, .outer_angle = 1.4, .profile = profile },
-            // A cool fill from the side, the same everywhere.
             .{ .kind = .directional, .position = .{ 0, 0, 0 }, .direction = .{ 0.7, -0.3, 0.6 }, .color = .{ 0.5, 0.6, 1.0 }, .intensity = 0.25 },
         } else &.{});
 

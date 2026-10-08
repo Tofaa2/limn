@@ -1,5 +1,3 @@
-// Ray queries against the TLAS with simple hit shading: emission, shadowed sun
-// and probe light. The includer enables GL_EXT_ray_query and 64-bit integers.
 #ifndef RT_GLSL
 #define RT_GLSL
 #include "gi.glsl"
@@ -7,10 +5,8 @@
 
 const int RT_MISS = 0;
 const int RT_HIT = 1;
-// Instance masks: opaque only, or transparent as well.
 const uint RT_SOLID = 0x01u;
 const uint RT_ALL = 0x03u;
-// Hit the back of a single-sided surface.
 const int RT_BACK = 2;
 
 bool rtOccluded(uint64_t tlas, vec3 origin, vec3 direction, float max_distance) {
@@ -20,8 +16,6 @@ bool rtOccluded(uint64_t tlas, vec3 origin, vec3 direction, float max_distance) 
     return rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
-// Traces one ray. Returns the hit kind, `radiance` (zero on a miss) and
-// `distance_hit`. `lod` is the texture mip for hit shading.
 int rtTraceMasked(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 direction, float max_distance, float lod, bool probe_light, uint mask, out vec3 radiance, out float distance_hit, out float opacity) {
     opacity = 1.0;
     radiance = vec3(0.0);
@@ -59,9 +53,15 @@ int rtTraceMasked(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 directi
     if (material.base_color_texture != INVALID_ID)
         base_color *= textureLod(TEX(material.base_color_texture, material.sampler_index), materialUv(material, (material.uv_sets & 1u) != 0u ? uvb : uv), lod);
     float metallic = material.metallic;
+    vec4 mr = vec4(1.0);
     if (material.metallic_roughness_texture != INVALID_ID)
-        metallic *= textureLod(TEX(material.metallic_roughness_texture, material.sampler_index), materialUv(material, uv), lod).b;
-    // Metals bounce diffuse light here, since their specular is not traced.
+        mr = textureLod(TEX(material.metallic_roughness_texture, material.sampler_index), materialUv(material, uv), lod);
+    if ((material.flags & MATERIAL_SPECULAR_GLOSSINESS) != 0u) {
+        float unused_roughness;
+        specularGlossiness(material, mr, base_color.rgb, unused_roughness, metallic);
+    } else {
+        metallic *= mr.b;
+    }
     base_color *= unpackUnorm4x8(v0.color) * lambda.x + unpackUnorm4x8(v1.color) * lambda.y + unpackUnorm4x8(v2.color) * lambda.z;
     base_color.rgb *= unpackUnorm4x8(instance.tint).rgb;
     if ((material.flags & MATERIAL_BLEND) != 0u) opacity = clamp(base_color.a * (1.0 - material.transmission * 0.85), 0.0, 1.0);
@@ -77,9 +77,7 @@ int rtTraceMasked(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 directi
         if (!rtOccluded(tlas, position + normal * 0.02, frame.sun_direction, 1e4))
             radiance += albedo / PI * frame.sun_radiance * n_dot_l;
     }
-    // Local lights as points, one shadow ray each.
     if ((frame.flags & FRAME_GI_LOCAL_LIGHTS) != 0u) {
-        // Bounce light count is in bits 20..29 of the flags.
         uint light_count = min(frame.light_count, max((frame.flags >> 20) & 1023u, 1u));
         for (uint i = 0u; i < light_count; i++) {
             Light light = frame.lights.data[i];
@@ -127,14 +125,11 @@ int rtTraceMasked(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 directi
     return RT_HIT;
 }
 
-// Traces one ray against opaque geometry.
 int rtTrace(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 direction, float max_distance, float lod, bool probe_light, out vec3 radiance, out float distance_hit) {
     float opacity;
     return rtTraceMasked(frame, tlas, origin, direction, max_distance, lod, probe_light, RT_SOLID, radiance, distance_hit, opacity);
 }
 
-// Traces one ray for a reflection: the first transparent hit is shaded and
-// blended over a second ray behind it.
 int rtTracePicture(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 direction, float max_distance, float lod, out vec3 radiance, out float distance_hit) {
     if ((frame.flags & FRAME_REFLECT_TRANSPARENT) == 0u) return rtTrace(frame, tlas, origin, direction, max_distance, lod, true, radiance, distance_hit);
     float opacity;
@@ -150,8 +145,6 @@ int rtTracePicture(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 direct
     return RT_HIT;
 }
 
-// Applies smoke and fire along a ray to what it returned from `distance_seen`
-// (see `fluidAlong`).
 vec3 rtThroughFluids(FrameConstants frame, vec3 origin, vec3 direction, float distance_seen, vec3 radiance) {
     if ((frame.flags & FRAME_FLUID_RAYS) == 0u || frame.fluids.count == 0u) return radiance;
     vec3 ambient = vec3(0.0);

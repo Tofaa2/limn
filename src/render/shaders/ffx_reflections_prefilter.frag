@@ -2,19 +2,15 @@
 #include "common.glsl"
 #include "ffx_reflections.glsl"
 
-// Variance-guided spatial filter over neighbours on the same surface
-// (ffx_denoiser_reflections_prefilter.h).
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint radiance_texture;
-    // Variance in alpha.
     uint reprojected_texture;
     uint surface_texture;
     uint average_texture;
 } push;
 
 layout(location = 0) in vec2 in_uv;
-// Filtered reflection (rgb) and variance (a).
 layout(location = 0) out vec4 out_prefiltered;
 
 float radianceWeight(vec3 center_radiance, vec3 neighbor_radiance, float variance) {
@@ -33,11 +29,9 @@ void main() {
     if (!(center_variance > 0.0) || !ffxIsGlossy(center.roughness)) return;
 
     vec3 average = textureLod(TEX(push.average_texture, frame.sampler_linear_clamp), in_uv, 0.0).rgb;
-    // Weighting the center too suppresses fireflies.
     float accumulated_weight = radianceWeight(average, center_radiance, center_variance);
     vec3 accumulated_radiance = center_radiance * accumulated_weight;
     float accumulated_variance = center_variance * accumulated_weight * accumulated_weight;
-    // First 15 points of Halton(2,3) scaled to [-3, 3].
     const ivec2 offsets[15] = ivec2[](
         ivec2(0, 1), ivec2(-2, 1), ivec2(2, -3), ivec2(-3, 0), ivec2(1, 2), ivec2(-1, -2), ivec2(3, 0), ivec2(-3, 3),
         ivec2(0, -3), ivec2(-1, -1), ivec2(2, 1), ivec2(-2, -2), ivec2(1, 0), ivec2(0, 2), ivec2(3, -1));

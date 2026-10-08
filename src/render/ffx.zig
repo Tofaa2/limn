@@ -12,6 +12,7 @@ const Create = extern struct {
     physical_device: usize,
     device: usize,
     get_device_proc_addr: *const anyopaque,
+    pipeline_cache: u64,
     generation: u32,
     render_width: u32,
     render_height: u32,
@@ -74,6 +75,7 @@ pub const Upscaler = struct {
             .physical_device = @intFromEnum(device.physical),
             .device = @intFromEnum(device.vkd.handle),
             .get_device_proc_addr = rhi.deviceProcAddr(),
+            .pipeline_cache = @intFromEnum(device.pipeline_cache),
             .generation = @intFromEnum(generation),
             .render_width = render_size[0],
             .render_height = render_size[1],
@@ -119,8 +121,6 @@ pub const Upscaler = struct {
             .motion = image(device, inputs.motion),
             .output = image(device, inputs.output),
             .jitter = .{ inputs.jitter[0] * width * jitter_sign[0], inputs.jitter[1] * height * jitter_sign[1] },
-            // Renderer motion is current minus previous as a fraction of the
-            // picture; the upscaler wants previous minus current in pixels.
             .motion_scale = .{ -width, -height },
             .render_width = self.render_size[0],
             .render_height = self.render_size[1],

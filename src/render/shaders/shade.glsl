@@ -1,27 +1,16 @@
 #include "common.glsl"
 #define DEFER_REFLECTIONS
-// Only passes that do not write depth may read it.
 #define CONTACT_SHADOWS
 #include "shading.glsl"
 
-// Visibility-buffer shading: each pixel refetches its triangle, computes
-// barycentrics with analytic derivatives, samples the material and lights it.
-// Outputs lit color and motion vectors.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint visibility_texture;
     uint ao_texture;
     uint debug_view;
-    // Reduced-resolution probe irradiance (rgb) and its depth (a), or
-    // INVALID_ID for per-pixel probes.
     uint gi_texture;
-    // Built-in pass: bit i set when material shader i has its own pass. Custom
-    // pass: the material shader this pass is for.
     uint material_shader;
-    // Last frame's TAA output, whose alpha holds soft-shadow visibility, or
-    // INVALID_ID.
     uint shadow_history;
-    // Bounce light from gtao.frag, or INVALID_ID, and its strength.
     uint bounce_texture;
     float bounce_strength;
 } push;
@@ -29,44 +18,36 @@ layout(push_constant, scalar) uniform Push {
 layout(location = 0) in vec2 in_uv;
 
 layout(location = 0) out vec4 out_color;
-layout(location = 1) out vec2 out_motion;   // current uv - previous uv
-// For the reflection pass: specular weight and roughness, then octahedral
-// normal and sky visibility.
+layout(location = 1) out vec2 out_motion;
 layout(location = 2) out vec4 out_reflection;
 layout(location = 3) out vec4 out_surface;
 
-// Material outputs. A custom material shader receives the standard material's
-// values and may change any.
 struct MaterialSurface {
     vec3 base_color;
     float metallic;
     float roughness;
-    // Material AO, 1 = unoccluded.
     float occlusion;
     vec3 emissive;
-    // World-space shading normal.
     vec3 normal;
-    // Clearcoat strength, roughness and world-space normal.
     float clearcoat;
     float clearcoat_roughness;
     vec3 clearcoat_normal;
 };
 
 struct MaterialContext {
-    vec3 position;        // world space
+    vec3 position;
     vec3 geometric_normal;
-    vec3 view;            // towards the camera
+    vec3 view;
     vec2 uv;
     vec2 uv_dx;
     vec2 uv_dy;
-    float time;           // seconds
-    vec4 params;          // the material's `params`
-    uint instance;        // index into frame.instances
-    vec4 instance_params; // the entity's or the copy's `params`
+    float time;
+    vec4 params;
+    uint instance;
+    vec4 instance_params;
 };
 
 #ifdef CUSTOM_MATERIAL
-// Defined by the file that includes this one.
 void customMaterial(inout MaterialSurface surface, MaterialContext context, FrameConstants frame);
 #endif
 
@@ -76,8 +57,6 @@ struct Barycentrics {
     vec3 ddy;
 };
 
-// Barycentrics after "Deferred Attribute Interpolation Shading", for Vulkan NDC
-// (y down).
 Barycentrics barycentrics(vec4 p0, vec4 p1, vec4 p2, vec2 ndc, vec2 resolution) {
     Barycentrics result;
     vec3 inv_w = 1.0 / vec3(p0.w, p1.w, p2.w);
@@ -115,7 +94,6 @@ vec3 hashColor(uint value) {
     return vec3(float(value & 255u), float((value >> 8u) & 255u), float((value >> 16u) & 255u)) / 255.0;
 }
 
-// Cofactor matrix: the inverse transpose up to scale.
 mat3 normalMatrix(mat4x3 m) {
     vec3 c0 = m[0];
     vec3 c1 = m[1];
@@ -134,7 +112,6 @@ void main() {
 #ifdef CUSTOM_MATERIAL
         discard;
 #endif
-        // Sky: camera motion only.
         vec4 world = frame.inv_view_proj * vec4(ndc, 1e-6, 1.0);
         vec3 direction = normalize(world.xyz / world.w - frame.camera_position);
         vec4 current = frame.view_proj_unjittered * vec4(direction, 0.0);
@@ -158,7 +135,6 @@ void main() {
 #ifdef CUSTOM_MATERIAL
     if (material.shader != push.material_shader) discard;
 #else
-    // Materials with their own shading pass are skipped.
     if (material.shader != 0u && ((push.material_shader >> material.shader) & 1u) != 0u) discard;
 #endif
 
@@ -173,7 +149,6 @@ void main() {
     vec3 w0 = (instance.transform * vec4(v0.position, 1.0)).xyz;
     vec3 w1 = (instance.transform * vec4(v1.position, 1.0)).xyz;
     vec3 w2 = (instance.transform * vec4(v2.position, 1.0)).xyz;
-    // Same wind sway as the geometry pass.
     float sway = frame.materials.data[instance.material].sway;
     if (sway != 0.0) {
         vec3 stands = instance.transform[3].xyz;
@@ -225,8 +200,10 @@ void main() {
     float roughness = material.roughness;
     float metallic = material.metallic;
     vec4 mr = vec4(1.0);
-    if (material.metallic_roughness_texture != INVALID_ID) {
-        mr = textureGrad(TEX(material.metallic_roughness_texture, d), UV_OF(2));
+    if (material.metallic_roughness_texture != INVALID_ID) mr = textureGrad(TEX(material.metallic_roughness_texture, d), UV_OF(2));
+    if ((material.flags & MATERIAL_SPECULAR_GLOSSINESS) != 0u) {
+        specularGlossiness(material, mr, base_color.rgb, roughness, metallic);
+    } else {
         roughness *= mr.g;
         metallic *= mr.b;
     }
@@ -235,7 +212,6 @@ void main() {
 
     float ao = 1.0;
     if (material.occlusion_texture != INVALID_ID) {
-        // Occlusion may share the metallic-roughness image (ORM).
         float sampled = material.occlusion_texture == material.metallic_roughness_texture && ((material.uv_sets >> 2) & 1u) == ((material.uv_sets >> 3) & 1u) && ((SHADE_FEATURES & FEATURE_TEXTURE_TRANSFORMS) == 0u || material.texture_transforms == INVALID_ID)
             ? mr.r
             : textureGrad(TEX(material.occlusion_texture, d), UV_OF(3)).r;
@@ -274,7 +250,6 @@ void main() {
     if (material.normal_texture != INVALID_ID && dot(tangent, tangent) > 1e-12) {
         vec3 t = normalize(tangent - normal * dot(normal, tangent));
         vec3 b = cross(normal, t) * (tangent_object.w < 0.0 ? -1.0 : 1.0);
-        // Two-channel normal maps: z is reconstructed.
         vec3 sampled = vec3(textureGrad(TEX(material.normal_texture, s), UV_OF(1)).xy * 2.0 - 1.0, 0.0);
         sampled.z = sqrt(max(1.0 - dot(sampled.xy, sampled.xy), 0.0));
         sampled.xy *= material.normal_scale;
@@ -302,7 +277,6 @@ void main() {
         Decal decal = frame.decals.data[i];
         vec3 local = (decal.world_to_decal * vec4(world_position, 1.0)).xyz;
         if (any(greaterThan(abs(local), vec3(0.5)))) continue;
-        // Projection axis: gradient of local z.
         vec3 axis = normalize(vec3(decal.world_to_decal[0][2], decal.world_to_decal[1][2], decal.world_to_decal[2][2]));
         float facing = dot(geometric_normal, axis) * (dot(geometric_normal, view_direction) < 0.0 ? -1.0 : 1.0);
         float weight = smoothstep(decal.angle_fade, decal.angle_fade + 0.25, facing);
@@ -329,8 +303,6 @@ void main() {
 
     ao = min(ao, screen_ao);
 
-    // Previous position from last frame's vertices and transform; static
-    // instances skip the fetches.
     vec3 previous_world = world_position;
     if ((instance.flags & INSTANCE_MOVING) != 0u) {
         vec3 p0 = frame.vertices.data[instance.previous_vertex_offset + i0].position;
@@ -344,7 +316,6 @@ void main() {
     out_motion = (current_clip.xy / current_clip.w - previous_clip.xy / previous_clip.w) * 0.5;
 
     if ((frame.flags & FRAME_SPECULAR_AA) != 0u) {
-        // Specular antialiasing (Kaplanyan et al.).
         vec3 normal_dx = dFdx(normal);
         vec3 normal_dy = dFdy(normal);
         float variance = 0.25 * (dot(normal_dx, normal_dx) + dot(normal_dy, normal_dy));
@@ -380,7 +351,6 @@ void main() {
     float noise = interleavedGradientNoise(gl_FragCoord.xy, frame.frame_index);
 
     if (push.debug_view != 0u) {
-        // Must match `DebugView` in renderer.zig. Output is display-referred.
         vec3 debug = vec3(0.0);
         switch (push.debug_view) {
         case 1u: debug = base_color.rgb; break;
@@ -431,8 +401,6 @@ void main() {
     if (push.shadow_history != INVALID_ID) {
         vec2 previous_uv = in_uv - out_motion;
         if (all(greaterThanEqual(previous_uv, vec2(0.0))) && all(lessThanEqual(previous_uv, vec2(1.0)))) {
-            // Soft-shadow history: this pixel and four neighbours. Values above
-            // 1 hold no result.
             ivec2 history_size = textureSize(TEX(push.shadow_history, frame.sampler_nearest_clamp), 0);
             ivec2 at = ivec2(previous_uv * vec2(history_size));
             ivec2 last = history_size - 1;
@@ -457,7 +425,6 @@ void main() {
     if (instance.lightmap != INVALID_ID) gathered = vec4(textureLod(TEX(instance.lightmap, frame.sampler_linear_clamp), raw1, 0.0).rgb, 1.0);
     vec3 lit = emissive + shadeSurface(frame, surface, gl_FragCoord.xy, noise, gathered);
     if ((SHADE_FEATURES & FEATURE_AERIAL) != 0u && frame.aerial != 0.0 && (frame.flags & FRAME_ENVIRONMENT) != 0u) {
-        // Aerial perspective (see aerialHaze).
         vec3 air_through;
         vec3 air;
         aerialHaze(frame, view_direction, length(world_position - frame.camera_position), air_through, air);

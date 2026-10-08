@@ -26,8 +26,6 @@ const helpers = @import("window");
 const Stage = helpers.Stage;
 
 pub fn main(init: std.process.Init) !void {
-    // The fallback is asked for so that path tracing has something to
-    // run on without ray tracing hardware; it costs nothing with it.
     var options = gfx.Options{ .path_tracing_fallback = true, .asset_cache_dir = "zig-out/asset-cache" };
     var path_traced = false;
     var drifting = false;
@@ -42,7 +40,6 @@ pub fn main(init: std.process.Init) !void {
     }
     var stage = try Stage.create(init, "Limn ray tracing", options);
     const renderer = stage.renderer;
-    // The question, asked once: it does not change while the renderer lives.
     const support = renderer.pathTracing();
     const hardware = support == .hardware;
     const scene = try renderer.createScene();
@@ -56,8 +53,6 @@ pub fn main(init: std.process.Init) !void {
     const helmet = try renderer.loadModel("examples/assets/DamagedHelmet.glb");
     _ = try renderer.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 0.5, 1.3, -0.2 }), math.mul(math.rotationY(1.2), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.7)))) });
 
-    // Things that show a reflection: a mirror ball, a polished one, and a
-    // glowing block for them to catch.
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_indices: [helpers.sphere_index_count]u32 = undefined;
@@ -101,12 +96,8 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_DOWN)) bounces = @max(bounces - 1, 1);
         if (stage.keyPressed(glfw.GLFW_KEY_C)) camera = (camera + 1) % cameras.len;
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE)) lamp_moving = !lamp_moving;
-        // A path-traced picture gathers only while nothing moves, so the
-        // lamp holds still for it.
         if (lamp_moving and !path_traced) lamp_clock += tick.dt;
 
-        // A lamp with a size, which is what makes a traced shadow soft:
-        // sharp where the thing that casts it is close, wide further off.
         try renderer.setLights(scene, &.{.{
             .position = .{ 1.5 + @sin(lamp_clock * 0.5) * 2.5, 2.2, @cos(lamp_clock * 0.37) * 0.9 },
             .color = .{ 1.0, 0.82, 0.6 },
@@ -139,7 +130,6 @@ pub fn main(init: std.process.Init) !void {
         }
         try list.text(font, "C camera · Up/Down bounces · Space lamp", .{ 24, 154 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
 
-        // With `--drift`, the camera sways from side to side.
         const drift: math.Vec3 = if (drifting) .{ @sin(tick.time * 0.6) * 0.8, @sin(tick.time * 0.43) * 0.25, 0 } else .{ 0, 0, 0 };
         try stage.end(try renderer.render(.{
             .views = &.{.{
@@ -149,8 +139,6 @@ pub fn main(init: std.process.Init) !void {
                 .target = stage.target(),
                 .settings = .{
                     .shadow_distance = 40,
-                    // Each of these is used only where the GPU can trace
-                    // rays; asking for them elsewhere does no harm.
                     .global_illumination = bounce_light,
                     .reflection_ray_tracing = traced_reflections,
                     .ray_traced_light_shadows = traced_shadows,

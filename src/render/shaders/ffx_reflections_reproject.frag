@@ -2,23 +2,17 @@
 #include "common.glsl"
 #include "ffx_reflections.glsl"
 
-// Reprojects last frame's reflections, trying both surface motion and
-// reflected-hit parallax (ffx_denoiser_reflections_reproject.h).
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
-    // Reflections (rgb) and ray length (a).
     uint radiance_texture;
-    // Current and previous surfaces; see FfxSurface.
     uint surface_texture;
     uint surface_history_texture;
     uint motion_texture;
-    // Previous denoised reflections (rgb), variance (a), and sample counts.
     uint history_texture;
     uint samples_history_texture;
 } push;
 
 layout(location = 0) in vec2 in_uv;
-// Reprojected reflection (rgb) and variance (a).
 layout(location = 0) out vec4 out_reprojected;
 layout(location = 1) out float out_samples;
 
@@ -30,8 +24,6 @@ FfxSurface surfaceHistory(FrameConstants frame, vec2 uv) {
     return ffxSurface(textureLod(TEX(push.surface_history_texture, frame.sampler_linear_clamp), uv, 0.0));
 }
 
-// Previous screen position of the reflected hit: the virtual point behind the
-// surface at the ray length, reprojected.
 vec2 hitReprojection(FrameConstants frame, vec2 uv, float surface_depth, float ray_length) {
     vec3 toward = normalize(worldPositionFromDepth(uv, 0.5, frame.inv_view_proj) - frame.camera_position);
     vec3 seeming = frame.camera_position + toward * (surface_depth + ray_length);
@@ -84,8 +76,6 @@ void pickReprojection(FrameConstants frame, ivec2 pixel, ivec2 last_pixel, FfxSu
         reprojection_uv = hit_uv;
         reprojection = hit_history;
     } else {
-        // Surface reprojection is rejected when its history is far from the
-        // local mean.
         vec3 unlike = surface_history - local_mean;
         if (dot(unlike, unlike) >= FFX_REPROJECT_SURFACE_DISCARD_VARIANCE_WEIGHT * length(local_variance)) {
             disocclusion_factor = 0.0;
@@ -114,7 +104,6 @@ void pickReprojection(FrameConstants frame, ivec2 pixel, ivec2 last_pixel, FfxSu
     reprojection = radianceHistory(frame, reprojection_uv);
     if (disocclusion_factor >= FFX_DISOCCLUSION_THRESHOLD) return;
 
-    // Fallback: bilinear sample with per-tap disocclusion rejection.
     vec2 place = frame.resolution * reprojection_uv - 0.5;
     vec2 f = fract(place);
     ivec2 corner = ivec2(floor(place));

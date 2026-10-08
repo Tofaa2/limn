@@ -2,37 +2,25 @@
 #include "common.glsl"
 #include "hair.glsl"
 
-// Hair simulation, one strand per invocation: Verlet integration with gravity,
-// wind, density repulsion and a pull toward the rest pose, then collision and
-// root-to-tip length constraints.
 layout(local_size_x = 64) in;
 
 layout(buffer_reference, scalar) buffer HairPointsOut { HairPoint data[]; };
-// Points per cell of a grid around the hair.
 layout(buffer_reference, scalar) buffer HairDensity { uint data[]; };
 
-// Must match `SimulationParams` in passes/hair.zig.
 layout(buffer_reference, scalar) readonly buffer Params {
-    // Rest pose, in hair space.
     HairPoints rest;
-    // World-space points now and one step ago. This step is written over the
-    // older buffer.
     HairPointsOut current;
     HairPointsOut next;
-    // Density of the previous step, and the one being counted.
     HairDensity density_before;
     HairDensity density_now;
     mat4 transform;
-    // World to collision field space.
     mat4 world_to_field;
     vec3 gravity;
     float damping;
     vec3 wind;
     float gustiness;
-    // Distance field: grid corner and cell size, in field units.
     vec3 field_low;
     float field_cell;
-    // Bounds of the two density grids.
     vec3 density_low_before;
     float density_cell_before;
     vec3 density_low_now;
@@ -40,26 +28,19 @@ layout(buffer_reference, scalar) readonly buffer Params {
     float time;
     float dt;
     float previous_dt;
-    // Pull toward the rest pose per 1/60 s, along the strand and at the root.
     float stiffness;
     float root_stiffness;
-    // World units per field unit.
     float field_scale;
-    // Distance kept from the collision shape.
     float margin;
-    // Strength of strand-strand repulsion.
     float volume;
     uint strand_count;
     uint points_per_strand;
     uint collider_count;
-    // Nonzero to reset to the rest pose.
     uint reset;
-    // Field texture (INVALID_ID for none) and cells per side.
     uint field_texture;
     uint field_size;
     uint density_size;
     uint pad;
-    // Sphere colliders: world-space centre and radius.
     vec4 colliders[6];
 };
 
@@ -68,11 +49,8 @@ layout(push_constant, scalar) uniform Push {
     Params params;
 } push;
 
-// Maximum points per strand.
 const uint most_points = 64u;
 
-// Signed distance at `place` in field space, negative inside; large outside the
-// grid.
 float fieldAt(Params params, vec3 place) {
     vec3 cells = (place - params.field_low) / params.field_cell;
     float size = float(params.field_size);
@@ -85,7 +63,6 @@ float fieldAt(Params params, vec3 place) {
     return mix(a, b, layer - below);
 }
 
-// Pushes a world-space point out of the collision shape to the margin.
 vec3 outsideShape(Params params, vec3 point) {
     if (params.field_texture == INVALID_ID) return point;
     vec3 place = (params.world_to_field * vec4(point, 1.0)).xyz;
@@ -109,7 +86,6 @@ uint densityAt(Params params, ivec3 cell) {
     return params.density_before.data[uint(cell.x + (cell.y + cell.z * size) * size)];
 }
 
-// Displacement down the density gradient, in cells per 1/60 s.
 vec3 awayFromCrowd(Params params, vec3 point) {
     if (params.volume <= 0.0) return vec3(0.0);
     ivec3 cell = ivec3(floor((point - params.density_low_before) / params.density_cell_before));
@@ -134,7 +110,6 @@ void main() {
     vec3 combed_above = above;
     params.next.data[first] = HairPoint(above, 0.0);
     params.current.data[first] = HairPoint(above, 0.0);
-    // Final positions and length-constraint corrections.
     vec3 placed[most_points];
     vec3 pulled[most_points];
     placed[0] = above;
@@ -151,7 +126,6 @@ void main() {
             float gust = 1.0 + params.gustiness * sin(params.time * 2.3 + dot(here, vec3(1.7, 0.6, 1.1)));
             point = here + travel + (params.gravity + params.wind * gust) * params.dt * params.dt;
             point += awayFromCrowd(params, here) * params.dt * 60.0;
-            // Root stiffness blends out over the first 35% of the strand.
             float hold = mix(params.root_stiffness, params.stiffness, smoothstep(0.0, 0.35, combed.along));
             point = mix(point, target, 1.0 - pow(1.0 - clamp(hold, 0.0, 1.0), params.dt * 60.0));
         }
@@ -164,7 +138,6 @@ void main() {
         vec3 along = point - above;
         float stretched = length(along);
         vec3 kept = above + (stretched > 1.0e-6 ? along / stretched : normalize(target - combed_above + vec3(0.0, -1.0e-6, 0.0))) * reach;
-        // Collide again after the length constraint.
         kept = outsideShape(params, kept);
         pulled[index] = kept - point;
         placed[index] = kept;
@@ -176,9 +149,6 @@ void main() {
         above = kept;
         combed_above = target;
     }
-    // Velocity correction from the next point's constraint ("Fast Simulation of
-    // Inextensible Hair and Fur", Müller et al. 2012), written into the
-    // previous position.
     const float handed_back = 0.9;
     for (uint index = 1u; index < count; index++) {
         vec3 here = params.reset == 0u ? params.current.data[first + index].position : placed[index];

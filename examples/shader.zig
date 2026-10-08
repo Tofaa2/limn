@@ -25,16 +25,12 @@ pub fn main(init: std.process.Init) !void {
     renderer.setEnvironment(scene, try renderer.createSky(sky_desc), 0.6);
     renderer.setSun(scene, gfx.skySun(sky_desc));
 
-    // The shader is compiled to SPIR-V by the build (see `build.zig`) and
-    // handed over as bytes.
     const lava = try renderer.createMaterialShader(@embedFile("lava.frag.spv"));
 
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(1.0, &sphere_positions, &sphere_normals, &sphere_indices);
-    // `params` are the material's own numbers, read by the shader: here
-    // the scale of the pattern and the strength of the glow.
     var glow: f32 = 3;
     const molten = try renderer.createModel(&.{.{
         .positions = &sphere_positions,
@@ -48,8 +44,6 @@ pub fn main(init: std.process.Init) !void {
     const ground = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.12, 0.11, 0.1, 1 }, .metallic = 0, .roughness = 0.6 } }});
     _ = try renderer.spawn(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 30, 0.5, 30 })) });
 
-    // Five of the same model. `params` on an entity are that entity's own
-    // numbers: here how far it has cooled.
     const count = 5;
     var balls: [count]gfx.Entity = undefined;
     for (&balls, 0..) |*ball, index| {
@@ -80,7 +74,6 @@ pub fn main(init: std.process.Init) !void {
             glow = @max(glow - 1, 0);
             changed = true;
         }
-        // A material's shader and numbers can be replaced at any time.
         if (changed) try renderer.setMaterialShader(molten, null, lava, .{ 2.5, glow, 0, 0 });
 
         list.clear();

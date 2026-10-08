@@ -73,7 +73,6 @@ pub fn main(init: std.process.Init) !void {
     helpers.sphereMesh(1.2, &sphere_positions, &sphere_normals, &sphere_indices);
     const ball = try renderer.createModel(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0.8, 0.8, 0.8, 1 }, .metallic = 0, .roughness = 0.5 } }});
     _ = try renderer.spawn(scene, .{ .model = ball, .transform = math.translation(.{ 3.5, 1.2, -1.5 }) });
-    // A crate that opts out: decals pass it by.
     _ = try renderer.spawn(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ -3.2, 0.6, 0.4 }), math.scaling(.{ 1.2, 1.2, 1.2 })), .receive_decals = false, .tint = .{ 0.9, 0.5, 0.3 } });
 
     const arrow_image = try drawImage(renderer, arrow);
@@ -98,23 +97,16 @@ pub fn main(init: std.process.Init) !void {
 
         var decals: [16]gfx.DecalDesc = undefined;
         var count: usize = 0;
-        // Road markings: a row of arrows on the floor.
         for (0..5) |index| {
             decals[count] = .{ .transform = project(.{ (@as(f32, @floatFromInt(index)) - 2) * 3.2, 0, 3.2 }, std.math.pi * 0.5, down, .{ 1.0, 1.6 }, 0.5), .image = arrow_image, .color = .{ 0.95, 0.9, 0.75, 0.95 } };
             count += 1;
         }
-        // A wet patch: no color of its own, only a smoother, bumpier
-        // surface, so it shows as a change in the reflections.
         decals[count] = .{ .transform = project(.{ -1, 0, 0.6 }, 0.4, down, .{ 4.5, 3.2 }, 0.5), .image = blot_image, .color = .{ 0.05, 0.05, 0.06, 0.55 }, .roughness = 0.05 };
         count += 1;
-        // Paint thrown at the wall, wrapping onto the ball in front of it.
         decals[count] = .{ .transform = project(.{ 3.2, 1.6, -2.6 }, 0, 0, .{ 4.2, 3.4 }, 6.0), .image = blot_image, .color = .{ 0.75, 0.08, 0.12, 0.92 }, .roughness = 0.3, .angle_fade = 0.05 };
         count += 1;
-        // A sign that glows.
         decals[count] = .{ .transform = project(.{ -5.5, 2.2, -4.7 }, 0, 0, .{ 2.4, 2.4 }, 0.6), .image = ring_image, .color = .{ 0.2, 0.9, 1.0, 1 }, .emissive = 6 };
         count += 1;
-        // A mark that moves: decals are handed over each frame, so moving
-        // one costs nothing more than leaving it where it was.
         const mark = math.Vec3{ @sin(clock * 0.6) * 6, 0, @cos(clock * 0.6) * 3.5 - 0.5 };
         decals[count] = .{ .transform = project(mark, clock, down, .{ 1.8, 1.8 }, 3.0), .image = ring_image, .color = .{ 1.0, 0.75, 0.1, 1 }, .emissive = 2 };
         count += 1;

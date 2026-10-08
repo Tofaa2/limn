@@ -1,12 +1,9 @@
 #version 460
 #include "common.glsl"
 
-// Builds one level of the min-depth pyramid (reverse-Z, so min is farthest) for
-// occlusion culling.
 layout(push_constant, scalar) uniform Push {
     uint source_texture;
     uint sampler_index;
-    // Nonzero when reading the full-resolution depth buffer (level 0).
     uint first;
     int source_lod;
     vec2 texel;
@@ -17,8 +14,6 @@ layout(location = 0) out float out_depth;
 
 void main() {
     if (push.first != 0u) {
-        // Level 0 is at most 2x smaller than the depth buffer, so four taps
-        // cover it.
         vec2 offset = push.texel * 0.25;
         float a = textureLod(TEX(push.source_texture, push.sampler_index), in_uv + vec2(-offset.x, -offset.y), 0.0).r;
         float b = textureLod(TEX(push.source_texture, push.sampler_index), in_uv + vec2(offset.x, -offset.y), 0.0).r;

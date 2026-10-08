@@ -15,6 +15,11 @@ pub const png = @import("png.zig");
 pub const font = @import("font_baker").font;
 /// KTX2 texture files, including Basis Universal and Zstandard.
 pub const ktx2 = @import("asset/ktx2.zig");
+/// DDS texture files with block-compressed data.
+pub const dds = @import("asset/dds.zig");
+/// The `KHR_lights_punctual` lights of a glTF file.
+pub const SceneLight = @import("asset/gltf.zig").SceneLight;
+pub const loadSceneLights = @import("asset/gltf.zig").loadLights;
 
 /// Owns the device, assets, scenes and frame pipeline. Callable from any
 /// thread; `render` from one thread at a time.
@@ -213,8 +218,11 @@ test {
     _ = @import("asset/gltf.zig");
     _ = @import("asset/model_cache.zig");
     _ = @import("asset/ktx2.zig");
+    _ = @import("asset/dds.zig");
     _ = @import("render/text_layout.zig");
     _ = @import("render/renderer.zig");
+    _ = @import("render/renderer/images.zig");
+    _ = @import("render/renderer/view_math.zig");
     _ = @import("render/frame_graph.zig");
     _ = @import("render/collision_field.zig");
     _ = @import("render/api.zig");

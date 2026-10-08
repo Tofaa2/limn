@@ -91,3 +91,14 @@ http://www.cemyuksel.com/research/hairmodels
 They may be downloaded and used freely for personal or research projects;
 anything published that was made with them is expected to link to that
 page. Without them the example makes a head of hair of its own.
+
+`bistro/` is not kept with these sources either (it is in `.gitignore`, at
+3.5 GB). The `bistro` example looks there for Amazon Lumberyard Bistro as
+glTF with DDS textures:
+
+    git clone --depth 1 https://github.com/zeux/niagara_bistro examples/assets/bistro
+
+That repository is a lightly edited copy of the scene from NVIDIA's
+rtxdi-assets, under the MIT license. The scene itself is by Amazon
+Lumberyard, released under CC BY 4.0 through NVIDIA's Open Research Content
+Archive.

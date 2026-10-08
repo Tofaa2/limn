@@ -3,8 +3,6 @@
 #include "environment.glsl"
 #include "clouds.glsl"
 
-// Clear-sky atmosphere for one cube face: single Rayleigh and Mie scattering
-// integrated along the view ray, plus a multiple-scattering estimate.
 layout(push_constant, scalar) uniform Push {
     vec3 to_sun;
     uint face;
@@ -14,13 +12,9 @@ layout(push_constant, scalar) uniform Push {
     float max_radiance;
     float sun_disc;
     float stars;
-    // Moon direction and disc brightness; 0 for none.
     vec3 to_moon;
     float moon;
-    // Ozone amount; 1 is Earth's.
     float ozone;
-    // Cloud layer; density 0 for none. `depth_texture` holds a linear sampler
-    // here.
     CloudData clouds;
 } push;
 
@@ -33,16 +27,13 @@ const float RAYLEIGH_HEIGHT = 8000.0;
 const float MIE_HEIGHT = 1200.0;
 const vec3 RAYLEIGH = vec3(5.8e-6, 13.5e-6, 33.1e-6);
 const float MIE = 4e-6;
-// Ozone absorption, in a layer centered at 25 km.
 const vec3 OZONE = vec3(0.650e-6, 1.881e-6, 0.085e-6);
 
 float ozoneDensity(float height) {
     return max(1.0 - abs(height - 25e3) / 15e3, 0.0);
 }
-// Sun radiance above the atmosphere. Must match `skySun` in renderer.zig.
 const float SUN_STRENGTH = 8.0;
 
-// Distance at which a ray leaves a planet-centered sphere, or -1 on a miss.
 float sphereExit(vec3 origin, vec3 direction, float radius) {
     float b = dot(origin, direction);
     float c = dot(origin, origin) - radius * radius;
@@ -64,7 +55,6 @@ void main() {
     float mie_strength = MIE * push.turbidity;
     vec3 origin = vec3(0.0, PLANET_RADIUS + 200.0, 0.0);
 
-    // Rays below the horizon are clamped to it; ground color is mixed in later.
     vec3 ray = normalize(vec3(direction.x, max(direction.y, 0.0), direction.z));
     float distance_out = sphereExit(origin, ray, ATMOSPHERE_RADIUS);
     const int steps = 24;
@@ -76,8 +66,6 @@ void main() {
     vec3 sum_rayleigh = vec3(0.0);
     vec3 sum_mie = vec3(0.0);
     vec3 sum_multiple = vec3(0.0);
-    // Zenith sky radiance from single scattering above the planet's shadow,
-    // used as isotropic ambient for air in shadow.
     vec3 overhead_glow = vec3(0.0);
     {
         const int column_steps = 12;
@@ -115,8 +103,6 @@ void main() {
         depth_mie += density_mie;
         depth_ozone += ozoneDensity(height) * step_length;
         if (hitsPlanet(point, sun)) {
-            // In the planet's shadow only the zenith glow lights the air
-            // (twilight).
             vec3 scatter_at = RAYLEIGH * exp(-height / RAYLEIGH_HEIGHT) + mie_strength * exp(-height / MIE_HEIGHT);
             vec3 view_only = exp(-(RAYLEIGH * depth_rayleigh + mie_strength * 1.1 * depth_mie + ozone * depth_ozone));
             sum_multiple += view_only * scatter_at * step_length * overhead_glow;
@@ -135,7 +121,6 @@ void main() {
         vec3 attenuation = exp(-(RAYLEIGH * (depth_rayleigh + light_rayleigh) + mie_strength * 1.1 * (depth_mie + light_mie) + ozone * (depth_ozone + light_ozone)));
         sum_rayleigh += attenuation * density_rayleigh;
         sum_mie += attenuation * density_mie;
-        // Multiple scattering as a geometric series, isotropic.
         vec3 scatter_here = RAYLEIGH * exp(-height / RAYLEIGH_HEIGHT) + mie_strength * exp(-height / MIE_HEIGHT);
         vec3 again = 1.0 - exp(-scatter_here * RAYLEIGH_HEIGHT);
         sum_multiple += attenuation * scatter_here * step_length * again / (1.0 - again);
@@ -176,7 +161,6 @@ void main() {
         vec3 sunlight = SUN_STRENGTH * exp(-(RAYLEIGH * sun_rayleigh + mie_strength * 1.1 * sun_mie + ozone * sun_ozone));
         color = cloudsOverSky(clouds, direction, sun, sunlight, color);
     }
-    // Moon disc, drawn about 3x the sun's size to survive the cube resolution.
     if (push.moon > 0.0 && direction.y > 0.0) {
         float moon_disc = smoothstep(0.9990, 0.9994, dot(direction, normalize(push.to_moon)));
         color += transmittance * vec3(0.92, 0.95, 1.0) * (moon_disc * push.moon * 0.6);

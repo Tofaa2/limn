@@ -1,7 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// Blends fluid motion over the scene's motion vectors by fluid coverage.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;

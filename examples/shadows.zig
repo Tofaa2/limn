@@ -72,8 +72,6 @@ pub fn main(init: std.process.Init) !void {
     }});
     _ = try renderer.spawn(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.5, -avenue_length * 0.5 }), math.scaling(.{ 60, 1, avenue_length + 40 })) });
 
-    // Two fences: a post every little way, three rails along each, and a
-    // lattice of slats between the rails.
     var bars: std.ArrayList(math.Mat4) = .empty;
     defer bars.deinit(gpa);
     for ([_]f32{ -2.2, 2.2 }) |x| {
@@ -112,7 +110,6 @@ pub fn main(init: std.process.Init) !void {
         if (rolling) rolled += tick.dt;
         renderer.setTransform(roller, math.translation(.{ @sin(rolled * 0.5) * 1.2, 0.6, -6 - @mod(rolled * 3, 60) }));
 
-        // What the two kinds of shadow pass took.
         var cascades_ms: f32 = 0;
         var virtual_ms: f32 = 0;
         for (renderer.device.passTimings()) |timing| {

@@ -1,12 +1,6 @@
 #ifndef CULL_OCCLUSION_GLSL
 #define CULL_OCCLUSION_GLSL
 
-// Sphere test against a view's depth pyramid. Requires a `push` block with
-// `frame`, `view`, `hiz_texture` and `hiz_size`.
-
-// 2D Polyhedral Bounds of a Clipped, Perspective-Projected 3D Sphere (Mara &
-// McGuire 2013). `c` is in view space, +z forward. False if the sphere touches
-// the near plane.
 bool projectSphere(vec3 c, float r, float near, float p00, float p11, out vec4 aabb) {
     if (c.z < r + near) return false;
     vec3 cr = c * r;
@@ -21,9 +15,7 @@ bool projectSphere(vec3 c, float r, float near, float p00, float p11, out vec4 a
     return true;
 }
 
-// Farthest depth in the pyramid over a screen rectangle.
 float farthestDepth(vec2 uv_min, vec2 uv_max) {
-    // Level where the box is at most one texel wide, so four taps cover it.
     vec2 size = (uv_max - uv_min) * push.hiz_size;
     float level = ceil(log2(max(max(size.x, size.y), 1.0)));
     uint s = push.frame.sampler_nearest_clamp;

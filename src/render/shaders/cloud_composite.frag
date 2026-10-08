@@ -2,7 +2,6 @@
 #include "common.glsl"
 #include "clouds.glsl"
 
-// Composites the clouds over the lit scene.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     CloudRef clouds;
@@ -23,8 +22,6 @@ void main() {
         if (segment.y <= segment.x || length(position - frame.camera_position) <= segment.x) discard;
     }
     vec4 result = textureLod(TEX(push.cloud_texture, frame.sampler_linear_clamp), in_uv, 0.0);
-    // Alpha above 1 marks pixels the march skipped.
     result.a = min(result.a, 1.0);
-    // Premultiplied blend: result = rgb + dst * (1 - a).
     out_color = vec4(result.rgb, 1.0 - result.a);
 }

@@ -141,7 +141,6 @@ pub fn build(gpa: std.mem.Allocator, lo: []const [3]f32, hi: []const [3]f32, lea
             }
             left_count = @intCast(front);
         }
-        // No cut separates the items: halve them.
         if (left_count == 0 or left_count == node.count) left_count = node.count / 2;
 
         var left = Box{};
@@ -171,7 +170,6 @@ test "every item ends up in exactly one leaf whose box holds it" {
             high[axis] = low[axis] + rng.float(f32) * 3;
         }
     }
-    // A run of identical items, which no cut can separate.
     for (100..140) |index| {
         lo[index] = .{ 5, 5, 5 };
         hi[index] = .{ 6, 6, 6 };

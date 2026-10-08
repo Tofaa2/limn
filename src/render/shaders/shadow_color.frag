@@ -1,8 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// Shadow tint of translucent casters for a cascade: color is multiplied in;
-// alpha keeps the depth of the caster nearest the sun.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
 } push;

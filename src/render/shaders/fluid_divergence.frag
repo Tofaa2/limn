@@ -2,7 +2,6 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Velocity divergence per cell. The second channel flags solid cells.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;

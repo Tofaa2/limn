@@ -1,0 +1,448 @@
+//! Scenes and the entities in them. Internal to the renderer.
+const std = @import("std");
+const rhi = @import("../../rhi/rhi.zig");
+const math = @import("../../math.zig");
+const gltf = @import("../../asset/gltf.zig");
+const gpu = @import("../gpu.zig");
+const api = @import("../api.zig");
+const renderer_state = @import("../state.zig");
+const render = @import("../renderer.zig");
+
+const Renderer = render.Renderer;
+const Mat4 = math.Mat4;
+const Vec3 = math.Vec3;
+const Environment = api.Environment;
+const Scene = api.Scene;
+const Entity = api.Entity;
+const LightmapDesc = api.LightmapDesc;
+const Pose = api.Pose;
+const CloudDesc = api.CloudDesc;
+const CloudFlash = api.CloudFlash;
+const Sun = api.Sun;
+const Light = api.Light;
+const EntityDesc = api.EntityDesc;
+const DecalDesc = api.DecalDesc;
+const max_decals = api.max_decals;
+const hdr_format = renderer_state.hdr_format;
+const ModelEntry = renderer_state.ModelEntry;
+const SceneData = renderer_state.SceneData;
+const no_skin = renderer_state.no_skin;
+const EntityData = renderer_state.EntityData;
+const packTint = renderer_state.packTint;
+const InstanceGroupData = renderer_state.InstanceGroupData;
+const destroyFluidTextures = @import("fluid.zig").destroyFluidTextures;
+const freeHair = @import("hair.zig").freeHair;
+const freeProbe = @import("probes.zig").freeProbe;
+
+/// Sets the scene's volumetric cloud layer; null removes it. Drawn by
+/// views with `Settings.clouds` on.
+pub fn setClouds(self: *Renderer, scene: Scene, clouds: ?CloudDesc) !void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const data = self.scenes.get(scene) orelse return error.InvalidScene;
+    data.clouds = clouds;
+}
+
+/// Position and brightness of the lightning flash in the scene's clouds
+/// right now, if any.
+pub fn cloudFlash(self: *Renderer, scene: Scene) ?CloudFlash {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const data = self.scenes.get(scene) orelse return null;
+    if (data.flash_brightness <= 0) return null;
+    return .{
+        .position = .{
+            @floatCast(data.flash_position[0] - data.origin[0]),
+            @floatCast(data.flash_position[1] - data.origin[1]),
+            @floatCast(data.flash_position[2] - data.origin[2]),
+        },
+        .brightness = data.flash_brightness,
+    };
+}
+
+/// Replaces the scene's decals. They apply to opaque surfaces before
+/// lighting.
+pub fn setDecals(self: *Renderer, scene: Scene, decals: []const DecalDesc) !void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const data = self.scenes.get(scene) orelse return error.InvalidScene;
+    if (decals.len > max_decals) return error.TooManyDecals;
+    data.decals.clearRetainingCapacity();
+    try data.decals.appendSlice(self.gpa, decals);
+}
+
+/// Creates an empty scene: no entities or lights, sun off, no
+/// environment.
+pub fn createScene(self: *Renderer) !Scene {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    return self.scenes.insert(.{});
+}
+
+/// Destroys the scene and every entity in it.
+pub fn destroyScene(self: *Renderer, scene: Scene) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    var removed = self.scenes.remove(scene) orelse return;
+    for (removed.entities.items) |entity| {
+        const data = self.entities.remove(entity) orelse continue;
+        if (self.models.get(data.model)) |model| model.references -= 1;
+        freeEntityStorage(self, data);
+    }
+    freeScene(self, &removed);
+}
+
+pub fn freeScene(self: *Renderer, scene: *SceneData) void {
+    scene.entities.deinit(self.gpa);
+    scene.lights.deinit(self.gpa);
+    for (scene.emitters.items) |emitter| if (self.emitters.remove(emitter)) |removed| {
+        self.device.destroyBuffer(removed.buffer);
+        if (removed.order) |order| self.device.destroyBuffer(order);
+        if (removed.trail) |trail| self.device.destroyBuffer(trail);
+    };
+    scene.emitters.deinit(self.gpa);
+    for (scene.probes.items) |probe| if (self.probes.remove(probe)) |removed_probe| {
+        var removed = removed_probe;
+        freeProbe(self, &removed);
+    };
+    scene.probes.deinit(self.gpa);
+    for (scene.fluids.items) |fluid| if (self.fluids.remove(fluid)) |removed| {
+        var state = removed;
+        destroyFluidTextures(self, &state);
+    };
+    scene.fluids.deinit(self.gpa);
+    for (scene.waters.items) |water| if (self.waters.remove(water)) |removed| {
+        for (removed.state) |texture| self.device.destroyTexture(texture);
+    };
+    scene.waters.deinit(self.gpa);
+    for (scene.hairs.items) |hair| if (self.hairs.remove(hair)) |removed| freeHair(self, removed);
+    scene.hairs.deinit(self.gpa);
+    for (scene.liquids.items) |liquid| if (self.liquids.remove(liquid)) |removed_liquid| {
+        var removed = removed_liquid;
+        removed.deinit(self.device);
+    };
+    scene.liquids.deinit(self.gpa);
+    if (scene.trace_nodes) |buffer| self.device.destroyBuffer(buffer);
+    if (scene.trace_instances) |buffer| self.device.destroyBuffer(buffer);
+    scene.decals.deinit(self.gpa);
+    scene.movers.deinit(self.gpa);
+    for (scene.groups.items) |group| if (self.instance_groups.remove(group)) |removed| {
+        if (removed.impostor) |impostor| {
+            self.device.destroyTexture(impostor.color);
+            self.device.destroyTexture(impostor.normal);
+        }
+        self.gpa.free(removed.transforms);
+        self.gpa.free(removed.tints);
+        self.gpa.free(removed.params);
+        if (self.models.get(removed.model)) |model| model.references -= 1;
+    };
+    scene.groups.deinit(self.gpa);
+    scene.static_tlas.deinit(self.gpa);
+    for (scene.instance_slots) |slot| if (slot.buffer) |buffer| self.device.destroyBuffer(buffer);
+    scene.transparent.deinit(self.gpa);
+    scene.static_transparent.deinit(self.gpa);
+    scene.layout.deinit(self.gpa);
+    if (scene.refs) |buffer| self.device.destroyBuffer(buffer);
+    scene.static_ranges.deinit(self.gpa);
+    if (scene.static_cull) |buffer| self.device.destroyBuffer(buffer);
+    if (scene.impostor_table) |buffer| self.device.destroyBuffer(buffer);
+    if (scene.impostor_list) |buffer| self.device.destroyBuffer(buffer);
+    if (scene.candidates) |buffer| self.device.destroyBuffer(buffer);
+    if (scene.seen) |buffer| self.device.destroyBuffer(buffer);
+    for (scene.seen_readback) |readback| if (readback) |buffer| self.device.destroyBuffer(buffer);
+    if (scene.skin_bounds) |buffer| self.device.destroyBuffer(buffer);
+    if (scene.tlas) |tlas| self.device.destroyAcceleration(tlas);
+    if (scene.gi) |volume| volume.deinit(self.device);
+    if (scene.gi_coarse) |volume| volume.deinit(self.device);
+    if (scene.gi_middle) |volume| volume.deinit(self.device);
+}
+
+/// Replaces the scene's sun. `intensity` 0 turns it and its shadows off.
+pub fn setSun(self: *Renderer, scene: Scene, sun: Sun) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.scenes.get(scene)) |data| data.sun = sun;
+}
+
+/// Sets the HDR environment used for the sky and image-based lighting.
+pub fn setEnvironment(self: *Renderer, scene: Scene, environment: ?Environment, intensity: f32) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.scenes.get(scene)) |data| {
+        data.environment = environment;
+        data.environment_intensity = intensity;
+    }
+}
+
+/// Replaces the scene's point and spot lights.
+pub fn setLights(self: *Renderer, scene: Scene, lights: []const Light) !void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const data = self.scenes.get(scene) orelse return error.InvalidScene;
+    data.lights.clearRetainingCapacity();
+    try data.lights.appendSlice(self.gpa, lights);
+    data.lights_version += 1;
+}
+
+/// Adds an entity; the model may still be loading. The entity holds a
+/// reference to the model until `despawn` or `destroyScene`. Fails with
+/// `error.InvalidScene` or `error.InvalidModel` for a stale handle.
+pub fn spawn(self: *Renderer, scene: Scene, desc: EntityDesc) !Entity {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const scene_data = self.scenes.get(scene) orelse return error.InvalidScene;
+    const model = self.models.get(desc.model) orelse return error.InvalidModel;
+    const entity = try self.entities.insert(.{
+        .scene = scene,
+        .model = desc.model,
+        .transform = desc.transform,
+        .previous_transform = desc.transform,
+        .visible = desc.visible,
+        .tint = packTint(desc.tint),
+        .params = desc.params,
+        .receive_decals = desc.receive_decals,
+    });
+    errdefer _ = self.entities.remove(entity);
+    try scene_data.entities.append(self.gpa, entity);
+    model.references += 1;
+    scene_data.layout_dirty = true;
+    return entity;
+}
+
+/// Removes an entity and releases its model reference. A stale handle is
+/// ignored.
+pub fn despawn(self: *Renderer, entity: Entity) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const data = self.entities.remove(entity) orelse return;
+    if (self.scenes.get(data.scene)) |scene| {
+        for (scene.entities.items, 0..) |candidate, index| if (@as(u32, @bitCast(candidate)) == @as(u32, @bitCast(entity))) {
+            _ = scene.entities.orderedRemove(index);
+            break;
+        };
+        scene.layout_dirty = true;
+    }
+    if (self.models.get(data.model)) |model| model.references -= 1;
+    freeEntityStorage(self, data);
+}
+
+pub fn freeEntityStorage(self: *Renderer, entity: EntityData) void {
+    if (entity.lightmap) |lightmap| {
+        for (lightmap.gathered) |texture| self.device.destroyTexture(texture);
+        self.device.destroyTexture(lightmap.shown);
+    }
+    if (self.models.get(entity.model)) |model| {
+        if (model.source) |source| for (entity.skin_offsets, 0..) |offset, index| {
+            if (offset == no_skin) continue;
+            self.vertices.free(self, offset, model.meshes[source.instances[index].mesh].vertex_count * 2);
+        };
+    }
+    self.gpa.free(entity.skin_offsets);
+    for (entity.skin_blas) |blas| if (blas) |value| self.device.destroyAcceleration(value);
+    self.gpa.free(entity.skin_blas);
+    self.gpa.free(entity.bounds_offsets);
+    self.gpa.free(entity.node_world);
+    self.gpa.free(entity.previous_node_world);
+}
+
+/// Sets the model-to-world transform. The change from last frame counts
+/// as motion; use `teleport` for a jump that should not.
+pub fn setTransform(self: *Renderer, entity: Entity, transform: Mat4) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.entities.get(entity)) |data| data.transform = transform;
+}
+
+/// Like `setTransform`, but resets motion history.
+pub fn teleport(self: *Renderer, entity: Entity, transform: Mat4) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.entities.get(entity)) |data| {
+        data.transform = transform;
+        data.previous_transform = transform;
+    }
+}
+
+/// Changes the color an entity's materials are multiplied by.
+pub fn setTint(self: *Renderer, entity: Entity, tint: [3]f32) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.entities.get(entity)) |data| data.tint = packTint(tint);
+}
+
+/// Sets the entity's `MaterialContext.instance_params`.
+pub fn setParams(self: *Renderer, entity: Entity, params: [4]f32) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.entities.get(entity)) |data| data.params = params;
+}
+
+/// Overrides morph target weights (up to 64, in model order) on every
+/// mesh that has any; null returns them to the animation. Only skinned
+/// meshes morph.
+pub fn setMorphWeights(self: *Renderer, entity: Entity, weights: ?[]const f32) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const data = self.entities.get(entity) orelse return;
+    if (weights) |values| {
+        var stored: [gltf.max_morph_targets]f32 = @splat(0);
+        for (values[0..@min(values.len, stored.len)], 0..) |value, index| stored[index] = value;
+        data.morph_weights = stored;
+    } else data.morph_weights = null;
+}
+
+/// Bakes a lightmap for a static entity over `LightmapDesc.frames`
+/// frames; it replaces the irradiance probes on its surfaces. Null removes
+/// it. Needs non-overlapping `MeshDesc.uvs1`, ray tracing
+/// (`error.RayTracingUnavailable`) and `Settings.global_illumination`.
+pub fn bakeLightmap(self: *Renderer, entity: Entity, desc: ?LightmapDesc) !void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const data = self.entities.get(entity) orelse return error.InvalidEntity;
+    const scene = self.scenes.get(data.scene) orelse return error.InvalidScene;
+    if (data.lightmap) |old| {
+        for (old.gathered) |texture| self.device.destroyTexture(texture);
+        self.device.destroyTexture(old.shown);
+        data.lightmap = null;
+    }
+    const wanted = desc orelse return;
+    if (self.pipelines.lightmap_bake == null) return error.RayTracingUnavailable;
+    const size = std.math.clamp(wanted.resolution, 16, 4096);
+    var made: [3]?rhi.Texture = @splat(null);
+    errdefer for (made) |texture| if (texture) |value| self.device.destroyTexture(value);
+    for (&made) |*texture| texture.* = try self.device.createTexture(.{ .name = "lightmap", .width = size, .height = size, .format = hdr_format, .usage = .{ .sampled = true, .color_attachment = true } });
+    data.lightmap = .{
+        .gathered = .{ made[0].?, made[1].? },
+        .shown = made[2].?,
+        .wanted = @max(wanted.frames, 1),
+        .rays = std.math.clamp(wanted.rays, 1, 256),
+        .reach = @max(wanted.reach, 0.01),
+    };
+    scene.lightmaps_baking += 1;
+}
+
+/// Baked fraction of an entity's lightmap, 0 to 1; null if it has none.
+pub fn lightmapProgress(self: *Renderer, entity: Entity) ?f32 {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const data = self.entities.get(entity) orelse return null;
+    const lightmap = data.lightmap orelse return null;
+    return @as(f32, @floatFromInt(@min(lightmap.rounds, lightmap.wanted))) / @as(f32, @floatFromInt(lightmap.wanted));
+}
+
+/// Shows or hides an entity. A hidden entity is not drawn and casts no
+/// shadows; showing it again resets its motion history.
+pub fn setVisible(self: *Renderer, entity: Entity, visible: bool) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const data = self.entities.get(entity) orelse return;
+    if (data.visible == visible) return;
+    data.visible = visible;
+    data.history_frames = 0;
+    if (self.scenes.get(data.scene)) |scene| scene.layout_dirty = true;
+}
+
+/// Sets the animation pose. Null returns the model to its rest pose.
+pub fn setPose(self: *Renderer, entity: Entity, pose: ?Pose) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.entities.get(entity)) |data| data.pose = pose;
+}
+
+/// Allocates per-entity animation state once its model is ready.
+pub fn resolveEntity(self: *Renderer, entity: *EntityData, model: *ModelEntry) !void {
+    if (entity.resolved) return;
+    const source = &model.source.?;
+    const gpa = self.gpa;
+    if (source.skins.len != 0 or source.animations.len != 0) {
+        entity.node_world = try gpa.dupe(Mat4, model.node_world);
+        entity.previous_node_world = try gpa.dupe(Mat4, model.node_world);
+    }
+    entity.skin_offsets = try gpa.alloc(u32, source.instances.len);
+    @memset(entity.skin_offsets, no_skin);
+    entity.skin_blas = try gpa.alloc(?rhi.AccelerationStructure, source.instances.len);
+    @memset(entity.skin_blas, null);
+    entity.bounds_offsets = try gpa.alloc(u32, source.instances.len);
+    @memset(entity.bounds_offsets, gpu.invalid_id);
+    for (source.instances, entity.skin_offsets) |instance, *offset| {
+        const mesh = model.meshes[instance.mesh];
+        if (instance.skin == null or mesh.skin_offset == null) continue;
+        offset.* = try self.vertices.alloc(self, mesh.vertex_count * 2);
+    }
+    entity.history_frames = 0;
+    entity.resolved = true;
+}
+
+/// The entity whose pose a group's copies take, if posed this frame.
+pub fn groupDriver(self: *Renderer, group: *const InstanceGroupData, model_instances: usize) ?*EntityData {
+    const entity = self.entities.get(group.driver orelse return null) orelse return null;
+    if (!entity.visible or !entity.resolved) return null;
+    if (!std.meta.eql(entity.model, group.model) or !std.meta.eql(entity.scene, group.scene)) return null;
+    if (entity.skin_offsets.len != model_instances) return null;
+    return entity;
+}
+
+/// Moves everything in a scene by `offset` without it counting as motion,
+/// for keeping float precision in large worlds. The camera, draw lists
+/// and world-unit settings are the caller's to shift.
+pub fn shiftScene(self: *Renderer, scene: Scene, offset: Vec3) !void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const data = self.scenes.get(scene) orelse return error.InvalidScene;
+    inline for (0..3) |axis| data.origin[axis] -= offset[axis];
+    for (data.entities.items) |item| {
+        const entity = self.entities.get(item) orelse continue;
+        inline for (0..3) |axis| {
+            entity.transform[12 + axis] += offset[axis];
+            entity.previous_transform[12 + axis] += offset[axis];
+        }
+    }
+    for (data.groups.items) |item| {
+        const group = self.instance_groups.get(item) orelse continue;
+        for (group.transforms) |*transform| {
+            inline for (0..3) |axis| transform[12 + axis] += offset[axis];
+        }
+    }
+    data.static_version += 1;
+    for (data.lights.items) |*light| light.position = math.add(light.position, offset);
+    data.lights_version += 1;
+    for (data.decals.items) |*decal| {
+        inline for (0..3) |axis| decal.transform[12 + axis] += offset[axis];
+    }
+    for (data.emitters.items) |item| {
+        const emitter = self.emitters.get(item) orelse continue;
+        emitter.desc.position = math.add(emitter.desc.position, offset);
+        emitter.shift = math.add(emitter.shift, offset);
+    }
+    for (data.fluids.items) |item| {
+        const fluid = self.fluids.get(item) orelse continue;
+        inline for (0..3) |axis| fluid.desc.transform[12 + axis] += offset[axis];
+    }
+    for (data.waters.items) |item| {
+        const water = self.waters.get(item) orelse continue;
+        inline for (0..3) |axis| water.desc.transform[12 + axis] += offset[axis];
+    }
+    if (data.gi_bounds) |*bounds| {
+        bounds[0] = math.add(bounds[0], offset);
+        bounds[1] = math.add(bounds[1], offset);
+    }
+    inline for (.{ &data.gi, &data.gi_coarse, &data.gi_middle }) |slot| {
+        if (slot.*) |*volume| volume.origin = math.add(volume.origin, offset);
+    }
+}
+
+/// The scene's zero in the application's world: minus the sum of every
+/// `shiftScene` offset.
+pub fn sceneOrigin(self: *Renderer, scene: Scene) [3]f64 {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    return if (self.scenes.get(scene)) |data| data.origin else .{ 0, 0, 0 };
+}
+
+/// Pins the irradiance probe volume to a world-space box; null derives it
+/// from the scene's static geometry (the default).
+pub fn setGiVolume(self: *Renderer, scene: Scene, bounds: ?[2]Vec3) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.scenes.get(scene)) |data| data.gi_bounds = bounds;
+}

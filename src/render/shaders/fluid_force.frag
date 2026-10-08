@@ -2,8 +2,6 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Forces: buoyancy, smoke weight, wind and vorticity confinement (Fedkiw et al.
-// 2001).
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;

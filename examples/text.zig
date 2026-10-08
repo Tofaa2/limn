@@ -52,14 +52,10 @@ pub fn main(init: std.process.Init) !void {
     const floor = try renderer.createModel(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.3, 0.32, 0.36, 1 }, .metallic = 0, .roughness = 0.4 } }});
     _ = try renderer.spawn(scene, .{ .model = floor });
 
-    // The built-in font starts with Latin letters; anything else it holds
-    // is baked when asked for, as are its ligatures.
     const font = renderer.defaultFont();
     try renderer.prepareText(font, hebrew ++ arabic ++ mixed ++ "→·“”");
     try renderer.prepareLigatures(font);
 
-    // A font per script. Only the characters named are baked, and the
-    // glyphs that shaping turns them into along with them.
     var loaded: [samples.len]*const gfx.Font = undefined;
     for (samples, &loaded) |sample, *slot| {
         var path_buffer: [128]u8 = undefined;
@@ -78,8 +74,6 @@ pub fn main(init: std.process.Init) !void {
         const left = gfx.Rect{ .x = 24, .y = 24, .width = 560, .height = 672 };
         try list.roundedRect(left, Color.rgba(12, 14, 22, 225), .{ .radius = 14 });
         var y: f32 = left.y + 16;
-        // One atlas, any size: the glyphs are stored as distances, not
-        // pixels, so they stay sharp.
         for ([_]f32{ 11, 16, 26, 40, 58 }) |size| {
             try list.text(font, "Sharp at any size", .{ left.x + 20, y }, .{ .size = size });
             y += size * 1.25;
@@ -93,7 +87,6 @@ pub fn main(init: std.process.Init) !void {
         y += 40;
         try list.text(font, "Outlined by a shadow", .{ left.x + 20, y }, .{ .size = 24, .color = Color.hex(0xffd23f), .shadow = Color.rgba(0, 0, 0, 220) });
         y += 44;
-        // Right-to-left lines are right-aligned, as their readers expect.
         try list.text(font, hebrew, .{ left.x + left.width - 20, y }, .{ .size = 26, .alignment = .right });
         try list.text(font, "Hebrew", .{ left.x + 20, y + 8 }, .{ .size = 13, .color = label });
         y += 36;
@@ -102,7 +95,6 @@ pub fn main(init: std.process.Init) !void {
         y += 40;
         try list.text(font, mixed, .{ left.x + 20, y }, .{ .size = 18 });
         y += 40;
-        // Runs with their own size and color, wrapped as one block.
         _ = try list.richText(&.{
             .{ .text = "Rich text " },
             .{ .text = "mixes ", .color = Color.hex(0x3ddc97) },
@@ -122,10 +114,8 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        // Columns read downward, from right to left.
         try list.textVertical(font, "TOP\nDOWN", .{ 1226, 504 }, .{ .size = 26, .color = Color.hex(0x3ddc97) });
 
-        // Text in the scene: facing the camera, or lying where it is put.
         const turn = tick.time * 0.4;
         try list.text3d(font, "Always faces you", .{ 2.6, 1.0, 0 }, .{ .size = 0.3 });
         try list.text3d(font, "Fixed in the world", .{ 0, 0, 0 }, .{

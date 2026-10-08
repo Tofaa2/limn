@@ -111,7 +111,7 @@ pub const Options = struct {
     /// Anisotropic filtering for roughness/metalness, occlusion and emissive.
     data_texture_anisotropy: f32 = 1,
     /// Maximum probes along X, Y and Z in one light probe grid.
-    gi_max_probes: [3]u32 = .{ 24, 12, 24 },
+    gi_max_probes: [3]u32 = .{ 32, 12, 32 },
     /// Tiles per side of the local-light shadow atlas, 1..4. A spot light uses
     /// one tile, a point light six.
     local_shadow_tiles_per_side: u32 = 4,
@@ -638,7 +638,9 @@ pub const Light = struct {
     /// Uses one atlas tile for a spot light and six for a point light; at most
     /// 16 tiles per frame, assigned in order.
     cast_shadows: bool = false,
-    /// Radius of the emitting sphere; 0 is an ideal point.
+    /// Radius of the emitting sphere; 0 is an ideal point. For a directional
+    /// light, the tangent of the angle its disc spans from the center: the
+    /// sun's is about 0.005.
     source_radius: f32 = 0,
     /// Point lights only: makes the source a tube this long along `direction`,
     /// `source_radius` thick. Shadows are still cast from the center.
@@ -908,7 +910,7 @@ pub const Settings = struct {
     /// Distance between probes; grows automatically for large scenes.
     gi_probe_spacing: f32 = 1.5,
     /// Rays traced per probe per frame, 16..256.
-    gi_rays: u32 = 64,
+    gi_rays: u32 = 128,
     /// Multiplies the probes' indirect light.
     gi_intensity: f32 = 1,
     /// Resolution probe irradiance is evaluated at. Below `.full` it uses
@@ -916,9 +918,12 @@ pub const Settings = struct {
     gi_resolution: EffectResolution = .full,
     /// Each probe is re-traced once every this many frames, 1..16.
     gi_update_interval: u32 = 4,
+    /// Probes farther than this from the camera are re-traced an eighth as
+    /// often, which is what pays for `gi_rays`. 0 treats all alike.
+    gi_far_distance: f32 = 30,
     /// Share of a probe's previous value kept each frame, 0..1. Large changes
     /// bypass it; see `gi_change_tolerance`.
-    gi_hysteresis: f32 = 0.995,
+    gi_hysteresis: f32 = 0.998,
     /// In a scene too large for the grid at `gi_probe_spacing`: true keeps that
     /// spacing in a grid that follows the camera, plus a coarse grid over the
     /// whole scene; false uses only the coarse grid.
@@ -944,8 +949,10 @@ pub const Settings = struct {
     /// cells. Costs a pass per probe update and eight texture fetches per
     /// shaded pixel.
     gi_probe_relocation: bool = false,
-    /// Relative difference between a probe's fast and steady estimates (0.25 =
-    /// 25%) beyond which the steady one follows at once. 0 turns it off.
+    /// How far a probe's steady estimate may sit above its fast one (0.25 =
+    /// 25%) before it follows at once. It may sit two and a half times as far
+    /// below, so a ray that lands on a lamp does not flash the probe. 0 turns
+    /// it off.
     gi_change_tolerance: f32 = 0.3,
     /// Resolution of the ambient occlusion pass.
     ao_resolution: EffectResolution = .half,
@@ -958,7 +965,7 @@ pub const Settings = struct {
     ao_steps: u32 = 5,
     /// Refresh the far sun cascades every 2nd, 4th and 8th frame. A cascade
     /// with a moving caster is still redrawn every frame.
-    shadow_cascade_stagger: bool = true,
+    shadow_cascade_stagger: bool = false,
     /// Temporal antialiasing (TAA). Several other settings rely on it to
     /// average out their noise.
     temporal_antialiasing: bool = true,
@@ -973,6 +980,9 @@ pub const Settings = struct {
     /// Adapt exposure to the picture's average brightness. False uses
     /// `exposure_compensation` alone.
     automatic_exposure: bool = true,
+    /// How fast automatic exposure follows the picture, per second; it
+    /// brightens at this rate and darkens 1.6 times faster.
+    exposure_speed: f32 = 3,
     /// Stops added on top of automatic exposure, or the absolute exposure
     /// (as 2^EV) when automatic exposure is off.
     exposure_compensation: f32 = 0,

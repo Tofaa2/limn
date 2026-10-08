@@ -1,15 +1,11 @@
 #version 460
 #include "common.glsl"
 
-// Renders one mesh into an impostor atlas tile: orthographic, with the model's
-// bounding sphere filling the tile.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
-    // Mesh to model.
     mat4 node;
     vec3 center;
     float radius;
-    // Capture camera: right, up and direction toward it.
     vec3 right;
     uint vertex_offset;
     vec3 up;
@@ -29,6 +25,5 @@ void main() {
     out_normal = transpose(inverse(mat3(push.node))) * vertexNormal(vertex);
     out_uv = vertex.uv;
     out_vertex_color = unpackUnorm4x8(vertex.color);
-    // Reverse-Z.
     gl_Position = vec4(dot(from_middle, push.right), -dot(from_middle, push.up), 0.5 + 0.5 * dot(from_middle, push.toward), 1.0);
 }

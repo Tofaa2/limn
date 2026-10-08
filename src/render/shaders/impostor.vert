@@ -2,8 +2,6 @@
 #include "common.glsl"
 #include "impostor.glsl"
 
-// Draws the instances culling selected as impostors: a card showing the atlas
-// tile nearest the view direction.
 struct StaticCull {
     vec4 sphere;
     uint first_ref;
@@ -18,15 +16,12 @@ layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     Impostors impostors;
     StaticCulls instances;
-    // Instances to draw, listed by culling.
     ImpostorList list;
-    // Entity instances preceding instance-group instances.
     uint entity_instances;
 } push;
 
 layout(location = 0) out vec3 out_position;
 layout(location = 1) out vec2 out_uv;
-// Model rotation in world space, without scale.
 layout(location = 2) flat out mat3 out_turn;
 layout(location = 5) flat out uvec3 out_textures;
 

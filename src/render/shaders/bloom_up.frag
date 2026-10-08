@@ -1,7 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// 3x3 tent upsample, additively blended onto the next larger level.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;

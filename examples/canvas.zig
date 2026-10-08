@@ -38,7 +38,6 @@ pub fn main(init: std.process.Init) !void {
         try canvas_scene.draw(&list, renderer.defaultFont(), assets, .{ @floatFromInt(size[0]), @floatFromInt(size[1]) }, @floatCast(now));
         try list.text(renderer.defaultFont(), fps_text, .{ @as(f32, @floatFromInt(size[0])) * 0.5, 16 }, .{ .size = 20, .alignment = .center });
 
-        // No scene: the renderer clears to `clear_color` and draws the list.
         if (try renderer.render(.{ .views = &.{.{ .draw_lists = &.{&list}, .clear_color = .{ 0.02, 0.025, 0.045, 1 } }} })) {
             frames += 1;
             fps_frames += 1;

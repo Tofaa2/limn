@@ -1,24 +1,15 @@
-// Ray-scene intersection. With RAY_TRACED: ray queries against the TLAS.
-// Without: a software BVH (bvh.zig), one over the instances and one per mesh.
-// Both return instance, triangle and barycentrics.
 #ifndef TRACE_GLSL
 #define TRACE_GLSL
 
 struct TraceHit {
-    // Distance along the ray.
     float t;
-    // Index into the frame's instances.
     uint instance;
-    // Triangle index in the mesh's full-detail indices.
     uint primitive;
-    // Barycentric weights of the second and third vertex.
     vec2 barycentric;
 };
 
 #ifdef RAY_TRACED
 
-// The includer enables GL_EXT_ray_query and declares `traceScene()`, which
-// returns the TLAS address.
 bool traceClosest(vec3 origin, vec3 direction, float max_distance, out TraceHit hit) {
     rayQueryEXT query;
     rayQueryInitializeEXT(query, accelerationStructureEXT(traceScene()), gl_RayFlagsOpaqueEXT, 0xffu, origin, 0.0, direction, max_distance);
@@ -40,7 +31,6 @@ bool traceAny(vec3 origin, vec3 direction, float max_distance) {
 
 #else
 
-// Must match `Node` in bvh.zig.
 struct BvhNode {
     vec3 lo;
     uint first;
@@ -48,7 +38,6 @@ struct BvhNode {
     uint count;
 };
 
-// Scene BVH leaf: world-to-mesh transform and instance index.
 struct BvhInstance {
     mat4x3 to_mesh;
     uint instance;
@@ -61,15 +50,12 @@ layout(buffer_reference, scalar) readonly buffer BvhNodes { BvhNode data[]; };
 layout(buffer_reference, scalar) readonly buffer BvhItems { uint data[]; };
 layout(buffer_reference, scalar) readonly buffer BvhInstances { BvhInstance data[]; };
 
-// Declared by the includer: scene nodes and instances, mesh nodes, leaf
-// triangle lists and the frame.
 BvhNodes traceSceneNodes();
 BvhInstances traceSceneInstances();
 BvhNodes traceMeshNodes();
 BvhItems traceMeshItems();
 FrameConstants traceFrame();
 
-// Entry distance into the box; negative on a miss or beyond `nearest`.
 float traceBox(vec3 lo, vec3 hi, vec3 origin, vec3 inverse, float nearest) {
     vec3 a = (lo - origin) * inverse;
     vec3 b = (hi - origin) * inverse;
@@ -85,12 +71,9 @@ vec3 traceInverse(vec3 direction) {
     return 1.0 / safe;
 }
 
-// Traces one mesh in its own space. `nearest` is the closest hit so far and is
-// updated. Returns whether anything was hit.
 bool traceMesh(Instance instance, uint instance_index, vec3 origin, vec3 direction, bool any_hit, inout float nearest, inout TraceHit hit) {
     FrameConstants frame = traceFrame();
     Mesh mesh = frame.meshes.data[instance.mesh];
-    // Meshes without a BVH are invisible to rays.
     if (mesh.bvh == INVALID_ID) return false;
     BvhNodes nodes = traceMeshNodes();
     BvhItems items = traceMeshItems();
@@ -111,7 +94,6 @@ bool traceMesh(Instance instance, uint instance_index, vec3 origin, vec3 directi
                 vec3 p0 = frame.vertices.data[instance.vertex_offset + frame.indices.data[base]].position;
                 vec3 p1 = frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 1u]].position;
                 vec3 p2 = frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 2u]].position;
-                // Möller and Trumbore.
                 vec3 edge1 = p1 - p0;
                 vec3 edge2 = p2 - p0;
                 vec3 across = cross(direction, edge2);
@@ -138,7 +120,6 @@ bool traceMesh(Instance instance, uint instance_index, vec3 origin, vec3 directi
             current = stack[--depth];
             continue;
         }
-        // Child indices are relative to the mesh root.
         uint left = root + node.first;
         BvhNode a = nodes.data[left];
         BvhNode b = nodes.data[left + 1u];
@@ -182,8 +163,6 @@ bool traceWalk(vec3 origin, vec3 direction, float max_distance, bool any_hit, ou
             for (uint i = 0u; i < node.count; i++) {
                 BvhInstance placed = instances.data[node.first + i];
                 Instance instance = frame.instances.data[placed.instance];
-                // The direction is not renormalized in mesh space, so t stays
-                // in world units.
                 vec3 mesh_origin = placed.to_mesh * vec4(origin, 1.0);
                 vec3 mesh_direction = placed.to_mesh * vec4(direction, 0.0);
                 if (traceMesh(instance, placed.instance, mesh_origin, mesh_direction, any_hit, nearest, hit)) {

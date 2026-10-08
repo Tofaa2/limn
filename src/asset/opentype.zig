@@ -400,7 +400,6 @@ pub const Layout = struct {
             if (self.positions) {
                 const placed = switch (actual) {
                     1 => try self.adjustOne(glyphs, subtable, at),
-                    // Pair adjustments are applied only inside a context.
                     2 => if (depth == 0) null else try self.adjustPair(glyphs, subtable, flag, at),
                     7 => try self.context(gpa, glyphs, subtable, flag, at, depth),
                     8 => try self.chained(gpa, glyphs, subtable, flag, at, depth),

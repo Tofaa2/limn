@@ -3,18 +3,13 @@
 #include "cull_view.glsl"
 #include "vsm.glsl"
 
-// Allocates atlas slots for the pages vsm_mark.comp requested and picks the
-// pages to draw this frame, writing their cull and draw views. One invocation
-// walks every page.
 layout(local_size_x = 1) in;
 
-// The frame's culling views (`CullView` in cull_view.glsl) as raw words.
 layout(buffer_reference, scalar) buffer CullViews { uint data[]; };
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     Vsm vsm;
-    // Culling views: the camera's, and the first of those reserved for pages.
     CullViews views;
     uint first_page_view;
     uint pad;
@@ -28,7 +23,6 @@ const uint cull_view_lod_band = 53u;
 const uint cull_view_min_radius = 54u;
 const uint cull_view_receiver_culling = 55u;
 
-// Copies the camera's culling view to page `which`; returns its word offset.
 uint pageCullView(uint which) {
     uint first = (push.first_page_view + which) * cull_view_words;
     for (uint word = 0u; word < cull_view_words; word++) push.views.data[first + word] = push.views.data[word];
@@ -43,7 +37,6 @@ uint pageCullView(uint which) {
 void setPlane(uint first, uint plane, vec4 value) {
     for (uint part = 0u; part < 4u; part++) push.views.data[first + plane * 4u + part] = floatBitsToUint(value[part]);
 }
-
 
 bool moved(Vsm vsm, uint level, ivec2 page) {
     if (vsm.all_moved != 0u) return true;
@@ -91,8 +84,6 @@ void main() {
     uint total = vsm.levels * per_level;
     uint places = uint(vsm_atlas_pages * vsm_atlas_pages);
 
-    // Re-key the table for the camera position; pages outside the window free
-    // their slots.
     for (uint slot = 0u; slot < total; slot++) {
         uint level = slot / per_level;
         ivec2 window = vsmWindow(vsm, level);
@@ -111,7 +102,6 @@ void main() {
 
     uint drawn = 0u;
     uint search = 0u;
-    // Two rounds: stale pages first, then new ones.
     for (uint slot = 0u; slot < total * 2u; slot++) {
         bool stale_round = slot < total;
         VsmPage entry = vsm.pages.data[slot % total];
@@ -121,7 +111,6 @@ void main() {
         ivec2 wrapped = ivec2(int((slot % total) % per_level) % vsm_pages, int((slot % total) % per_level) / vsm_pages);
         ivec2 page = window + ((wrapped - window) & (vsm_pages - 1));
         if (entry.place == 0u) {
-            // A free slot, else the least recently requested.
             uint found = places;
             for (uint tried = 0u; tried < places && found == places; tried++) {
                 uint place = (search + tried) % places;

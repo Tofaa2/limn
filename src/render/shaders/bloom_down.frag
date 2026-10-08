@@ -1,8 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// 13-tap downsample from "Next Generation Post Processing in Call of Duty:
-// Advanced Warfare". The first level uses Karis averaging to stop fireflies.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;

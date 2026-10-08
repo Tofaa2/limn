@@ -4,9 +4,6 @@
 #include "common.glsl"
 #include "rt.glsl"
 
-// Progressive lightmap bake: traces cosine-weighted rays from each texel and
-// accumulates indirect light (hits lit by the shadowed sun and the probes).
-// Direct sun is excluded. Stores irradiance / pi, as the probes do.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint64_t tlas;
@@ -31,7 +28,6 @@ uint hash(uint value) {
 
 void main() {
     FrameConstants frame = push.frame;
-    // Use the surface normal; winding in the lightmap is arbitrary.
     vec3 normal = normalize(in_normal);
     uint state = hash(uint(gl_FragCoord.x) + hash(uint(gl_FragCoord.y) + hash(push.rounds)));
     vec3 hint = abs(normal.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
@@ -44,7 +40,6 @@ void main() {
         float turn = 2.0 * PI * float(state) / 4294967296.0;
         state = hash(state);
         float out_from = sqrt(float(state) / 4294967296.0);
-        // Cosine-weighted direction.
         vec3 direction = normalize(side * cos(turn) * out_from + other * sin(turn) * out_from + normal * sqrt(max(1.0 - out_from * out_from, 0.0)));
         vec3 radiance;
         float distance_hit;

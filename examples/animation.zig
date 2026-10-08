@@ -82,18 +82,14 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_D)) orbit += tick.dt;
         if (!paused) clock += tick.dt;
 
-        // 1: one weight sweeps idle -> walk -> run -> walk -> idle.
         const gait = 1 - @cos(clock * 0.7);
         const crossfade: gfx.Pose = if (gait < 1)
             .{ .animation = clips.idle, .time = clock, .blend = .{ .animation = clips.walk, .time = clock, .weight = gait } }
         else
             .{ .animation = clips.walk, .time = clock, .blend = .{ .animation = clips.run, .time = clock, .weight = gait - 1 } };
 
-        // 2: a layer limited to the spine and everything above it.
         var masked = gfx.Pose{ .animation = clips.walk, .time = clock };
-        // 3: a layer added on top, relative to the clip's own first frame.
         var additive = gfx.Pose{ .animation = clips.run, .time = clock };
-        // 4: layers stack in order.
         var both = gfx.Pose{ .animation = clips.run, .time = clock };
         if (layers_on) {
             const wave = gfx.Pose.Blend{ .animation = clips.wave, .time = clock, .weight = 1, .root = clips.spine };

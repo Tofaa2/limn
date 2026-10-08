@@ -1,35 +1,19 @@
 #version 460
 #include "common.glsl"
 
-// Edge-avoiding a-trous filter for the path tracer's noisy light. The light is
-// demodulated by albedo, filtered with plane, normal and variance-guided
-// luminance weights over several passes of growing step, then remodulated and
-// added to the steady light.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
-    // Demodulated noisy light. First pass: a = second moment of luminance;
-    // later passes: a = variance.
     uint color_texture;
-    // Albedo (black where nothing is denoised) and distance, negative via a
-    // mirror.
     uint guide_texture;
-    // Pixels between taps.
     int step_size;
     uint gathered;
-    // 0: first pass, 3: middle, 1: last, 2: single pass without filtering.
     uint mode;
-    // Steady light, a = accumulated frame count.
     uint steady_texture;
-    // Accumulated normal (rgb, unnormalized) and distance (a, negative via a
-    // mirror).
     uint facing_texture;
-    // Glossy reflections added by the last pass: denoised, and accumulated
-    // while the camera is still (a = frame count).
     uint gloss_texture;
     uint gloss_gathered_texture;
 } push;
 
-// Frame counts over which accumulated reflections replace denoised ones.
 const vec2 gathered_takes_over = vec2(128.0, 1024.0);
 
 const uint mode_first = 0u;
@@ -42,7 +26,6 @@ bool mirroredAt(FrameConstants frame, ivec2 pixel) {
     return texelFetch(TEX(push.facing_texture, frame.sampler_nearest_clamp), pixel, 0).a < 0.0;
 }
 
-// World position of a pixel's hit; `reach` is its distance, 0 for none.
 vec3 positionAt(FrameConstants frame, ivec2 pixel, out float reach) {
     reach = abs(texelFetch(TEX(push.facing_texture, frame.sampler_nearest_clamp), pixel, 0).a);
     vec2 uv = (vec2(pixel) + 0.5) * frame.inv_resolution;
@@ -56,12 +39,10 @@ vec3 facingAt(FrameConstants frame, ivec2 pixel) {
     return size > 1e-4 ? facing / size : vec3(0.0, 1.0, 0.0);
 }
 
-// Normal similarity weight.
 float facingWeight(vec3 facing, vec3 other) {
     return pow(max(dot(facing, other), 0.0), 48.0);
 }
 
-// Albedo floor for demodulation.
 vec3 divisor(vec3 guide) {
     return max(guide, vec3(0.03));
 }
@@ -70,8 +51,6 @@ vec3 lightAt(FrameConstants frame, ivec2 pixel) {
     return texelFetch(TEX(push.color_texture, frame.sampler_nearest_clamp), pixel, 0).rgb;
 }
 
-// Relative standard deviation of a pixel's light. The first pass derives it
-// from the temporal moments.
 float doubtAt(FrameConstants frame, ivec2 pixel, float frames) {
     vec4 texel = texelFetch(TEX(push.color_texture, frame.sampler_nearest_clamp), pixel, 0);
     if (push.mode != mode_first) return texel.a;
@@ -107,7 +86,6 @@ void main() {
         out_color = push.mode == mode_last ? vec4(steady_texel.rgb + grainy * (colored ? divisor(guide) : vec3(1.0)) + gloss, 1.0) : vec4(grainy, 0.0);
         return;
     }
-    // Plane from the nearer neighbour on each axis.
     float reach_a;
     float reach_b;
     vec3 left = positionAt(frame, clamp(pixel - ivec2(1, 0), ivec2(0), last_pixel), reach_a);
@@ -147,13 +125,11 @@ void main() {
     float own_brightness = luminance(own);
     float around_brightness = around_count > 0.0 ? luminance(around) / around_count : own_brightness;
     if (push.mode == mode_first) {
-        // Firefly clamp to the neighbourhood maximum, looser with more frames.
         float most = brightest_around * (1.0 + frames / 256.0);
         if (around_count > 0.0 && own_brightness > most) {
             own *= most / own_brightness;
             own_brightness = most;
         }
-        // With few frames, spatial variance stands in for temporal.
         float around_spread = around_count > 1.0 ? sqrt(max(around_squared / around_count - around_brightness * around_brightness, 0.0)) : 0.0;
         float by_neighbours = around_spread / (around_brightness + 1e-3);
         doubt = mix(by_neighbours, doubt, clamp((frames - 1.0) / 6.0, 0.0, 1.0));
@@ -181,14 +157,12 @@ void main() {
             weight *= exp(-off_plane / (0.01 * reach + 1e-4));
             weight *= facingWeight(facing, facingAt(frame, tap));
             weight *= exp(-abs(luminance(light) - reference) / allowed);
-            // In mirrors, also weight by distance.
             if (mirrored) weight *= exp(-abs(tap_reach - reach) / (0.05 * reach + 0.02));
             total += light * weight;
             weight_total += weight;
         }
     }
     vec3 smoothed = weight_total > 1e-6 ? total / weight_total : own;
-    // Fade the filter out as frames accumulate.
     smoothed = mix(smoothed, traced, clamp(frames / 4096.0, 0.0, 1.0));
     if (any(isnan(smoothed)) || any(isinf(smoothed))) smoothed = any(isnan(traced)) || any(isinf(traced)) ? vec3(0.0) : traced;
     out_color = push.mode == mode_last ? vec4(steady_texel.rgb + smoothed * divisor(guide) + gloss, 1.0) : vec4(smoothed, doubt);

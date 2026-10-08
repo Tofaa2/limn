@@ -1,5 +1,3 @@
-// Cloud layer: a slab between two altitudes on a curved planet, with density
-// from the noise volume made by cloud_noise.frag.
 #ifndef CLOUDS_GLSL
 #define CLOUDS_GLSL
 #include "volume.glsl"
@@ -11,19 +9,15 @@ float cloudRemap(float value, float low, float high) {
     return clamp((value - low) / max(high - low, 1e-5), 0.0, 1.0);
 }
 
-// Height above the curved ground, relative to the camera to keep float
-// precision.
 float cloudAltitude(CloudData clouds, vec3 position, vec3 camera) {
     vec2 across = position.xz - camera.xz;
     return position.y + dot(across, across) / (2.0 * clouds.planet_radius);
 }
 
-// Extinction per meter. `detailed` adds small-scale erosion.
 float cloudDensity(CloudData clouds, uint s, vec3 position, float altitude, bool detailed) {
     float height = (altitude - clouds.bottom) / (clouds.top - clouds.bottom);
     if (height <= 0.0 || height >= 1.0) return 0.0;
     vec3 p = (position + clouds.offset) / clouds.period;
-    // Volume slices run along world Y.
     vec3 uvw = vec3(p.x, p.z, p.y);
     vec4 noise = sampleVolumeRepeat(clouds.noise_texture, s, uvw, CLOUD_NOISE_SIZE, CLOUD_NOISE_TILES);
     float billows = noise.g * 0.625 + noise.b * 0.25 + noise.a * 0.125;
@@ -31,7 +25,6 @@ float cloudDensity(CloudData clouds, uint s, vec3 position, float altitude, bool
     float profile = smoothstep(0.0, 0.12, height) * smoothstep(1.0, 0.35, height);
     float weather = sampleVolumeRepeat(clouds.noise_texture, s, vec3(uvw.xy * 0.17 + 0.31, 0.37), CLOUD_NOISE_SIZE, CLOUD_NOISE_TILES).r;
     float coverage = clamp(clouds.coverage + (weather - 0.55) * clouds.variation, 0.0, 1.0);
-    // Noise is roughly 0.3..1; coverage lowers the cloud threshold.
     float threshold = 1.0 - coverage * 0.5;
     if (clouds.anvil > 0.0) {
         float storm = clouds.anvil * smoothstep(0.6, 0.85, weather);
@@ -50,9 +43,6 @@ float cloudDensity(CloudData clouds, uint s, vec3 position, float altitude, bool
     return density * clouds.density;
 }
 
-// Nearest and farthest positive ray distances at `altitude`; negative when
-// none. `height` = start altitude, `rise` = direction.y, `bend` = (1 - rise^2)
-// / (2 * planet radius).
 vec2 cloudCrossings(float height, float rise, float bend, float altitude) {
     float c = height - altitude;
     if (bend < 1e-12) {
@@ -70,8 +60,6 @@ vec2 cloudCrossings(float height, float rise, float bend, float altitude) {
     return vec2(low >= 0.0 ? low : high, high);
 }
 
-// Ray span inside the layer in front of the camera: (start, end); end < start
-// when empty.
 vec2 cloudSegment(CloudData clouds, float height, float rise) {
     float bend = (1.0 - rise * rise) / (2.0 * clouds.planet_radius);
     vec2 bottom = cloudCrossings(height, rise, bend, clouds.bottom);
@@ -86,7 +74,6 @@ vec2 cloudSegment(CloudData clouds, float height, float rise) {
     return vec2(0.0, end);
 }
 
-// Sun visibility under the layer, from one density sample.
 float cloudShadow(FrameConstants frame, vec3 position) {
     if ((SHADE_FEATURES & FEATURE_CLOUD_SHADOWS) == 0u || (frame.flags & FRAME_CLOUD_SHADOWS) == 0u) return 1.0;
     CloudData clouds = frame.clouds.data;
@@ -99,9 +86,6 @@ float cloudShadow(FrameConstants frame, vec3 position) {
     return mix(1.0, exp(-optical_depth), clouds.shadow_strength);
 }
 
-// Composites a coarse cloud layer over sky `color` seen along `direction`.
-// `sun` points at the sun, `sunlight` is its radiance at the ground.
-// `clouds.depth_texture` holds a linear sampler here.
 vec3 cloudsOverSky(CloudData clouds, vec3 direction, vec3 sun, vec3 sunlight, vec3 color) {
     vec2 segment = cloudSegment(clouds, 2.0, direction.y);
     segment.y = min(segment.y, clouds.max_distance);

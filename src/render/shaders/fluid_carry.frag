@@ -2,7 +2,6 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Forward advection guess for the MacCormack correction in fluid_advect.frag.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;

@@ -4,8 +4,6 @@
 #include "liquid.glsl"
 #include "water.glsl"
 
-// Shades a liquid as one surface: refracted, absorbed scene behind it and sky
-// and sun reflections on top.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     LiquidRef liquid;
@@ -33,7 +31,6 @@ void main() {
     vec2 uv = gl_FragCoord.xy * frame.inv_resolution;
     float thickness = textureLod(TEX(push.thickness_texture, linear), uv, 0.0).r;
 
-    // Normal from depth: per axis, use the neighbour closer in depth.
     vec3 position = pointAt(pixel, here);
     float left = texelFetch(TEX(push.distance_texture, nearest), pixel + ivec2(-1, 0), 0).r;
     float right = texelFetch(TEX(push.distance_texture, nearest), pixel + ivec2(1, 0), 0).r;
@@ -54,14 +51,12 @@ void main() {
     float n_dot_v = clamp(dot(normal, view), 0.0, 1.0);
     float fresnel = 0.02 + 0.98 * pow(1.0 - n_dot_v, 5.0);
 
-    // Refraction offset; never samples something in front.
     vec2 bend = (frame.view * vec4(normal, 0.0)).xy * vec2(1.0, -1.0) * liquid.refraction * min(thickness * 2.0, 1.0) / max(here, 0.5);
     vec2 behind_uv = clamp(uv - bend, vec2(0.001), vec2(0.999));
     float behind_depth = textureLod(TEX(push.depth_texture, nearest), behind_uv, 0.0).r;
     if (behind_depth > 0.0 && linearDepth(behind_depth, frame.near) < here) behind_uv = uv;
     vec3 behind = textureLod(TEX(push.scene_texture, linear), behind_uv, 0.0).rgb;
 
-    // Beer-Lambert absorption plus a little in-scattering.
     vec3 clear = exp(-liquid.murk * thickness * (vec3(1.0) - liquid.color));
     vec3 ambient = vec3(0.0);
     if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
@@ -79,7 +74,6 @@ void main() {
     float glint = pow(clamp(dot(normal, halfway), 0.0, 1.0), 220.0) * sun_shadow;
     vec3 color = mix(under, reflected, fresnel) + frame.sun_radiance * glint * 1.5;
 
-    // Thin drops are shaded as spray.
     float drop = 1.0 - smoothstep(liquid.radius * 0.15, liquid.radius * 0.9, thickness);
     color = mix(color, lit * 0.5 + reflected * 0.3, drop * 0.35);
     out_color = vec4(color, 1.0);

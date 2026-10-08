@@ -2,7 +2,6 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Curl of the velocity field.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
     uint velocity_texture;

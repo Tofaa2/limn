@@ -50,8 +50,6 @@ pub fn build(gpa: std.mem.Allocator, positions: []const [3]f32, indices: []const
     var low: [3]f32 = undefined;
     inline for (0..3) |axis| low[axis] = (lowest[axis] + highest[axis]) * 0.5 - side * 0.5;
 
-    // Columns are cast slightly off-centre so that no ray runs along a
-    // shared edge and counts it twice.
     var crossings: std.ArrayList(Crossing) = .empty;
     defer crossings.deinit(gpa);
     const nudge = [2]f32{ cell * 0.0137, cell * 0.0071 };
@@ -91,7 +89,6 @@ pub fn build(gpa: std.mem.Allocator, positions: []const [3]f32, indices: []const
         var end = start;
         while (end < crossings.items.len and crossings.items[end].column == column) end += 1;
         const run = crossings.items[start..end];
-        // With an odd number of crossings, the column starts inside.
         var index: usize = 0;
         var from: f32 = -std.math.inf(f32);
         if (run.len % 2 == 0) {
@@ -150,7 +147,6 @@ fn sweep(distances: []f32, size: usize, backward: bool) void {
             while (dy <= 1) : (dy += 1) {
                 var dx: isize = -1;
                 while (dx <= 1) : (dx += 1) {
-                    // Only the neighbours that come earlier in the order.
                     if (dz == 0 and (dy > 0 or (dy == 0 and dx >= 0))) continue;
                     const sign: isize = if (backward) -1 else 1;
                     const nx = x + dx * sign;

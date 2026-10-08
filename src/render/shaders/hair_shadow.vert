@@ -3,20 +3,15 @@
 #include "hair.glsl"
 #include "visibility_page.glsl"
 
-// Hair in a shadow map: light-facing ribbons with a minimum width, since
-// strands are far narrower than a shadow texel.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     HairPoints points;
-    // Virtual shadow map page to draw into, when `paged`.
     VisibilityPage page;
     mat4 view_proj;
     mat4 transform;
-    // Direction of light travel.
     vec3 light;
     float root_width;
     float tip_width;
-    // Minimum strand width in world units.
     float least_width;
     uint points_per_strand;
     uint paged;

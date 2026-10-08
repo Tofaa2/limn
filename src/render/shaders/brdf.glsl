@@ -1,4 +1,3 @@
-// Microfacet BRDF building blocks.
 #ifndef BRDF_GLSL
 #define BRDF_GLSL
 
@@ -8,7 +7,6 @@ float distributionGgx(float n_dot_h, float alpha) {
     return a2 / (PI * d * d);
 }
 
-// Height-correlated Smith visibility, includes the 1 / (4 NoL NoV) term.
 float visibilitySmithGgx(float n_dot_l, float n_dot_v, float alpha) {
     float a2 = alpha * alpha;
     float lambda_v = n_dot_l * sqrt(n_dot_v * n_dot_v * (1.0 - a2) + a2);
@@ -21,7 +19,6 @@ vec3 fresnelSchlick(float cos_theta, vec3 f0) {
     return f0 + (1.0 - f0) * f;
 }
 
-// Low-discrepancy sequence for the offline-style integrals.
 vec2 hammersley(uint i, uint count) {
     uint bits = (i << 16u) | (i >> 16u);
     bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);

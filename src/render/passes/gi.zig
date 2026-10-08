@@ -12,6 +12,9 @@ const SceneData = render.SceneData;
 const Settings = render.Settings;
 const GiVolume = render.GiVolume;
 const gi_probe_limit = render.gi_probe_limit;
+/// Most probes across X times Z: the atlases lay them side by side, 16 texels
+/// each, and a texture is at most 32768 wide.
+const gi_atlas_tiles = 2048;
 const gi_irradiance_texels = render.gi_irradiance_texels;
 const gi_visibility_texels = render.gi_visibility_texels;
 const hdr_format = render.hdr_format;
@@ -27,8 +30,6 @@ pub fn ensureGiVolume(renderer: *Renderer, slot: *?GiVolume, scene_origin: [3]f6
         const same = std.mem.eql(u32, &volume.counts, &counts) and volume.rays_per_probe == rays_per_probe and
             @abs(volume.spacing - spacing) < 1e-4;
         if (same) {
-            // Probes are stored by world cell modulo the grid size; only cells
-            // that wrapped are new.
             inline for (0..3) |axis| volume.shift[axis] = cell[axis] - volume.cell[axis];
             var kept: u64 = 1;
             var total: u64 = 1;
@@ -97,6 +98,10 @@ pub fn prepareGi(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame
     _ = pipelines;
     var gi_max_counts: [3]u32 = undefined;
     inline for (0..3) |axis| gi_max_counts[axis] = std.math.clamp(renderer.options.gi_max_probes[axis], 2, gi_probe_limit);
+    while (gi_max_counts[0] * gi_max_counts[2] > gi_atlas_tiles) {
+        const widest: usize = if (gi_max_counts[0] >= gi_max_counts[2]) 0 else 2;
+        gi_max_counts[widest] -= 1;
+    }
     if (!settings.global_illumination or scene_frame.tlas_count == 0) return null;
     if (scene.tlas == null or scene.tlas_capacity < scene_frame.tlas_count) {
         if (scene.tlas) |old| device.destroyAcceleration(old);
@@ -107,6 +112,7 @@ pub fn prepareGi(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame
     }
 
     const bounds = scene.gi_bounds orelse scene_frame.bounds;
+    inline for (0..3) |axis| if (!(bounds[1][axis] >= bounds[0][axis]) or !std.math.isFinite(bounds[1][axis] - bounds[0][axis])) return null;
     const extent = math.sub(bounds[1], bounds[0]);
     const wanted = @max(settings.gi_probe_spacing, 0.25);
     var spacing = wanted;
@@ -199,13 +205,14 @@ pub fn updateGi(
         @sqrt(first) * @cos(std.math.tau * third),
     });
     const rotation_columns = [3][4]f32{ rotation[0..4].*, rotation[4..8].*, rotation[8..12].* };
-    // Clamp distances just beyond the neighbouring probes, to keep the moments
-    // well conditioned.
     const max_distance = volume.spacing * 1.75 * 1.5;
     const probe_count = volume.probeCount();
     const moved = volume.shift[0] != 0 or volume.shift[1] != 0 or volume.shift[2] != 0;
     const stride: u32 = if (volume.frames < 200 or moved) 1 else std.math.clamp(settings.gi_update_interval, 1, 16);
     const phase: u32 = @intCast(renderer.frame_index % stride);
+
+    const far_distance: f32 = if (moved or volume.frames < 200) 0 else @max(settings.gi_far_distance, 0);
+    const update_turn: u32 = @truncate(renderer.frame_index / stride);
 
     cmd.bindPipeline(pipelines.trace);
     cmd.pushConstants(extern struct {
@@ -221,6 +228,8 @@ pub fn updateGi(
         probe_phase: u32,
         grid: u32,
         skip_buried: u32,
+        far_distance: f32,
+        turn: u32,
     }{
         .frame = frame_address,
         .rays = device.bufferAddress(volume.rays),
@@ -228,7 +237,6 @@ pub fn updateGi(
         .rotation = rotation_columns,
         .rays_per_probe = volume.rays_per_probe,
         .probe_count = probe_count,
-        // Multibounce needs every grid in use written at least once.
         .multibounce = @intFromBool(volume.frames != 0 and
             (if (scene.gi) |other| other.frames != 0 else true) and
             (if (scene.gi_coarse) |other| other.frames != 0 else true) and
@@ -237,16 +245,18 @@ pub fn updateGi(
         .probe_phase = phase,
         .grid = grid_index,
         .skip_buried = @intFromBool(settings.gi_skip_buried_probes),
+        .far_distance = far_distance,
+        .turn = update_turn,
         .max_distance = 1000,
     });
     cmd.dispatch((((probe_count + stride - 1) / stride) * volume.rays_per_probe + 63) / 64, 1, 1);
     cmd.sync(.compute_to_all);
 
-    // Hysteresis: probes traced every `stride` frames blend more per update;
-    // early updates weigh twice an even average until the steady rate.
     const settled = std.math.pow(f32, std.math.clamp(settings.gi_hysteresis, 0, 0.999), @floatFromInt(stride));
     const gathered: f32 = @floatFromInt(volume.frames);
     const hysteresis: f32 = if (volume.frames == 0) 0 else @min(settled, @max(0.8, 1 - 2 / (gathered + 2)));
+    const fast_hysteresis = 0.97;
+    const raise_reluctance = 2.5;
     const UpdatePush = extern struct {
         frame: u64,
         rays: u64,
@@ -260,6 +270,8 @@ pub fn updateGi(
         /// Grid cells the volume moved by; probes that wrapped start over.
         shift: [3]i32,
         grid: u32,
+        far_distance: f32,
+        turn: u32,
     };
     const RelocatePush = extern struct { update: UpdatePush, previous_offsets: u32, pad: [3]u32 = .{ 0, 0, 0 } };
     const update_push = UpdatePush{
@@ -271,9 +283,11 @@ pub fn updateGi(
         .max_distance = max_distance,
         .probe_stride = stride,
         .probe_phase = phase,
-        .fast_hysteresis = if (volume.frames == 0) 0 else 0.9,
+        .fast_hysteresis = if (volume.frames == 0) 0 else fast_hysteresis,
         .shift = volume.shift,
         .grid = grid_index,
+        .far_distance = far_distance,
+        .turn = update_turn,
     };
     const load: rhi.LoadOp = if (volume.frames == 0) .clear else .load;
     try cmd.beginRendering(.{ .color = &.{
@@ -294,7 +308,7 @@ pub fn updateGi(
             cmd.pushConstants(ClampPush{
                 .frame = frame_address,
                 .fast = device.textureIndex(volume.irradiance_fast),
-                .scale = @max(1 + sign * tolerance, 0),
+                .scale = if (sign > 0) 1 + tolerance else @max(1 - tolerance * raise_reluctance, 0),
                 .offset = sign * 0.002,
             });
             cmd.drawFullscreen();
@@ -309,7 +323,6 @@ pub fn updateGi(
     cmd.endRendering();
     cmd.transition(volume.visibility, .shader_read);
     if (settings.gi_probe_relocation) {
-        // Relocation takes effect from the next frame's trace.
         const read = volume.offsets[volume.offset_turn];
         const write = volume.offsets[1 - volume.offset_turn];
         if (!volume.offsets_valid) {

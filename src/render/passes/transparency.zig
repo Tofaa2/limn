@@ -98,7 +98,6 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.endRendering();
             cmd.transition(view.hdr, .shader_read);
             if (state.desc.write_depth) {
-                // A separate pass: the liquid pass reads depth.
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = view.motion, .load = .load }}, .depth = .{ .texture = view.depth, .load = .load } });
                 cmd.bindPipeline(renderer.pipelines.liquid_surface);
                 cmd.pushConstants(extern struct { frame: u64, distance: u32, pad: u32 = 0 }{ .frame = frame_address, .distance = device.textureIndex(targets.smooth[1]) });
@@ -140,7 +139,6 @@ pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
         }
         cmd.endRendering();
         cmd.transition(view.hdr, .shader_read);
-        // Depth is written in a separate pass: the water pass reads it.
         var any_depth = false;
         for (scene.waters.items) |item| {
             const state = renderer.waters.get(item) orelse continue;
@@ -193,7 +191,7 @@ pub fn forwardWeightedPipeline(renderer: *Renderer) !rhi.Pipeline {
     const made = try renderer.device.createGraphicsPipeline(.{
         .name = "forward transparent (weighted)",
         .vertex = shaderCode("forward.vert.spv"),
-        .fragment = shaderCode("forward.frag.spv"),
+        .fragment = shaderCode("forward_weighted.frag.spv"),
         .color_targets = &.{ .{ .format = hdr_format, .blend = .additive }, .{ .format = .rg16_float, .blend = .alpha }, .{ .format = .r8_unorm, .blend = .revealage } },
         .depth = .{ .write = false, .compare = .greater_or_equal },
         .cull = .none,

@@ -2,8 +2,6 @@
 #include "common.glsl"
 #include "fluid.glsl"
 
-// Projects a fluid along its depth into a 2D image: smoke as coverage, fire as
-// emission.
 layout(push_constant, scalar) uniform Push {
     FluidRef fluid;
 } push;
@@ -26,7 +24,6 @@ void main() {
         color += transmittance * (fluid.data.smoke_color * (1.0 - step_transmittance) + fire * fireGlow(value.y) * depth);
         transmittance *= step_transmittance;
     }
-    // Straight alpha; emission counts as coverage.
     float alpha = clamp(max(1.0 - transmittance, luminance(color)), 0.0, 1.0);
     out_color = vec4(color / max(alpha, 1e-4), alpha);
 }

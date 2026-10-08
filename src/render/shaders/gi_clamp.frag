@@ -1,8 +1,6 @@
 #version 460
 #include "common.glsl"
 
-// Clamps the steady irradiance atlas to fast * (1 +- tolerance). Drawn twice,
-// with min and max blending.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint fast_texture;

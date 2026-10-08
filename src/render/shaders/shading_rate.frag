@@ -1,22 +1,16 @@
 #version 460
 #include "common.glsl"
 
-// Picks a shading rate per tile: 2x2 where last frame's tile was nearly one
-// color on one smooth surface, else 1x1.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
-    // Last frame's final color and this frame's depth.
     uint history_texture;
     uint depth_texture;
-    // Tile size in pixels.
     uint tile;
-    // Relative luminance variation allowed for coarse shading.
     float contrast;
 } push;
 
 layout(location = 0) out uint out_rate;
 
-// `rhi.shadingRate` values for 1x1 and 2x2.
 const uint rate_fine = 0u;
 const uint rate_coarse = 5u;
 
@@ -40,7 +34,6 @@ void main() {
             farthest = min(farthest, depth);
         }
     }
-    // Reverse-Z: relative depth spread equals relative distance spread.
     bool one_surface = nearest - farthest <= 0.02 * nearest;
     bool flat_color = brightest - darkest <= push.contrast * (brightest + 0.02);
     out_rate = one_surface && flat_color ? rate_coarse : rate_fine;

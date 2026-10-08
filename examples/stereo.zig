@@ -29,7 +29,6 @@ pub fn main(init: std.process.Init) !void {
     const sky = gfx.SkyDesc{ .sun_direction = .{ -0.45, -0.7, -0.4 } };
     renderer.setSun(scene, gfx.skySun(sky));
     renderer.setEnvironment(scene, try renderer.createSky(sky), 1);
-    // Each eye keeps its own history from frame to frame.
     const right_view = try renderer.createView();
 
     var positions: [24][3]f32 = undefined;
@@ -54,9 +53,6 @@ pub fn main(init: std.process.Init) !void {
         .material = .{ .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 0.35 },
     }});
 
-    // Things at every distance: a floor of tiles, two rows of pillars
-    // going away, and balls hung in the air between them, the nearest
-    // almost at the camera.
     var blocks: std.ArrayList(math.Mat4) = .empty;
     defer blocks.deinit(gpa);
     var block_colors: std.ArrayList([3]f32) = .empty;

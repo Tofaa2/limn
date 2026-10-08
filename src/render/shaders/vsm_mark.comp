@@ -2,7 +2,6 @@
 #include "common.glsl"
 #include "vsm.glsl"
 
-// Marks the virtual shadow map page each visible pixel falls in.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(push_constant, scalar) uniform Push {

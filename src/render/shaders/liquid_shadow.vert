@@ -2,14 +2,11 @@
 #include "common.glsl"
 #include "liquid.glsl"
 
-// Liquid particles into a shadow cascade: one light-facing quad each.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     LiquidRef liquid;
     LiquidParticles particles;
     mat4 view_proj;
-    // Drawn radius as a multiple of the particle radius, and the liquid's
-    // opacity to light.
     float swell;
     float strength;
 } push;
@@ -29,7 +26,6 @@ void main() {
         return;
     }
     vec3 world = (liquid.from_box * vec4(push.particles.data[slot].position, 1.0)).xyz;
-    // Orthographic light: right and up are the matrix rows.
     vec3 across = normalize(vec3(push.view_proj[0][0], push.view_proj[1][0], push.view_proj[2][0]));
     vec3 up = normalize(vec3(push.view_proj[0][1], push.view_proj[1][1], push.view_proj[2][1]));
     float radius = liquid.radius * push.swell;

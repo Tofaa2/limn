@@ -2,17 +2,13 @@
 #define STORAGE_IMAGES
 #include "common.glsl"
 
-// Compute version of hiz.frag: builds one level of the min-depth pyramid
-// (reverse-Z, so min is farthest) for occlusion culling.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(push_constant, scalar) uniform Push {
     uint source_texture;
     uint sampler_index;
-    // Nonzero when reading the full-resolution depth buffer (level 0).
     uint first;
     int source_lod;
-    // Target storage image and its size.
     uint target;
     uint pad;
     ivec2 size;
@@ -26,8 +22,6 @@ void main() {
     float c;
     float d;
     if (push.first != 0u) {
-        // Level 0 is at most 2x smaller than the depth buffer, so four taps
-        // cover it.
         vec2 texel = 1.0 / vec2(push.size);
         vec2 uv = (vec2(pixel) + 0.5) * texel;
         vec2 offset = texel * 0.25;

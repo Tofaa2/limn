@@ -1,0 +1,48 @@
+name: docs
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the shader compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Generate docs
+        run: zig build docs
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: zig-out/docs
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

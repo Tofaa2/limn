@@ -71,7 +71,6 @@ pub fn device(io: std.Io, handle: vk.Device) dispatch.DeviceWrapper {
     c.volkLoadDeviceTable(&table, @ptrFromInt(@intFromEnum(handle)));
     var result: dispatch.DeviceWrapper = undefined;
     inline for (@typeInfo(dispatch.DeviceDispatch).@"struct".fields) |field| {
-        // Debug-utils commands are instance-level in volk.
         @field(result.dispatch, field.name) = if (@hasField(c.VolkDeviceTable, field.name))
             @ptrCast(@field(table, field.name))
         else if (@hasDecl(c, field.name))

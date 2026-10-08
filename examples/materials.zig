@@ -22,8 +22,6 @@ pub fn main(init: std.process.Init) !void {
     const renderer = stage.renderer;
     const scene = try renderer.createScene();
 
-    // Light from a picture of a real place. The second argument caps how
-    // bright a single texel may be, which keeps small lamps from sparkling.
     const studio = try renderer.loadEnvironment("examples/assets/studio_small_03_1k.hdr", 64);
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.6, -0.45 } };
     const sky = try renderer.createSky(sky_desc);
@@ -36,7 +34,6 @@ pub fn main(init: std.process.Init) !void {
     var indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(0.5, &positions, &normals, &indices);
 
-    // The grid: metallic grows upward, roughness to the right.
     for (0..rows) |row| for (0..columns) |column| {
         const metallic = @as(f32, @floatFromInt(row)) / (rows - 1);
         const roughness = 0.04 + 0.96 * @as(f32, @floatFromInt(column)) / (columns - 1);
@@ -53,7 +50,6 @@ pub fn main(init: std.process.Init) !void {
         }) });
     };
 
-    // The front row: one sphere for each of the rarer kinds.
     const special = [_]struct { name: []const u8, material: gfx.Material }{
         .{ .name = "glass", .material = .{ .base_color = .{ 0.9, 0.97, 1.0, 1 }, .metallic = 0, .roughness = 0.03, .transmission = 1, .ior = 1.5, .thickness = 0.6 } },
         .{ .name = "tinted glass", .material = .{ .base_color = .{ 0.95, 0.55, 0.2, 1 }, .metallic = 0, .roughness = 0.12, .transmission = 1, .ior = 1.45, .thickness = 0.8 } },
@@ -68,7 +64,6 @@ pub fn main(init: std.process.Init) !void {
         _ = try renderer.spawn(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - @as(f32, special.len - 1) * 0.5) * spacing, 0.5, 1.2 }) });
     }
 
-    // A floor to stand them on, and a model with painted textures.
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 9, 0.05, 6 }, &box_positions, &box_indices);

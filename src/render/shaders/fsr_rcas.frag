@@ -1,14 +1,10 @@
 #version 460
 #include "common.glsl"
 
-// AMD FidelityFX Super Resolution 1 sharpening pass (RCAS), from
-// src/third_party/ffx_fsr1. Input is compressed to 0..1 (see fsr_easu.frag);
-// the output is expanded back to HDR.
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     uint source_texture;
     uint pad;
-    // Constants from `FsrRcasCon`.
     uvec4 con;
 } push;
 
