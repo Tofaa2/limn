@@ -601,7 +601,8 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena, slot
 }
 
 /// Converts the scene's lights to GPU records and assigns shadow atlas
-/// tiles to the ones that cast shadows.
+/// tiles to the ones that cast shadows. The scene's first view in a frame
+/// ranks the lights; later views keep its choice, as they share the atlas.
 pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, shadows: bool, camera_position: Vec3, traced_shadows: bool) !Lighting {
     const device = self.device;
     var fluid_lights: usize = 0;
@@ -624,7 +625,11 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
     const granted = try self.gpa.alloc(bool, scene.lights.items.len);
     defer self.gpa.free(granted);
     @memset(granted, false);
-    if (shadows) {
+    const shared = shadows and scene.shadow_grants_frame == self.frame_index and
+        scene.shadow_grants_traced == traced_shadows and scene.shadow_grants.items.len == granted.len;
+    if (shared) {
+        @memcpy(granted, scene.shadow_grants.items);
+    } else if (shadows) {
         const Candidate = struct { index: u32, score: f32 };
         const candidates = try self.gpa.alloc(Candidate, scene.lights.items.len);
         defer self.gpa.free(candidates);
@@ -648,6 +653,10 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
             tiles_left -= needed;
             granted[candidate.index] = true;
         }
+        try scene.shadow_grants.resize(self.gpa, granted.len);
+        @memcpy(scene.shadow_grants.items, granted);
+        scene.shadow_grants_frame = self.frame_index;
+        scene.shadow_grants_traced = traced_shadows;
     }
     result.tiles_key = std.hash.Wyhash.hash(tiles_per_side, std.mem.sliceAsBytes(granted));
     for (scene.lights.items, lights.items[0..scene.lights.items.len], granted) |light, *out, has_tiles| {
@@ -773,7 +782,7 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
                 };
                 try self.meshes.write(self.device, entry.mesh_base + @as(u32, @intCast(last_mesh)), std.mem.asBytes(&record));
             }
-            if (vertices) for (self.scenes.table.slots.items) |*slot| if (slot.value) |*scene| {
+            for (self.scenes.table.slots.items) |*slot| if (slot.value) |*scene| {
                 scene.static_version += 1;
             };
             self.stats.geometry_bytes_compacted += @as(u64, count) * pool.stride;

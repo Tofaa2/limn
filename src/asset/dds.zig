@@ -18,6 +18,8 @@ pub const Texture = struct {
 
 const header_size = 4 + 124;
 const dx10_size = 20;
+const caps2_cubemap = 0x200;
+const caps2_volume = 0x200000;
 
 pub fn isDds(bytes: []const u8) bool {
     return bytes.len >= header_size and std.mem.eql(u8, bytes[0..4], "DDS ");
@@ -29,6 +31,8 @@ pub fn read(bytes: []const u8) !Texture {
     const width = word(bytes, 16);
     const levels = @max(word(bytes, 28), 1);
     if (width == 0 or height == 0 or width > 16384 or height > 16384 or levels > 15) return error.UnsupportedDds;
+    if (levels > std.math.log2_int(u32, @max(width, height)) + 1) return error.UnsupportedDds;
+    if (word(bytes, 112) & (caps2_cubemap | caps2_volume) != 0) return error.UnsupportedDds;
     const four_cc = bytes[84..88];
     var offset: usize = header_size;
     var srgb = false;
@@ -93,4 +97,19 @@ test "a BC7 texture with a DX10 header and two levels is read" {
     try std.testing.expectEqual(@as(usize, 80), texture.data.len);
     try std.testing.expectEqual(@as(u8, 7), texture.data[79]);
     try std.testing.expectError(error.TruncatedDds, read(file[0 .. file.len - 1]));
+}
+
+test "too many levels and legacy cube maps are refused" {
+    var file: [header_size + 32]u8 = @splat(0);
+    file[0..4].* = "DDS ".*;
+    std.mem.writeInt(u32, file[12..16], 4, .little);
+    std.mem.writeInt(u32, file[16..20], 4, .little);
+    file[84..88].* = "DXT5".*;
+    std.mem.writeInt(u32, file[28..32], 4, .little);
+    try std.testing.expectError(error.UnsupportedDds, read(&file));
+    std.mem.writeInt(u32, file[28..32], 1, .little);
+    std.mem.writeInt(u32, file[112..116], caps2_cubemap, .little);
+    try std.testing.expectError(error.UnsupportedDds, read(&file));
+    std.mem.writeInt(u32, file[112..116], 0, .little);
+    try std.testing.expectEqual(Format.bc3, (try read(&file)).format);
 }

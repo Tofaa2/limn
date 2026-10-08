@@ -9,6 +9,7 @@ const FrameData = device_module.FrameData;
 const FrameGenerator = device_module.FrameGenerator;
 const frames_in_flight = device_module.frames_in_flight;
 const registerTexture = @import("textures.zig").registerTexture;
+const waitQueue = @import("frames.zig").waitQueue;
 
 /// Format of the swapchain images.
 pub fn backbufferFormat(self: *Device) !types.Format {
@@ -66,7 +67,10 @@ pub fn prepareSurface(self: *Device) !bool {
     if (swapchain.requested_width == 0 or swapchain.requested_height == 0) return false;
     if (swapchain.dirty or swapchain.stale or swapchain.handle == .null_handle) {
         finishPacedPresent(self);
-        try recreateSwapchain(self);
+        recreateSwapchain(self) catch |err| switch (err) {
+            error.NoDrawableArea => return false,
+            else => return err,
+        };
     }
     return true;
 }
@@ -189,6 +193,8 @@ fn presentPaced(self: *Device, image: u32, at: std.Io.Timestamp) void {
     const wait = std.Io.Timestamp.now(self.io, .awake).durationTo(at);
     if (wait.nanoseconds > 0) self.io.sleep(wait, .awake) catch {};
     present(self, image) catch {
+        self.swapchain_mutex.lockUncancelable(self.io);
+        defer self.swapchain_mutex.unlock(self.io);
         self.swapchain.?.stale = true;
     };
     self.pacing.store(false, .release);
@@ -201,9 +207,11 @@ pub fn finishPacedPresent(self: *Device) void {
     self.paced = null;
 }
 
+/// `error.NoDrawableArea` while the surface is 0x0. A failure leaves the
+/// swapchain marked for another attempt.
 fn recreateSwapchain(self: *Device) !void {
     const swapchain = &self.swapchain.?;
-    try self.vkd.deviceWaitIdle();
+    try waitQueue(self);
     const capabilities = try self.instance.getPhysicalDeviceSurfaceCapabilitiesKHR(self.physical, self.surface);
     const formats = try self.instance.getPhysicalDeviceSurfaceFormatsAllocKHR(self.physical, self.surface, self.gpa);
     defer self.gpa.free(formats);
@@ -248,7 +256,15 @@ fn recreateSwapchain(self: *Device) !void {
             .width = std.math.clamp(swapchain.requested_width, capabilities.min_image_extent.width, capabilities.max_image_extent.width),
             .height = std.math.clamp(swapchain.requested_height, capabilities.min_image_extent.height, capabilities.max_image_extent.height),
         };
-    if (extent.width == 0 or extent.height == 0) return error.SurfaceUnsupported;
+    if (extent.width == 0 or extent.height == 0) return error.NoDrawableArea;
+    const texture_format: types.Format = switch (format.format) {
+        .b8g8r8a8_srgb => .bgra8_srgb,
+        .b8g8r8a8_unorm => .bgra8_unorm,
+        .r8g8b8a8_srgb => .rgba8_srgb,
+        .r8g8b8a8_unorm => .rgba8_unorm,
+        .a2b10g10r10_unorm_pack32 => .a2b10g10r10_unorm,
+        else => return error.UnsupportedSurfaceFormat,
+    };
     var image_count = @max(capabilities.min_image_count + 1, 3) + @as(u32, @intFromBool(generating));
     if (capabilities.max_image_count != 0) image_count = @min(image_count, capabilities.max_image_count);
     var composite_alpha: vk.CompositeAlphaFlagsKHR = .{ .opaque_bit_khr = true };
@@ -272,6 +288,11 @@ fn recreateSwapchain(self: *Device) !void {
     }, null);
     releaseSwapchainImages(self);
     if (old != .null_handle) self.vkd.destroySwapchainKHR(old, null);
+    swapchain.handle = handle;
+    swapchain.fifo = present_mode == .fifo_khr;
+    swapchain.format = format;
+    swapchain.extent = extent;
+    swapchain.dirty = true;
     for (&self.frames) |*frame| {
         if (!frame.acquire_abandoned) continue;
         const fresh = try self.vkd.createSemaphore(&.{}, null);
@@ -282,23 +303,9 @@ fn recreateSwapchain(self: *Device) !void {
         frame.generated_available = fresh_generated;
         frame.acquire_abandoned = false;
     }
-    swapchain.handle = handle;
-    swapchain.fifo = present_mode == .fifo_khr;
-    swapchain.format = format;
-    swapchain.extent = extent;
-    swapchain.dirty = false;
-    swapchain.stale = false;
 
     const images = try self.vkd.getSwapchainImagesAllocKHR(handle, self.gpa);
     defer self.gpa.free(images);
-    const texture_format: types.Format = switch (format.format) {
-        .b8g8r8a8_srgb => .bgra8_srgb,
-        .b8g8r8a8_unorm => .bgra8_unorm,
-        .r8g8b8a8_srgb => .rgba8_srgb,
-        .r8g8b8a8_unorm => .rgba8_unorm,
-        .a2b10g10r10_unorm_pack32 => .a2b10g10r10_unorm,
-        else => return error.UnsupportedSurfaceFormat,
-    };
     for (images) |image| {
         try swapchain.textures.append(self.gpa, try registerTexture(self, image, null, .{
             .width = extent.width,
@@ -311,6 +318,8 @@ fn recreateSwapchain(self: *Device) !void {
         try swapchain.render_finished.append(self.gpa, try self.vkd.createSemaphore(&.{}, null));
     }
     if (generating) swapchain.generated = createGeneratedTextures(self, texture_format, extent) catch null;
+    swapchain.dirty = false;
+    swapchain.stale = false;
 }
 
 fn createGeneratedTextures(self: *Device, format: types.Format, extent: vk.Extent2D) ![2]types.Texture {

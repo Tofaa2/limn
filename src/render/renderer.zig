@@ -313,6 +313,7 @@ pub const Renderer = struct {
     /// its history was reset.
     generating: ?@import("ffx.zig").Upscaler = null,
     generating_reset: bool = false,
+    generating_failed: bool = false,
     /// Scene whose lights the local shadow atlas currently holds.
     local_shadow_scene: ?Scene = null,
     local_shadow_frame: u64 = std.math.maxInt(u64),
@@ -365,6 +366,8 @@ pub const Renderer = struct {
 
         const self = try gpa.create(Renderer);
         errdefer gpa.destroy(self);
+        pipelines_module.acquireOverrides();
+        errdefer pipelines_module.releaseOverrides();
         const storage = rhi.BufferUsage{ .storage = true, .copy_src = true, .copy_dst = true };
         const geometry = rhi.BufferUsage{ .storage = true, .index = true, .copy_src = true, .copy_dst = true, .acceleration_input = true };
         self.* = .{
@@ -455,6 +458,7 @@ pub const Renderer = struct {
             @memset(device.mapped(buffer.*), 0);
         }
         self.main_view = try insertView(self);
+        errdefer self.views.table.deinit();
         self.pick_buffer = try device.createBuffer(.{ .name = "pick", .size = @sizeOf(gpu.Pick), .usage = .{ .storage = true, .copy_src = true } });
         for (&self.pick_readback) |*buffer| {
             buffer.* = try device.createBuffer(.{ .name = "pick readback", .size = @sizeOf(gpu.Pick), .usage = .{}, .memory = .gpu_to_cpu });
@@ -462,7 +466,9 @@ pub const Renderer = struct {
         }
 
         self.fonts.default_font = try gpa.create(Font);
+        errdefer gpa.destroy(self.fonts.default_font);
         self.fonts.default_font.* = try font_module.load(gpa, @embedFile("fonts/DejaVuSans.ttf"), font_module.default_ranges);
+        errdefer self.fonts.default_font.deinit();
         try registerFont(self, self.fonts.default_font);
         if (options.asset_cache_max_bytes != 0) if (options.asset_cache_dir) |directory| {
             _ = gltf.trimCache(gpa, self.io, directory, options.asset_cache_max_bytes) catch |err| std.log.warn("asset cache not trimmed: {}", .{err});
@@ -610,10 +616,7 @@ pub const Renderer = struct {
         self.scratch_refs.deinit(self.gpa);
         self.scratch_instances.deinit(self.gpa);
         self.scratch_static_cull.deinit(self.gpa);
-        var overrides = pipelines_module.shader_overrides.valueIterator();
-        while (overrides.next()) |code| self.gpa.free(code.*);
-        pipelines_module.shader_overrides.deinit(self.gpa);
-        pipelines_module.shader_overrides = .empty;
+        pipelines_module.releaseOverrides();
         const gpa = self.gpa;
         const io = self.io;
         gpa.destroy(self);
@@ -844,7 +847,11 @@ pub const Renderer = struct {
     fn generateFrame(context: *anyopaque, cmd: *rhi.CommandEncoder, shown: rhi.Texture, output: rhi.Texture) bool {
         const self: *Renderer = @ptrCast(@alignCast(context));
         const upscaler = self.generating orelse return false;
-        return upscaler.generate(self.device, cmd, shown, output, self.generating_reset);
+        return upscaler.generate(self.device, cmd, shown, output, self.generating_reset) catch {
+            if (!self.generating_failed) std.log.warn("FidelityFX frame generation failed; frames are shown without it", .{});
+            self.generating_failed = true;
+            return false;
+        };
     }
 
     fn renderFrame(self: *Renderer, frame: rhi.Frame, desc: FrameDesc) !void {

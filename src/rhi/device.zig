@@ -513,6 +513,7 @@ pub const Device = struct {
         self.queue = self.vkd.getDeviceQueue(self.queue_family, 0);
         self.detached_queue = if (queue_count > 1) self.vkd.getDeviceQueue(self.queue_family, 1) else null;
         self.allocator = memory.Allocator.init(gpa, self.vkd, self.instance.getPhysicalDeviceMemoryProperties(self.physical));
+        errdefer self.allocator.deinit();
 
         self.buffers = .init(gpa);
         self.textures = .init(gpa);
@@ -520,10 +521,17 @@ pub const Device = struct {
         self.pipelines = .init(gpa);
         self.accelerations = .init(gpa);
         self.texture_slots = try SlotAllocator.init(gpa, texture_capacity);
+        errdefer self.texture_slots.deinit(gpa);
         self.storage_slots = try SlotAllocator.init(gpa, storage_capacity);
+        errdefer self.storage_slots.deinit(gpa);
         self.sampler_slots = try SlotAllocator.init(gpa, sampler_capacity);
+        errdefer self.sampler_slots.deinit(gpa);
 
         try self.createDescriptorTable();
+        errdefer {
+            self.vkd.destroyDescriptorPool(self.descriptor_pool, null);
+            self.vkd.destroyDescriptorSetLayout(self.descriptor_layout, null);
+        }
         const push_range = vk.PushConstantRange{ .stage_flags = self.shaderStages(), .offset = 0, .size = push_constant_size };
         self.pipeline_layout = try self.vkd.createPipelineLayout(&.{
             .set_layout_count = 1,
@@ -531,6 +539,7 @@ pub const Device = struct {
             .push_constant_range_count = 1,
             .p_push_constant_ranges = @ptrCast(&push_range),
         }, null);
+        errdefer self.vkd.destroyPipelineLayout(self.pipeline_layout, null);
 
         const cache_data = if (desc.pipeline_cache_path) |path| readFile(gpa, io, path) else null;
         defer if (cache_data) |bytes| gpa.free(bytes);
@@ -538,31 +547,45 @@ pub const Device = struct {
             .initial_data_size = if (cache_data) |bytes| bytes.len else 0,
             .p_initial_data = if (cache_data) |bytes| bytes.ptr else null,
         }, null);
+        errdefer self.vkd.destroyPipelineCache(self.pipeline_cache, null);
         self.pipeline_cache_path = if (desc.pipeline_cache_path) |path| try gpa.dupe(u8, path) else null;
+        errdefer if (self.pipeline_cache_path) |path| gpa.free(path);
 
+        var frames_made: usize = 0;
+        errdefer for (self.frames[0..frames_made]) |*frame| destroyFrame(self, frame);
         for (&self.frames) |*frame| {
             const pool = try self.vkd.createCommandPool(&.{ .queue_family_index = self.queue_family }, null);
+            errdefer self.vkd.destroyCommandPool(pool, null);
             var command: vk.CommandBuffer = undefined;
             try self.vkd.allocateCommandBuffers(&.{
                 .command_pool = pool,
                 .level = .primary,
                 .command_buffer_count = 1,
             }, @ptrCast(&command));
+            const fence = try self.vkd.createFence(&.{ .flags = .{ .signaled_bit = true } }, null);
+            errdefer self.vkd.destroyFence(fence, null);
+            const image_available = try self.vkd.createSemaphore(&.{}, null);
+            errdefer self.vkd.destroySemaphore(image_available, null);
+            const generated_available = try self.vkd.createSemaphore(&.{}, null);
+            errdefer self.vkd.destroySemaphore(generated_available, null);
             frame.* = .{
                 .pool = pool,
                 .command = command,
-                .fence = try self.vkd.createFence(&.{ .flags = .{ .signaled_bit = true } }, null),
-                .image_available = try self.vkd.createSemaphore(&.{}, null),
-                .generated_available = try self.vkd.createSemaphore(&.{}, null),
+                .fence = fence,
+                .image_available = image_available,
+                .generated_available = generated_available,
                 .query_pool = try self.vkd.createQueryPool(&.{
                     .query_type = .timestamp,
                     .query_count = max_timing_scopes * 2,
                 }, null),
             };
+            frames_made += 1;
         }
         self.immediate_pool = try self.vkd.createCommandPool(&.{ .queue_family_index = self.queue_family }, null);
+        errdefer self.vkd.destroyCommandPool(self.immediate_pool, null);
         if (self.detached_queue != null)
             self.detached_pool = try self.vkd.createCommandPool(&.{ .flags = .{ .reset_command_buffer_bit = true }, .queue_family_index = self.queue_family }, null);
+        errdefer if (self.detached_pool != .null_handle) self.vkd.destroyCommandPool(self.detached_pool, null);
         try self.vkd.allocateCommandBuffers(&.{
             .command_pool = self.immediate_pool,
             .level = .primary,
@@ -580,7 +603,8 @@ pub const Device = struct {
     /// Waits for the GPU, writes the pipeline cache and destroys everything,
     /// including resources the application leaked. All handles become invalid.
     pub fn deinit(self: *Device) void {
-        self.vkd.deviceWaitIdle() catch {};
+        presentation_module.finishPacedPresent(self);
+        frames_module.waitQueue(self) catch {};
         persistPipelineCache(self) catch |err| std.log.warn("could not persist pipeline cache: {}", .{err});
         destroySwapchain(self);
         while (self.pipelines.popAny()) |pipeline| self.vkd.destroyPipeline(pipeline.handle, null);
@@ -594,6 +618,7 @@ pub const Device = struct {
             var texture = texture_value;
             for (texture.sub_views.items) |sub| self.vkd.destroyImageView(sub.view, null);
             texture.sub_views.deinit(self.gpa);
+            texture.storage_slots.deinit(self.gpa);
             self.vkd.destroyImageView(texture.view, null);
             if (texture.allocation) |allocation| {
                 self.vkd.destroyImage(texture.image, null);
@@ -615,13 +640,7 @@ pub const Device = struct {
         self.texture_slots.deinit(self.gpa);
         self.storage_slots.deinit(self.gpa);
         self.sampler_slots.deinit(self.gpa);
-        for (&self.frames) |*frame| {
-            self.vkd.destroyQueryPool(frame.query_pool, null);
-            self.vkd.destroySemaphore(frame.image_available, null);
-            self.vkd.destroySemaphore(frame.generated_available, null);
-            self.vkd.destroyFence(frame.fence, null);
-            self.vkd.destroyCommandPool(frame.pool, null);
-        }
+        for (&self.frames) |*frame| destroyFrame(self, frame);
         self.vkd.destroyCommandPool(self.immediate_pool, null);
         if (self.detached_pool != .null_handle) self.vkd.destroyCommandPool(self.detached_pool, null);
         self.vkd.destroyPipelineCache(self.pipeline_cache, null);
@@ -696,6 +715,7 @@ pub const Device = struct {
     pub const destroyTexture = textures_module.destroyTexture;
     pub const textureResource = textures_module.textureResource;
     pub const textureInfo = textures_module.textureInfo;
+    pub const textureExists = textures_module.textureExists;
     pub const textureIndex = textures_module.textureIndex;
     pub const storageIndex = textures_module.storageIndex;
     pub const subView = textures_module.subView;
@@ -889,6 +909,14 @@ fn debugCallback(
         std.log.warn("vulkan: {s}", .{message});
     }
     return .false;
+}
+
+fn destroyFrame(self: *Device, frame: *FrameData) void {
+    self.vkd.destroyQueryPool(frame.query_pool, null);
+    self.vkd.destroySemaphore(frame.image_available, null);
+    self.vkd.destroySemaphore(frame.generated_available, null);
+    self.vkd.destroyFence(frame.fence, null);
+    self.vkd.destroyCommandPool(frame.pool, null);
 }
 
 pub fn sameHandle(a: anytype, b: @TypeOf(a)) bool {

@@ -21,7 +21,9 @@ layout(location = 6) in vec4 in_vertex_color;
 layout(location = 7) in vec2 in_uv1;
 
 layout(location = 0) out vec4 out_color;
+#ifndef PEEL
 layout(location = 1) out vec4 out_motion;
+#endif
 #ifdef WEIGHTED
 layout(location = 2) out float out_reveal;
 #endif
@@ -166,7 +168,9 @@ void main() {
         aerialHaze(frame, surface.view, length(in_position - frame.camera_position), air_through, air);
         color = color * air_through + air * coverage * (1.0 - air_through);
     }
+#ifndef PEEL
     out_motion = vec4((in_clip.xy / in_clip.w - in_previous_clip.xy / in_previous_clip.w) * 0.5, 0.0, coverage);
+#endif
     if (push.mode == 1u) {
         float weight = clamp(pow(min(1.0, coverage * 10.0) + 0.01, 3.0) * 1e8 * pow(gl_FragCoord.z * 0.9 + 0.1, 3.0), 1e-2, 3e3);
         out_color = vec4(color, coverage) * weight;

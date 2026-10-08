@@ -221,6 +221,7 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
                 if (streaming.from_cache and floor > 0 and image.block == .bc7 and image.cache_key != 0) if (self.options.asset_cache_dir) |directory| {
                     const extension: []const u8 = if (image.two_channel) "bc5" else if (image.one_channel) "bc4" else "bc7";
                     const path = try std.fmt.allocPrint(self.gpa, "{s}/{x:0>16}.{s}", .{ directory, image.cache_key, extension });
+                    errdefer self.gpa.free(path);
                     const tail_offset = stream.levelOffset(floor);
                     const in_cache = blk: {
                         const file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch break :blk false;

@@ -485,8 +485,12 @@ pub fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]align(1
 /// Loads and processes a `.glb`/`.gltf` file. Requires `acquireLibraries`.
 /// The caller owns the result and must `deinit` it.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: LoadOptions) !Model {
-    const cache_salt: u64 = std.hash.Wyhash.hash(@intFromBool(options.lods.clusters), std.mem.asBytes(&[2]f32{ options.lods.normal_weight, options.lods.uv_weight }));
     const model_cache_dir: ?[]const u8 = if (options.compress_textures) options.cache_dir else null;
+    var salt = std.hash.Wyhash.init(@intFromBool(options.lods.clusters));
+    salt.update(std.mem.asBytes(&[2]f32{ options.lods.normal_weight, options.lods.uv_weight }));
+    salt.update(&.{@intFromBool(options.normal_maps_bc5)});
+    if (options.cache_dir != null) salt.update(std.mem.asBytes(&bufferStamp(gpa, io, path)));
+    const cache_salt = salt.final();
     if (model_cache_dir) |directory| {
         if (loadCached(gpa, io, path, directory, cache_salt) catch null) |cached| return cached;
     }
@@ -591,7 +595,9 @@ fn decodeImageInner(job: *ImageJob) !void {
             break :blk decoded;
         }
         const directory = std.fs.path.dirname(job.model_path) orelse ".";
-        const image_path = try std.fs.path.join(job.gpa, &.{ directory, uri });
+        const file_name = try job.gpa.dupe(u8, uri);
+        defer job.gpa.free(file_name);
+        const image_path = try std.fs.path.join(job.gpa, &.{ directory, std.Uri.percentDecodeInPlace(file_name) });
         defer job.gpa.free(image_path);
         const file_bytes = try readFile(job.gpa, job.io, image_path);
         owned = file_bytes;
@@ -804,6 +810,32 @@ const CachedModel = struct {
     animations: []Animation,
     images: []CachedImage,
 };
+
+/// Stamps the buffer files a `.gltf` names, so that the cache notices one
+/// changing. 0 for a `.glb`.
+fn bufferStamp(gpa: std.mem.Allocator, io: std.Io, path: []const u8) u64 {
+    if (!std.ascii.endsWithIgnoreCase(path, ".gltf")) return 0;
+    const bytes = readFile(gpa, io, path) catch return 0;
+    defer gpa.free(bytes);
+    const data = gltf.parse(.{ .memory = .{
+        .alloc_func = zmesh.mem.zmeshAllocUser,
+        .free_func = zmesh.mem.zmeshFreeUser,
+    } }, bytes) catch return 0;
+    defer gltf.free(data);
+    if (data.buffers_count == 0) return 0;
+    const directory = std.fs.path.dirname(path) orelse ".";
+    var stamp: u64 = 0;
+    for (data.buffers.?[0..data.buffers_count]) |buffer| {
+        const uri = std.mem.span(buffer.uri orelse continue);
+        if (std.mem.startsWith(u8, uri, "data:")) continue;
+        const file_name = gpa.dupe(u8, uri) catch continue;
+        defer gpa.free(file_name);
+        const buffer_path = std.fs.path.join(gpa, &.{ directory, std.Uri.percentDecodeInPlace(file_name) }) catch continue;
+        defer gpa.free(buffer_path);
+        stamp = stamp *% 31 +% (modelKey(io, buffer_path) catch 0);
+    }
+    return stamp;
+}
 
 /// Hashes path, size and modification time. Images a `.gltf` references by
 /// URI are not included.
@@ -2329,4 +2361,24 @@ pub fn trimCache(gpa: std.mem.Allocator, io: std.Io, directory: []const u8, max_
         freed += file.size;
     }
     return freed;
+}
+
+test "a node that is its own child is refused" {
+    if (!build_features.validate_input) return error.SkipZigTest;
+    const io = std.testing.io;
+    acquireLibraries(io);
+    defer releaseLibraries(io);
+    const path = ".zig-cache/limn-test-cycle.gltf";
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        var buffer: [256]u8 = undefined;
+        var writer = file.writerStreaming(io, &buffer);
+        try writer.interface.writeAll(
+            \\{"asset":{"version":"2.0"},"nodes":[{"children":[0]}]}
+        );
+        try writer.interface.flush();
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.testing.expectError(error.InvalidGltf, loadLights(std.testing.allocator, io, path));
 }

@@ -1,6 +1,7 @@
 //! Debug names and the deferred destruction of Vulkan objects. Internal to the device.
 const vk = @import("vulkan");
 const device_module = @import("../device.zig");
+const waitQueue = @import("frames.zig").waitQueue;
 
 const Device = device_module.Device;
 const Deletion = device_module.Deletion;
@@ -18,7 +19,7 @@ pub fn setName(self: *Device, object_type: vk.ObjectType, handle: u64, label: [:
 
 pub fn retire(self: *Device, object: Deletion) void {
     self.deletions.append(self.gpa, .{ .frame = self.frame_number, .object = object }) catch {
-        self.vkd.deviceWaitIdle() catch {};
+        waitQueue(self) catch {};
         destroyNow(self, object);
     };
 }

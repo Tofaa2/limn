@@ -2,10 +2,10 @@
 A high quality, performant, realtime, concurrency-first, physically based renderer written in zig with Vulkan 1.3
 
 Latest docs are published to https://tofaa2.github.io/limn/
-Changes can also be found in CHANGEME.md
+Changes can also be found in CHANGELOG.md
 
 # Path tracing
-Path tracing is WIP and contains noise, unfortunately RTX is an oversold concept for marketting that requires vendor locked software and tooling to make it look actually good. Its recommended to keep regular ray tracing enabled and path tracing disabled.
+Path tracing is WIP and contains noise, unfortunately RTX is an oversold concept for marketing that requires vendor locked software and tooling to make it look actually good. Its recommended to keep regular ray tracing enabled and path tracing disabled.
 
 ![Sponza, path traced](.github/images/rtx_path.png)
 
@@ -60,13 +60,14 @@ provides everything. The example assets are stored with Git LFS: run
 zig build            # library and examples
 zig build run        # the meadow example
 zig build test       # unit tests
+zig build checks     # picking, reloading, streaming and out of memory, without a window
 zig build verify     # formatting, tests, and the examples under Vulkan validation
 zig build docs       # API reference in zig-out/docs
 ```
 
 Add `-Doptimize=ReleaseFast` for full speed. Every example takes `--frames N`
 and `--screenshot file.png`, and lists its keys at the top of its source
-file; `zig build scene` renders the test scene offscreen with timings.
+file.
 
 ## Documentation
 
@@ -92,4 +93,4 @@ Apache-2.0; see [`LICENSE`](LICENSE). Bundled work keeps its own terms:
 - FidelityFX Super Resolution 1 (MIT): `src/third_party/ffx_fsr1`
 - FidelityFX SDK 1.1.4, for Super Resolution 2 and 3 (MIT): `src/third_party/ffx_sdk`
 - DejaVu Sans, the built-in font: `src/render/fonts/LICENSE`
-- Example models, environments and fonts: `examples/assets/README.md`
+- Example models, environments and fonts, some for non-commercial use only: `examples/assets/README.md`

@@ -21,6 +21,7 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/forward.vert", .name = "forward.vert.spv" },
     .{ .src = shader_dir ++ "/forward.frag", .name = "forward.frag.spv" },
     .{ .src = shader_dir ++ "/forward.frag", .name = "forward_weighted.frag.spv", .defines = &.{"WEIGHTED"} },
+    .{ .src = shader_dir ++ "/forward.frag", .name = "forward_peel.frag.spv", .defines = &.{"PEEL"} },
     .{ .src = shader_dir ++ "/hiz.frag", .name = "hiz.frag.spv" },
     .{ .src = shader_dir ++ "/gi_trace.comp", .name = "gi_trace.comp.spv" },
     .{ .src = shader_dir ++ "/gi_relocate.frag", .name = "gi_relocate.frag.spv" },
@@ -35,6 +36,8 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/shadow_color.frag", .name = "shadow_color.frag.spv" },
     .{ .src = shader_dir ++ "/shade.frag", .name = "shade.frag.spv" },
     .{ .src = shader_dir ++ "/shade.frag", .name = "shade_rt.frag.spv", .defines = &.{"RAY_TRACED"} },
+    .{ .src = shader_dir ++ "/shade.frag", .name = "shade_plain.frag.spv", .defines = &.{"PLAIN"} },
+    .{ .src = shader_dir ++ "/shade.frag", .name = "shade_rt_plain.frag.spv", .defines = &.{ "RAY_TRACED", "PLAIN" } },
     .{ .src = shader_dir ++ "/ao_depth.frag", .name = "ao_depth.frag.spv" },
     .{ .src = shader_dir ++ "/gtao.frag", .name = "gtao.frag.spv" },
     .{ .src = shader_dir ++ "/gtao_denoise.frag", .name = "gtao_denoise.frag.spv" },
@@ -200,7 +203,10 @@ const examples: []const Example = &.{
         .root = "examples/shader.zig",
         .description = "A material written by the application: molten rock that cools per object",
         .windowed = true,
-        .shaders = &.{.{ .src = "examples/shaders/lava.frag", .name = "lava.frag.spv" }},
+        .shaders = &.{
+            .{ .src = "examples/shaders/lava.frag", .name = "lava.frag.spv" },
+            .{ .src = "examples/shaders/lava.frag", .name = "lava_plain.frag.spv", .defines = &.{"PLAIN"} },
+        },
     },
     .{
         .name = "rtx",
@@ -318,13 +324,6 @@ const examples: []const Example = &.{
     },
 };
 
-/// Shaders of the examples that the verification scene draws with too.
-const verify_shaders: []const Shader = &.{
-    .{ .src = "examples/shaders/fullscreen.vert", .name = "example_fullscreen.vert.spv" },
-    .{ .src = "examples/shaders/outline.frag", .name = "outline.frag.spv" },
-    .{ .src = "examples/shaders/lava.frag", .name = "lava.frag.spv" },
-};
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -401,19 +400,22 @@ pub fn build(b: *std.Build) void {
     font_baker.addImport("build_features", features_module);
     renderer.addImport("font_baker", font_baker);
     addShaders(b, renderer, renderer_shaders, shaders_step);
+    const shader_reload = b.option(bool, "shader_reload", "Keep the shader source paths in the library for `shaders.reload` (default: Debug only)") orelse (optimize == .Debug);
     const shader_options = b.addOptions();
     var shader_names: [renderer_shaders.len][]const u8 = undefined;
     var shader_sources: [renderer_shaders.len][]const u8 = undefined;
     var shader_defines: [renderer_shaders.len][]const u8 = undefined;
     for (renderer_shaders, 0..) |shader, index| {
         shader_names[index] = shader.name;
-        shader_sources[index] = b.pathFromRoot(shader.src);
-        shader_defines[index] = if (shader.defines.len != 0) shader.defines[0] else "";
+        shader_sources[index] = if (shader_reload) b.pathFromRoot(shader.src) else "";
+        shader_defines[index] = "";
+        for (shader.defines) |define| shader_defines[index] = b.fmt("{s} -D{s}", .{ shader_defines[index], define });
     }
     shader_options.addOption([]const []const u8, "names", &shader_names);
     shader_options.addOption([]const []const u8, "sources", &shader_sources);
     shader_options.addOption([]const []const u8, "defines", &shader_defines);
-    shader_options.addOption([]const u8, "include_dir", b.pathFromRoot(shader_dir));
+    shader_options.addOption([]const u8, "include_dir", if (shader_reload) b.pathFromRoot(shader_dir) else "");
+    shader_options.addOption(bool, "reload", shader_reload);
     renderer.addOptions("shader_sources", shader_options);
     renderer.addImport("build_features", features_module);
     if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk);
@@ -475,28 +477,7 @@ pub fn build(b: *std.Build) void {
     window_module.addImport("limn", renderer);
     window_module.addImport("glfw", glfw_module);
 
-    const canvas_scene = b.createModule(.{
-        .root_source_file = b.path("examples/canvas_scene.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    canvas_scene.addImport("limn", renderer);
-    const verify_module = b.createModule(.{
-        .root_source_file = b.path("src/verify.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = thread_sanitizer,
-    });
-    verify_module.addImport("limn", renderer);
-    verify_module.addImport("canvas_scene", canvas_scene);
-    addShaders(b, verify_module, verify_shaders, shaders_step);
-    const headless = b.addExecutable(.{ .name = "scene", .root_module = verify_module, .use_llvm = true });
-    b.installArtifact(headless);
-    check_step.dependOn(&headless.step);
-    const run_scene = b.addRunArtifact(headless);
-    if (b.args) |args| run_scene.addArgs(args);
-    b.step("scene", "Render the verification scene offscreen to a PNG and print timings").dependOn(&run_scene.step);
-
+    var example_exes: std.StringHashMapUnmanaged(*std.Build.Step.Compile) = .empty;
     var particles_example: ?*std.Build.Step.Compile = null;
     var animation_example: ?*std.Build.Step.Compile = null;
     var instancing_example: ?*std.Build.Step.Compile = null;
@@ -523,6 +504,7 @@ pub fn build(b: *std.Build) void {
         }
         addShaders(b, module, example.shaders, shaders_step);
         const exe = b.addExecutable(.{ .name = example.name, .root_module = module, .use_llvm = true });
+        example_exes.put(b.allocator, example.name, exe) catch @panic("OOM");
         b.installArtifact(exe);
         check_step.dependOn(&exe.step);
         const run = b.addRunArtifact(exe);
@@ -547,19 +529,22 @@ pub fn build(b: *std.Build) void {
     const format_check = b.addSystemCommand(&.{
         "zig", "fmt", "--check", "build.zig", "src", "examples",
     });
-    const verify_render = b.addRunArtifact(headless);
-    verify_render.addArgs(&.{ "--validation", "--peel", "--sort-test", "--tube", "--tube-shadows", "--flare", "--width", "640", "--height", "360", "--frames", "48", "--motion", "--soak", "3", "--threads", "4", "--crowd", "120", "--render-scale", "0.67", "--refits", "100", "--overlay", "--lights", "--glass", "--flat-panes", "--pane-row", "group", "--relocate", "--gi-spacing", "0.3", "--gi-middle-ratio", "2", "--lod-fade", "0.25", "--clouds", "--morph-row", ".zig-cache/renderer-morph-row", "--colored-shadows", "--decals", "--ktx2-bc1", ".zig-cache/renderer-bc1.ktx2", "--ktx2-model", ".zig-cache/renderer-ktx2-model", "--cube-env", ".zig-cache/renderer-cube-env.ktx2", "--fog", "0.012", "--output" });
-    _ = verify_render.addOutputFileArg("verify.png");
-    verify_render.has_side_effects = true;
-    const verify_views = b.addRunArtifact(headless);
-    verify_views.has_side_effects = true;
-    verify_views.addArgs(&.{ "--validation", "--width", "640", "--height", "360", "--frames", "24", "--motion", "--views", "--overlay", "--lights", "--custom-pass", "--material", "--instance-params", "--crowd", "40", "--crowd-group", "--meshlet-bounds", "--shadow-small", "2", "--skip-buried", "--shadow-lod-light", "--aerial", "0.004", "--bounce-lights", "64", "--mirror-panel", "--probe", "--probe-settle", "4", "--glass", "--lens-pane", "--layered-refraction", "--particles", "--decals", "--compress-images", "--bc7-test", "--shift-frame", "12", "--clouds", "--fluid", "--fluid-frame", ".zig-cache/renderer-fluid-frame.png", "--fluid-flipbook", ".zig-cache/renderer-fluid-flipbook.png", "--fluid-sharp", "--decal-count", "70", "--light-size", "0.12", "--half-reflections", "--text-fallback", "--lut", "warm", "--bumps", "--tints", "--sheen", "--aniso", "--morph", "--contact-shadows", "0.3", "--autofocus", "--stars", "--gi-coarse-interval", "3", "--stream", "24", "--stream-visible", "--ktx2", ".zig-cache/renderer-decal.ktx2", "--coat", "--coat-maps", "--transform-panel", "--wave", "--instances", "2000", "--gi-spacing", "0.9", "--reload-frame", "8", "--names", "--profile", "--sky-sweep", "--sky-spread", "4", "--grade", "--dof", "6", "--half-dof", "--dof-blades", "6", "--motion-blur", "0.5", "--pick", "200", "200", "--fail-frame", "5", "--oom", "40", "--gpu-oom", "45", "--cache", ".zig-cache/renderer-assets", "--output" });
-    _ = verify_views.addOutputFileArg("verify_views.png");
-    const verify_step = b.step("verify", "Check formatting, run tests and render the world with validation enabled");
+    const verify_step = b.step("verify", "Check formatting, run tests and render the examples with validation enabled");
     verify_step.dependOn(&format_check.step);
     verify_step.dependOn(test_step);
-    verify_step.dependOn(&verify_render.step);
-    verify_step.dependOn(&verify_views.step);
+    const checks_module = b.createModule(.{
+        .root_source_file = b.path("src/checks.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = thread_sanitizer,
+    });
+    checks_module.addImport("limn", renderer);
+    const checks = b.addExecutable(.{ .name = "checks", .root_module = checks_module, .use_llvm = true });
+    check_step.dependOn(&checks.step);
+    const run_checks = b.addRunArtifact(checks);
+    run_checks.has_side_effects = true;
+    b.step("checks", "Check picking, shader reloading, streaming and running out of memory, without a window").dependOn(&run_checks.step);
+    verify_step.dependOn(&run_checks.step);
     const verify_particles = b.addRunArtifact(particles_example.?);
     verify_particles.has_side_effects = true;
     verify_particles.addArgs(&.{ "--frames", "90", "--screenshot" });
@@ -578,6 +563,27 @@ pub fn build(b: *std.Build) void {
     verify_liquid.addArgs(&.{ "--frames", "90", "--screenshot" });
     _ = verify_liquid.addOutputFileArg("verify_liquid.png");
     verify_step.dependOn(&verify_liquid.step);
+    for ([_][]const u8{ "shadows", "stereo", "lightmap", "voxels", "asteroids" }) |name| {
+        const run = b.addRunArtifact(example_exes.get(name).?);
+        run.has_side_effects = true;
+        run.addArgs(&.{ "--frames", "30", "--screenshot" });
+        _ = run.addOutputFileArg(b.fmt("verify_{s}.png", .{name}));
+        verify_step.dependOn(&run.step);
+    }
+    const Variant = struct { example: []const u8, name: []const u8, arguments: []const []const u8 };
+    for ([_]Variant{
+        .{ .example = "shadows", .name = "virtual_shadows", .arguments = &.{ "--vsm", "1" } },
+        .{ .example = "upscaling", .name = "fsr2", .arguments = &.{ "--mode", "4" } },
+        .{ .example = "upscaling", .name = "fsr3", .arguments = &.{ "--mode", "5" } },
+        .{ .example = "upscaling", .name = "coarse_shading", .arguments = &.{ "--mode", "2", "--vrs" } },
+    }) |variant| {
+        const run = b.addRunArtifact(example_exes.get(variant.example).?);
+        run.has_side_effects = true;
+        run.addArgs(variant.arguments);
+        run.addArgs(&.{ "--frames", "30", "--screenshot" });
+        _ = run.addOutputFileArg(b.fmt("verify_{s}.png", .{variant.name}));
+        verify_step.dependOn(&run.step);
+    }
     for (pictured, pictured_examples) |name, example| {
         const verify_example = b.addRunArtifact(example.?);
         verify_example.has_side_effects = true;
@@ -585,16 +591,6 @@ pub fn build(b: *std.Build) void {
         _ = verify_example.addOutputFileArg(b.fmt("verify_{s}.png", .{name}));
         verify_step.dependOn(&verify_example.step);
     }
-    const verify_compaction = b.addRunArtifact(headless);
-    verify_compaction.has_side_effects = true;
-    verify_compaction.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "8", "--compact-test", "--output" });
-    _ = verify_compaction.addOutputFileArg("verify_compaction.png");
-    verify_step.dependOn(&verify_compaction.step);
-    const verify_coarse = b.addRunArtifact(headless);
-    verify_coarse.has_side_effects = true;
-    verify_coarse.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "8", "--coarse-test", "--coarse-near", "--geometry-distance", "500", "--geometry-coarse", "6", "--output" });
-    _ = verify_coarse.addOutputFileArg("verify_coarse.png");
-    verify_step.dependOn(&verify_coarse.step);
     for ([_][]const []const u8{ &.{}, &.{ "--path", "1" } }, [_][]const u8{ "verify_rtx.png", "verify_rtx_path.png" }) |extra, picture| {
         const verify_rtx = b.addRunArtifact(rtx_example.?);
         verify_rtx.has_side_effects = true;
@@ -623,54 +619,47 @@ pub fn build(b: *std.Build) void {
     verify_storm.addArgs(&.{ "--storm", "1", "--frames", "60", "--screenshot" });
     _ = verify_storm.addOutputFileArg("verify_storm.png");
     verify_step.dependOn(&verify_storm.step);
-    const verify_raw_stream = b.addRunArtifact(headless);
-    verify_raw_stream.has_side_effects = true;
-    verify_raw_stream.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "12", "--no-compress", "--stream", "64", "--output" });
-    _ = verify_raw_stream.addOutputFileArg("verify_raw_stream.png");
-    verify_step.dependOn(&verify_raw_stream.step);
-    const verify_cluster_lods = b.addRunArtifact(headless);
-    verify_cluster_lods.has_side_effects = true;
-    verify_cluster_lods.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "48", "--cache", ".zig-cache/renderer-assets", "--cluster-lods", "--terrain", "--lod-fade", "0.25", "--output" });
-    _ = verify_cluster_lods.addOutputFileArg("verify_cluster_lods.png");
-    verify_step.dependOn(&verify_cluster_lods.step);
-    const verify_receiver_culling = b.addRunArtifact(headless);
-    verify_receiver_culling.has_side_effects = true;
-    verify_receiver_culling.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "48", "--cache", ".zig-cache/renderer-assets", "--no-cascade-stagger", "--output" });
-    _ = verify_receiver_culling.addOutputFileArg("verify_receiver_culling.png");
-    verify_step.dependOn(&verify_receiver_culling.step);
-    const verify_geometry_streaming = b.addRunArtifact(headless);
-    verify_geometry_streaming.has_side_effects = true;
-    verify_geometry_streaming.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "40", "--cache", ".zig-cache/renderer-assets", "--terrain", "--geometry-distance", "20", "--camera", "62", "4", "0", "160", "-4", "0", "--teleport", "16", "-9", "1.6", "0", "4", "1.6", "0", "--output" });
-    _ = verify_geometry_streaming.addOutputFileArg("verify_geometry_streaming.png");
-    verify_step.dependOn(&verify_geometry_streaming.step);
-    const verify_cache_stream = b.addRunArtifact(headless);
-    verify_cache_stream.has_side_effects = true;
-    verify_cache_stream.addArgs(&.{ "--validation", "--width", "480", "--height", "270", "--frames", "24", "--cache", ".zig-cache/renderer-assets", "--stream", "64", "--stream-from-cache", "--stream-skip-occluded", "--output" });
-    _ = verify_cache_stream.addOutputFileArg("verify_cache_stream.png");
-    verify_step.dependOn(&verify_cache_stream.step);
 }
 
 const ffx_root = "src/third_party/ffx_sdk";
+/// A switch of a FidelityFX shader. The flags src/render/ffx/limn_ffx.cpp
+/// makes its contexts with decide which values are asked for, and only those
+/// are compiled.
+const FfxOption = struct {
+    name: []const u8,
+    /// The only value asked for, or null for both.
+    value: ?u1 = null,
+    /// The one pass it is ever set in.
+    pass: ?[]const u8 = null,
+
+    fn compiled(option: FfxOption, pass: []const u8, value: u1) bool {
+        if (option.value) |only| return value == only;
+        if (option.pass) |only| return value == 0 or std.mem.eql(u8, pass, only);
+        return true;
+    }
+};
 /// An effect of the FidelityFX SDK: each pass is a compute shader compiled
-/// once for every combination of `options`.
+/// once for every combination of `options` that is asked for.
 const FfxEffect = struct {
     /// The directory of its shaders.
     name: []const u8,
     /// What its options' names start with.
     prefix: []const u8,
     /// The first is the lowest bit of a combination's number.
-    options: []const []const u8,
+    options: []const FfxOption,
     fixed: []const []const u8 = &.{},
     passes: []const []const u8,
 };
-const ffx_upscaler_options = [_][]const u8{
-    "OPTION_REPROJECT_USE_LANCZOS_TYPE",
-    "OPTION_HDR_COLOR_INPUT",
-    "OPTION_LOW_RESOLUTION_MOTION_VECTORS",
-    "OPTION_JITTERED_MOTION_VECTORS",
-    "OPTION_INVERTED_DEPTH",
-    "OPTION_APPLY_SHARPENING",
-};
+fn ffxUpscalerOptions(comptime accumulate: []const u8) [6]FfxOption {
+    return .{
+        .{ .name = "OPTION_REPROJECT_USE_LANCZOS_TYPE" },
+        .{ .name = "OPTION_HDR_COLOR_INPUT", .value = 1 },
+        .{ .name = "OPTION_LOW_RESOLUTION_MOTION_VECTORS", .value = 1 },
+        .{ .name = "OPTION_JITTERED_MOTION_VECTORS", .value = 0 },
+        .{ .name = "OPTION_INVERTED_DEPTH", .value = 1 },
+        .{ .name = "OPTION_APPLY_SHARPENING", .pass = accumulate },
+    };
+}
 const ffx_sampler_options = [_][]const u8{
     "OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0",
     "OPTION_ACCUMULATE_SAMPLERS_USE_DATA_HALF=0",
@@ -679,12 +668,12 @@ const ffx_sampler_options = [_][]const u8{
     "OPTION_UPSAMPLE_USE_LANCZOS_TYPE=2",
 };
 const ffx_effects = [_]FfxEffect{
-    .{ .name = "fsr2", .prefix = "FFX_FSR2", .options = &ffx_upscaler_options, .fixed = &ffx_sampler_options, .passes = &.{
+    .{ .name = "fsr2", .prefix = "FFX_FSR2", .options = &ffxUpscalerOptions("ffx_fsr2_accumulate_pass"), .fixed = &ffx_sampler_options, .passes = &.{
         "ffx_fsr2_accumulate_pass",                 "ffx_fsr2_autogen_reactive_pass", "ffx_fsr2_compute_luminance_pyramid_pass",
         "ffx_fsr2_depth_clip_pass",                 "ffx_fsr2_lock_pass",             "ffx_fsr2_rcas_pass",
         "ffx_fsr2_reconstruct_previous_depth_pass", "ffx_fsr2_tcr_autogen_pass",
     } },
-    .{ .name = "fsr3upscaler", .prefix = "FFX_FSR3UPSCALER", .options = &ffx_upscaler_options, .fixed = &ffx_sampler_options, .passes = &.{
+    .{ .name = "fsr3upscaler", .prefix = "FFX_FSR3UPSCALER", .options = &ffxUpscalerOptions("ffx_fsr3upscaler_accumulate_pass"), .fixed = &ffx_sampler_options, .passes = &.{
         "ffx_fsr3upscaler_accumulate_pass",             "ffx_fsr3upscaler_autogen_reactive_pass", "ffx_fsr3upscaler_debug_view_pass",
         "ffx_fsr3upscaler_luma_instability_pass",       "ffx_fsr3upscaler_luma_pyramid_pass",     "ffx_fsr3upscaler_prepare_inputs_pass",
         "ffx_fsr3upscaler_prepare_reactivity_pass",     "ffx_fsr3upscaler_rcas_pass",             "ffx_fsr3upscaler_shading_change_pass",
@@ -693,7 +682,11 @@ const ffx_effects = [_]FfxEffect{
     .{
         .name = "frameinterpolation",
         .prefix = "FFX_FRAMEINTERPOLATION",
-        .options = &.{ "OPTION_LOW_RES_MOTION_VECTORS", "OPTION_JITTER_MOTION_VECTORS", "OPTION_INVERTED_DEPTH" },
+        .options = &.{
+            .{ .name = "OPTION_LOW_RES_MOTION_VECTORS", .value = 1 },
+            .{ .name = "OPTION_JITTER_MOTION_VECTORS", .value = 0 },
+            .{ .name = "OPTION_INVERTED_DEPTH", .value = 1 },
+        },
         .fixed = &ffx_sampler_options,
         .passes = &.{
             "ffx_frameinterpolation_compute_game_vector_field_inpainting_pyramid_pass",
@@ -709,7 +702,7 @@ const ffx_effects = [_]FfxEffect{
             "ffx_frameinterpolation_setup_pass",
         },
     },
-    .{ .name = "opticalflow", .prefix = "FFX_OPTICALFLOW", .options = &.{"OPTION_HDR_COLOR_INPUT"}, .passes = &.{
+    .{ .name = "opticalflow", .prefix = "FFX_OPTICALFLOW", .options = &.{.{ .name = "OPTION_HDR_COLOR_INPUT", .value = 0 }}, .passes = &.{
         "ffx_opticalflow_compute_luminance_pyramid_pass",
         "ffx_opticalflow_compute_optical_flow_advanced_pass_v5",
         "ffx_opticalflow_compute_scd_divergence_pass",
@@ -721,8 +714,9 @@ const ffx_effects = [_]FfxEffect{
 };
 
 /// Builds the FidelityFX SDK and the renderer's wrapper round it, and links
-/// `renderer` with them. Shader permutations are compiled with glslc and
-/// packed into the SDK's headers by src/ffx_permutations.zig.
+/// `renderer` with them. The shader permutations that are asked for are
+/// compiled with glslc and packed into the SDK's headers by
+/// src/ffx_permutations.zig.
 fn addFidelityFx(
     b: *std.Build,
     renderer: *std.Build.Module,
@@ -746,13 +740,20 @@ fn addFidelityFx(
     const gpu = b.path(ffx_root ++ "/include/FidelityFX/gpu");
     for (ffx_effects) |effect| {
         const option_names = b.allocator.alloc([]const u8, effect.options.len) catch @panic("OOM");
-        for (effect.options, option_names) |option, *name| name.* = b.fmt("{s}_{s}", .{ effect.prefix, option });
+        for (effect.options, option_names) |option, *name| name.* = b.fmt("{s}_{s}", .{ effect.prefix, option.name });
         for (effect.passes) |pass| {
             const generate = b.addRunArtifact(generator);
             const headers = generate.addOutputDirectoryArg(pass);
             generate.addArg(pass);
             generate.addArg(std.mem.join(b.allocator, ",", option_names) catch @panic("OOM"));
             for (0..@as(usize, 1) << @intCast(effect.options.len)) |combination| {
+                const asked = for (effect.options, 0..) |option, bit| {
+                    if (!option.compiled(pass, @truncate(combination >> @intCast(bit)))) break false;
+                } else true;
+                if (!asked) {
+                    generate.addArg("-");
+                    continue;
+                }
                 const compile = b.addSystemCommand(&.{ "glslc", "-fshader-stage=compute", "--target-env=vulkan1.2", "-Os", "-g", "-DFFX_GLSL=1", "-DFFX_GPU=1", "-DFFX_HALF=0" });
                 for (effect.fixed) |fixed| compile.addArg(b.fmt("-D{s}_{s}", .{ effect.prefix, fixed }));
                 for (option_names, 0..) |name, bit| compile.addArg(b.fmt("-D{s}={d}", .{ name, (combination >> @intCast(bit)) & 1 }));

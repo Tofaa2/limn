@@ -3251,6 +3251,7 @@ FfxErrorCode CreatePipelineVK(FfxInterface* backendInterface,
     // WON'T WORK WITH FSR3!!
     backendInterface->fpGetPermutationBlobByIndex(effect, pass, FFX_BIND_COMPUTE_SHADER_STAGE, permutationOptions, &shaderBlob);
     FFX_ASSERT(shaderBlob.data && shaderBlob.size);
+    if (!shaderBlob.data || !shaderBlob.size) return FFX_ERROR_BACKEND_API_ERROR;
 
     //////////////////////////////////////////////////////////////////////////
     // One root signature (or pipeline layout) per pipeline

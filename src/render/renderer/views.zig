@@ -69,11 +69,13 @@ pub const Views = struct {
     }
 
     /// A target texture as an image for a `DrawList`. Views listed earlier in
-    /// the same frame have already drawn into it.
-    pub fn targetImage(views: *Views, target: rhi.Texture) Image {
+    /// the same frame have already drawn into it. `error.InvalidTarget` once
+    /// the target is destroyed.
+    pub fn targetImage(views: *Views, target: rhi.Texture) !Image {
         const self = views.renderer();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (!self.device.textureExists(target)) return error.InvalidTarget;
         const info = self.device.textureInfo(target);
         return .{ .index = self.device.textureIndex(target), .width = info.width, .height = info.height };
     }

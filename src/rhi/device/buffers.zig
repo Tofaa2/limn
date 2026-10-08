@@ -6,6 +6,7 @@ const device_module = @import("../device.zig");
 const Device = device_module.Device;
 const BufferResource = device_module.BufferResource;
 const createStaging = @import("frames.zig").createStaging;
+const waitQueue = @import("frames.zig").waitQueue;
 const retire = @import("objects.zig").retire;
 const sameHandle = device_module.sameHandle;
 const setName = @import("objects.zig").setName;
@@ -49,8 +50,18 @@ pub fn createBuffer(self: *Device, desc: types.BufferDesc) !types.Buffer {
 
 /// Drops queued uploads that target a resource being destroyed.
 pub fn cancelUploads(self: *Device, buffer: ?types.Buffer, texture: ?types.Texture) void {
-    var write: usize = 0;
     var orphaned: [16]types.Buffer = undefined;
+    var orphan_count: usize = orphaned.len;
+    while (orphan_count == orphaned.len) {
+        orphan_count = cancelSomeUploads(self, buffer, texture, &orphaned);
+        for (orphaned[0..orphan_count]) |staging| self.destroyBuffer(staging);
+    }
+}
+
+/// One pass of `cancelUploads`, which stops dropping uploads once
+/// `orphaned` is full. Returns how many staging buffers it put there.
+fn cancelSomeUploads(self: *Device, buffer: ?types.Buffer, texture: ?types.Texture, orphaned: *[16]types.Buffer) usize {
+    var write: usize = 0;
     var orphan_count: usize = 0;
     const items = self.uploads.items;
     for (items) |upload| {
@@ -60,18 +71,18 @@ pub fn cancelUploads(self: *Device, buffer: ?types.Buffer, texture: ?types.Textu
             .mips => |target| if (texture != null and sameHandle(target, texture.?)) types.Buffer.invalid else null,
             .copy => |copy| if (buffer != null and sameHandle(copy.destination, buffer.?)) copy.source else null,
         };
-        if (staging) |value| {
-            if (value.isValid() and orphan_count < orphaned.len) {
+        if (staging) |value| if (orphan_count < orphaned.len) {
+            if (value.isValid()) {
                 orphaned[orphan_count] = value;
                 orphan_count += 1;
             }
             continue;
-        }
+        };
         items[write] = upload;
         write += 1;
     }
     self.uploads.items.len = write;
-    for (orphaned[0..orphan_count]) |staging| self.destroyBuffer(staging);
+    return orphan_count;
 }
 
 /// Invalidates the handle at once; the buffer itself is released after
@@ -139,7 +150,7 @@ pub fn readBuffer(self: *Device, gpa: std.mem.Allocator, buffer: types.Buffer, s
     std.debug.assert(!self.in_frame);
     const staging = try self.createBuffer(.{ .name = "readback", .size = size, .usage = .{}, .memory = .gpu_to_cpu });
     defer self.destroyBuffer(staging);
-    try self.vkd.deviceWaitIdle();
+    try waitQueue(self);
     const encoder = try self.beginImmediate();
     self.vkd.cmdCopyBuffer(encoder.command, self.bufferResource(buffer).handle, self.bufferResource(staging).handle, &.{.{ .src_offset = 0, .dst_offset = 0, .size = size }});
     try self.endImmediate();

@@ -9,6 +9,7 @@ const Device = device_module.Device;
 const TextureResource = device_module.TextureResource;
 const cancelUploads = @import("buffers.zig").cancelUploads;
 const createStaging = @import("frames.zig").createStaging;
+const waitQueue = @import("frames.zig").waitQueue;
 const max_mip_levels = device_module.max_mip_levels;
 const retire = @import("objects.zig").retire;
 const setName = @import("objects.zig").setName;
@@ -86,6 +87,7 @@ pub fn registerTexture(
     }, null);
     errdefer self.vkd.destroyImageView(view, null);
     var bindless_index: ?u32 = null;
+    errdefer if (bindless_index) |slot| self.texture_slots.release(slot);
     if (sampled) {
         const slot = try self.texture_slots.allocate();
         bindless_index = slot;
@@ -134,6 +136,11 @@ pub fn destroyTexture(self: *Device, texture: types.Texture) void {
 /// created or destroyed, including a swapchain rebuild.
 pub fn textureResource(self: *Device, texture: types.Texture) *TextureResource {
     return self.textures.get(texture) orelse @panic("stale or invalid texture handle");
+}
+
+/// False for a stale or invalid handle.
+pub fn textureExists(self: *Device, texture: types.Texture) bool {
+    return self.textures.get(texture) != null;
 }
 
 /// Panics on a stale handle.
@@ -254,7 +261,7 @@ pub fn readTexture(self: *Device, gpa: std.mem.Allocator, texture: types.Texture
     const size = @as(u64, info.width) * info.height * info.format.bytesPerPixel();
     const staging = try self.createBuffer(.{ .name = "readback", .size = size, .usage = .{}, .memory = .gpu_to_cpu });
     defer self.destroyBuffer(staging);
-    try self.vkd.deviceWaitIdle();
+    try waitQueue(self);
     var encoder = try self.beginImmediate();
     const previous = self.textureResource(texture).states[0];
     encoder.transition(texture, .copy_src);
@@ -293,6 +300,7 @@ pub fn createSampler(self: *Device, desc: types.SamplerDesc) !types.Sampler {
     }, null);
     errdefer self.vkd.destroySampler(handle, null);
     const slot = try self.sampler_slots.allocate();
+    errdefer self.sampler_slots.release(slot);
     const image_info = vk.DescriptorImageInfo{ .sampler = handle, .image_view = .null_handle, .image_layout = .undefined };
     self.vkd.updateDescriptorSets(&.{.{
         .dst_set = self.descriptor_set,

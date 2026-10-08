@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
     renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 0.6);
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
-    const lava = try renderer.materials.createShader(@embedFile("lava.frag.spv"));
+    const lava = try renderer.materials.createShader(@embedFile("lava.frag.spv"), @embedFile("lava_plain.frag.spv"));
 
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;

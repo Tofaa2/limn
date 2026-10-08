@@ -330,7 +330,9 @@ pub fn shadeVariantDesc(device: *const rhi.Device, reflective: bool, constants: 
     return .{
         .name = if (reflective) "shading (reflective, variant)" else "shading (variant)",
         .vertex = shaderCode("fullscreen.vert.spv"),
-        .fragment = if (device.ray_tracing) shaderCode("shade_rt.frag.spv") else shaderCode("shade.frag.spv"),
+        .fragment = if (reflective)
+            (if (device.ray_tracing) shaderCode("shade_rt.frag.spv") else shaderCode("shade.frag.spv"))
+        else if (device.ray_tracing) shaderCode("shade_rt_plain.frag.spv") else shaderCode("shade_plain.frag.spv"),
         .color_targets = if (reflective) &shade_reflective_targets else &shade_plain_targets,
         .cull = .none,
         .fragment_constants = constants,
@@ -561,6 +563,11 @@ pub const SceneData = struct {
     /// their records must be rewritten.
     static_count: u32 = 0,
     static_version: u64 = 0,
+    /// Which lights `prepareLights` gave shadow atlas tiles, and the frame it
+    /// chose them in.
+    shadow_grants: std.ArrayList(bool) = .empty,
+    shadow_grants_frame: u64 = std.math.maxInt(u64),
+    shadow_grants_traced: bool = false,
     /// The groups' ray-tracing instances, and the group state they were made
     /// from.
     static_tlas: std.ArrayList(rhi.AccelerationInstance) = .empty,
@@ -1030,7 +1037,10 @@ pub const ViewData = struct {
     /// The FidelityFX upscaler this view resolves with, and whether one was
     /// asked for and would not start.
     upscaler: ?@import("ffx.zig").Upscaler = null,
-    upscaler_refused: bool = false,
+    upscaler_refused: ?@import("ffx.zig").Generation = null,
+    /// Renderer frame the upscaler last ran in; its history is stale after a
+    /// gap.
+    upscaler_frame: u64 = 0,
     /// One word per instance of the instance groups: seen last frame
     /// (`InstanceVisibility` in cull_view.glsl).
     instance_visibility: ?rhi.Buffer = null,
@@ -1057,7 +1067,10 @@ pub const ViewData = struct {
         if (self.visibility) |buffer| device.destroyBuffer(buffer);
         if (self.instance_visibility) |buffer| device.destroyBuffer(buffer);
         if (self.vsm) |vsm| vsm.deinit(device);
-        if (self.upscaler) |upscaler| upscaler.destroy();
+        if (self.upscaler) |upscaler| {
+            device.waitIdle() catch {};
+            upscaler.destroy();
+        }
         device.destroyBuffer(self.exposure);
     }
 };
@@ -1534,7 +1547,7 @@ pub const PickPending = struct { pixel: [2]u32, scene: Scene, layout_version: u6
 /// What a read-back copy of a scene's seen instances describes.
 pub const SeenTag = struct { layout_version: u64 = 0, count: u32 = 0, valid: bool = false };
 pub const DrawPipelines = struct { format: rhi.Format, flat: rhi.Pipeline, depth_tested: rhi.Pipeline };
-pub const ImageEntry = struct { texture: rhi.Texture, index: u32 };
+pub const ImageEntry = struct { texture: rhi.Texture, index: u32, id: u32 };
 
 pub const StreamFrustum = struct {
     view: Mat4,

@@ -47,6 +47,8 @@ pub const Image = struct {
     /// Size in pixels.
     width: u32,
     height: u32,
+    /// Which image of `Renderer.images` this is; 0 for any other.
+    id: u32 = 0,
 };
 
 /// Axis-aligned rectangle; `x`, `y` is the top-left corner, y down.
@@ -225,7 +227,9 @@ pub const Path = struct {
         try self.points.append(self.gpa, p);
     }
 
+    /// `error.EmptyPath` before a first point.
     pub fn quadTo(self: *Path, control: [2]f32, end: [2]f32) !void {
+        if (self.points.items.len == 0) return error.EmptyPath;
         const start = self.points.items[self.points.items.len - 1];
         try self.cubicTo(
             .{ start[0] + (control[0] - start[0]) * 2 / 3, start[1] + (control[1] - start[1]) * 2 / 3 },
@@ -234,7 +238,9 @@ pub const Path = struct {
         );
     }
 
+    /// `error.EmptyPath` before a first point.
     pub fn cubicTo(self: *Path, control_a: [2]f32, control_b: [2]f32, end: [2]f32) !void {
+        if (self.points.items.len == 0) return error.EmptyPath;
         const start = self.points.items[self.points.items.len - 1];
         const deviation = @max(
             @abs(cross2(start, end, control_a)),
@@ -470,25 +476,29 @@ pub const DrawList = struct {
     }
 
     /// Composes `transform` onto the current 2D transform until the matching
-    /// `popTransform`. Screen-space only. Nests up to 16 deep.
+    /// `popTransform`. Screen-space only. Nests up to 16 deep; deeper pushes
+    /// change nothing.
     pub fn pushTransform(self: *DrawList, transform: Transform2D) void {
-        std.debug.assert(self.transform_depth < self.transform_stack.len);
-        self.transform_stack[self.transform_depth] = self.transform;
-        self.transform_depth += 1;
+        self.transform_depth +|= 1;
+        if (self.transform_depth > self.transform_stack.len) return;
+        self.transform_stack[self.transform_depth - 1] = self.transform;
         self.transform = self.transform.mul(transform);
     }
 
+    /// Ignored without a matching `pushTransform`.
     pub fn popTransform(self: *DrawList) void {
-        std.debug.assert(self.transform_depth > 0);
+        if (self.transform_depth == 0) return;
         self.transform_depth -= 1;
-        self.transform = self.transform_stack[self.transform_depth];
+        if (self.transform_depth < self.transform_stack.len) self.transform = self.transform_stack[self.transform_depth];
     }
 
     /// Restricts screen-space drawing to `r` (in the current transform's
     /// coordinates) until the matching `popClip`. Nested clips intersect.
-    /// Under a rotation the clip is the bounding box of `r`. Nests 16 deep.
+    /// Under a rotation the clip is the bounding box of `r`. Nests 16 deep;
+    /// deeper pushes change nothing.
     pub fn pushClip(self: *DrawList, r: Rect) !void {
-        std.debug.assert(self.clip_depth < self.clip_stack.len);
+        self.clip_depth +|= 1;
+        if (self.clip_depth > self.clip_stack.len) return;
         var low = [2]f32{ std.math.inf(f32), std.math.inf(f32) };
         var high = [2]f32{ -std.math.inf(f32), -std.math.inf(f32) };
         for ([4][2]f32{ .{ r.x, r.y }, .{ r.x + r.width, r.y }, .{ r.x, r.y + r.height }, .{ r.x + r.width, r.y + r.height } }) |corner| {
@@ -502,15 +512,15 @@ pub const DrawList = struct {
             low = .{ @max(low[0], outer.x), @max(low[1], outer.y) };
             high = .{ @min(high[0], outer.x + outer.width), @min(high[1], outer.y + outer.height) };
         }
-        self.clip_stack[self.clip_depth] = self.clip;
-        self.clip_depth += 1;
+        self.clip_stack[self.clip_depth - 1] = self.clip;
         try self.setClip(.{ .x = low[0], .y = low[1], .width = @max(high[0] - low[0], 0), .height = @max(high[1] - low[1], 0) });
     }
 
+    /// Ignored without a matching `pushClip`.
     pub fn popClip(self: *DrawList) !void {
-        std.debug.assert(self.clip_depth > 0);
+        if (self.clip_depth == 0) return;
         self.clip_depth -= 1;
-        try self.setClip(self.clip_stack[self.clip_depth]);
+        if (self.clip_depth < self.clip_stack.len) try self.setClip(self.clip_stack[self.clip_depth]);
     }
 
     fn setClip(self: *DrawList, clip: ?Rect) !void {

@@ -27,6 +27,9 @@ pub const Texture = struct {
     data: []u8,
 };
 
+/// The most a file may unpack to.
+const max_bytes = 1 << 32;
+
 const vk_r8g8b8a8_unorm = 37;
 const vk_r8g8b8a8_srgb = 43;
 const vk_r16g16b16a16_sfloat = 97;
@@ -67,6 +70,7 @@ pub fn read(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     const levels = @max(std.mem.readInt(u32, bytes[40..44], .little), 1);
     const scheme = std.mem.readInt(u32, bytes[44..48], .little);
     if (width == 0 or width > 16384 or height > 16384 or levels > 15) return error.InvalidKtx2;
+    if (levels > std.math.log2_int(u32, @max(width, height)) + 1) return error.InvalidKtx2;
     if (depth > 1) return error.UnsupportedKtx2;
     if ((faces != 1 and faces != 6) or layers > 2048) return error.InvalidKtx2;
     if (faces == 6 and width != height) return error.InvalidKtx2;
@@ -91,7 +95,15 @@ pub fn read(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     if (bytes.len < 80 + @as(usize, levels) * 24) return error.InvalidKtx2;
 
     var total: usize = 0;
-    for (0..levels) |level| total += images * levelBytes(format, @max(width >> @intCast(level), 1), @max(height >> @intCast(level), 1));
+    for (0..levels) |level| {
+        const entry = bytes[80 + level * 24 ..][0..24];
+        const size = images * levelBytes(format, @max(width >> @intCast(level), 1), @max(height >> @intCast(level), 1));
+        const stored = std.mem.readInt(u64, entry[8..16], .little);
+        const unpacked = std.mem.readInt(u64, entry[16..24], .little);
+        if (unpacked != size or stored > bytes.len or (scheme == 0 and stored != size)) return error.InvalidKtx2;
+        total += size;
+    }
+    if (total > max_bytes) return error.UnsupportedKtx2;
     const data = try gpa.alloc(u8, total);
     errdefer gpa.free(data);
     var cursor: usize = 0;
@@ -134,6 +146,7 @@ fn readBasis(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     const faces = info[4];
     const hdr = info[5] != 0;
     if (width == 0 or width > 16384 or height > 16384 or levels > 15) return error.InvalidKtx2;
+    if (levels > std.math.log2_int(u32, @max(width, height)) + 1) return error.InvalidKtx2;
     if ((faces != 1 and faces != 6) or layers > 2048) return error.InvalidKtx2;
     const format: Format = if (hdr) .bc6h else .bc7;
     var total: usize = 0;
@@ -304,4 +317,18 @@ test "cube maps and arrays keep every face and layer of every level" {
     try std.testing.expectEqual(@as(u32, 3), copy.layers);
     try std.testing.expectEqual(@as(u32, 1), copy.faces);
     try std.testing.expectEqualSlices(u8, &array, copy.data);
+}
+
+test "a header that claims more than the file holds is refused" {
+    var data: [(64 + 16) + 16]u8 = @splat(0);
+    const file = try write(std.testing.allocator, .{ .width = 8, .height = 8, .format = .bc7, .srgb = true, .levels = 3, .data = &data });
+    defer std.testing.allocator.free(file);
+    const header = file[0..104];
+    var damaged = header.*;
+    std.mem.writeInt(u32, damaged[40..44], 9, .little);
+    try std.testing.expectError(error.InvalidKtx2, read(std.testing.allocator, &damaged));
+    damaged = header.*;
+    std.mem.writeInt(u32, damaged[20..24], 16384, .little);
+    std.mem.writeInt(u32, damaged[24..28], 16384, .little);
+    try std.testing.expectError(error.InvalidKtx2, read(std.testing.allocator, &damaged));
 }

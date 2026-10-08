@@ -54,8 +54,10 @@ pub const Materials = struct {
 
     /// Registers a custom material. `spirv` is a fragment shader that defines
     /// `CUSTOM_MATERIAL`, includes "shade.glsl" and defines
-    /// `customMaterial()`; see `examples/shaders/lava.frag`.
-    pub fn createShader(materials: *Materials, spirv: []const u8) !MaterialShader {
+    /// `customMaterial()`; see `examples/shaders/lava.frag`. `plain_spirv` is the
+    /// same shader compiled with `PLAIN` defined, for views that keep no
+    /// reflection targets; null uses `spirv` there too.
+    pub fn createShader(materials: *Materials, spirv: []const u8, plain_spirv: ?[]const u8) !MaterialShader {
         const self = materials.renderer();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -64,7 +66,7 @@ pub const Materials = struct {
             const plain = try self.device.createGraphicsPipeline(.{
                 .name = "custom material",
                 .vertex = shaderCode("fullscreen.vert.spv"),
-                .fragment = spirv,
+                .fragment = plain_spirv orelse spirv,
                 .color_targets = &.{ .{ .format = hdr_format }, .{ .format = .rg16_float } },
                 .cull = .none,
             });

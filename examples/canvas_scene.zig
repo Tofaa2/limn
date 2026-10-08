@@ -1,6 +1,5 @@
-//! The 2D demo content, shared by the windowed `canvas` example and the
-//! headless harness: a panning/zooming world of sprites and shapes under a
-//! fixed HUD, drawn entirely with one `DrawList`.
+//! The 2D content of the `canvas` example: a panning/zooming world of
+//! sprites and shapes under a fixed HUD, drawn entirely with one `DrawList`.
 const std = @import("std");
 const gfx = @import("limn");
 

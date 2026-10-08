@@ -5,6 +5,8 @@
 //!       <first.spv> <second.spv> ...
 //!
 //! Option i is bit i of a permutation's number; files are in number order.
+//! `-` in the place of a file is a permutation that is not built: the SDK
+//! finds it empty.
 const std = @import("std");
 
 /// Binding kinds, in the SDK's order.
@@ -172,8 +174,12 @@ pub fn main(init: std.process.Init) !void {
     while (option_names.next()) |name| try options.append(gpa, name);
 
     var unique: std.ArrayList(Unique) = .empty;
-    var indirection: std.ArrayList(usize) = .empty;
+    var indirection: std.ArrayList(?usize) = .empty;
     while (arguments.next()) |path| {
+        if (std.mem.eql(u8, path, "-")) {
+            try indirection.append(gpa, null);
+            continue;
+        }
         const bytes = try withoutSource(gpa, try std.Io.Dir.cwd().readFileAlloc(init.io, path, gpa, .unlimited));
         var digest: [16]u8 = undefined;
         _ = try std.fmt.bufPrint(&digest, "{x:0>16}", .{std.hash.Wyhash.hash(0, bytes)});
@@ -233,7 +239,7 @@ pub fn main(init: std.process.Init) !void {
     try out.print("\n}} {s}_PermutationInfo;\n\n", .{pass});
 
     try out.print("static const uint32_t g_{s}_IndirectionTable[] = {{\n", .{pass});
-    for (indirection.items) |index| try out.print("    {d},\n", .{index});
+    for (indirection.items) |index| try out.print("    {d},\n", .{index orelse unique.items.len});
     try out.writeAll("};\n\n");
 
     try out.print("static const {s}_PermutationInfo g_{s}_PermutationInfo[] = {{\n", .{ pass, pass });
@@ -253,6 +259,7 @@ pub fn main(init: std.process.Init) !void {
         }
         try out.writeAll("},\n");
     }
+    try out.writeAll("    { 0, 0, " ++ "0, 0, 0, 0, 0, " ** kind_names.len ++ "},\n");
     try out.writeAll("};\n\n#endif\n");
 
     var folder = try std.Io.Dir.cwd().openDir(init.io, directory, .{});

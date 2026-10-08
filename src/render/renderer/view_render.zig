@@ -65,6 +65,7 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, desc: ViewDesc, delta_time:
         .backbuffer => frame.backbuffer orelse return error.NoSurface,
         .texture => |texture| texture,
     };
+    if (!device.textureExists(target)) return error.InvalidTarget;
     const info = device.textureInfo(target);
     const region = desc.region orelse Region{ .x = 0, .y = 0, .width = info.width, .height = info.height };
     if (region.width == 0 or region.height == 0 or
@@ -285,7 +286,7 @@ const SceneGraph = struct {
     fn stepParticles(c: *SceneGraph) !void {
         const p = c.pass;
         const device = c.renderer.device;
-        if (c.fresh_scene) try particle_passes.simulateParticles(c.renderer, p.cmd, p.scene, c.arena, p.frame_address, c.delta_time, if (p.view.history_valid) device.textureIndex(p.view.depth) else null);
+        if (c.fresh_scene) try particle_passes.simulateParticles(c.renderer, p.cmd, p.scene, c.arena, p.frame_address, c.delta_time, if (p.view_data.camera_known) device.textureIndex(p.view.depth) else null);
     }
 
     fn deform(c: *SceneGraph) !void {
@@ -538,6 +539,7 @@ fn renderScene(
         if (view_data.state) |*old| old.deinit(device);
         view_data.state = null;
         view_data.state = try ViewState.init(device, width, height, scales);
+        view_data.upscaler_refused = null;
         view_data.exposure_reset = true;
         view_data.camera_known = false;
     }
