@@ -342,6 +342,18 @@ pub fn build(b: *std.Build) void {
     const fidelityfx = b.option(bool, "fidelityfx", "Build AMD's FidelityFX SDK in, for FSR 2 and FSR 3 upscaling (default: true)") orelse true;
     const features = b.addOptions();
     features.addOption(bool, "fidelityfx", fidelityfx);
+    const dlss_sdk = b.option([]const u8, "dlss_sdk", "Where NVIDIA's DLSS SDK is (default: dlss_sdk, which `zig build dlss-sdk` fetches)") orelse b.pathFromRoot(dlss_sdk_default);
+    const dlss_found = if (b.build_root.handle.access(b.graph.io, b.pathResolve(&.{ dlss_sdk, "include", "nvsdk_ngx.h" }), .{})) |_| true else |_| false;
+    const dlss = b.option(bool, "dlss", "Build NVIDIA DLSS upscaling and ray reconstruction in (default: true where the SDK is found)") orelse dlss_found;
+    const nixos = if (b.build_root.handle.access(b.graph.io, nixos_drivers, .{})) |_| true else |_| false;
+    if (dlss and !dlss_found) std.debug.panic("no DLSS SDK at {s}; run `zig build dlss-sdk` or pass -Ddlss_sdk", .{dlss_sdk});
+    features.addOption(bool, "dlss", dlss);
+    features.addOption([:0]const u8, "dlss_libraries", if (dlss) b.allocator.dupeZ(u8, b.pathResolve(&.{ dlss_sdk, dlssLibraries(target), "rel" })) catch @panic("OOM") else "");
+    const fetch_dlss = b.addSystemCommand(&.{ "git", "clone", "--depth", "1", "--branch", dlss_sdk_version, "--filter=blob:none", "--sparse", "https://github.com/NVIDIA/DLSS", b.pathFromRoot(dlss_sdk_default) });
+    const trim_dlss = b.addSystemCommand(&.{ "git", "-C", b.pathFromRoot(dlss_sdk_default), "sparse-checkout", "set", "include", dlssLibraries(target) });
+    trim_dlss.step.dependOn(&fetch_dlss.step);
+    b.step("dlss-sdk", "Fetch NVIDIA's DLSS SDK into dlss_sdk, under NVIDIA's license; builds after it have DLSS").dependOn(&trim_dlss.step);
+    features.addOption(bool, "dlss_logging", b.option(bool, "dlss_logging", "Let DLSS write its log (default: false)") orelse false);
     features.addOption(bool, "validate_input", validate_input);
     const features_module = features.createModule();
     const zmesh = b.dependency("zmesh", .{ .target = target, .optimize = asset_optimize });
@@ -421,6 +433,7 @@ pub fn build(b: *std.Build) void {
     renderer.addOptions("shader_sources", shader_options);
     renderer.addImport("build_features", features_module);
     if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk);
+    if (dlss) addDlss(b, renderer, target, asset_optimize, vulkan_include, dlss_sdk);
 
     const library = b.addLibrary(.{ .name = "limn", .root_module = renderer, .linkage = .static, .use_llvm = true });
     b.installArtifact(library);
@@ -510,6 +523,7 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
         check_step.dependOn(&exe.step);
         const run = b.addRunArtifact(exe);
+        if (dlss and nixos) run.setEnvironmentVariable("LD_LIBRARY_PATH", b.fmt("{s}:{s}", .{ b.graph.environ_map.get("LD_LIBRARY_PATH") orelse "", nixos_drivers }));
         if (b.args) |args| run.addArgs(args);
         b.step(example.name, example.description).dependOn(&run.step);
         if (std.mem.eql(u8, example.name, "meadow")) b.step("run", example.description).dependOn(&run.step);
@@ -804,6 +818,49 @@ fn addFidelityFx(
     });
     library.root_module.addCSourceFile(.{ .file = b.path("src/render/ffx/limn_ffx.cpp"), .flags = &flags });
     renderer.linkLibrary(library);
+}
+
+const dlss_sdk_default = "dlss_sdk";
+/// Where NixOS keeps the GPU driver's libraries, which are on no default path;
+/// DLSS needs them on the library path of what it runs in.
+const nixos_drivers = "/run/opengl-driver/lib";
+const dlss_sdk_version = "v310.9.1";
+
+/// Where the DLSS SDK keeps its libraries for `target`.
+fn dlssLibraries(target: std.Build.ResolvedTarget) []const u8 {
+    return switch (target.result.os.tag) {
+        .windows => "lib/Windows_x86_64",
+        else => if (target.result.cpu.arch == .aarch64) "lib/Linux_aarch64" else "lib/Linux_x86_64",
+    };
+}
+
+/// Builds src/render/dlss/limn_dlss.cpp against the DLSS SDK at `sdk` and links
+/// NVIDIA's loader. That is built against the GNU C++ library, which `cc`
+/// is asked for.
+fn addDlss(
+    b: *std.Build,
+    renderer: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    vulkan_include: std.Build.LazyPath,
+    sdk: []const u8,
+) void {
+    const library = b.addLibrary(.{
+        .name = "renderer_dlss",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libcpp = true }),
+    });
+    library.root_module.addIncludePath(.{ .cwd_relative = b.pathResolve(&.{ sdk, "include" }) });
+    library.root_module.addIncludePath(vulkan_include);
+    library.root_module.addCSourceFile(.{ .file = b.path("src/render/dlss/limn_dlss.cpp"), .flags = &.{ "-std=c++17", "-w" } });
+    renderer.linkLibrary(library);
+    const windows = target.result.os.tag == .windows;
+    renderer.addObjectFile(.{ .cwd_relative = b.pathResolve(&.{ sdk, dlssLibraries(target), if (windows) "nvsdk_ngx_s.lib" else "libnvsdk_ngx.a" }) });
+    if (!windows) {
+        const gnu_cpp = std.mem.trim(u8, b.run(&.{ "cc", "-print-file-name=libstdc++.so.6" }), " \n");
+        renderer.addObjectFile(.{ .cwd_relative = gnu_cpp });
+        renderer.addRPath(.{ .cwd_relative = std.fs.path.dirname(gnu_cpp) orelse "." });
+        renderer.linkSystemLibrary("dl", .{});
+    }
 }
 
 fn volkModule(

@@ -5,6 +5,7 @@ const device = @import("device.zig");
 pub const Device = device.Device;
 pub const FrameGenerator = device.FrameGenerator;
 pub const deviceProcAddr = @import("loader.zig").deviceProcAddr;
+pub const instanceProcAddr = @import("loader.zig").instanceProcAddr;
 pub const Detached = device.Detached;
 pub const Frame = device.Frame;
 pub const CommandEncoder = @import("command.zig").CommandEncoder;

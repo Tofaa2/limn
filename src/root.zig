@@ -181,6 +181,7 @@ pub const PassContext = renderer.PassContext;
 pub const scene_color_format = renderer.scene_color_format;
 /// How path tracing follows rays on this device; see `Renderer.pathTracing`.
 pub const PathTracing = renderer.PathTracing;
+pub const Dlss = renderer.Dlss;
 /// Counters for the last frame; see `Renderer.getStats`.
 pub const Stats = renderer.Stats;
 

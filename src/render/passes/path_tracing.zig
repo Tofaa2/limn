@@ -4,6 +4,7 @@ const std = @import("std");
 const rhi = @import("../../rhi/rhi.zig");
 const render = @import("../renderer.zig");
 const scene_pass = @import("../scene_pass.zig");
+const post = @import("post.zig");
 
 const Renderer = render.Renderer;
 const ViewData = render.ViewData;
@@ -25,12 +26,20 @@ const DenoisePush = extern struct {
     facing: u32,
     gloss: u32,
     gloss_gathered: u32,
+    lamp: u32,
 };
 
 /// Frames after the camera stops before the accumulated image is antialiased by
 /// itself, and frames over which TAA then fades out.
 pub const frames_to_settle = 8;
 pub const frames_to_hand_over = 16;
+
+/// Most frames a pixel keeps while the camera moves, and while lights or
+/// objects change, when what it kept may no longer be how it is lit.
+const moving_history = 64;
+const changed_history = 16;
+const changed_lamp_history = 4;
+const still_history = 8192;
 
 /// `history_clip_weight` in ffx_reflections_resolve.frag; AMD's default.
 const reflection_stability = 0.7;
@@ -51,7 +60,10 @@ fn makeTargets(device: *rhi.Device, cmd: *rhi.CommandEncoder, view_data: *ViewDa
         .{ .slot = &view_data.path_facing_old, .name = "path tracing facing (last frame)", .format = .rgba16_float },
         .{ .slot = &view_data.path_surface, .name = "path tracing surface", .format = .rgba16_float },
         .{ .slot = &view_data.path_surface_old, .name = "path tracing surface (last frame)", .format = .rgba16_float },
-        .{ .slot = &view_data.path_gloss, .name = "path tracing reflections", .format = .rgba16_float },
+        .{ .slot = &view_data.path_reservoir, .name = "path tracing light samples", .format = .rgba32_float },
+        .{ .slot = &view_data.path_reservoir_old, .name = "path tracing light samples (last frame)", .format = .rgba32_float },
+        .{ .slot = &view_data.path_lamp, .name = "path tracing lamp light", .format = .rgba16_float },
+        .{ .slot = &view_data.path_lamp_old, .name = "path tracing lamp light (last frame)", .format = .rgba16_float },
         .{ .slot = &view_data.path_gloss_gathered, .name = "path tracing reflections gathered", .format = .rgba32_float },
         .{ .slot = &view_data.path_gloss_gathered_old, .name = "path tracing reflections gathered (last frame)", .format = .rgba32_float },
         .{ .slot = &view_data.reflection_reprojected, .name = "reflection denoise: reprojected", .format = .rgba16_float },
@@ -81,11 +93,12 @@ fn makeTargets(device: *rhi.Device, cmd: *rhi.CommandEncoder, view_data: *ViewDa
     }
     view_data.path_size = .{ width, height };
     view_data.path_gathered = 0;
+    view_data.path_reusable = false;
 }
 
 /// Runs the reflection denoiser (ffx_reflections.glsl) and returns its result,
 /// which is also next frame's history.
-fn denoiseReflections(renderer: *Renderer, p: *const ScenePass, gloss: rhi.Texture, surface: rhi.Texture) !rhi.Texture {
+fn denoiseReflections(renderer: *Renderer, p: *const ScenePass, gloss: rhi.Texture, reach: rhi.Texture, surface: rhi.Texture) !rhi.Texture {
     const device = renderer.device;
     const cmd = p.cmd;
     const view_data = p.view_data;
@@ -101,7 +114,7 @@ fn denoiseReflections(renderer: *Renderer, p: *const ScenePass, gloss: rhi.Textu
 
     try cmd.beginRendering(.{ .color = &.{ .{ .texture = reprojected, .load = .discard }, .{ .texture = samples, .load = .discard } } });
     cmd.bindPipeline(renderer.pipelines.reflection_reproject);
-    cmd.pushConstants(extern struct { frame: u64, radiance: u32, surface: u32, surface_history: u32, motion: u32, history: u32, samples_history: u32 }{
+    cmd.pushConstants(extern struct { frame: u64, radiance: u32, surface: u32, surface_history: u32, motion: u32, history: u32, samples_history: u32, reach: u32 }{
         .frame = p.frame_address,
         .radiance = device.textureIndex(gloss),
         .surface = device.textureIndex(surface),
@@ -109,6 +122,7 @@ fn denoiseReflections(renderer: *Renderer, p: *const ScenePass, gloss: rhi.Textu
         .motion = device.textureIndex(p.view.motion),
         .history = device.textureIndex(view_data.reflection_resolved_old.?),
         .samples_history = device.textureIndex(view_data.reflection_samples_old.?),
+        .reach = device.textureIndex(reach),
     });
     cmd.drawFullscreen();
     cmd.endRendering();
@@ -210,32 +224,38 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass) !bool {
         }
         key.update(std.mem.asBytes(&settings.path_tracing_bounces));
         key.update(std.mem.asBytes(&settings.path_tracing_clamp));
+        key.update(std.mem.asBytes(&settings.path_tracing_probes));
         const path_key = key.final();
-        if (path_key != view_data.path_key) {
-            view_data.path_key = path_key;
-            view_data.path_gathered = 0;
-        }
-        const camera_moved = !std.meta.eql(view_data.path_camera, desc.camera);
+        const reconstructing = settings.path_tracing_denoise and try post.dlssFor(renderer, p, .ray_reconstruction);
+        if (reconstructing != view_data.path_reconstructing) view_data.path_gathered = 0;
+        view_data.path_reconstructing = reconstructing;
+        const changed = path_key != view_data.path_key;
+        view_data.path_key = path_key;
+        if (changed) view_data.path_gathered = @min(view_data.path_gathered, changed_history);
+        const moved = !std.meta.eql(view_data.path_camera, desc.camera) or changed;
         const previous_eye = view_data.path_camera.position;
         view_data.path_camera = desc.camera;
-        view_data.path_still = if (camera_moved or view_data.path_gathered == 0) 0 else view_data.path_still +| 1;
+        view_data.path_still = if (moved or view_data.path_gathered == 0) 0 else view_data.path_still +| 1;
         std.mem.swap(?rhi.Texture, &view_data.path_accum, &view_data.path_accum_old);
         std.mem.swap(?rhi.Texture, &view_data.path_guide, &view_data.path_guide_old);
         std.mem.swap(?rhi.Texture, &view_data.path_soft, &view_data.path_soft_old);
         std.mem.swap(?rhi.Texture, &view_data.path_facing, &view_data.path_facing_old);
         std.mem.swap(?rhi.Texture, &view_data.path_surface, &view_data.path_surface_old);
         std.mem.swap(?rhi.Texture, &view_data.path_gloss_gathered, &view_data.path_gloss_gathered_old);
+        std.mem.swap(?rhi.Texture, &view_data.path_reservoir, &view_data.path_reservoir_old);
+        std.mem.swap(?rhi.Texture, &view_data.path_lamp, &view_data.path_lamp_old);
         const accum = view_data.path_accum.?;
         const guide = view_data.path_guide.?;
         const soft = view_data.path_soft.?;
         const facing = view_data.path_facing.?;
         const surface = view_data.path_surface.?;
-        const gloss = view_data.path_gloss.?;
+        const lamp = view_data.path_lamp.?;
         const gloss_gathered = view_data.path_gloss_gathered.?;
+        const reservoir = view_data.path_reservoir.?;
         cmd.beginScope("path tracing");
-        try cmd.beginRendering(.{ .color = &.{ .{ .texture = accum, .load = .discard }, .{ .texture = guide, .load = .discard }, .{ .texture = soft, .load = .discard }, .{ .texture = facing, .load = .discard }, .{ .texture = gloss, .load = .discard }, .{ .texture = gloss_gathered, .load = .discard }, .{ .texture = surface, .load = .discard } } });
+        try cmd.beginRendering(.{ .color = &.{ .{ .texture = accum, .load = .discard }, .{ .texture = guide, .load = .discard }, .{ .texture = soft, .load = .discard }, .{ .texture = facing, .load = .discard }, .{ .texture = lamp, .load = .discard }, .{ .texture = gloss_gathered, .load = .discard }, .{ .texture = surface, .load = .discard }, .{ .texture = reservoir, .load = .discard } } });
         cmd.bindPipeline(renderer.pipelines.path_trace);
-        cmd.pushConstants(extern struct { frame: u64, scene: u64, scene_instances: u64, mesh_nodes: u64, mesh_items: u64, gathered: u32, bounces: u32, samples: u32, clamp_radiance: f32, sun_radius: f32, light_count: u32, glowing: u64, glowing_count: u32, history_color: u32, history_guide: u32, history_soft: u32, history_gloss: u32, moved: u32, previous_camera: [3]f32, reset: u32, centered: u32, history_facing: u32, history_surface: u32 }{
+        cmd.pushConstants(extern struct { frame: u64, scene: u64, scene_instances: u64, mesh_nodes: u64, mesh_items: u64, gathered: u32, bounces: u32, samples: u32, clamp_radiance: f32, sun_radius: f32, light_count: u32, glowing: u64, glowing_count: u32, history_color: u32, history_guide: u32, history_soft: u32, history_gloss: u32, moved: u32, previous_camera: [3]f32, reset: u32, centered: u32, history_facing: u32, history_surface: u32, history_reservoir: u32, reusable: u32, motion: u32, depth: u32, history_limit: f32, history_lamp: u32, lamp_limit: f32, probes: u32, reconstructed: u32 }{
             .frame = frame_address,
             .scene = where,
             .scene_instances = instances_address,
@@ -253,12 +273,21 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass) !bool {
             .history_guide = device.textureIndex(view_data.path_guide_old.?),
             .history_soft = device.textureIndex(view_data.path_soft_old.?),
             .history_gloss = device.textureIndex(view_data.path_gloss_gathered_old.?),
-            .moved = @intFromBool(camera_moved),
+            .moved = @intFromBool(moved),
             .previous_camera = previous_eye,
             .reset = @intFromBool(view_data.path_gathered == 0),
             .centered = @intFromBool(settings.temporal_antialiasing),
             .history_facing = device.textureIndex(view_data.path_facing_old.?),
             .history_surface = device.textureIndex(view_data.path_surface_old.?),
+            .history_reservoir = device.textureIndex(view_data.path_reservoir_old.?),
+            .reusable = @intFromBool(view_data.path_reusable),
+            .motion = device.textureIndex(view.motion),
+            .depth = device.textureIndex(view.depth),
+            .history_limit = if (changed) changed_history else moving_history,
+            .history_lamp = device.textureIndex(view_data.path_lamp_old.?),
+            .lamp_limit = if (changed) changed_lamp_history else if (moved) moving_history else still_history,
+            .probes = @intFromBool(settings.path_tracing_probes),
+            .reconstructed = @intFromBool(reconstructing),
         });
         cmd.drawFullscreen();
         cmd.endRendering();
@@ -266,50 +295,55 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass) !bool {
         cmd.transition(guide, .shader_read);
         cmd.transition(soft, .shader_read);
         cmd.transition(facing, .shader_read);
-        cmd.transition(gloss, .shader_read);
+        cmd.transition(lamp, .shader_read);
         cmd.transition(gloss_gathered, .shader_read);
         cmd.transition(surface, .shader_read);
+        cmd.transition(reservoir, .shader_read);
         cmd.endScope();
 
-        cmd.beginScope("path tracing denoise");
-        var denoise = DenoisePush{
-            .frame = frame_address,
-            .color = device.textureIndex(soft),
-            .guide = device.textureIndex(guide),
-            .step_size = 1,
-            .gathered = view_data.path_gathered,
-            .mode = .none,
-            .steady = device.textureIndex(accum),
-            .facing = device.textureIndex(facing),
-            .gloss = device.textureIndex(gloss),
-            .gloss_gathered = device.textureIndex(gloss_gathered),
-        };
-        if (settings.path_tracing_denoise) {
-            denoise.gloss = device.textureIndex(try denoiseReflections(renderer, p, gloss, surface));
-            const between = [2]rhi.Texture{ view_data.path_filtered.?, view_data.path_filtered_other.? };
-            for (denoise_steps[0 .. denoise_steps.len - 1], 0..) |step, run| {
-                const smoothed = between[run % 2];
-                denoise.step_size = step;
-                denoise.mode = if (run == 0) .first else .between;
-                try cmd.beginRendering(.{ .color = &.{.{ .texture = smoothed, .load = .discard }} });
-                cmd.bindPipeline(renderer.pipelines.path_denoise);
-                cmd.pushConstants(denoise);
-                cmd.drawFullscreen();
-                cmd.endRendering();
-                cmd.transition(smoothed, .shader_read);
-                denoise.color = device.textureIndex(smoothed);
+        if (!reconstructing) {
+            cmd.beginScope("path tracing denoise");
+            var denoise = DenoisePush{
+                .frame = frame_address,
+                .color = device.textureIndex(soft),
+                .guide = device.textureIndex(guide),
+                .step_size = 1,
+                .gathered = view_data.path_gathered,
+                .mode = .none,
+                .steady = device.textureIndex(accum),
+                .facing = device.textureIndex(facing),
+                .gloss = device.textureIndex(gloss_gathered),
+                .gloss_gathered = device.textureIndex(gloss_gathered),
+                .lamp = device.textureIndex(lamp),
+            };
+            if (settings.path_tracing_denoise) {
+                denoise.gloss = device.textureIndex(try denoiseReflections(renderer, p, gloss_gathered, guide, surface));
+                const between = [2]rhi.Texture{ view_data.path_filtered.?, view_data.path_filtered_other.? };
+                for (denoise_steps[0 .. denoise_steps.len - 1], 0..) |step, run| {
+                    const smoothed = between[run % 2];
+                    denoise.step_size = step;
+                    denoise.mode = if (run == 0) .first else .between;
+                    try cmd.beginRendering(.{ .color = &.{.{ .texture = smoothed, .load = .discard }} });
+                    cmd.bindPipeline(renderer.pipelines.path_denoise);
+                    cmd.pushConstants(denoise);
+                    cmd.drawFullscreen();
+                    cmd.endRendering();
+                    cmd.transition(smoothed, .shader_read);
+                    denoise.color = device.textureIndex(smoothed);
+                }
+                denoise.step_size = denoise_steps[denoise_steps.len - 1];
+                denoise.mode = .last;
             }
-            denoise.step_size = denoise_steps[denoise_steps.len - 1];
-            denoise.mode = .last;
+            try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .discard }} });
+            cmd.bindPipeline(renderer.pipelines.path_denoise_final);
+            cmd.pushConstants(denoise);
+            cmd.drawFullscreen();
+            cmd.endRendering();
+            cmd.transition(view.hdr, .shader_read);
+            cmd.endScope();
         }
-        try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .discard }} });
-        cmd.bindPipeline(renderer.pipelines.path_denoise_final);
-        cmd.pushConstants(denoise);
-        cmd.drawFullscreen();
-        cmd.endRendering();
-        cmd.transition(view.hdr, .shader_read);
-        cmd.endScope();
-        view_data.path_gathered = @min(view_data.path_gathered + 1, 8192);
+        view_data.path_gathered = @min(view_data.path_gathered + 1, still_history);
+        view_data.path_reusable = true;
         renderer.stats.path_traced_frames = view_data.path_gathered;
         renderer.stats.path_tracing_hardware = device.ray_tracing;
         path_traced = true;

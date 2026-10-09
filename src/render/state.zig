@@ -1039,7 +1039,7 @@ pub const ViewState = struct {
         });
         self.fog = try made.texture(.{ .name = "fog", .width = scaledExtent(scales.fog, width), .height = scaledExtent(scales.fog, height), .format = hdr_format, .usage = color });
         for (&self.history) |*texture| {
-            texture.* = try made.texture(.{ .name = "taa history", .width = resolved_width, .height = resolved_height, .format = hdr_format, .usage = .{ .sampled = true, .color_attachment = true, .storage = device.storage_images } });
+            texture.* = try made.texture(.{ .name = "taa history", .width = resolved_width, .height = resolved_height, .format = hdr_format, .usage = .{ .sampled = true, .color_attachment = true, .storage = device.storage_images, .copy_dst = true } });
         }
         for (&self.bloom, 0..) |*texture, level| {
             texture.* = try made.texture(.{
@@ -1128,9 +1128,16 @@ pub const ViewData = struct {
     /// denoiser; this frame's and last frame's.
     path_surface: ?rhi.Texture = null,
     path_surface_old: ?rhi.Texture = null,
+    /// Lamp and glow light on the surface seen, over its color; this frame's
+    /// and last frame's.
+    path_lamp: ?rhi.Texture = null,
+    path_lamp_old: ?rhi.Texture = null,
+    /// The light sample each pixel keeps for lamp and glow light (`Reservoir`
+    /// in pathtrace.frag); this frame's and last frame's.
+    path_reservoir: ?rhi.Texture = null,
+    path_reservoir_old: ?rhi.Texture = null,
     /// Glossy reflections as traced this frame, and the reflection
     /// denoiser's (ffx_reflections.glsl) targets and history.
-    path_gloss: ?rhi.Texture = null,
     path_gloss_gathered: ?rhi.Texture = null,
     path_gloss_gathered_old: ?rhi.Texture = null,
     reflection_reprojected: ?rhi.Texture = null,
@@ -1143,6 +1150,8 @@ pub const ViewData = struct {
     path_camera: Camera = .{},
     path_size: [2]u32 = .{ 0, 0 },
     path_gathered: u32 = 0,
+    /// Whether last frame's light samples and surfaces are there to reuse.
+    path_reusable: bool = false,
     path_traced: bool = false,
     path_still: u32 = 0,
     path_key: u64 = 0,
@@ -1158,6 +1167,14 @@ pub const ViewData = struct {
     /// Renderer frame the upscaler last ran in; its history is stale after a
     /// gap.
     upscaler_frame: u64 = 0,
+    /// The DLSS feature this view resolves with, the one that would not start,
+    /// and the renderer frame it last ran in.
+    dlss: ?@import("dlss.zig").Upscaler = null,
+    dlss_refused: ?@import("dlss.zig").Feature = null,
+    dlss_frame: u64 = 0,
+    /// The view was path traced for DLSS Ray Reconstruction this frame: its
+    /// path tracing targets hold what that reads, not what is gathered.
+    path_reconstructing: bool = false,
     /// One word per instance of the instance groups: seen last frame
     /// (`InstanceVisibility` in cull_view.glsl).
     instance_visibility: ?rhi.Buffer = null,
@@ -1178,13 +1195,17 @@ pub const ViewData = struct {
         if (self.path_soft) |texture| device.destroyTexture(texture);
         if (self.path_soft_old) |texture| device.destroyTexture(texture);
         if (self.path_filtered_other) |texture| device.destroyTexture(texture);
-        inline for (.{ "path_facing", "path_facing_old", "path_surface", "path_surface_old", "path_gloss", "path_gloss_gathered", "path_gloss_gathered_old", "reflection_reprojected", "reflection_samples", "reflection_samples_old", "reflection_average", "reflection_prefiltered", "reflection_resolved", "reflection_resolved_old" }) |name| {
+        inline for (.{ "path_facing", "path_facing_old", "path_surface", "path_surface_old", "path_reservoir", "path_reservoir_old", "path_lamp", "path_lamp_old", "path_gloss_gathered", "path_gloss_gathered_old", "reflection_reprojected", "reflection_samples", "reflection_samples_old", "reflection_average", "reflection_prefiltered", "reflection_resolved", "reflection_resolved_old" }) |name| {
             if (@field(self, name)) |texture| device.destroyTexture(texture);
         }
         if (self.visibility) |buffer| device.destroyBuffer(buffer);
         if (self.instance_visibility) |buffer| device.destroyBuffer(buffer);
         if (self.vsm) |vsm| vsm.deinit(device);
         if (self.upscaler) |upscaler| {
+            device.waitIdle() catch {};
+            upscaler.destroy();
+        }
+        if (self.dlss) |upscaler| {
             device.waitIdle() catch {};
             upscaler.destroy();
         }

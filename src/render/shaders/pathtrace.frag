@@ -6,6 +6,7 @@
 #include "common.glsl"
 #include "brdf.glsl"
 #include "ffx_reflections.glsl"
+#include "gi.glsl"
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
@@ -31,6 +32,15 @@ layout(push_constant, scalar) uniform Push {
     uint centered;
     uint history_facing;
     uint history_surface;
+    uint history_reservoir;
+    uint reusable;
+    uint motion;
+    uint depth;
+    float history_limit;
+    uint history_lamp;
+    float lamp_limit;
+    uint probes;
+    uint reconstructed;
 } push;
 
 #ifdef RAY_TRACED
@@ -56,15 +66,19 @@ layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_guide;
 layout(location = 2) out vec4 out_soft;
 layout(location = 3) out vec4 out_facing;
-layout(location = 4) out vec4 out_gloss;
+layout(location = 4) out vec4 out_lamp;
 layout(location = 5) out vec4 out_gloss_gathered;
 layout(location = 6) out vec4 out_surface;
+layout(location = 7) out vec4 out_reservoir;
 
 vec3 first_color;
 bool first_met;
 float first_distance;
 bool first_mirrored;
 vec3 first_facing;
+vec3 first_scatter;
+vec3 first_reflect;
+float first_roughness;
 bool primary_met;
 vec3 primary_facing;
 float primary_roughness;
@@ -84,6 +98,32 @@ uint pcg(uint value) {
 float random() {
     random_state = pcg(random_state);
     return float(random_state >> 8) / 16777216.0;
+}
+
+uint sequence_seed;
+uint sequence_index;
+uint sequence_dimension;
+
+uint scrambled(uint value, uint seed) {
+    value = bitfieldReverse(value) + seed;
+    value ^= value * 0x6c50b47cu;
+    value ^= value * 0xb82f1e52u;
+    value ^= value * 0xc7afe638u;
+    value ^= value * 0x8d22f6e6u;
+    return bitfieldReverse(value);
+}
+
+/// The next two numbers of this pixel's Owen-scrambled Sobol sequence, which
+/// cover the unit square evenly over the frames a pixel accumulates.
+vec2 randomPair() {
+    uint seed = pcg(sequence_seed + sequence_dimension * 0x9e3779b9u);
+    sequence_dimension++;
+    uint index = scrambled(sequence_index, seed);
+    uint second = 0u;
+    for (uint bits = index, direction = 0x80000000u; bits != 0u; bits >>= 1u, direction ^= direction >> 1u)
+        if ((bits & 1u) != 0u) second ^= direction;
+    uvec2 point = uvec2(scrambled(bitfieldReverse(index), pcg(seed + 1u)), scrambled(second, pcg(seed + 2u)));
+    return vec2(point >> 8u) / 16777216.0;
 }
 
 struct Surface {
@@ -147,6 +187,19 @@ Surface surfaceAt(FrameConstants frame, TraceHit hit, vec3 origin, vec3 directio
         surface.roughness *= packed.g;
     }
     surface.roughness = clamp(surface.roughness, 0.03, 1.0);
+    vec4 tangent_object = vertexTangent(v0) * lambda.x + vertexTangent(v1) * lambda.y + vertexTangent(v2) * lambda.z;
+    vec3 tangent = mat3(instance.transform) * tangent_object.xyz;
+    if (material.normal_texture != INVALID_ID && dot(tangent, tangent) > 1e-12) {
+        vec3 along_u = normalize(tangent - surface.normal * dot(surface.normal, tangent));
+        vec3 along_v = cross(surface.normal, along_u) * (tangent_object.w < 0.0 ? -1.0 : 1.0);
+        vec2 normal_uv = materialUv(material, (material.uv_sets & 2u) != 0u ? uvb : uv);
+        vec3 sampled = vec3(textureLod(TEX(material.normal_texture, material.sampler_index), normal_uv, detailLevel(material.normal_texture, material.sampler_index, spread)).xy * 2.0 - 1.0, 0.0);
+        sampled.z = sqrt(max(1.0 - dot(sampled.xy, sampled.xy), 0.0));
+        sampled.xy *= material.normal_scale;
+        surface.normal = normalize(along_u * sampled.x + along_v * sampled.y + surface.normal * sampled.z);
+        float toward_eye = dot(surface.normal, -direction);
+        if (toward_eye < 0.01) surface.normal = normalize(surface.normal - direction * (0.01 - toward_eye));
+    }
     surface.emissive = material.emissive;
     surface.even_glow = (instance.flags & INSTANCE_AIMED) != 0u;
     if (material.emissive_texture != INVALID_ID)
@@ -166,14 +219,29 @@ const float softened_mirror = 0.3;
 
 const float lit_by_itself = 0.5;
 
+const float lamp_clamp = 8.0;
+
 const float moving_steady_weight = 1.0 / 3.0;
 const float moving_mirror_weight = 0.5;
+
+/// Share of light from all directions a surface of reflectance `f0` reflects
+/// toward the eye, by Karis's fit. DLSS Ray Reconstruction reads it as the
+/// specular albedo.
+vec3 reflectedOverall(vec3 f0, float roughness, float n_dot_v) {
+    vec4 fit = roughness * vec4(-1.0, -0.0275, -0.572, 0.022) + vec4(1.0, 0.0425, 1.04, -0.04);
+    float bent = min(fit.x * fit.x, exp2(-9.28 * n_dot_v)) * fit.x + fit.y;
+    vec2 scale_bias = vec2(-1.04, 1.04) * bent + fit.zw;
+    return f0 * scale_bias.x + scale_bias.y;
+}
 
 bool mirrorLike(Surface surface) {
     return surface.roughness <= mirror_roughness;
 }
 
-vec3 surfaceResponse(Surface surface, vec3 view, vec3 light) {
+/// Light reflected toward `view` per unit arriving from `light`; `shine` is the
+/// part of it that is specular.
+vec3 surfaceResponse(Surface surface, vec3 view, vec3 light, out vec3 shine) {
+    shine = vec3(0.0);
     float n_dot_l = dot(surface.normal, light);
     float n_dot_v = max(dot(surface.normal, view), 1e-4);
     if (n_dot_l <= 0.0) return vec3(0.0);
@@ -183,6 +251,7 @@ vec3 surfaceResponse(Surface surface, vec3 view, vec3 light) {
     vec3 fresnel = fresnelSchlick(max(dot(view, half_vector), 0.0), f0);
     vec3 specular = mirrorLike(surface) ? vec3(0.0) : fresnel * distributionGgx(max(dot(surface.normal, half_vector), 0.0), alpha) * visibilitySmithGgx(n_dot_l, n_dot_v, alpha);
     vec3 diffuse = surface.albedo * (1.0 - surface.metallic) * (1.0 - fresnel) / PI;
+    shine = specular * n_dot_l;
     return (diffuse + specular) * n_dot_l;
 }
 
@@ -204,48 +273,108 @@ vec3 skyLight(FrameConstants frame, vec3 direction, bool with_sun) {
     return textureLod(TEX_CUBE(frame.env_sky, frame.sampler_linear_clamp), direction, 0.0).rgb * frame.env_intensity;
 }
 
-vec3 lampCandidate(FrameConstants frame, Surface surface, vec3 view, uint light_count, out vec3 toward, out float reach) {
-    uint pick = min(uint(random() * float(light_count)), light_count - 1u);
-    Light light = frame.lights.data[pick];
-    float attenuation = 1.0;
-    reach = 1e4;
-    if ((light.flags & LIGHT_DIRECTIONAL) != 0u) {
-        toward = -light.direction;
-    } else {
-        vec3 target = light.position;
-        if (light.source_radius > 0.0) target += (vec3(random(), random(), random()) * 2.0 - 1.0) * light.source_radius * 0.57;
-        vec3 to_light = target - surface.position;
-        float distance_squared = dot(to_light, to_light);
-        float range_squared = light.range * light.range;
-        if (distance_squared >= range_squared) return vec3(0.0);
-        float window = clamp(1.0 - (distance_squared * distance_squared) / (range_squared * range_squared), 0.0, 1.0);
-        attenuation = window * window / max(distance_squared, 0.01);
-        reach = sqrt(distance_squared);
-        toward = to_light / max(reach, 1e-5);
-        if ((light.flags & LIGHT_SPOT) != 0u) {
-            float cone = clamp(dot(-toward, light.direction) * light.cone_scale + light.cone_offset, 0.0, 1.0);
-            attenuation *= cone * cone;
-        }
-        if ((light.flags & LIGHT_RECTANGLE) != 0u) attenuation *= clamp(dot(-toward, light.direction), 0.0, 1.0);
-        reach -= 0.004;
-    }
-    if (attenuation <= 1e-5 || dot(surface.flat_normal, toward) <= 0.0) return vec3(0.0);
-    return surfaceResponse(surface, view, toward) * light.color * (attenuation * float(light_count));
+/// One point on a lamp or on a glowing triangle. `source` is 0 for none, a
+/// lamp's index plus one, or `glow_source` plus a glowing instance's index plus
+/// one. `place` picks the point on it.
+struct LightSample {
+    uint source;
+    uint triangle;
+    vec2 place;
+};
+
+const uint glow_source = 512u;
+const float place_steps = 4096.0;
+
+/// The light sample a pixel keeps between frames: `worth` scales the sample's
+/// light into an estimate of all lamp light, `count` is how many candidates
+/// it was chosen from.
+struct Reservoir {
+    LightSample pick;
+    float worth;
+    float count;
+};
+
+const float reservoir_count_limit = 255.0;
+
+vec4 packReservoir(Reservoir reservoir) {
+    uvec2 cell = min(uvec2(reservoir.pick.place * place_steps), uvec2(place_steps - 1.0));
+    return vec4(float(reservoir.pick.source) + 2048.0 * floor(min(reservoir.count, reservoir_count_limit)), float(reservoir.pick.triangle), float(cell.x + cell.y * uint(place_steps)), reservoir.worth);
 }
 
-vec3 glowCandidate(FrameConstants frame, Surface surface, vec3 view, out vec3 toward, out float reach) {
-    GlowingList list = GlowingList(push.glowing);
-    Glowing chosen = list.data[min(uint(random() * float(push.glowing_count)), push.glowing_count - 1u)];
-    uint triangle = min(uint(random() * float(chosen.triangles)), chosen.triangles - 1u);
+Reservoir unpackReservoir(vec4 packed) {
+    Reservoir reservoir;
+    if (any(isnan(packed)) || any(isinf(packed)) || any(lessThan(packed, vec4(0.0)))) packed = vec4(0.0);
+    uint head = uint(packed.r);
+    uint cell = uint(packed.b);
+    reservoir.pick.source = head & 2047u;
+    reservoir.pick.triangle = uint(packed.g);
+    reservoir.pick.place = (vec2(cell % uint(place_steps), cell / uint(place_steps)) + 0.5) / place_steps;
+    reservoir.count = float(head >> 11u);
+    reservoir.worth = packed.a;
+    return reservoir;
+}
+
+vec2 randomPlace() {
+    return (floor(vec2(random(), random()) * place_steps) + 0.5) / place_steps;
+}
+
+/// Light `pick` sends to the eye off `surface` before shadowing. `rarity` is
+/// one over the chance that uniform picking lands on this sample.
+vec3 sampleLight(FrameConstants frame, Surface surface, vec3 view, LightSample pick, out vec3 toward, out float reach, out float rarity, out vec3 shine) {
+    shine = vec3(0.0);
+    toward = vec3(0.0);
+    reach = 0.0;
+    rarity = 0.0;
+    if (pick.source == 0u) return vec3(0.0);
+    if (pick.source <= glow_source) {
+        uint light_count = min(frame.light_count, push.light_count);
+        if (pick.source > light_count) return vec3(0.0);
+        Light light = frame.lights.data[pick.source - 1u];
+        rarity = float(light_count);
+        float attenuation = 1.0;
+        reach = 1e4;
+        if ((light.flags & LIGHT_DIRECTIONAL) != 0u) {
+            toward = -light.direction;
+        } else {
+            vec3 target = light.position;
+            if (light.source_radius > 0.0) {
+                float height = 1.0 - 2.0 * pick.place.x;
+                float ring = sqrt(max(1.0 - height * height, 0.0));
+                float turn = 2.0 * PI * pick.place.y;
+                target += vec3(ring * cos(turn), ring * sin(turn), height) * light.source_radius * 0.7;
+            }
+            vec3 to_light = target - surface.position;
+            float distance_squared = dot(to_light, to_light);
+            float range_squared = light.range * light.range;
+            if (distance_squared >= range_squared) return vec3(0.0);
+            float window = clamp(1.0 - (distance_squared * distance_squared) / (range_squared * range_squared), 0.0, 1.0);
+            attenuation = window * window / max(distance_squared, 0.01);
+            reach = sqrt(distance_squared);
+            toward = to_light / max(reach, 1e-5);
+            if ((light.flags & LIGHT_SPOT) != 0u) {
+                float cone = clamp(dot(-toward, light.direction) * light.cone_scale + light.cone_offset, 0.0, 1.0);
+                attenuation *= cone * cone;
+            }
+            if ((light.flags & LIGHT_RECTANGLE) != 0u) attenuation *= clamp(dot(-toward, light.direction), 0.0, 1.0);
+            reach -= 0.004;
+        }
+        if (attenuation <= 1e-5 || dot(surface.flat_normal, toward) <= 0.0) return vec3(0.0);
+        vec3 response = surfaceResponse(surface, view, toward, shine);
+        shine *= light.color * attenuation;
+        return response * light.color * attenuation;
+    }
+    uint index = pick.source - glow_source - 1u;
+    if (index >= push.glowing_count) return vec3(0.0);
+    Glowing chosen = GlowingList(push.glowing).data[index];
+    if (pick.triangle >= chosen.triangles) return vec3(0.0);
     Instance instance = frame.instances.data[chosen.instance];
     Mesh mesh = frame.meshes.data[instance.mesh];
-    uint base = mesh.index_offset + triangle * 3u;
+    uint base = mesh.index_offset + pick.triangle * 3u;
     vec3 p0 = (instance.transform * vec4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base]].position, 1.0)).xyz;
     vec3 p1 = (instance.transform * vec4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 1u]].position, 1.0)).xyz;
     vec3 p2 = (instance.transform * vec4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 2u]].position, 1.0)).xyz;
-    float side = sqrt(random());
-    float along = random();
-    vec2 weights = vec2(side * (1.0 - along), side * along);
+    float side = sqrt(pick.place.x);
+    vec2 weights = vec2(side * (1.0 - pick.place.y), side * pick.place.y);
     vec3 point = p0 + (p1 - p0) * weights.x + (p2 - p0) * weights.y;
     vec3 across = cross(p1 - p0, p2 - p0);
     float area = 0.5 * length(across);
@@ -257,70 +386,194 @@ vec3 glowCandidate(FrameConstants frame, Surface surface, vec3 view, out vec3 to
     reach -= 0.004;
     float facing = abs(dot(across, toward)) / (2.0 * area);
     if (facing <= 1e-4 || dot(surface.flat_normal, toward) <= 0.0) return vec3(0.0);
-    Material material = frame.materials.data[instance.material];
-    float spread = facing * area / max(distance_squared, 0.01);
-    return surfaceResponse(surface, view, toward) * material.emissive * (spread * float(chosen.triangles) * float(push.glowing_count));
+    rarity = area * float(chosen.triangles) * float(push.glowing_count);
+    vec3 arriving = frame.materials.data[instance.material].emissive * (facing / max(distance_squared, 0.01));
+    vec3 response = surfaceResponse(surface, view, toward, shine);
+    shine *= arriving;
+    return response * arriving;
 }
 
-void considerCandidate(vec3 candidate, vec3 toward, float reach, inout vec3 kept, inout vec3 kept_toward, inout float kept_reach, inout float kept_weight, inout float weight_sum) {
-    float weight = luminance(candidate);
-    if (weight <= 0.0) return;
-    weight_sum += weight;
-    if (random() * weight_sum < weight) {
-        kept = candidate;
-        kept_toward = toward;
-        kept_reach = reach;
-        kept_weight = weight;
+/// A reservoir being filled, with the light of the sample it holds.
+struct Resampling {
+    Reservoir reservoir;
+    vec3 light;
+    vec3 shine;
+    vec3 toward;
+    float reach;
+    float target;
+    float weight_sum;
+};
+
+Resampling emptyResampling() {
+    return Resampling(Reservoir(LightSample(0u, 0u, vec2(0.0)), 0.0, 0.0), vec3(0.0), vec3(0.0), vec3(0.0), 0.0, 0.0, 0.0);
+}
+
+/// Offers `pick`, which stands for `count` candidates each worth `worth`, and
+/// returns whether it replaced the sample held.
+bool offer(inout Resampling resampling, FrameConstants frame, Surface surface, vec3 view, LightSample pick, float worth, float count) {
+    resampling.reservoir.count += count;
+    vec3 toward;
+    float reach;
+    float rarity;
+    vec3 shine;
+    vec3 light = sampleLight(frame, surface, view, pick, toward, reach, rarity, shine);
+    float target = luminance(light);
+    float weight = target * (worth < 0.0 ? rarity : worth) * count;
+    if (!(weight > 0.0) || isinf(weight)) return false;
+    resampling.weight_sum += weight;
+    if (random() * resampling.weight_sum >= weight) return false;
+    resampling.reservoir.pick = pick;
+    resampling.light = light;
+    resampling.shine = shine;
+    resampling.toward = toward;
+    resampling.reach = reach;
+    resampling.target = target;
+    return true;
+}
+
+void settle(inout Resampling resampling) {
+    resampling.reservoir.worth = resampling.target > 0.0 && resampling.reservoir.count > 0.0 ? resampling.weight_sum / (resampling.reservoir.count * resampling.target) : 0.0;
+}
+
+const uint lamp_candidates = 4u;
+const uint glow_candidates = 4u;
+
+/// A reservoir of fresh candidates from the lamps and glowing triangles.
+/// Candidates of the two kinds are weighted for the share each is given.
+Resampling freshCandidates(FrameConstants frame, Surface surface, vec3 view) {
+    Resampling resampling = emptyResampling();
+    uint light_count = min(frame.light_count, push.light_count);
+    uint lamps = light_count != 0u ? lamp_candidates : 0u;
+    uint glows = push.glowing_count != 0u ? glow_candidates : 0u;
+    float all = float(lamps + glows);
+    for (uint index = 0u; index < lamps; index++) {
+        LightSample pick = LightSample(1u + min(uint(random() * float(light_count)), light_count - 1u), 0u, randomPlace());
+        offer(resampling, frame, surface, view, pick, -1.0, all / float(lamps));
+        resampling.reservoir.count -= all / float(lamps) - 1.0;
     }
+    for (uint index = 0u; index < glows; index++) {
+        uint chosen = min(uint(random() * float(push.glowing_count)), push.glowing_count - 1u);
+        uint triangles = GlowingList(push.glowing).data[chosen].triangles;
+        LightSample pick = LightSample(glow_source + 1u + chosen, min(uint(random() * float(triangles)), triangles - 1u), randomPlace());
+        offer(resampling, frame, surface, view, pick, -1.0, all / float(glows));
+        resampling.reservoir.count -= all / float(glows) - 1.0;
+    }
+    settle(resampling);
+    return resampling;
 }
 
-const uint lamp_candidates = 2u;
-const uint glow_candidates = 3u;
+bool reuse_lamps;
+vec3 reuse_toward;
+vec3 reuse_point;
+bool reuse_mirrored;
+float reuse_reach;
+vec4 reservoir_kept;
 
-vec3 directLight(FrameConstants frame, Surface surface, vec3 view, out vec3 lamps) {
+const float reused_frames = 20.0;
+const int reused_neighbours = 3;
+const float reused_radius = 24.0;
+
+/// Where on last frame's screen `point` was, which this pixel sees at `reach`
+/// along its ray. Follows a moving object where the rasterized picture shows
+/// the same surface.
+bool seenBefore(FrameConstants frame, vec3 point, float reach, bool mirrored, out vec2 was_at) {
+    was_at = gl_FragCoord.xy * frame.inv_resolution;
+    if (push.moved == 0u) return true;
+    vec4 clip = frame.prev_view_proj_unjittered * vec4(point, 1.0);
+    if (clip.w <= 0.0) return false;
+    was_at = clip.xy / clip.w * 0.5 + 0.5 + frame.prev_jitter;
+    if (!mirrored) {
+        ivec2 pixel = ivec2(gl_FragCoord.xy);
+        float depth = texelFetch(TEX(push.depth, frame.sampler_nearest_clamp), pixel, 0).r;
+        vec3 drawn = worldPositionFromDepth(gl_FragCoord.xy * frame.inv_resolution, depth, frame.inv_view_proj);
+        if (depth > 0.0 && abs(distance(drawn, frame.camera_position) - reach) <= 0.02 * reach + 0.01) {
+            vec4 now = frame.view_proj_unjittered * vec4(point, 1.0);
+            was_at += (now.xy / now.w - clip.xy / clip.w) * 0.5 - texelFetch(TEX(push.motion, frame.sampler_nearest_clamp), pixel, 0).rg;
+        }
+    }
+    return all(greaterThan(was_at, vec2(0.0))) && all(lessThan(was_at, vec2(1.0)));
+}
+
+/// Whether the surface a pixel showed last frame is close enough to `surface`
+/// for its reservoir to be reused.
+bool alike(FrameConstants frame, ivec2 at, Surface surface, float expected, float slack) {
+    vec4 before = texelFetch(TEX(push.history_facing, frame.sampler_nearest_clamp), at, 0);
+    if (any(isnan(before)) || (before.a < 0.0) != reuse_mirrored) return false;
+    float size = length(before.rgb);
+    if (size < 1e-4 || dot(before.rgb / size, surface.normal) < 0.8) return false;
+    return abs(abs(before.a) - expected) <= slack * expected + 0.02;
+}
+
+/// Lamp and glow light on the surface the pixel shows, resampled from this
+/// frame's candidates, the pixel's reservoir of last frame and its neighbours'.
+vec3 reusedLamps(FrameConstants frame, Surface surface, vec3 view, vec3 start, out vec3 shine) {
+    Resampling fresh = freshCandidates(frame, surface, view);
+    if (fresh.reservoir.worth > 0.0 && traceAny(start, fresh.toward, fresh.reach)) fresh.reservoir.worth = 0.0;
+    Resampling resampling = emptyResampling();
+    resampling.reservoir.pick = fresh.reservoir.pick;
+    resampling.reservoir.count = fresh.reservoir.count;
+    resampling.light = fresh.light;
+    resampling.shine = fresh.shine;
+    resampling.toward = fresh.toward;
+    resampling.reach = fresh.reach;
+    resampling.target = fresh.target;
+    resampling.weight_sum = fresh.target * fresh.reservoir.worth * fresh.reservoir.count;
+    bool reused = false;
+    vec2 was_at;
+    bool seen = push.reusable != 0u && seenBefore(frame, reuse_point, reuse_reach, reuse_mirrored, was_at);
+    was_at *= frame.resolution;
+    if (seen) {
+        float expected = distance(push.previous_camera, reuse_point);
+        float limit = reused_frames * max(fresh.reservoir.count, 1.0);
+        ivec2 last = ivec2(frame.resolution) - 1;
+        for (int index = 0; index <= reused_neighbours; index++) {
+            vec2 place = was_at;
+            if (index > 0) {
+                float turn = 2.0 * PI * random();
+                place += vec2(cos(turn), sin(turn)) * (reused_radius * sqrt(random()));
+            }
+            ivec2 at = ivec2(floor(place));
+            if (any(lessThan(at, ivec2(0))) || any(greaterThan(at, last))) continue;
+            if (!alike(frame, at, surface, expected, index == 0 ? 0.03 : 0.1)) continue;
+            Reservoir before = unpackReservoir(texelFetch(TEX(push.history_reservoir, frame.sampler_nearest_clamp), at, 0));
+            if (before.count <= 0.0) continue;
+            if (offer(resampling, frame, surface, view, before.pick, before.worth, min(before.count, limit))) reused = true;
+        }
+    }
+    settle(resampling);
+    if (reused && resampling.reservoir.worth > 0.0 && traceAny(start, resampling.toward, resampling.reach)) resampling.reservoir.worth = 0.0;
+    reservoir_kept = packReservoir(resampling.reservoir);
+    shine = resampling.shine * resampling.reservoir.worth;
+    return resampling.light * resampling.reservoir.worth;
+}
+
+/// Sun light on `surface`. `lamps` is the light of lamps and glowing triangles
+/// and `shine` the specular part of that.
+vec3 directLight(FrameConstants frame, Surface surface, vec3 view, bool reusing, out vec3 lamps, out vec3 shine) {
     vec3 total = vec3(0.0);
     lamps = vec3(0.0);
+    shine = vec3(0.0);
+    vec3 sun_shine;
     vec3 start = surface.position + surface.flat_normal * 0.002;
     if (dot(frame.sun_radiance, vec3(1.0)) > 0.0) {
         mat3 basis = tangentBasis(frame.sun_direction);
-        float turn = 2.0 * PI * random();
-        float reach = push.sun_radius * sqrt(random());
+        vec2 xi = randomPair();
+        float turn = 2.0 * PI * xi.x;
+        float reach = push.sun_radius * sqrt(xi.y);
         vec3 toward = normalize(basis * vec3(cos(turn) * reach, sin(turn) * reach, 1.0));
-        vec3 response = surfaceResponse(surface, view, toward);
+        vec3 response = surfaceResponse(surface, view, toward, sun_shine);
         if (dot(response, vec3(1.0)) > 0.0 && dot(surface.flat_normal, toward) > 0.0 && !traceAny(start, toward, 1e4))
             total += response * frame.sun_radiance;
     }
-    uint light_count = min(frame.light_count, push.light_count);
-    if (light_count != 0u) {
-        vec3 kept = vec3(0.0);
-        vec3 kept_toward = vec3(0.0);
-        float kept_reach = 0.0;
-        float kept_weight = 0.0;
-        float weight_sum = 0.0;
-        uint candidates = min(light_count, lamp_candidates);
-        for (uint index = 0u; index < candidates; index++) {
-            vec3 toward;
-            float reach;
-            vec3 candidate = lampCandidate(frame, surface, view, light_count, toward, reach);
-            considerCandidate(candidate, toward, reach, kept, kept_toward, kept_reach, kept_weight, weight_sum);
-        }
-        if (kept_weight > 0.0 && !traceAny(start, kept_toward, kept_reach))
-            lamps += kept * (weight_sum / (float(candidates) * kept_weight));
+    if (min(frame.light_count, push.light_count) == 0u && push.glowing_count == 0u) return total;
+    if (reusing) {
+        lamps = reusedLamps(frame, surface, view, start, shine);
+        return total;
     }
-    if (push.glowing_count != 0u) {
-        vec3 kept = vec3(0.0);
-        vec3 kept_toward = vec3(0.0);
-        float kept_reach = 0.0;
-        float kept_weight = 0.0;
-        float weight_sum = 0.0;
-        for (uint index = 0u; index < glow_candidates; index++) {
-            vec3 toward;
-            float reach;
-            vec3 candidate = glowCandidate(frame, surface, view, toward, reach);
-            considerCandidate(candidate, toward, reach, kept, kept_toward, kept_reach, kept_weight, weight_sum);
-        }
-        if (kept_weight > 0.0 && !traceAny(start, kept_toward, kept_reach))
-            lamps += kept * (weight_sum / (float(glow_candidates) * kept_weight));
+    Resampling fresh = freshCandidates(frame, surface, view);
+    if (fresh.reservoir.worth > 0.0 && !traceAny(start, fresh.toward, fresh.reach)) {
+        lamps = fresh.light * fresh.reservoir.worth;
+        shine = fresh.shine * fresh.reservoir.worth;
     }
     return total;
 }
@@ -392,12 +645,16 @@ vec3 tracePath(FrameConstants frame, vec3 origin, vec3 direction, bool scatterin
             primary_distance = travelled;
             primary_mirror = pure_mirror;
         }
-        if (!first_met && !pure_mirror) {
+        bool first_here = !first_met && !pure_mirror;
+        if (first_here) {
             first_met = true;
             first_distance = travelled;
             first_mirrored = bounce > 0u;
             first_color = glows ? vec3(0.0) : max(surface.albedo, vec3(0.03));
             first_facing = surface.normal;
+            first_scatter = surface.albedo * (1.0 - surface.metallic);
+            first_reflect = reflectedOverall(mix(vec3(0.04), surface.albedo, surface.metallic), surface.roughness, max(dot(surface.normal, -direction), 0.0));
+            first_roughness = surface.roughness;
         }
         if (unaimed || !surface.even_glow) {
             if (glossy_first) gloss += carried * surface.emissive;
@@ -407,13 +664,31 @@ vec3 tracePath(FrameConstants frame, vec3 origin, vec3 direction, bool scatterin
         if (bounce == push.bounces) break;
         vec3 view = -direction;
         vec3 lamps;
-        vec3 sun = carried * directLight(frame, surface, view, lamps);
+        vec3 shine;
+        reuse_point = frame.camera_position + reuse_toward * travelled;
+        reuse_mirrored = first_mirrored;
+        reuse_reach = travelled;
+        vec3 sun = carried * directLight(frame, surface, view, reuse_lamps && first_here && !scattering, lamps, shine);
         lamps *= carried;
+        shine *= carried;
         if (glossy_first) gloss += sun + lamps;
         else if (rough_bounce) indirect += sun + lamps;
         else {
             gathered += sun;
-            soft += lamps;
+            soft += lamps - shine;
+            float shine_brightness = luminance(shine);
+            float most = lamp_clamp * push.clamp_radiance;
+            if (shine_brightness > most) shine *= most / shine_brightness;
+            gathered += shine;
+        }
+        if ((rough_bounce || glossy_first) && !mirrorLike(surface) && push.probes != 0u && (frame.flags & FRAME_GI) != 0u) {
+            float coverage = giCoverage(frame, surface.position);
+            if (coverage > 0.0 && random() < coverage) {
+                vec3 bounced = carried * surface.albedo * giIrradiance(frame, surface.position, surface.normal, view);
+                if (glossy_first) gloss += bounced;
+                else indirect += bounced;
+                break;
+            }
         }
 
         vec3 f0 = mix(vec3(0.04), surface.albedo, surface.metallic);
@@ -442,7 +717,7 @@ vec3 tracePath(FrameConstants frame, vec3 origin, vec3 direction, bool scatterin
         if (reflects) {
             float alpha = surface.roughness * surface.roughness;
             vec3 view_local = view * basis;
-            vec3 half_vector = basis * visibleFacet(vec3(view_local.xy, max(view_local.z, 1e-3)), alpha, vec2(random(), random()));
+            vec3 half_vector = basis * visibleFacet(vec3(view_local.xy, max(view_local.z, 1e-3)), alpha, randomPair());
             next = reflect(direction, half_vector);
             float n_dot_l = dot(surface.normal, next);
             if (n_dot_l <= 0.0 || dot(surface.flat_normal, next) <= 0.0) break;
@@ -455,8 +730,9 @@ vec3 tracePath(FrameConstants frame, vec3 origin, vec3 direction, bool scatterin
             }
             if (!unaimed) rough_bounce = true;
         } else {
-            float turn = 2.0 * PI * random();
-            float radius = sqrt(random());
+            vec2 xi = randomPair();
+            float turn = 2.0 * PI * xi.x;
+            float radius = sqrt(xi.y);
             next = normalize(basis * vec3(cos(turn) * radius, sin(turn) * radius, sqrt(max(1.0 - radius * radius, 0.0))));
             if (dot(surface.flat_normal, next) <= 0.0) break;
             carried *= scattered * (1.0 - fresnel_view) / (1.0 - mirror_share);
@@ -506,13 +782,23 @@ void main() {
     FrameConstants frame = push.frame;
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     random_state = pcg(uint(pixel.x) + pcg(uint(pixel.y) + pcg(push.gathered * 7919u + frame.frame_index)));
+    sequence_seed = pcg(uint(pixel.x) + pcg(uint(pixel.y)));
+    sequence_dimension = 0u;
+    reservoir_kept = vec4(0.0);
+    reuse_toward = normalize(worldPositionFromDepth((vec2(pixel) + 0.5) * frame.inv_resolution, 0.5, frame.inv_view_proj) - frame.camera_position);
     vec3 total = vec3(0.0);
     vec3 total_soft = vec3(0.0);
+    vec3 total_lamp = vec3(0.0);
+    vec3 total_raw = vec3(0.0);
+    vec3 total_scatter = vec3(0.0);
+    vec3 total_reflect = vec3(0.0);
+    vec4 total_facing = vec4(0.0);
     vec3 total_gloss = vec3(0.0);
     vec3 guide = vec3(0.0);
     uint samples = max(push.samples, 1u);
     for (uint index = 0u; index < samples; index++) {
-        vec2 uv = (vec2(pixel) + (push.centered != 0u ? vec2(0.5) : vec2(random(), random()))) * frame.inv_resolution;
+        sequence_index = frame.frame_index * samples + index;
+        vec2 uv = (vec2(pixel) + (push.centered != 0u ? vec2(0.5) : randomPair())) * frame.inv_resolution;
         vec3 through = worldPositionFromDepth(uv, 0.5, frame.inv_view_proj);
         vec3 direction = normalize(through - frame.camera_position);
         first_met = false;
@@ -520,6 +806,9 @@ void main() {
         first_mirrored = false;
         first_color = vec3(0.0);
         first_facing = vec3(0.0, 1.0, 0.0);
+        first_scatter = vec3(0.0);
+        first_reflect = vec3(0.0);
+        first_roughness = 1.0;
         primary_met = false;
         primary_facing = vec3(0.0, 1.0, 0.0);
         primary_roughness = 1.0;
@@ -530,9 +819,11 @@ void main() {
         vec3 indirect;
         vec3 gloss;
         split_met = false;
+        reuse_lamps = index == 0u;
         vec3 light = tracePath(frame, frame.camera_position, direction, false, soft, indirect, gloss);
         if (split_met) {
             split_met = false;
+            reuse_lamps = false;
             vec3 scattered_soft;
             vec3 scattered_indirect;
             vec3 scattered_gloss;
@@ -552,8 +843,16 @@ void main() {
         if (gloss_brightness > push.clamp_radiance) gloss *= push.clamp_radiance / gloss_brightness;
         float brightness = luminance(indirect);
         if (brightness > push.clamp_radiance) indirect *= push.clamp_radiance / brightness;
+        float lamp_brightness = luminance(soft);
+        if (lamp_brightness > lamp_clamp * push.clamp_radiance) soft *= lamp_clamp * push.clamp_radiance / lamp_brightness;
         total += light;
-        total_soft += (soft + indirect) / (dot(first_color, vec3(1.0)) > 0.0 ? first_color : vec3(1.0));
+        vec3 tint = dot(first_color, vec3(1.0)) > 0.0 ? first_color : vec3(1.0);
+        total_soft += indirect / tint;
+        total_lamp += soft / tint;
+        total_raw += light + soft + indirect + gloss;
+        total_scatter += first_scatter;
+        total_reflect += first_reflect;
+        total_facing += vec4(first_met ? first_facing : vec3(0.0), first_roughness);
         total_gloss += gloss;
         guide += first_color;
     }
@@ -565,6 +864,7 @@ void main() {
     vec4 grainy_before = vec4(0.0);
     vec3 shown_before = vec3(0.0);
     vec4 facing_before = vec4(0.0);
+    vec3 lamp_before = vec3(0.0);
     if (push.reset == 0u) {
         if (push.moved == 0u) {
             vec4 before = texelFetch(TEX(push.history_color, frame.sampler_nearest_clamp), pixel, 0);
@@ -573,31 +873,34 @@ void main() {
             grainy_before = texelFetch(TEX(push.history_soft, frame.sampler_nearest_clamp), pixel, 0);
             shown_before = texelFetch(TEX(push.history_guide, frame.sampler_nearest_clamp), pixel, 0).rgb;
             facing_before = texelFetch(TEX(push.history_facing, frame.sampler_nearest_clamp), pixel, 0);
+            lamp_before = texelFetch(TEX(push.history_lamp, frame.sampler_nearest_clamp), pixel, 0).rgb;
         } else {
             vec2 center = (vec2(pixel) + 0.5) * frame.inv_resolution;
             vec3 toward = normalize(worldPositionFromDepth(center, 0.5, frame.inv_view_proj) - frame.camera_position);
             vec3 point = frame.camera_position + toward * first_distance;
-            vec4 clip = frame.prev_view_proj_unjittered * vec4(point, 1.0);
-            vec2 was_at = clip.xy / clip.w * 0.5 + 0.5 + frame.prev_jitter;
-            if (clip.w > 0.0 && all(greaterThan(was_at, vec2(0.0))) && all(lessThan(was_at, vec2(1.0)))) {
+            vec2 was_at;
+            if (seenBefore(frame, point, first_distance, first_mirrored, was_at)) {
                 vec4 guide_before = textureLod(TEX(push.history_guide, frame.sampler_linear_clamp), was_at, 0.0);
+                vec4 facing_seen = textureLod(TEX(push.history_facing, frame.sampler_linear_clamp), was_at, 0.0);
                 float expected = distance(push.previous_camera, point);
-                bool was_mirrored = guide_before.a < 0.0;
+                bool was_mirrored = facing_seen.a < 0.0;
                 vec3 unlike = abs(guide_before.rgb - shown);
-                if (was_mirrored == first_mirrored && abs(abs(guide_before.a) - expected) <= 0.03 * expected + 0.02 && max(unlike.r, max(unlike.g, unlike.b)) < 0.2) {
+                if (was_mirrored == first_mirrored && abs(abs(facing_seen.a) - expected) <= 0.03 * expected + 0.02 && max(unlike.r, max(unlike.g, unlike.b)) < 0.2) {
                     count = textureLod(TEX(push.history_color, frame.sampler_linear_clamp), was_at, 0.0).a;
                     light_before = historySharp(push.history_color, frame.sampler_linear_clamp, was_at, frame.resolution);
                     grainy_before = textureLod(TEX(push.history_soft, frame.sampler_linear_clamp), was_at, 0.0);
                     shown_before = guide_before.rgb;
-                    facing_before = textureLod(TEX(push.history_facing, frame.sampler_linear_clamp), was_at, 0.0);
+                    facing_before = facing_seen;
+                    lamp_before = textureLod(TEX(push.history_lamp, frame.sampler_linear_clamp), was_at, 0.0).rgb;
                 }
             }
-            count = min(count, dot(shown, vec3(1.0)) > 0.0 && !first_mirrored ? 64.0 : 6.0);
+            count = min(count, dot(shown, vec3(1.0)) > 0.0 && !first_mirrored ? push.history_limit : 6.0);
         }
     }
-    if (any(isnan(light_before)) || any(isinf(light_before)) || any(isnan(grainy_before)) || any(isinf(grainy_before)) || any(isnan(shown_before)) || any(isinf(shown_before)) || any(isnan(facing_before)) || any(isinf(facing_before)) || isnan(count) || isinf(count)) {
+    if (any(isnan(light_before)) || any(isinf(light_before)) || any(isnan(grainy_before)) || any(isinf(grainy_before)) || any(isnan(shown_before)) || any(isinf(shown_before)) || any(isnan(facing_before)) || any(isinf(facing_before)) || any(isnan(lamp_before)) || any(isinf(lamp_before)) || isnan(count) || isinf(count)) {
         count = 0.0;
         light_before = vec3(0.0);
+        lamp_before = vec3(0.0);
         grainy_before = vec4(0.0);
         shown_before = vec3(0.0);
         facing_before = vec4(0.0);
@@ -621,6 +924,13 @@ void main() {
     vec4 gloss_before = push.reset == 0u && push.moved == 0u ? texelFetch(TEX(push.history_gloss, frame.sampler_nearest_clamp), pixel, 0) : vec4(0.0);
     if (any(isnan(gloss_before)) || any(isinf(gloss_before))) gloss_before = vec4(0.0);
     out_gloss_gathered = vec4(mix(gloss_before.rgb, gloss_now, 1.0 / (gloss_before.a + 1.0)), min(gloss_before.a + 1.0, 8192.0));
-    out_gloss = vec4(out_gloss_gathered.rgb, gloss_reach);
-    out_guide = vec4(mix(shown_before, shown, shown_weight), first_mirrored ? -shown_distance : shown_distance);
+    out_guide = vec4(mix(shown_before, shown, shown_weight), gloss_reach);
+    out_lamp = vec4(mix(lamp_before, min(total_lamp / float(samples), vec3(60000.0)), max(weight, 1.0 / push.lamp_limit)), 1.0);
+    out_reservoir = reservoir_kept;
+    if (push.reconstructed != 0u) {
+        out_color = vec4(min(total_raw / float(samples), vec3(60000.0)), 1.0);
+        out_guide = vec4(total_scatter / float(samples), gloss_reach);
+        out_lamp = vec4(total_reflect / float(samples), 1.0);
+        out_soft = total_facing / float(samples);
+    }
 }

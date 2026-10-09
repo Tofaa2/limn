@@ -537,6 +537,11 @@ fn stateInfo(state: types.TextureState) StateInfo {
             .stage = .{ .compute_shader_bit = true },
             .access = .{ .shader_storage_read_bit = true, .shader_storage_write_bit = true },
         },
+        .external => .{
+            .layout = .general,
+            .stage = .{ .all_commands_bit = true },
+            .access = .{ .memory_read_bit = true, .memory_write_bit = true },
+        },
         .shading_rate => .{
             .layout = .fragment_shading_rate_attachment_optimal_khr,
             .stage = .{ .fragment_shading_rate_attachment_bit_khr = true },

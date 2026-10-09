@@ -56,7 +56,7 @@
           pkgs.libxcursor
           pkgs.libxext
           pkgs.libxi
-        ];
+        ] + ":/run/opengl-driver/lib";
       };
   };
 }
