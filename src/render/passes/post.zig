@@ -6,6 +6,7 @@ const gpu = @import("../gpu.zig");
 const render = @import("../renderer.zig");
 const ScenePass = @import("../scene_pass.zig").ScenePass;
 const ffx = @import("../ffx.zig");
+const dlss = @import("../dlss.zig");
 const path_tracing = @import("path_tracing.zig");
 
 const Renderer = render.Renderer;
@@ -129,6 +130,73 @@ fn resolveWithFidelityFx(renderer: *Renderer, p: *const ScenePass, output: rhi.T
     return true;
 }
 
+/// The view's DLSS `feature` at this frame's sizes, started if it is not
+/// running yet. False where DLSS is not asked for or will not run.
+pub fn dlssFor(renderer: *Renderer, p: *const ScenePass, feature: dlss.Feature) !bool {
+    const device = renderer.device;
+    const view_data = p.view_data;
+    if (p.settings.upscaling != .dlss or !p.settings.temporal_antialiasing or p.debugging) return false;
+    if (!renderer.dlss.offers(feature) or !device.storage_images) return false;
+    const output_info = device.textureInfo(p.view.history[0]);
+    const render_size = [2]u32{ p.width, p.height };
+    const output_size = [2]u32{ output_info.width, output_info.height };
+    if (view_data.dlss) |upscaler| {
+        if (upscaler.feature == feature and std.meta.eql(upscaler.render_size, render_size) and std.meta.eql(upscaler.output_size, output_size)) return true;
+        try device.waitIdle();
+        upscaler.destroy();
+        view_data.dlss = null;
+    }
+    if (view_data.dlss_refused == feature) return false;
+    view_data.dlss = dlss.Upscaler.create(device, p.cmd, feature, render_size, output_size) orelse {
+        std.log.warn("DLSS would not start; temporal antialiasing stands in", .{});
+        view_data.dlss_refused = feature;
+        return false;
+    };
+    view_data.dlss_frame = 0;
+    return true;
+}
+
+/// Resolves with DLSS instead of TAA when requested and available: Ray
+/// Reconstruction for a picture path traced for it, Super Resolution
+/// otherwise. Returns whether it did.
+fn resolveWithDlss(renderer: *Renderer, p: *const ScenePass, output: rhi.Texture, path_traced: bool) !bool {
+    const device = renderer.device;
+    const cmd = p.cmd;
+    const view_data = p.view_data;
+    const view = p.view;
+    const reconstructing = path_traced and view_data.path_reconstructing;
+    if (!try dlssFor(renderer, p, if (reconstructing) .ray_reconstruction else .super_resolution)) return false;
+    const reset = !view.history_valid or view_data.dlss_frame +% 1 != renderer.frame_index;
+    view_data.dlss_frame = renderer.frame_index;
+    const color = if (reconstructing) view_data.path_accum.? else view.hdr;
+    cmd.beginScope(if (reconstructing) "dlss ray reconstruction" else "dlss super resolution");
+    defer cmd.endScope();
+    cmd.transition(color, .shader_read);
+    cmd.transition(view.depth, .shader_read);
+    cmd.transition(view.motion, .shader_read);
+    cmd.transition(output, .external);
+    defer cmd.transition(output, .shader_read);
+    view_data.dlss.?.dispatch(device, cmd, .{
+        .color = color,
+        .depth = view.depth,
+        .motion = view.motion,
+        .output = output,
+        .diffuse_albedo = if (reconstructing) view_data.path_guide.? else null,
+        .specular_albedo = if (reconstructing) view_data.path_lamp.? else null,
+        .normal_roughness = if (reconstructing) view_data.path_soft.? else null,
+        .jitter = p.jitter,
+        .world_to_view = p.view_matrix,
+        .view_to_clip = p.proj_unjittered,
+        .delta_time = p.delta_time,
+        .reset = reset,
+    }) catch {
+        std.log.warn("DLSS failed; temporal antialiasing stands in", .{});
+        view_data.dlss_refused = view_data.dlss.?.feature;
+        return false;
+    };
+    return true;
+}
+
 /// Temporal antialiasing. Returns the texture later passes continue from.
 pub fn resolveTemporal(renderer: *Renderer, p: *const ScenePass, path_traced: bool) !rhi.Texture {
     const device = renderer.device;
@@ -144,6 +212,10 @@ pub fn resolveTemporal(renderer: *Renderer, p: *const ScenePass, path_traced: bo
     if (settings.temporal_antialiasing and !debugging) {
         const current = view.history[@intCast(view_data.frames & 1)];
         const previous = view.history[@intCast((view_data.frames + 1) & 1)];
+        if (try resolveWithDlss(renderer, p, current, path_traced)) {
+            view.history_valid = true;
+            return current;
+        }
         if (try resolveWithFidelityFx(renderer, p, current)) {
             view.history_valid = true;
             return current;

@@ -831,6 +831,10 @@ pub const Settings = struct {
     /// and `.fsr3` need `temporal_antialiasing`; `.fsr2` and `.fsr3` also need
     /// storage images and `-Dfidelityfx`, else fall back to `.temporal`. `.fsr`
     /// is FSR 1, sharpened by `sharpen`.
+    /// `.dlss` is NVIDIA DLSS, also at full size, where it only antialiases;
+    /// a path traced view is denoised by its Ray Reconstruction in place of
+    /// `path_tracing_denoise`. It needs `temporal_antialiasing`, an NVIDIA GPU
+    /// and the DLSS SDK (`zig build dlss-sdk`), else falls back to `.temporal`.
     upscaling: Upscaling = .temporal,
     /// FSR 3 frame generation: shows a generated picture between every two
     /// rendered. Needs `.fsr3` upscaling on a view that fills the backbuffer;
@@ -1066,11 +1070,17 @@ pub const Settings = struct {
     path_tracing_bounces: u32 = 4,
     /// Paths per pixel per frame, 1..64.
     path_tracing_samples: u32 = 1,
-    /// Most light a path may return through a rough bounce, before exposure;
-    /// directly seen and mirrored light is not limited.
+    /// Most light a path may return through a rough bounce, before exposure.
+    /// Lamp light on the surface seen is limited to eight times this; directly
+    /// seen and mirrored light is not limited.
     path_tracing_clamp: f32 = 12,
-    /// Denoise by averaging lamp and indirect light over neighbouring pixels of
-    /// the same surface, while a pixel still varies between frames.
+    /// End a path in the bounce light probes at the first surface it reaches
+    /// after a rough bounce, where the GPU traces rays. Much less noise; false
+    /// follows every bounce, for a still picture left to gather.
+    path_tracing_probes: bool = true,
+    /// Denoise by averaging indirect light over neighbouring pixels of the same
+    /// surface, while a pixel still varies between frames. Lamp light is only
+    /// gathered over frames.
     path_tracing_denoise: bool = true,
     /// Show one input of the shading instead of the lit picture.
     debug_view: DebugView = .none,
@@ -1102,7 +1112,7 @@ pub const DebugView = enum(u32) {
 };
 
 /// See `Settings.upscaling`.
-pub const Upscaling = enum { spatial, temporal, fsr, fsr2, fsr3 };
+pub const Upscaling = enum { spatial, temporal, fsr, fsr2, fsr3, dlss };
 
 /// Fraction of the output resolution an effect is computed at; upsampled
 /// depth-aware.
@@ -1469,6 +1479,14 @@ pub const PathTracing = enum {
     shader,
     /// `Settings.path_tracing` has no effect.
     unavailable,
+};
+
+/// What NVIDIA DLSS offers on this device; see `Renderer.dlssSupport`.
+pub const Dlss = struct {
+    /// `Upscaling.dlss` upscales and antialiases.
+    super_resolution: bool = false,
+    /// `Upscaling.dlss` denoises a path traced view.
+    ray_reconstruction: bool = false,
 };
 
 /// Counters describing the last frame; see `Renderer.getStats`.

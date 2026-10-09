@@ -533,7 +533,7 @@ fn renderScene(
         .output_width = output_width,
         .output_height = output_height,
         .fsr = settings.upscaling == .fsr,
-        .temporal_upscale = (settings.upscaling == .temporal or settings.upscaling == .fsr2 or settings.upscaling == .fsr3) and settings.temporal_antialiasing and settings.debug_view == .none and (output_width > width or output_height > height),
+        .temporal_upscale = (settings.upscaling == .temporal or settings.upscaling == .fsr2 or settings.upscaling == .fsr3 or settings.upscaling == .dlss) and settings.temporal_antialiasing and settings.debug_view == .none and (output_width > width or output_height > height),
     };
     if (view_data.state == null or view_data.state.?.width != width or view_data.state.?.height != height or
         !std.meta.eql(view_data.state.?.scales, scales))
@@ -542,6 +542,7 @@ fn renderScene(
         view_data.state = null;
         view_data.state = try ViewState.init(device, width, height, scales);
         view_data.upscaler_refused = null;
+        view_data.dlss_refused = null;
         view_data.exposure_reset = true;
         view_data.camera_known = false;
     }
@@ -567,7 +568,7 @@ fn renderScene(
     const debugging = settings.debug_view != .none;
     if (settings.temporal_antialiasing and !debugging) {
         const upscale_area = @as(f32, @floatFromInt(output_width)) * @as(f32, @floatFromInt(output_height)) / (@as(f32, @floatFromInt(width)) * @as(f32, @floatFromInt(height)));
-        const jitter_count: u64 = if ((settings.upscaling == .temporal or settings.upscaling == .fsr2 or settings.upscaling == .fsr3) and upscale_area > 1) @intFromFloat(@min(@ceil(8 * upscale_area), 64)) else 8;
+        const jitter_count: u64 = if ((settings.upscaling == .temporal or settings.upscaling == .fsr2 or settings.upscaling == .fsr3 or settings.upscaling == .dlss) and upscale_area > 1) @intFromFloat(@min(@ceil(8 * upscale_area), 64)) else 8;
         const sample: u32 = @intCast(view_data.frames % jitter_count + 1);
         const offset = [2]f32{ halton(sample, 2) - 0.5, halton(sample, 3) - 0.5 };
         jitter = .{ offset[0] / @as(f32, @floatFromInt(width)), offset[1] / @as(f32, @floatFromInt(height)) };

@@ -10,6 +10,7 @@ layout(push_constant, scalar) uniform Push {
     uint motion_texture;
     uint history_texture;
     uint samples_history_texture;
+    uint reach_texture;
 } push;
 
 layout(location = 0) in vec2 in_uv;
@@ -132,7 +133,7 @@ void main() {
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     ivec2 last_pixel = ivec2(frame.resolution) - 1;
     FfxSurface surface = ffxSurface(texelFetch(TEX(push.surface_texture, frame.sampler_nearest_clamp), pixel, 0));
-    vec4 radiance = texelFetch(TEX(push.radiance_texture, frame.sampler_nearest_clamp), pixel, 0);
+    vec4 radiance = vec4(texelFetch(TEX(push.radiance_texture, frame.sampler_nearest_clamp), pixel, 0).rgb, texelFetch(TEX(push.reach_texture, frame.sampler_nearest_clamp), pixel, 0).a);
     out_reprojected = vec4(0.0);
     out_samples = 0.0;
     if (!ffxIsGlossy(surface.roughness)) return;

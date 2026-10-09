@@ -131,6 +131,7 @@ pub const EmitterDesc = api.EmitterDesc;
 pub const ViewDesc = api.ViewDesc;
 pub const FrameDesc = api.FrameDesc;
 pub const PathTracing = api.PathTracing;
+pub const Dlss = api.Dlss;
 pub const Stats = api.Stats;
 
 pub const hdr_format = renderer_state.hdr_format;
@@ -332,6 +333,8 @@ pub const Renderer = struct {
     frame_scene_views: u32 = 0,
     /// The upscaler of the view this frame generates frames from, and whether
     /// its history was reset.
+    /// What DLSS offers on this device.
+    dlss: @import("dlss.zig").Library = .{},
     generating: ?@import("ffx.zig").Upscaler = null,
     generating_reset: bool = false,
     generating_failed: bool = false,
@@ -382,6 +385,7 @@ pub const Renderer = struct {
             .hdr_output = options.hdr_output,
             .ray_tracing = options.ray_tracing,
             .mesh_shaders = options.mesh_shaders,
+            .nvidia_ngx = @import("dlss.zig").available,
         });
         errdefer device.deinit();
         gltf.acquireLibraries(io);
@@ -398,6 +402,7 @@ pub const Renderer = struct {
             .options = options,
             .io = io,
             .device = device,
+            .dlss = @import("dlss.zig").Library.start(device),
             .pipelines = try createPipelines(device),
             .sampler_linear_clamp = try device.createSampler(.{ .address_u = .clamp_to_edge, .address_v = .clamp_to_edge, .address_w = .clamp_to_edge }),
             .sampler_nearest_clamp = try device.createSampler(.{
@@ -646,6 +651,7 @@ pub const Renderer = struct {
         self.scratch_moved.deinit(self.gpa);
         self.scratch_instances.deinit(self.gpa);
         self.scratch_static_cull.deinit(self.gpa);
+        self.dlss.stop(device);
         pipelines_module.releaseOverrides();
         const gpa = self.gpa;
         const io = self.io;
@@ -667,6 +673,12 @@ pub const Renderer = struct {
     pub fn pathTracing(self: *const Renderer) PathTracing {
         if (self.device.ray_tracing) return .hardware;
         return if (self.options.path_tracing_fallback) .shader else .unavailable;
+    }
+
+    /// What `Upscaling.dlss` would do on this device: nothing without
+    /// the DLSS SDK built in, an NVIDIA GPU and a driver that runs it. Safe from any thread.
+    pub fn dlssSupport(self: *const Renderer) Dlss {
+        return .{ .super_resolution = self.dlss.super_resolution, .ray_reconstruction = self.dlss.ray_reconstruction };
     }
 
     /// Last frame's counters, with current loading count and GPU memory use.

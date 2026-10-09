@@ -6,6 +6,8 @@
 //!   2        reflections traced where the screen has no answer
 //!   3        shadows of the lamp, traced and soft
 //!   P        path tracing: the whole picture by following light
+//!   D        NVIDIA DLSS: denoises the path traced picture, antialiases
+//!            the other
 //!   Up/Down  bounces of the path tracer
 //!   C        next camera
 //!   Space    stop and start the lamp
@@ -15,8 +17,8 @@
 //! reflections, shadow maps), and path tracing runs in a shader instead,
 //! more slowly. `--software 1` tries that on a GPU that could do better.
 //!
-//! `--path 1` starts path traced; `--drift 1` keeps the camera swaying, to
-//! see the traced picture hold while it moves. `--frames N`,
+//! `--path 1` starts path traced and `--dlss 1` with DLSS; `--drift 1` keeps
+//! the camera swaying, to see the traced picture hold while it moves. `--frames N`,
 //! `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");
@@ -29,6 +31,7 @@ pub fn main(init: std.process.Init) !void {
     var options = gfx.Options{ .path_tracing_fallback = true, .asset_cache_dir = "zig-out/asset-cache" };
     var path_traced = false;
     var drifting = false;
+    var dlss = false;
     {
         var arguments = try init.minimal.args.iterateAllocator(init.gpa);
         defer arguments.deinit();
@@ -36,12 +39,14 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, argument, "--software")) options.ray_tracing = false;
             if (std.mem.eql(u8, argument, "--path")) path_traced = true;
             if (std.mem.eql(u8, argument, "--drift")) drifting = true;
+            if (std.mem.eql(u8, argument, "--dlss")) dlss = true;
         }
     }
     var stage = try Stage.create(init, "Limn ray tracing", options);
     const renderer = stage.renderer;
     const support = renderer.pathTracing();
     const hardware = support == .hardware;
+    const dlss_support = renderer.dlssSupport();
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.25, -1.0, 0.12 } };
@@ -92,11 +97,12 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_2)) traced_reflections = !traced_reflections;
         if (stage.keyPressed(glfw.GLFW_KEY_3)) traced_shadows = !traced_shadows;
         if (stage.keyPressed(glfw.GLFW_KEY_P)) path_traced = !path_traced;
+        if (stage.keyPressed(glfw.GLFW_KEY_D)) dlss = !dlss;
         if (stage.keyPressed(glfw.GLFW_KEY_UP)) bounces = @min(bounces + 1, 16);
         if (stage.keyPressed(glfw.GLFW_KEY_DOWN)) bounces = @max(bounces - 1, 1);
         if (stage.keyPressed(glfw.GLFW_KEY_C)) camera = (camera + 1) % cameras.len;
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE)) lamp_moving = !lamp_moving;
-        if (lamp_moving and !path_traced) lamp_clock += tick.dt;
+        if (lamp_moving) lamp_clock += tick.dt;
 
         try renderer.scenes.setLights(scene, &.{.{
             .position = .{ 1.5 + @sin(lamp_clock * 0.5) * 2.5, 2.2, @cos(lamp_clock * 0.37) * 0.9 },
@@ -109,7 +115,7 @@ pub fn main(init: std.process.Init) !void {
 
         list.clear();
         const stats = renderer.getStats();
-        try list.rect(.{ .x = 12, .y = 12, .width = 520, .height = 168 }, gfx.Color.rgba(10, 12, 20, 190));
+        try list.rect(.{ .x = 12, .y = 12, .width = 520, .height = 188 }, gfx.Color.rgba(10, 12, 20, 190));
         try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms", .{ stage.fps, stage.gpu_ms }), .{ 24, 20 }, .{ .size = 17 });
         try list.text(font, switch (support) {
             .hardware => "This GPU traces rays: they go through its ray tracing.",
@@ -121,6 +127,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .key = "2", .label = "reflections", .on = traced_reflections and hardware, .state = if (!hardware) "screen only" else if (traced_reflections) "screen, then traced" else "screen only" },
             .{ .key = "3", .label = "lamp shadows", .on = traced_shadows and hardware, .state = if (!hardware) "shadow map" else if (traced_shadows) "traced, soft" else "shadow map" },
             .{ .key = "P", .label = "path tracing", .on = path_traced, .state = if (!path_traced) "off" else try std.fmt.bufPrint(&count_buffer, "{d} bounces · {d} frames", .{ bounces, stats.path_traced_frames }) },
+            .{ .key = "D", .label = "DLSS", .on = dlss and (if (path_traced) dlss_support.ray_reconstruction else dlss_support.super_resolution), .state = if (!dlss) "off" else if (path_traced) (if (dlss_support.ray_reconstruction) "ray reconstruction" else "needs `zig build dlss-sdk` and an NVIDIA GPU") else if (dlss_support.super_resolution) "antialiasing" else "needs `zig build dlss-sdk` and an NVIDIA GPU" },
         };
         for (rows, 0..) |row, index| {
             const y = 70 + 20 * @as(f32, @floatFromInt(index));
@@ -128,9 +135,9 @@ pub fn main(init: std.process.Init) !void {
             try list.text(font, row.label, .{ 52, y }, .{ .size = 14 });
             try list.text(font, row.state, .{ 190, y }, .{ .size = 14, .color = if (row.on) gfx.Color.hex(0x3ddc97) else gfx.Color.hex(0x7c8499) });
         }
-        try list.text(font, "C camera · Up/Down bounces · Space lamp", .{ 24, 154 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
+        try list.text(font, "C camera · Up/Down bounces · Space lamp", .{ 24, 174 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
 
-        const drift: math.Vec3 = if (drifting) .{ @sin(tick.time * 0.6) * 0.8, @sin(tick.time * 0.43) * 0.25, 0 } else .{ 0, 0, 0 };
+        const drift: math.Vec3 = if (drifting) .{ (@cos(tick.time * 1.2) - 1) * 0.4, @sin(tick.time * 0.43) * 0.25, 0 } else .{ 0, 0, 0 };
         try stage.end(try renderer.render(.{
             .views = &.{.{
                 .scene = scene,
@@ -144,6 +151,7 @@ pub fn main(init: std.process.Init) !void {
                     .ray_traced_light_shadows = traced_shadows,
                     .path_tracing = path_traced,
                     .path_tracing_bounces = bounces,
+                    .upscaling = if (dlss) .dlss else .temporal,
                 },
             }},
             .delta_time = tick.dt,

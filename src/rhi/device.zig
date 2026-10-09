@@ -229,6 +229,9 @@ pub const Device = struct {
     hdr_wanted: bool = false,
     /// Ray queries and acceleration structures are available.
     ray_tracing: bool = false,
+    /// Whether the extensions NVIDIA's NGX asks for are enabled; see
+    /// `DeviceDesc.nvidia_ngx`.
+    nvidia_ngx: bool = false,
     /// Compute shaders can write textures (`TextureUsage.storage`).
     storage_images: bool = false,
     /// Pixels per shading rate texel each way; 0 when unsupported.
@@ -396,6 +399,9 @@ pub const Device = struct {
         self.properties = selected.properties;
 
         self.ray_tracing = desc.ray_tracing and try supportsRayQueries(gpa, self.instance, self.physical);
+        self.nvidia_ngx = desc.nvidia_ngx and for (ngx_extensions) |extension| {
+            if (!try deviceExtensionListed(gpa, self.instance, self.physical, extension)) break false;
+        } else true;
         self.bc_textures = blk: {
             var supported = vk.PhysicalDeviceFeatures2{ .features = .{} };
             self.instance.getPhysicalDeviceFeatures2(self.physical, &supported);
@@ -470,7 +476,7 @@ pub const Device = struct {
             },
         };
         const queue_priorities = [2]f32{ 1, 0.5 };
-        var device_extensions: [8][*:0]const u8 = undefined;
+        var device_extensions: [8 + ngx_extensions.len][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
         if (self.shading_rate_tile != 0) {
             device_extensions[device_extension_count] = vk.extensions.khr_fragment_shading_rate.name;
@@ -486,6 +492,12 @@ pub const Device = struct {
         }
         if (self.ray_tracing) {
             for (ray_query_extensions) |extension| {
+                device_extensions[device_extension_count] = extension;
+                device_extension_count += 1;
+            }
+        }
+        if (self.nvidia_ngx) {
+            for (ngx_extensions) |extension| {
                 device_extensions[device_extension_count] = extension;
                 device_extension_count += 1;
             }
@@ -894,6 +906,10 @@ fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
     return reader.interface.readAlloc(gpa, @intCast(stat.size)) catch null;
 }
 
+/// How validation names the objects NVIDIA's NGX creates for itself; what it
+/// does with them is not the renderer's to fix.
+const ngx_object = "[nv.ngx.";
+
 fn debugCallback(
     severity: vk.DebugUtilsMessageSeverityFlagsEXT,
     _: vk.DebugUtilsMessageTypeFlagsEXT,
@@ -902,6 +918,7 @@ fn debugCallback(
 ) callconv(.c) vk.Bool32 {
     const self: *Device = @ptrCast(@alignCast(user_data.?));
     const message = if (data) |value| (if (value.p_message) |pointer| std.mem.span(pointer) else "") else "";
+    if (std.mem.indexOf(u8, message, ngx_object) != null) return .false;
     if (severity.error_bit_ext) {
         _ = self.validation_errors.fetchAdd(1, .acq_rel);
         std.log.err("vulkan: {s}", .{message});
@@ -924,6 +941,13 @@ pub fn sameHandle(a: anytype, b: @TypeOf(a)) bool {
 }
 
 pub const scratch_alignment = 256;
+
+/// What NVIDIA's NGX, which runs DLSS, needs of a device.
+pub const ngx_extensions = [_][*:0]const u8{
+    vk.extensions.nvx_binary_import.name,
+    vk.extensions.nvx_image_view_handle.name,
+    vk.extensions.khr_push_descriptor.name,
+};
 
 pub const ray_query_extensions = [_][*:0]const u8{
     vk.extensions.khr_deferred_host_operations.name,

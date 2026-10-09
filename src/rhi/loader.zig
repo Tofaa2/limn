@@ -57,6 +57,11 @@ pub fn instance(io: std.Io, handle: vk.Instance) dispatch.InstanceWrapper {
     return result;
 }
 
+/// Vulkan's `vkGetInstanceProcAddr`.
+pub fn instanceProcAddr() *const anyopaque {
+    return @ptrCast(c.vkGetInstanceProcAddr.?);
+}
+
 /// Vulkan's `vkGetDeviceProcAddr`.
 pub fn deviceProcAddr() *const anyopaque {
     return @ptrCast(c.vkGetDeviceProcAddr.?);

@@ -15,10 +15,11 @@
 //!   Up/Down  the share of the window's size the scene is drawn at
 //!   V        variable-rate shading: flat stretches shaded once for
 //!            every 2 by 2 pixels
+//!   6        NVIDIA DLSS, on an NVIDIA GPU after `zig build dlss-sdk`
 //!   G        FSR 3 frame generation (with 5, in a window)
 //!   A/D      orbit the camera
 //!
-//! `--mode N` (1 to 5), `--scale X`, `--vrs 1`, `--framegen 1`. `--frames N`,
+//! `--mode N` (1 to 6), `--scale X`, `--vrs 1`, `--framegen 1`. `--frames N`,
 //! `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");
@@ -44,7 +45,8 @@ pub fn main(init: std.process.Init) !void {
                 2 => .temporal,
                 3 => .fsr,
                 4 => .fsr2,
-                else => .fsr3,
+                5 => .fsr3,
+                else => .dlss,
             };
             if (std.mem.eql(u8, argument, "--scale")) {
                 const wanted = try std.fmt.parseFloat(f32, arguments.next() orelse return error.MissingArgument);
@@ -135,6 +137,7 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_3)) mode = .fsr;
         if (stage.keyPressed(glfw.GLFW_KEY_4)) mode = .fsr2;
         if (stage.keyPressed(glfw.GLFW_KEY_5)) mode = .fsr3;
+        if (stage.keyPressed(glfw.GLFW_KEY_6)) mode = .dlss;
         if (stage.keyPressed(glfw.GLFW_KEY_UP) and scale_index + 1 < scales.len) scale_index += 1;
         if (stage.keyPressed(glfw.GLFW_KEY_DOWN) and scale_index > 0) scale_index -= 1;
         if (stage.keyPressed(glfw.GLFW_KEY_V)) coarse_shading = !coarse_shading;
@@ -156,6 +159,7 @@ pub fn main(init: std.process.Init) !void {
             .fsr => "FidelityFX Super Resolution 1",
             .fsr2 => "FidelityFX Super Resolution 2",
             .fsr3 => if (frame_generation) "FidelityFX Super Resolution 3 with frame generation" else "FidelityFX Super Resolution 3",
+            .dlss => "NVIDIA DLSS",
         }, .{ 24, 20 }, .{ .size = 20 });
         try list.text(font, try std.fmt.bufPrint(&text, "drawn at {d} x {d}, shown at {d} x {d}\n{d:.2} ms GPU · shading {d:.2} ms · {d:.0} fps rendered, {d:.0} shown", .{
             @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(tick.size[0])) * scale))),
@@ -167,7 +171,7 @@ pub fn main(init: std.process.Init) !void {
             stage.fps,
             stage.shown_fps,
         }), .{ 24, 50 }, .{ .size = 15 });
-        try list.text(font, try std.fmt.bufPrint(&text, "1-5 upscaler · Up/Down size · V coarse shading {s} · G frame generation · A/D orbit", .{if (coarse_shading) "on" else "off"}), .{ 24, 100 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
+        try list.text(font, try std.fmt.bufPrint(&text, "1-6 upscaler · Up/Down size · V coarse shading {s} · G frame generation · A/D orbit", .{if (coarse_shading) "on" else "off"}), .{ 24, 100 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
 
         const eye = math.Vec3{ @sin(orbit) * 13, 4.2, @cos(orbit) * 13 };
         try stage.end(try renderer.render(.{

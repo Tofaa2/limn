@@ -12,6 +12,7 @@ layout(push_constant, scalar) uniform Push {
     uint facing_texture;
     uint gloss_texture;
     uint gloss_gathered_texture;
+    uint lamp_texture;
 } push;
 
 const vec2 gathered_takes_over = vec2(128.0, 1024.0);
@@ -69,6 +70,7 @@ void main() {
     vec4 steady_texel = texelFetch(TEX(push.steady_texture, nearest), pixel, 0);
     float frames = max(steady_texel.a, 1.0);
     vec3 grainy = texelFetch(TEX(push.color_texture, nearest), pixel, 0).rgb;
+    vec3 lamp = texelFetch(TEX(push.lamp_texture, nearest), pixel, 0).rgb;
     vec3 gloss = vec3(0.0);
     if (push.mode == mode_last || push.mode == mode_none) {
         vec4 gathered = texelFetch(TEX(push.gloss_gathered_texture, nearest), pixel, 0);
@@ -77,13 +79,13 @@ void main() {
     }
     bool colored = dot(guide, vec3(1.0)) > 0.0;
     if (push.mode == mode_none) {
-        out_color = vec4(steady_texel.rgb + grainy * (colored ? divisor(guide) : vec3(1.0)) + gloss, 1.0);
+        out_color = vec4(steady_texel.rgb + (grainy + lamp) * (colored ? divisor(guide) : vec3(1.0)) + gloss, 1.0);
         return;
     }
     float reach;
     vec3 position = positionAt(frame, pixel, reach);
     if (!colored || reach <= 0.0) {
-        out_color = push.mode == mode_last ? vec4(steady_texel.rgb + grainy * (colored ? divisor(guide) : vec3(1.0)) + gloss, 1.0) : vec4(grainy, 0.0);
+        out_color = push.mode == mode_last ? vec4(steady_texel.rgb + (grainy + lamp) * (colored ? divisor(guide) : vec3(1.0)) + gloss, 1.0) : vec4(grainy, 0.0);
         return;
     }
     float reach_a;
@@ -165,5 +167,5 @@ void main() {
     vec3 smoothed = weight_total > 1e-6 ? total / weight_total : own;
     smoothed = mix(smoothed, traced, clamp(frames / 4096.0, 0.0, 1.0));
     if (any(isnan(smoothed)) || any(isinf(smoothed))) smoothed = any(isnan(traced)) || any(isinf(traced)) ? vec3(0.0) : traced;
-    out_color = push.mode == mode_last ? vec4(steady_texel.rgb + smoothed * divisor(guide) + gloss, 1.0) : vec4(smoothed, doubt);
+    out_color = push.mode == mode_last ? vec4(steady_texel.rgb + (smoothed + lamp) * divisor(guide) + gloss, 1.0) : vec4(smoothed, doubt);
 }

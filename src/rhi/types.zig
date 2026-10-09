@@ -59,6 +59,9 @@ pub const DeviceDesc = struct {
     debug_names: bool = false,
     /// Prefer an HDR10 surface (10-bit, PQ, Rec.2020) when there is one.
     hdr_output: bool = false,
+    /// Enable the extensions NVIDIA's NGX asks for, when the device has them;
+    /// check `Device.nvidia_ngx`.
+    nvidia_ngx: bool = false,
 };
 
 /// `unorm` reads as 0..1; `srgb` is decoded to linear when sampled and
@@ -340,6 +343,9 @@ pub const TextureState = enum {
     copy_src,
     copy_dst,
     storage,
+    /// Like `storage`, for code outside the encoder that may read and write
+    /// the texture by any means.
+    external,
     /// Set by `beginRendering`.
     shading_rate,
     /// Backbuffer only; set by the device on submit.
