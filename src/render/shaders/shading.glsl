@@ -373,7 +373,39 @@ vec3 sphereLight(Surface surface, vec3 to_light, float distance_to_light, float 
     return surfaceLight(diffuse_only, l, radiance) + surfaceLight(specular_only, specular_l, radiance) * normalization;
 }
 
-float soft_shadow_history = -1.0;
+uint soft_history_texture = INVALID_ID;
+vec2 soft_history_uv = vec2(0.0);
+uint soft_history_depth_texture = INVALID_ID;
+float soft_history_depth = 0.0;
+float soft_history_slack = 0.0;
+
+float softShadowHistory(FrameConstants frame) {
+    if (soft_history_texture == INVALID_ID) return -1.0;
+    vec2 previous_uv = soft_history_uv;
+    if (any(lessThan(previous_uv, vec2(0.0))) || any(greaterThan(previous_uv, vec2(1.0)))) return -1.0;
+    ivec2 history_size = textureSize(TEX(soft_history_texture, frame.sampler_nearest_clamp), 0);
+    ivec2 at = ivec2(previous_uv * vec2(history_size));
+    ivec2 last = history_size - 1;
+    float expected = soft_history_depth_texture != INVALID_ID ? soft_history_depth : 0.0;
+    ivec2 depth_size = soft_history_depth_texture != INVALID_ID ? textureSize(TEX(soft_history_depth_texture, frame.sampler_nearest_clamp), 0) : ivec2(1);
+    vec2 scale = vec2(depth_size) / vec2(history_size);
+    ivec2 depth_last = depth_size - 1;
+    const ivec2 offsets[5] = ivec2[](ivec2(0, 0), ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float total = 0.0;
+    float weight = 0.0;
+    for (int i = 0; i < 5; i++) {
+        float value = texelFetch(TEX(soft_history_texture, frame.sampler_nearest_clamp), clamp(at + offsets[i], ivec2(0), last), 0).a;
+        if (value > 1.0) continue;
+        if (expected > 0.0) {
+            float there = linearDepth(texelFetch(TEX(soft_history_depth_texture, frame.sampler_nearest_clamp), clamp(ivec2((vec2(at + offsets[i]) + 0.5) * scale), ivec2(0), depth_last), 0).r, frame.near);
+            if (abs(there - expected) > soft_history_slack) continue;
+        }
+        float tap = i == 0 ? 2.0 : 1.0;
+        total += value * tap;
+        weight += tap;
+    }
+    return weight > 0.0 ? total / weight : -1.0;
+}
 float soft_shadow_visibility = 2.0;
 
 vec3 localLights(FrameConstants frame, Surface surface, vec2 pixel, float noise) {
@@ -472,7 +504,8 @@ vec3 localLights(FrameConstants frame, Surface surface, vec2 pixel, float noise)
     }
     if (soft_weight > 0.0) {
         float now = soft_lit / soft_weight;
-        soft_shadow_visibility = soft_shadow_history >= 0.0 ? mix(soft_shadow_history, now, 0.12) : now;
+        float before = softShadowHistory(frame);
+        soft_shadow_visibility = before >= 0.0 ? mix(before, now, 0.12) : now;
         color += soft_light * soft_shadow_visibility;
     }
     return color;

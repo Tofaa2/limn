@@ -24,8 +24,8 @@ pub const Emitters = struct {
     /// Adds a GPU-simulated particle emitter to a scene.
     pub fn create(emitters: *Emitters, scene: Scene, desc: EmitterDesc) !Emitter {
         const self = emitters.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         return createEmitterLocked(self, scene, desc);
     }
 
@@ -33,8 +33,8 @@ pub const Emitters = struct {
     /// farther; dead slots come last). Waits for the GPU. Caller frees.
     pub fn sortKeys(emitters: *Emitters, gpa: std.mem.Allocator, emitter: Emitter) ![]f32 {
         const self = emitters.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.emitters.table.get(emitter) orelse return error.InvalidEmitter;
         const order = data.order orelse return error.EmitterNotSorted;
         const bytes = try self.device.readBuffer(gpa, order, @as(u64, data.order_count) * 8);
@@ -47,16 +47,16 @@ pub const Emitters = struct {
     /// Replaces an emitter's description; `capacity` is ignored.
     pub fn set(emitters: *Emitters, emitter: Emitter, desc: EmitterDesc) void {
         const self = emitters.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         if (self.emitters.table.get(emitter)) |data| data.desc = desc;
     }
 
     /// Live particles vanish at once. A stale handle is ignored.
     pub fn destroy(emitters: *Emitters, emitter: Emitter) void {
         const self = emitters.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         destroyEmitterLocked(self, emitter);
     }
 };

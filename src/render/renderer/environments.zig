@@ -35,8 +35,8 @@ pub const Environments = struct {
     /// A BC6H cube's `brightest_direction` stays straight up.
     pub fn load(environments: *Environments, path: []const u8, max_radiance: f32) !Environment {
         const self = environments.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const job = try self.gpa.create(EnvironmentJob);
         errdefer self.gpa.destroy(job);
         job.* = .{ .gpa = self.options.job_allocator orelse std.heap.smp_allocator, .io = self.io, .path = try self.gpa.dupe(u8, path) };
@@ -50,8 +50,8 @@ pub const Environments = struct {
     /// Creates an environment from a computed clear sky; ready on return.
     pub fn createSky(environments: *Environments, desc: SkyDesc) !Environment {
         const self = environments.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const environment = try self.environments.table.insert(.{ .max_radiance = 64, .sky_desc = desc });
         errdefer _ = self.environments.table.remove(environment);
         const entry = self.environments.table.get(environment).?;
@@ -68,8 +68,8 @@ pub const Environments = struct {
     /// of GPU time).
     pub fn setSky(environments: *Environments, environment: Environment, desc: SkyDesc) void {
         const self = environments.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const entry = self.environments.table.get(environment) orelse return;
         if (entry.sky_desc == null) return;
         if (std.meta.eql(entry.sky_desc.?, desc)) return;
@@ -82,16 +82,16 @@ pub const Environments = struct {
     /// thread.
     pub fn state(environments: *Environments, environment: Environment) AssetState {
         const self = environments.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         return (self.environments.table.get(environment) orelse return .failed).state;
     }
 
     /// Null until the environment is ready.
     pub fn info(environments: *Environments, environment: Environment) ?EnvironmentInfo {
         const self = environments.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const entry = self.environments.table.get(environment) orelse return null;
         return if (entry.state == .ready) .{ .brightest_direction = entry.brightest_direction } else null;
     }
@@ -100,8 +100,8 @@ pub const Environments = struct {
     /// set draw as if they had none.
     pub fn destroy(environments: *Environments, environment: Environment) void {
         const self = environments.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         var removed = self.environments.table.remove(environment) orelse return;
         if (removed.state == .loading) self.loading_count -= 1;
         freeEnvironment(self, &removed);

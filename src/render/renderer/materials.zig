@@ -59,8 +59,8 @@ pub const Materials = struct {
     /// reflection targets; null uses `spirv` there too.
     pub fn createShader(materials: *Materials, spirv: []const u8, plain_spirv: ?[]const u8) !MaterialShader {
         const self = materials.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         for (self.materials.shaders[1..], 1..) |*slot, index| {
             if (slot.* != null) continue;
             const plain = try self.device.createGraphicsPipeline(.{
@@ -89,8 +89,8 @@ pub const Materials = struct {
     /// Materials still using the shader fall back to the standard material.
     pub fn destroyShader(materials: *Materials, shader: MaterialShader) void {
         const self = materials.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         if (shader.slot == 0 or shader.slot >= self.materials.shaders.len) return;
         if (self.materials.shaders[shader.slot]) |pipelines| {
             self.device.destroyPipeline(pipelines.plain);
@@ -104,9 +104,9 @@ pub const Materials = struct {
     /// model must have finished loading.
     pub fn setShader(materials: *Materials, model: Model, material: ?u32, shader: ?MaterialShader, params: [4]f32) !void {
         const self = materials.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const entry = self.models.table.get(model) orelse return error.InvalidModel;
+        self.lock();
+        defer self.unlock();
+        const entry = self.models.table.get(model) orelse return;
         if (entry.state != .ready) return error.ModelNotReady;
         const records = entry.source.?.materials;
         if (material) |index| if (index >= records.len) return error.InvalidMaterial;
@@ -126,9 +126,9 @@ pub const Materials = struct {
     /// must outlive the model's use of them.
     pub fn setTextures(materials: *Materials, model: Model, material: ?u32, textures: MaterialTextures) !void {
         const self = materials.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const entry = self.models.table.get(model) orelse return error.InvalidModel;
+        self.lock();
+        defer self.unlock();
+        const entry = self.models.table.get(model) orelse return;
         const source = entry.source orelse return error.ModelNotReady;
         const count = source.materials.len;
         if (material) |index| if (index >= count) return error.InvalidMaterial;

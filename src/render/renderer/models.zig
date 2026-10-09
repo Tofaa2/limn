@@ -48,8 +48,8 @@ pub const Models = struct {
     /// it at once; they appear when it is ready.
     pub fn load(models: *Models, path: []const u8) !Model {
         const self = models.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const job = try self.gpa.create(ModelJob);
         errdefer self.gpa.destroy(job);
         job.* = .{
@@ -77,8 +77,8 @@ pub const Models = struct {
         const self = models.renderer();
         var source = try gltf.fromMeshes(self.options.job_allocator orelse std.heap.smp_allocator, meshes, lodOptions(self));
         errdefer source.deinit();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const model = try self.models.table.insert(.{ .source = source });
         self.loading_count += 1;
         return model;
@@ -87,24 +87,24 @@ pub const Models = struct {
     /// A handle that names no model reports `.failed`. Safe from any thread.
     pub fn state(models: *Models, model: Model) AssetState {
         const self = models.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         return (self.models.table.get(model) orelse return .failed).state;
     }
 
     /// The error a failed load ended with, if any.
     pub fn loadError(models: *Models, model: Model) ?anyerror {
         const self = models.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         return (self.models.table.get(model) orelse return error.InvalidModel).failure;
     }
 
     /// Null until the model is ready.
     pub fn info(models: *Models, model: Model) ?ModelInfo {
         const self = models.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const entry = self.models.table.get(model) orelse return null;
         return if (entry.state == .ready) entry.info else null;
     }
@@ -112,8 +112,8 @@ pub const Models = struct {
     /// Number of animation clips; 0 until the model is ready.
     pub fn animationCount(models: *Models, model: Model) u32 {
         const self = models.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const entry = self.models.table.get(model) orelse return 0;
         if (entry.state != .ready) return 0;
         return @intCast(entry.source.?.animations.len);
@@ -123,8 +123,8 @@ pub const Models = struct {
     /// name is not copied: valid until the model is destroyed.
     pub fn animationInfo(models: *Models, model: Model, index: u32) ?AnimationInfo {
         const self = models.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const entry = self.models.table.get(model) orelse return null;
         if (entry.state != .ready or index >= entry.source.?.animations.len) return null;
         const clip = entry.source.?.animations[index];
@@ -135,8 +135,8 @@ pub const Models = struct {
     /// if there is none.
     pub fn findNode(models: *Models, model: Model, name: []const u8) ?u32 {
         const self = models.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const entry = self.models.table.get(model) orelse return null;
         if (entry.state != .ready) return null;
         for (entry.source.?.nodes, 0..) |node, index| {
@@ -149,8 +149,8 @@ pub const Models = struct {
     /// space. Times past the clip's length count whole loops.
     pub fn rootMotion(models: *Models, model: Model, animation_index: u32, node: u32, from: f32, to: f32) !Vec3 {
         const self = models.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const entry = self.models.table.get(model) orelse return error.InvalidModel;
         if (entry.state != .ready) return error.ModelNotReady;
         const source = &entry.source.?;
@@ -164,8 +164,8 @@ pub const Models = struct {
     /// Null until loaded or if there is none.
     pub fn findAnimation(models: *Models, model: Model, name: []const u8) ?u32 {
         const self = models.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const entry = self.models.table.get(model) orelse return null;
         if (entry.state != .ready) return null;
         for (entry.source.?.animations, 0..) |clip, index| {
@@ -177,9 +177,9 @@ pub const Models = struct {
     /// Fails with `error.ModelInUse` while any entity still references it.
     pub fn destroy(models: *Models, model: Model) !void {
         const self = models.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const entry = self.models.table.get(model) orelse return error.InvalidModel;
+        self.lock();
+        defer self.unlock();
+        const entry = self.models.table.get(model) orelse return;
         if (entry.references != 0) return error.ModelInUse;
         var removed = self.models.table.remove(model).?;
         if (removed.state == .loading) self.loading_count -= 1;
@@ -374,9 +374,20 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
             count += 1;
             if (source.nodes[node].parent) |parent| needed[parent] = true;
         }
+        entry.node_moves = try gpa.alloc(bool, source.nodes.len);
+        const moves = entry.node_moves;
+        @memset(moves, false);
+        for (source.animations) |clip| for (clip.channels) |channel| {
+            if (channel.node < moves.len and channel.path != .weights) moves[channel.node] = true;
+        };
+        count = 0;
+        for (entry.order) |node| {
+            if (source.nodes[node].parent) |parent| moves[node] = moves[node] or moves[parent];
+            if (needed[node] and moves[node]) count += 1;
+        }
         entry.pose_order = try gpa.alloc(u32, count);
         var next: usize = 0;
-        for (entry.order) |node| if (needed[node]) {
+        for (entry.order) |node| if (needed[node] and moves[node]) {
             entry.pose_order[next] = node;
             next += 1;
         };
@@ -586,6 +597,8 @@ pub fn freeModel(self: *Renderer, entry: *ModelEntry) void {
     gpa.free(entry.material_images);
     entry.material_images = &.{};
     gpa.free(entry.streams);
+    gpa.free(entry.stream_parts);
+    entry.stream_parts = &.{};
     entry.streams = &.{};
     entry.streamed = 0;
     for (entry.textures) |texture| if (texture) |value| self.device.destroyTexture(value);
@@ -623,9 +636,11 @@ pub fn freeModel(self: *Renderer, entry: *ModelEntry) void {
     gpa.free(entry.meshes);
     gpa.free(entry.order);
     gpa.free(entry.pose_order);
+    gpa.free(entry.node_moves);
     gpa.free(entry.node_world);
     entry.meshes = &.{};
     entry.order = &.{};
     entry.pose_order = &.{};
+    entry.node_moves = &.{};
     entry.node_world = &.{};
 }

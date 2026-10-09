@@ -29,8 +29,8 @@ pub const Hairs = struct {
     /// Adds strands of hair, fur or grass to a scene (see `HairDesc`).
     pub fn create(hairs: *Hairs, scene: Scene, desc: HairDesc) !Hair {
         const self = hairs.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
         if (desc.points_per_strand < 2 or desc.points.len < desc.points_per_strand or desc.points.len % desc.points_per_strand != 0) return error.InvalidHair;
         if (desc.simulation != null and desc.points_per_strand > 64) return error.TooManyPointsPerStrand;
@@ -78,8 +78,8 @@ pub const Hairs = struct {
         const halves = try self.gpa.alloc(f16, field.distances.len);
         defer self.gpa.free(halves);
         for (halves, field.distances) |*half, distance| half.* = @floatCast(distance);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const texture = try self.device.createTexture(.{
             .name = "collision field",
             .width = field.size,
@@ -98,8 +98,8 @@ pub const Hairs = struct {
     /// A stale handle is ignored.
     pub fn destroyCollisionField(hairs: *Hairs, field: CollisionField) void {
         const self = hairs.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const removed = self.hairs.fields.remove(field) orelse return;
         self.device.destroyTexture(removed.texture);
     }
@@ -108,8 +108,8 @@ pub const Hairs = struct {
     /// it as combed. A stale handle is ignored.
     pub fn setSimulation(hairs: *Hairs, hair: Hair, simulation: ?HairSimulation) void {
         const self = hairs.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const state = self.hairs.table.get(hair) orelse return;
         setHairMotion(state, simulation);
         if (simulation == null) if (state.moving) |moving| {
@@ -122,8 +122,8 @@ pub const Hairs = struct {
     /// Sets the hair-to-world transform. A stale handle is ignored.
     pub fn setTransform(hairs: *Hairs, hair: Hair, transform: Mat4) void {
         const self = hairs.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const state = self.hairs.table.get(hair) orelse return;
         state.desc.transform = transform;
     }
@@ -131,8 +131,8 @@ pub const Hairs = struct {
     /// A stale handle is ignored.
     pub fn destroy(hairs: *Hairs, hair: Hair) void {
         const self = hairs.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const removed = self.hairs.table.remove(hair) orelse return;
         freeHair(self, removed);
         const scene = self.scenes.table.get(removed.scene) orelse return;

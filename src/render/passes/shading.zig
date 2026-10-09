@@ -237,6 +237,7 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
         shading_rate = rates;
     };
     cmd.beginScope("shading");
+    if (view.history_valid) cmd.transition(view.previous_depth, .shader_read);
     const reflections_on = settings.screen_space_reflections and !debugging;
     if (view.reflections) |*targets| {
         if (reflections_on) std.mem.swap(rhi.Texture, &targets.traced, &targets.history) else targets.history_valid = false;
@@ -255,7 +256,7 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
             .{ .texture = view.motion, .load = .discard },
         }, .shading_rate = shading_rate });
     }
-    const ShadePush = extern struct { frame: u64, visibility: u32, ao: u32, debug_view: u32, gi: u32, material_shader: u32, shadow_history: u32, bounce: u32, bounce_strength: f32 };
+    const ShadePush = extern struct { frame: u64, visibility: u32, ao: u32, debug_view: u32, gi: u32, material_shader: u32, shadow_history: u32, bounce: u32, bounce_strength: f32, shadow_depth: u32 = gpu.invalid_id };
     var shade_push = ShadePush{
         .frame = frame_address,
         .visibility = device.textureIndex(view.visibility),
@@ -270,6 +271,7 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
         else
             gpu.invalid_id,
     };
+    if (shade_push.shadow_history != gpu.invalid_id) shade_push.shadow_depth = device.textureIndex(view.previous_depth);
     for (renderer.materials.shaders, renderer.materials.shader_users, 0..) |shader, users, slot| {
         if (shader != null and users != 0) shade_push.material_shader |= @as(u32, 1) << @intCast(slot);
     }

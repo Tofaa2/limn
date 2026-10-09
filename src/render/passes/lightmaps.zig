@@ -39,7 +39,7 @@ pub fn bakeLightmaps(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.pushConstants(extern struct { frame: u64, tlas: u64, transform: [16]f32, vertex_offset: u32, gathered: u32, rounds: u32, rays: u32, reach: f32, pad: u32 = 0 }{
                 .frame = p.frame_address,
                 .tlas = device.accelerationAddress(tlas),
-                .transform = math.mul(entity.transform, model.node_world[instance.node]),
+                .transform = math.mul(renderer.transformOf(handle), model.node_world[instance.node]),
                 .vertex_offset = mesh.vertex_offset,
                 .gathered = device.textureIndex(from),
                 .rounds = lightmap.rounds,
@@ -58,6 +58,7 @@ pub fn bakeLightmaps(renderer: *Renderer, p: *const ScenePass) !void {
         cmd.transition(lightmap.shown, .shader_read);
         cmd.endScope();
         lightmap.rounds += 1;
+        if (lightmap.rounds == 1) renderer.restyleEntity(handle);
     }
     scene.lightmaps_baking = baking;
 }

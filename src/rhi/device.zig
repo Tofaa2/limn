@@ -24,7 +24,7 @@ pub const frames_in_flight = 2;
 pub const max_mip_levels = 16;
 /// Regions per frame `CommandEncoder.beginScope` can time; further ones
 /// get no timing.
-pub const max_timing_scopes = 48;
+pub const max_timing_scopes = 96;
 /// Bytes of the push constant block shared by every pipeline and stage.
 pub const push_constant_size = 256;
 const texture_capacity = 16384;

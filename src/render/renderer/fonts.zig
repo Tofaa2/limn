@@ -41,8 +41,8 @@ pub const Fonts = struct {
         errdefer self.gpa.destroy(font);
         font.* = try font_module.load(self.gpa, bytes, ranges);
         errdefer font.deinit();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         try registerFont(self, font);
         return font;
     }
@@ -73,8 +73,8 @@ pub const Fonts = struct {
     /// `features`.
     pub fn prepareTextWith(fonts: *Fonts, font: *const Font, text: []const u8, language: ?[4]u8, features: []const [4]u8) !void {
         const self = fonts.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const index = for (self.fonts.list.items, 0..) |candidate, index| {
             if (candidate == font) break index;
         } else return error.UnknownFont;
@@ -148,8 +148,8 @@ pub const Fonts = struct {
     /// The built-in font cannot be destroyed.
     pub fn destroy(fonts: *Fonts, font: *const Font) void {
         const self = fonts.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         if (font == @as(*const Font, self.fonts.default_font)) return;
         for (self.fonts.list.items, 0..) |candidate, index| {
             if (@as(*const Font, candidate) != font) continue;

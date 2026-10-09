@@ -47,9 +47,9 @@ pub const Scenes = struct {
     /// views with `Settings.clouds` on.
     pub fn setClouds(scenes: *Scenes, scene: Scene, clouds: ?CloudDesc) !void {
         const self = scenes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+        self.lock();
+        defer self.unlock();
+        const data = self.scenes.table.get(scene) orelse return;
         data.clouds = clouds;
     }
 
@@ -57,8 +57,8 @@ pub const Scenes = struct {
     /// right now, if any.
     pub fn cloudFlash(scenes: *Scenes, scene: Scene) ?CloudFlash {
         const self = scenes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.scenes.table.get(scene) orelse return null;
         if (data.flash_brightness <= 0) return null;
         return .{
@@ -75,9 +75,9 @@ pub const Scenes = struct {
     /// lighting.
     pub fn setDecals(scenes: *Scenes, scene: Scene, decals: []const DecalDesc) !void {
         const self = scenes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+        self.lock();
+        defer self.unlock();
+        const data = self.scenes.table.get(scene) orelse return;
         if (decals.len > max_decals) return error.TooManyDecals;
         data.decals.clearRetainingCapacity();
         try data.decals.appendSlice(self.gpa, decals);
@@ -87,19 +87,20 @@ pub const Scenes = struct {
     /// environment.
     pub fn create(scenes: *Scenes) !Scene {
         const self = scenes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         return self.scenes.table.insert(.{});
     }
 
     /// Destroys the scene and every entity in it.
     pub fn destroy(scenes: *Scenes, scene: Scene) void {
         const self = scenes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         var removed = self.scenes.table.remove(scene) orelse return;
         for (removed.entities.items) |entity| {
             const data = self.entities.table.remove(entity) orelse continue;
+            self.entity_marks.items[entity.index] = .{};
             if (self.models.table.get(data.model)) |model| model.references -= 1;
             freeEntityStorage(self, data);
         }
@@ -109,16 +110,16 @@ pub const Scenes = struct {
     /// Replaces the scene's sun. `intensity` 0 turns it and its shadows off.
     pub fn setSun(scenes: *Scenes, scene: Scene, sun: Sun) void {
         const self = scenes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         if (self.scenes.table.get(scene)) |data| data.sun = sun;
     }
 
     /// Sets the HDR environment used for the sky and image-based lighting.
     pub fn setEnvironment(scenes: *Scenes, scene: Scene, environment: ?Environment, intensity: f32) void {
         const self = scenes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         if (self.scenes.table.get(scene)) |data| {
             data.environment = environment;
             data.environment_intensity = intensity;
@@ -128,9 +129,9 @@ pub const Scenes = struct {
     /// Replaces the scene's point and spot lights.
     pub fn setLights(scenes: *Scenes, scene: Scene, lights: []const Light) !void {
         const self = scenes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+        self.lock();
+        defer self.unlock();
+        const data = self.scenes.table.get(scene) orelse return;
         data.lights.clearRetainingCapacity();
         try data.lights.appendSlice(self.gpa, lights);
         data.lights_version += 1;
@@ -141,17 +142,18 @@ pub const Scenes = struct {
     /// and world-unit settings are the caller's to shift.
     pub fn shift(scenes: *Scenes, scene: Scene, offset: Vec3) !void {
         const self = scenes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+        self.lock();
+        defer self.unlock();
+        const data = self.scenes.table.get(scene) orelse return;
         inline for (0..3) |axis| data.origin[axis] -= offset[axis];
         for (data.entities.items) |item| {
-            const entity = self.entities.table.get(item) orelse continue;
+            if (self.markOf(item) == null) continue;
             inline for (0..3) |axis| {
-                entity.transform[12 + axis] += offset[axis];
-                entity.previous_transform[12 + axis] += offset[axis];
+                self.entity_transforms.items[item.index][12 + axis] += offset[axis];
+                self.entity_previous.items[item.index][12 + axis] += offset[axis];
             }
         }
+        data.records_valid = false;
         for (data.groups.items) |item| {
             const group = self.instances.table.get(item) orelse continue;
             for (group.transforms) |*transform| {
@@ -190,8 +192,8 @@ pub const Scenes = struct {
     /// `scenes.shift` offset.
     pub fn origin(scenes: *Scenes, scene: Scene) [3]f64 {
         const self = scenes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         return if (self.scenes.table.get(scene)) |data| data.origin else .{ 0, 0, 0 };
     }
 
@@ -199,8 +201,8 @@ pub const Scenes = struct {
     /// from the scene's static geometry (the default).
     pub fn setGiVolume(scenes: *Scenes, scene: Scene, bounds: ?[2]Vec3) void {
         const self = scenes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         if (self.scenes.table.get(scene)) |data| data.gi_bounds = bounds;
     }
 };
@@ -256,6 +258,17 @@ pub fn freeScene(self: *Renderer, scene: *SceneData) void {
     scene.transparent.deinit(self.gpa);
     scene.static_transparent.deinit(self.gpa);
     scene.layout.deinit(self.gpa);
+    scene.posed.deinit(self.gpa);
+    scene.entries.deinit(self.gpa);
+    scene.spheres.deinit(self.gpa);
+    scene.blended.deinit(self.gpa);
+    scene.glowing.deinit(self.gpa);
+    scene.chunk_bounds.deinit(self.gpa);
+    scene.chunk_stale.deinit(self.gpa);
+    scene.edited.deinit(self.gpa);
+    scene.settling.deinit(self.gpa);
+    if (scene.previous) |buffer| self.device.destroyBuffer(buffer);
+    if (scene.tlas_instances) |buffer| self.device.destroyBuffer(buffer);
     if (scene.refs) |buffer| self.device.destroyBuffer(buffer);
     scene.static_ranges.deinit(self.gpa);
     if (scene.static_cull) |buffer| self.device.destroyBuffer(buffer);
@@ -284,21 +297,21 @@ pub const Entities = struct {
     /// `error.InvalidScene` or `error.InvalidModel` for a stale handle.
     pub fn spawn(entities: *Entities, scene: Scene, desc: EntityDesc) !Entity {
         const self = entities.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const scene_data = self.scenes.table.get(scene) orelse return error.InvalidScene;
         const model = self.models.table.get(desc.model) orelse return error.InvalidModel;
         const entity = try self.entities.table.insert(.{
             .scene = scene,
             .model = desc.model,
-            .transform = desc.transform,
-            .previous_transform = desc.transform,
             .visible = desc.visible,
             .tint = packTint(desc.tint),
             .params = desc.params,
             .receive_decals = desc.receive_decals,
         });
         errdefer _ = self.entities.table.remove(entity);
+        try self.markEntity(entity, scene, desc.transform);
+        errdefer self.entity_marks.items[entity.index] = .{};
         try scene_data.entities.append(self.gpa, entity);
         model.references += 1;
         scene_data.layout_dirty = true;
@@ -309,9 +322,10 @@ pub const Entities = struct {
     /// ignored.
     pub fn despawn(entities: *Entities, entity: Entity) void {
         const self = entities.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.entities.table.remove(entity) orelse return;
+        self.entity_marks.items[entity.index] = .{};
         if (self.scenes.table.get(data.scene)) |scene| {
             for (scene.entities.items, 0..) |candidate, index| if (std.meta.eql(candidate, entity)) {
                 _ = scene.entities.orderedRemove(index);
@@ -327,36 +341,47 @@ pub const Entities = struct {
     /// as motion; use `teleport` for a jump that should not.
     pub fn setTransform(entities: *Entities, entity: Entity, transform: Mat4) void {
         const self = entities.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.entities.table.get(entity)) |data| data.transform = transform;
+        if (!self.tryLock()) return self.queueEdit(entity, .{ .transform = transform });
+        defer self.unlock();
+        self.moveEntity(entity, transform, false);
+    }
+
+    /// `setTransform` for many entities at once; the slices pair up.
+    pub fn setTransforms(entities: *Entities, handles: []const Entity, transforms: []const Mat4) void {
+        const self = entities.renderer();
+        if (!self.tryLock()) return queueTransforms(self, handles, transforms);
+        defer self.unlock();
+        for (handles, transforms) |entity, transform| self.moveEntity(entity, transform, false);
     }
 
     /// Like `setTransform`, but resets motion history.
     pub fn teleport(entities: *Entities, entity: Entity, transform: Mat4) void {
         const self = entities.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.entities.table.get(entity)) |data| {
-            data.transform = transform;
-            data.previous_transform = transform;
-        }
+        if (!self.tryLock()) return self.queueEdit(entity, .{ .teleport = transform });
+        defer self.unlock();
+        self.moveEntity(entity, transform, true);
     }
 
     /// Changes the color an entity's materials are multiplied by.
     pub fn setTint(entities: *Entities, entity: Entity, tint: [3]f32) void {
         const self = entities.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.entities.table.get(entity)) |data| data.tint = packTint(tint);
+        if (!self.tryLock()) return self.queueEdit(entity, .{ .tint = packTint(tint) });
+        defer self.unlock();
+        const data = self.entities.table.get(entity) orelse return;
+        if (data.tint == packTint(tint)) return;
+        data.tint = packTint(tint);
+        self.restyleEntity(entity);
     }
 
     /// Sets the entity's `MaterialContext.instance_params`.
     pub fn setParams(entities: *Entities, entity: Entity, params: [4]f32) void {
         const self = entities.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.entities.table.get(entity)) |data| data.params = params;
+        if (!self.tryLock()) return self.queueEdit(entity, .{ .params = params });
+        defer self.unlock();
+        const data = self.entities.table.get(entity) orelse return;
+        if (std.mem.eql(f32, &data.params, &params)) return;
+        data.params = params;
+        self.restyleEntity(entity);
     }
 
     /// Overrides morph target weights (up to 64, in model order) on every
@@ -364,8 +389,8 @@ pub const Entities = struct {
     /// meshes morph.
     pub fn setMorphWeights(entities: *Entities, entity: Entity, weights: ?[]const f32) void {
         const self = entities.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.entities.table.get(entity) orelse return;
         if (weights) |values| {
             var stored: [gltf.max_morph_targets]f32 = @splat(0);
@@ -380,10 +405,10 @@ pub const Entities = struct {
     /// (`error.RayTracingUnavailable`) and `Settings.global_illumination`.
     pub fn bakeLightmap(entities: *Entities, entity: Entity, desc: ?LightmapDesc) !void {
         const self = entities.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const data = self.entities.table.get(entity) orelse return error.InvalidEntity;
-        const scene = self.scenes.table.get(data.scene) orelse return error.InvalidScene;
+        self.lock();
+        defer self.unlock();
+        const data = self.entities.table.get(entity) orelse return;
+        const scene = self.scenes.table.get(data.scene) orelse return;
         if (data.lightmap) |old| {
             for (old.gathered) |texture| self.device.destroyTexture(texture);
             self.device.destroyTexture(old.shown);
@@ -408,8 +433,8 @@ pub const Entities = struct {
     /// Baked fraction of an entity's lightmap, 0 to 1; null if it has none.
     pub fn lightmapProgress(entities: *Entities, entity: Entity) ?f32 {
         const self = entities.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.entities.table.get(entity) orelse return null;
         const lightmap = data.lightmap orelse return null;
         return @as(f32, @floatFromInt(@min(lightmap.rounds, lightmap.wanted))) / @as(f32, @floatFromInt(lightmap.wanted));
@@ -419,8 +444,8 @@ pub const Entities = struct {
     /// shadows; showing it again resets its motion history.
     pub fn setVisible(entities: *Entities, entity: Entity, visible: bool) void {
         const self = entities.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.entities.table.get(entity) orelse return;
         if (data.visible == visible) return;
         data.visible = visible;
@@ -431,11 +456,25 @@ pub const Entities = struct {
     /// Sets the animation pose. Null returns the model to its rest pose.
     pub fn setPose(entities: *Entities, entity: Entity, pose: ?Pose) void {
         const self = entities.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        if (!self.tryLock()) return self.queueEdit(entity, .{ .pose = pose });
+        defer self.unlock();
         if (self.entities.table.get(entity)) |data| data.pose = pose;
     }
 };
+
+/// Queues transforms a chunk at a time, so that the queue is not held long.
+fn queueTransforms(self: *Renderer, handles: []const Entity, transforms: []const Mat4) void {
+    var edits: [64]renderer_state.EntityEdit = undefined;
+    var done: usize = 0;
+    while (done < handles.len) {
+        const count = @min(edits.len, handles.len - done);
+        for (edits[0..count], handles[done..][0..count], transforms[done..][0..count]) |*edit, entity, transform| {
+            edit.* = .{ .entity = entity, .change = .{ .transform = transform } };
+        }
+        self.queueEdits(edits[0..count]);
+        done += count;
+    }
+}
 
 pub fn freeEntityStorage(self: *Renderer, entity: EntityData) void {
     if (entity.lightmap) |lightmap| {

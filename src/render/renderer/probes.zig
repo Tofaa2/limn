@@ -34,8 +34,8 @@ pub const Probes = struct {
     /// after the scene or its lighting changes.
     pub fn create(probes: *Probes, scene: Scene, desc: ReflectionProbeDesc) !ReflectionProbe {
         const self = probes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
         if (data.probes.items.len >= max_reflection_probes) return error.TooManyReflectionProbes;
         const size = std.math.clamp(desc.resolution, 16, 1024);
@@ -61,8 +61,8 @@ pub const Probes = struct {
     /// A new position takes effect with the next `probes.update`.
     pub fn set(probes: *Probes, probe: ReflectionProbe, desc: ReflectionProbeDesc) void {
         const self = probes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.probes.table.get(probe) orelse return;
         const resolution = data.desc.resolution;
         data.desc = desc;
@@ -73,16 +73,16 @@ pub const Probes = struct {
     /// Asks for a probe to be captured again.
     pub fn update(probes: *Probes, probe: ReflectionProbe) void {
         const self = probes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         if (self.probes.table.get(probe)) |data| data.dirty = true;
     }
 
     /// A stale handle is ignored.
     pub fn destroy(probes: *Probes, probe: ReflectionProbe) void {
         const self = probes.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         var removed = self.probes.table.remove(probe) orelse return;
         freeProbe(self, &removed);
         const scene = self.scenes.table.get(removed.scene) orelse return;

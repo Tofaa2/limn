@@ -29,8 +29,8 @@ pub const Instances = struct {
     /// while the scene holds at most `Options.gi_instance_limit` of them.
     pub fn create(instances: *Instances, scene: Scene, model: Model, transforms: []const Mat4) !InstanceGroup {
         const self = instances.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const scene_data = self.scenes.table.get(scene) orelse return error.InvalidScene;
         const entry = self.models.table.get(model) orelse return error.InvalidModel;
         const copy = try self.gpa.dupe(Mat4, transforms);
@@ -46,10 +46,10 @@ pub const Instances = struct {
     /// Replaces the transforms of a group; the count may change.
     pub fn set(instances: *Instances, group: InstanceGroup, transforms: []const Mat4) !void {
         const self = instances.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const data = self.instances.table.get(group) orelse return error.InvalidInstanceGroup;
-        const scene = self.scenes.table.get(data.scene) orelse return error.InvalidScene;
+        self.lock();
+        defer self.unlock();
+        const data = self.instances.table.get(group) orelse return;
+        const scene = self.scenes.table.get(data.scene) orelse return;
         if (transforms.len == data.transforms.len) {
             @memcpy(data.transforms, transforms);
             scene.static_version += 1;
@@ -65,10 +65,10 @@ pub const Instances = struct {
     /// empty slice removes them. Set again after the copy count changes.
     pub fn setColors(instances: *Instances, group: InstanceGroup, colors: []const [3]f32) !void {
         const self = instances.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const data = self.instances.table.get(group) orelse return error.InvalidInstanceGroup;
-        const scene = self.scenes.table.get(data.scene) orelse return error.InvalidScene;
+        self.lock();
+        defer self.unlock();
+        const data = self.instances.table.get(group) orelse return;
+        const scene = self.scenes.table.get(data.scene) orelse return;
         if (colors.len != 0 and colors.len != data.transforms.len) return error.ColorCountMismatch;
         const tints = try self.gpa.alloc(u32, colors.len);
         for (tints, colors) |*tint, color| tint.* = packTint(color);
@@ -81,10 +81,10 @@ pub const Instances = struct {
     /// empty slice removes them. Set again after the copy count changes.
     pub fn setParams(instances: *Instances, group: InstanceGroup, params: []const [4]f32) !void {
         const self = instances.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const data = self.instances.table.get(group) orelse return error.InvalidInstanceGroup;
-        const scene = self.scenes.table.get(data.scene) orelse return error.InvalidScene;
+        self.lock();
+        defer self.unlock();
+        const data = self.instances.table.get(group) orelse return;
+        const scene = self.scenes.table.get(data.scene) orelse return;
         if (params.len != 0 and params.len != data.transforms.len) return error.ParamCountMismatch;
         const copy = try self.gpa.dupe([4]f32, params);
         self.gpa.free(data.params);
@@ -97,10 +97,10 @@ pub const Instances = struct {
     /// take an entity's pose are never impostors.
     pub fn setImpostor(instances: *Instances, group: InstanceGroup, desc: ?ImpostorDesc) !void {
         const self = instances.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const data = self.instances.table.get(group) orelse return error.InvalidInstanceGroup;
-        const scene = self.scenes.table.get(data.scene) orelse return error.InvalidScene;
+        self.lock();
+        defer self.unlock();
+        const data = self.instances.table.get(group) orelse return;
+        const scene = self.scenes.table.get(data.scene) orelse return;
         if (data.impostor) |old| {
             self.device.destroyTexture(old.color);
             self.device.destroyTexture(old.normal);
@@ -121,8 +121,8 @@ pub const Instances = struct {
     /// do not take part in ray tracing.
     pub fn setPose(instances: *Instances, group: InstanceGroup, entity: ?Entity) void {
         const self = instances.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.instances.table.get(group) orelse return;
         const scene = self.scenes.table.get(data.scene) orelse return;
         data.driver = entity;
@@ -132,8 +132,8 @@ pub const Instances = struct {
     /// A stale handle is ignored.
     pub fn destroy(instances: *Instances, group: InstanceGroup) void {
         const self = instances.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const removed = self.instances.table.remove(group) orelse return;
         if (removed.impostor) |impostor| {
             self.device.destroyTexture(impostor.color);

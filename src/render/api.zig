@@ -95,8 +95,10 @@ pub const Options = struct {
     /// Use hardware ray tracing where available. False disables ray-traced
     /// effects; path tracing then runs in a shader.
     ray_tracing: bool = true,
-    /// Draw meshlets with mesh shaders where available, else indirect draws.
-    mesh_shaders: bool = true,
+    /// Draw meshlets with mesh shaders where available instead of indirect
+    /// draws. Off by default: indirect draws share vertices between
+    /// triangles and are the faster of the two.
+    mesh_shaders: bool = false,
     /// Build a BVH per model at load so `Settings.path_tracing` works without
     /// hardware ray tracing. No effect where the GPU traces rays.
     path_tracing_fallback: bool = false,
@@ -143,9 +145,9 @@ pub const Options = struct {
     /// Weight of UV deviation when LODs are built: 1 counts a UV shift as a
     /// shape error of the same distance, 0 ignores it.
     lod_uv_weight: f32 = gltf.default_lod_uv_weight,
-    /// Threads for animation poses, including the render thread: 0 picks
-    /// automatically (at most 8), 1 uses no other thread.
-    pose_threads: u32 = 0,
+    /// Threads for animation poses and instance records, including the render
+    /// thread: 0 picks automatically (at most 8), 1 uses no other thread.
+    worker_threads: u32 = 0,
     /// Include skinned and morphed meshes in the ray-tracing structure, at one
     /// structure build per such mesh per frame.
     gi_dynamic_geometry: bool = true,

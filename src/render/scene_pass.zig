@@ -17,16 +17,36 @@ const ViewState = render.ViewState;
 const Cascades = render.Cascades;
 const max_local_shadow_views = render.max_local_shadow_views;
 
+/// This frame's changes to a scene's instance records, last frame's
+/// transforms and ray-tracing instances, staged in the frame arena.
+pub const SceneUpdate = struct {
+    /// Every entity record is staged, to be copied whole.
+    whole: bool,
+    records: Staged = .{},
+    previous: Staged = .{},
+    tlas: Staged = .{},
+    entity_count: u32 = 0,
+    rigid_tlas: u32 = 0,
+    /// Addresses and counts of `InstanceMove` and `InstanceRewrite` lists.
+    moves: u64 = 0,
+    move_count: u32 = 0,
+    rewrites: u64 = 0,
+    rewrite_count: u32 = 0,
+    /// Ray-tracing instances of skinned meshes and where they go.
+    skinned_tlas: Staged = .{},
+    skinned_tlas_count: u32 = 0,
+    skinned_tlas_first: u32 = 0,
+
+    pub const Staged = struct { buffer: rhi.Buffer = undefined, offset: u64 = 0 };
+};
+
 /// What `prepareScene` leaves for the views that draw a scene this frame.
 pub const SceneFrame = struct {
     instances: u64,
     /// See `gpu.FrameConstants.previous_transforms`.
     previous_transforms: u64,
-    /// This frame's entity records in the frame arena, to be copied into the
-    /// instance buffer.
-    staged_buffer: rhi.Buffer,
-    staged_instances: u64,
-    staged_size: u64,
+    /// What `applySceneUpdate` has to do on the GPU.
+    update: SceneUpdate,
     joints: u64,
     skinned_vertices: u32,
     any_moving: bool,

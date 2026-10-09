@@ -475,6 +475,7 @@ pub const ModelEntry = struct {
     textures: []?rhi.Texture = &.{},
     /// Parallel to `textures`; entries with data are streamed.
     streams: []TextureStream = &.{},
+    stream_parts: []StreamPart = &.{},
     streamed: u32 = 0,
     materials_stale: bool = false,
     /// Overrides from `materials.setTextures`; empty, or one per material.
@@ -488,9 +489,11 @@ pub const ModelEntry = struct {
     transform_count: u32 = 0,
     /// Parents-before-children node order and rest-pose world matrices.
     order: []u32 = &.{},
-    /// The part of `order` a posed entity needs: nodes with a mesh, skin
-    /// joints, and their ancestors.
+    /// The part of `order` a posed entity needs: nodes an animation can
+    /// move that have a mesh, are skin joints or are ancestors of such.
     pose_order: []u32 = &.{},
+    /// Per node, whether an animation can move it.
+    node_moves: []bool = &.{},
     node_world: []Mat4 = &.{},
     info: ModelInfo = std.mem.zeroes(ModelInfo),
     references: u32 = 0,
@@ -539,6 +542,78 @@ pub const LayoutEntry = struct {
     model_instance: u32,
     first_of_entity: bool,
 };
+
+/// What `prepareScene` needs of a layout entry when its entity moves, kept
+/// apart from the entity and its model.
+pub const EntryInfo = struct {
+    /// Model-space bounds of the mesh.
+    center: Vec3,
+    radius: f32,
+    /// The model's matrix of the node the mesh hangs from; null when it is
+    /// skinned or an animation can move that node.
+    rest: ?*const Mat4 = null,
+    /// Where its ray-tracing instance is, or `gpu.invalid_id`.
+    tlas_slot: u32 = gpu.invalid_id,
+    bits: u8 = 0,
+
+    pub const skinned: u8 = 1;
+    /// Skinned, or on a node an animation can move.
+    pub const posed: u8 = 2;
+    pub const glows: u8 = 8;
+    /// Its record says it moved; the next frame must say otherwise.
+    pub const moved: u8 = 16;
+};
+
+/// An entity's transform bookkeeping, by entity slot. Small and apart from
+/// `EntityData` so that moving many entities touches little memory.
+pub const EntityMark = struct {
+    /// The entity's handle as bits; 0 while the slot is free.
+    handle: u64 = 0,
+    scene: Scene = undefined,
+    /// Its entries in the scene's layout.
+    layout_first: u32 = 0,
+    layout_count: u32 = 0,
+    /// Distance moved in the last prepared frame.
+    travelled: f32 = 0,
+    bits: u32 = 0,
+
+    /// In its scene's `edited` list.
+    pub const listed: u32 = 1;
+    pub const moved: u32 = 2;
+    /// Moved without it counting as motion.
+    pub const teleported: u32 = 4;
+    /// Tint, params or lightmap changed: its records are rewritten whole.
+    pub const restyled: u32 = 8;
+};
+
+/// `Move` in instance_update.comp: a new transform for one instance.
+pub const InstanceMove = extern struct {
+    instance: u32,
+    tlas_slot: u32 = gpu.invalid_id,
+    flags: u32,
+    pad: u32 = 0,
+    transform: [12]f32,
+
+    /// The record is marked as moving.
+    pub const moved: u32 = 1;
+    /// The transform it had becomes last frame's transform.
+    pub const keep: u32 = 2;
+};
+
+/// `Rewrite` in instance_update.comp: a whole record for one instance.
+pub const InstanceRewrite = extern struct {
+    instance: u32,
+    tlas_slot: u32 = gpu.invalid_id,
+    pad: [2]u32 = .{ 0, 0 },
+    previous: [12]f32,
+    record: gpu.Instance,
+};
+
+/// `Glowing` in pathtrace.frag: an evenly emissive instance and the
+/// triangle count of its full-detail level.
+pub const Glowing = extern struct { instance: u32, triangles: u32 };
+/// Most glowing instances path tracing samples directly.
+pub const max_glowing = 1024;
 
 pub const SceneData = struct {
     /// Bounds (center, radius) of what moved this frame, for choosing shadow
@@ -592,6 +667,45 @@ pub const SceneData = struct {
     static_transmissive: bool = false,
     /// Flattened (entity, model instance) list; index = GPU instance index.
     layout: std.ArrayList(LayoutEntry) = .empty,
+    /// The entities of `layout` that animate, and the most nodes one has.
+    posed: std.ArrayList(Entity) = .empty,
+    posed_nodes: usize = 0,
+    /// One per layout entry, and its world-space bounding sphere.
+    entries: std.ArrayList(EntryInfo) = .empty,
+    spheres: std.ArrayList([4]f32) = .empty,
+    /// The blended layout entries, without their centers; whether any
+    /// lets light through; and the first entries that glow.
+    blended: std.ArrayList(TransparentDraw) = .empty,
+    blended_transmissive: bool = false,
+    /// Layout entries of the animated entities.
+    posed_entries: u32 = 0,
+    glowing: std.ArrayList(Glowing) = .empty,
+    /// Bounds of the ray-traced entries of each `prepare_batch` of the
+    /// layout, and which must be measured again.
+    chunk_bounds: std.ArrayList([2]Vec3) = .empty,
+    chunk_stale: std.ArrayList(bool) = .empty,
+    /// Entity slots changed since the scene was last prepared.
+    edited: std.ArrayList(u32) = .empty,
+    /// Layout entries of the entities in `edited`, and of those among them
+    /// whose records are to be written whole.
+    edited_entries: usize = 0,
+    restyled_entries: usize = 0,
+    /// Layout entries whose records say they moved last frame, each with
+    /// its entity's slot.
+    settling: std.ArrayList([2]u32) = .empty,
+    /// False when every record must be written again, not only the edited.
+    records_valid: bool = false,
+    /// Last frame's transform of each entity instance.
+    previous: ?rhi.Buffer = null,
+    previous_capacity: u32 = 0,
+    /// Ray-tracing instances: entities', then groups', then skinned ones.
+    tlas_instances: ?rhi.Buffer = null,
+    tlas_instances_capacity: u32 = 0,
+    rigid_tlas: u32 = 0,
+    skinned_entries: u32 = 0,
+    /// Changes whenever the ray-tracing instances do.
+    tlas_content: u64 = 0,
+    static_tlas_uploaded: bool = false,
     layout_dirty: bool = true,
     layout_generation: u64 = 0,
     refs: ?rhi.Buffer = null,
@@ -681,10 +795,7 @@ pub const EntityData = struct {
     /// In the ray-tracing structure with an instance record, but never drawn.
     rays_only: bool = false,
     model: Model,
-    transform: Mat4,
-    previous_transform: Mat4,
     visible: bool,
-    travelled: f32 = 0,
     tint: u32 = 0xffffffff,
     params: [4]f32 = .{ 0, 0, 0, 0 },
     receive_decals: bool = true,
@@ -778,6 +889,10 @@ pub const ViewState = struct {
     width: u32,
     height: u32,
     depth: rhi.Texture,
+    /// Last frame's depth; the two swap every frame.
+    previous_depth: rhi.Texture,
+    /// Last frame's motion; swapped like the depth.
+    previous_motion: rhi.Texture,
     visibility: rhi.Texture,
     motion: rhi.Texture,
     ao_raw: rhi.Texture,
@@ -890,8 +1005,10 @@ pub const ViewState = struct {
             .usage = color,
         });
         self.depth = try made.texture(.{ .name = "depth", .width = width, .height = height, .format = .depth32_float, .usage = .{ .sampled = true, .depth_attachment = true } });
+        self.previous_depth = try made.texture(.{ .name = "depth", .width = width, .height = height, .format = .depth32_float, .usage = .{ .sampled = true, .depth_attachment = true } });
         self.visibility = try made.texture(.{ .name = "visibility", .width = width, .height = height, .format = .r32_uint, .usage = color });
         self.motion = try made.texture(.{ .name = "motion", .width = width, .height = height, .format = .rg16_float, .usage = color });
+        self.previous_motion = try made.texture(.{ .name = "motion", .width = width, .height = height, .format = .rg16_float, .usage = color });
         self.ao_raw = try made.texture(.{ .name = "ao raw", .width = scaledExtent(scales.ao, width), .height = scaledExtent(scales.ao, height), .format = .rg16_float, .usage = color });
         self.ao = try made.texture(.{ .name = "ao", .width = width, .height = height, .format = .r16_float, .usage = color });
         self.ao_history = try made.texture(.{ .name = "ao history", .width = width, .height = height, .format = .r16_float, .usage = color });
@@ -937,7 +1054,7 @@ pub const ViewState = struct {
     }
 
     pub fn deinit(self: *ViewState, device: *rhi.Device) void {
-        for ([_]rhi.Texture{ self.depth, self.visibility, self.motion, self.ao_raw, self.ao, self.ao_history, self.bounce_raw, self.bounce, self.bounce_history, self.ao_depth, self.hdr, self.fog, self.hiz }) |texture|
+        for ([_]rhi.Texture{ self.depth, self.previous_depth, self.visibility, self.motion, self.previous_motion, self.ao_raw, self.ao, self.ao_history, self.bounce_raw, self.bounce, self.bounce_history, self.ao_depth, self.hdr, self.fog, self.hiz }) |texture|
             device.destroyTexture(texture);
         for (self.history) |texture| device.destroyTexture(texture);
         if (self.gi_gather) |texture| device.destroyTexture(texture);
@@ -1184,6 +1301,8 @@ pub const Pipelines = struct {
     probe_face: rhi.Pipeline,
     fluid_motion: rhi.Pipeline,
     skin_bounds: rhi.Pipeline,
+    instance_moves: rhi.Pipeline,
+    instance_rewrites: rhi.Pipeline,
     particle_trails: rhi.Pipeline,
     env_cube: rhi.Pipeline,
     env_sky: rhi.Pipeline,
@@ -1288,7 +1407,30 @@ pub fn packTint(color: [3]f32) u32 {
 }
 
 pub const max_fluids = 8;
-pub const max_pose_threads = 8;
+pub const max_worker_threads = 8;
+/// A change to an entity that can be made later.
+pub const EntityEdit = struct {
+    entity: Entity,
+    change: Change,
+
+    pub const Change = union(enum) {
+        transform: Mat4,
+        /// A transform that is not motion.
+        teleport: Mat4,
+        /// As `packTint` packs it.
+        tint: u32,
+        params: [4]f32,
+        pose: ?Pose,
+    };
+};
+/// Layout entries `prepareScene` hands a thread at a time.
+pub const prepare_batch = 2048;
+/// Edited entities per thread below which moving them is not split.
+pub const move_batch = 4096;
+/// What one batch of `prepareScene` found.
+pub const PrepareChunk = struct {
+    any_moving: bool = false,
+};
 /// Animated entities per thread below which the work is not split.
 pub const pose_batch = 48;
 pub const max_liquids = 4;
@@ -1573,6 +1715,20 @@ pub fn blockFormat(block: gltf.Image.Block, one_channel: bool, two_channel: bool
         .bc7 => if (one_channel) .bc4_unorm else if (two_channel) .bc5_unorm else if (srgb) .bc7_srgb else .bc7_unorm,
     };
 }
+
+/// What texture streaming reads of one mesh of a model, in instance order.
+pub const StreamPart = struct {
+    /// Texture coordinate change per meter on the mesh; 0 or less skips it.
+    density: f32,
+    center: Vec3,
+    radius: f32,
+    /// The node it hangs from; null for a skinned mesh.
+    node: ?u32,
+    /// Streamed images its material uses, and the base-2 logarithm of
+    /// their larger side.
+    streams: [5]u32 = @splat(gpu.invalid_id),
+    log_sizes: [5]f32 = @splat(0),
+};
 
 pub const TextureStream = struct {
     /// The whole BC7 mip chain; empty for textures that are not streamed.

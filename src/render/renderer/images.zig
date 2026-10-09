@@ -43,8 +43,8 @@ pub const Images = struct {
     /// `srgb`: true for color, false for data.
     pub fn create(images: *Images, width: u32, height: u32, pixels: []const u8, srgb: bool) !Image {
         const self = images.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const device = self.device;
         const texture = try device.createTexture(.{
             .name = "image",
@@ -141,8 +141,8 @@ pub const Images = struct {
     /// renderer does not own (such as a `views.targetImage`) are ignored.
     pub fn destroy(images: *Images, image: Image) void {
         const self = images.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         for (self.images.list.items, 0..) |entry, index| {
             if (entry.index != image.index or entry.id != image.id) continue;
             self.device.destroyTexture(entry.texture);
@@ -163,8 +163,8 @@ fn own(self: *Renderer, texture: rhi.Texture, index: u32, width: u32, height: u3
 
 /// Makes an image from mip levels already in a GPU format.
 fn createImageFromLevels(self: *Renderer, source: ktx2.Texture) !Image {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
+    self.lock();
+    defer self.unlock();
     const device = self.device;
     if (source.faces != 1 or source.layers != 1) return error.UnsupportedTextureFormat;
     if (source.format != .rgba8 and source.format != .rgba16f and !device.bc_textures) return error.UnsupportedTextureFormat;

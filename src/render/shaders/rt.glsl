@@ -67,7 +67,7 @@ int rtTraceMasked(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 directi
     if ((material.flags & MATERIAL_BLEND) != 0u) opacity = clamp(base_color.a * (1.0 - material.transmission * 0.85), 0.0, 1.0);
     vec3 albedo = base_color.rgb * (1.0 - 0.7 * metallic);
     vec3 emissive = material.emissive;
-    if (material.emissive_texture != INVALID_ID)
+    if (material.emissive_texture != INVALID_ID && any(greaterThan(emissive, vec3(0.0))))
         emissive *= textureLod(TEX(material.emissive_texture, material.sampler_index), uv, lod).rgb;
 
     vec3 position = origin + direction * t;
@@ -91,7 +91,7 @@ int rtTraceMasked(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 directi
             } else {
                 float distance_squared = dot(to_light, to_light);
                 float range_squared = light.range * light.range;
-                if (distance_squared > range_squared) continue;
+                if (distance_squared > range_squared || dot(normal, to_light) <= 0.0) continue;
                 float window = clamp(1.0 - (distance_squared * distance_squared) / (range_squared * range_squared), 0.0, 1.0);
                 attenuation = window * window / max(distance_squared, 0.01);
                 reach = sqrt(distance_squared);

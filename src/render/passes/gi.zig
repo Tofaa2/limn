@@ -19,6 +19,15 @@ const gi_irradiance_texels = render.gi_irradiance_texels;
 const gi_visibility_texels = render.gi_visibility_texels;
 const hdr_format = render.hdr_format;
 const SceneFrame = scene_pass.SceneFrame;
+const FrameArena = render.FrameArena;
+
+/// Ray `index` of `count` spread evenly over the sphere.
+fn sphericalFibonacci(index: f32, count: f32) Vec3 {
+    const phi = std.math.tau * @mod(index * 0.618033988749895, 1.0);
+    const cos_theta = 1 - (2 * index + 1) / count;
+    const sin_theta = @sqrt(std.math.clamp(1 - cos_theta * cos_theta, 0, 1));
+    return .{ @cos(phi) * sin_theta, @sin(phi) * sin_theta, cos_theta };
+}
 
 /// Returns the volume in `slot` moved to `cell`, or a new one if the grid's
 /// shape, spacing or ray count changed.
@@ -187,6 +196,7 @@ pub fn updateGi(
     scene: *SceneData,
     volume: *GiVolume,
     scene_frame: SceneFrame,
+    arena: *FrameArena,
     frame_address: u64,
     settings: Settings,
     grid_index: u32,
@@ -197,6 +207,8 @@ pub fn updateGi(
     defer cmd.endScope();
     const tlas = scene.tlas.?;
     if (scene.tlas_hash != scene_frame.tlas_hash) {
+        cmd.beginScope("gi structure");
+        defer cmd.endScope();
         cmd.buildTlas(tlas, scene_frame.tlas_instances, scene_frame.tlas_count);
         scene.tlas_hash = scene_frame.tlas_hash;
     }
@@ -211,7 +223,11 @@ pub fn updateGi(
         @sqrt(first) * @sin(std.math.tau * third),
         @sqrt(first) * @cos(std.math.tau * third),
     });
-    const rotation_columns = [3][4]f32{ rotation[0..4].*, rotation[4..8].*, rotation[8..12].* };
+    const directions = try arena.alloc(device, [4]f32, volume.rays_per_probe);
+    for (directions.items, 0..) |*out, ray| {
+        const way = math.transformDirection(rotation, sphericalFibonacci(@floatFromInt(ray), @floatFromInt(volume.rays_per_probe)));
+        out.* = .{ way[0], way[1], way[2], 0 };
+    }
     const max_distance = volume.spacing * 1.75 * 1.5;
     const probe_count = volume.probeCount();
     const moved = volume.shift[0] != 0 or volume.shift[1] != 0 or volume.shift[2] != 0;
@@ -221,12 +237,13 @@ pub fn updateGi(
     const far_distance: f32 = if (moved or volume.frames < 200) 0 else @max(settings.gi_far_distance, 0);
     const update_turn: u32 = @truncate(renderer.frame_index / stride);
 
+    cmd.beginScope("gi trace");
     cmd.bindPipeline(pipelines.trace);
     cmd.pushConstants(extern struct {
         frame: u64,
         rays: u64,
         tlas: u64,
-        rotation: [3][4]f32,
+        directions: u64,
         rays_per_probe: u32,
         probe_count: u32,
         multibounce: u32,
@@ -241,7 +258,7 @@ pub fn updateGi(
         .frame = frame_address,
         .rays = device.bufferAddress(volume.rays),
         .tlas = device.accelerationAddress(tlas),
-        .rotation = rotation_columns,
+        .directions = directions.address,
         .rays_per_probe = volume.rays_per_probe,
         .probe_count = probe_count,
         .multibounce = @intFromBool(volume.frames != 0 and
@@ -258,6 +275,7 @@ pub fn updateGi(
     });
     cmd.dispatch((((probe_count + stride - 1) / stride) * volume.rays_per_probe + 63) / 64, 1, 1);
     cmd.sync(.compute_to_all);
+    cmd.endScope();
 
     const settled = std.math.pow(f32, std.math.clamp(settings.gi_hysteresis, 0, 0.999), @floatFromInt(stride));
     const gathered: f32 = @floatFromInt(volume.frames);
@@ -267,7 +285,7 @@ pub fn updateGi(
     const UpdatePush = extern struct {
         frame: u64,
         rays: u64,
-        rotation: [3][4]f32,
+        directions: u64,
         rays_per_probe: u32,
         hysteresis: f32,
         max_distance: f32,
@@ -284,7 +302,7 @@ pub fn updateGi(
     const update_push = UpdatePush{
         .frame = frame_address,
         .rays = device.bufferAddress(volume.rays),
-        .rotation = rotation_columns,
+        .directions = directions.address,
         .rays_per_probe = volume.rays_per_probe,
         .hysteresis = hysteresis,
         .max_distance = max_distance,
@@ -297,6 +315,7 @@ pub fn updateGi(
         .turn = update_turn,
     };
     const load: rhi.LoadOp = if (volume.frames == 0) .clear else .load;
+    cmd.beginScope("gi irradiance");
     try cmd.beginRendering(.{ .color = &.{
         .{ .texture = volume.irradiance, .load = load },
         .{ .texture = volume.irradiance_fast, .load = load },
@@ -323,13 +342,18 @@ pub fn updateGi(
         }
     }
     cmd.transition(volume.irradiance, .shader_read);
+    cmd.endScope();
+    cmd.beginScope("gi visibility");
     try cmd.beginRendering(.{ .color = &.{.{ .texture = volume.visibility, .load = load }} });
     cmd.bindPipeline(pipelines.visibility);
     cmd.pushConstants(update_push);
     cmd.drawFullscreen();
     cmd.endRendering();
     cmd.transition(volume.visibility, .shader_read);
+    cmd.endScope();
     if (settings.gi_probe_relocation) {
+        cmd.beginScope("gi relocation");
+        defer cmd.endScope();
         const read = volume.offsets[volume.offset_turn];
         const write = volume.offsets[1 - volume.offset_turn];
         if (!volume.offsets_valid) {

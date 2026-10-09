@@ -53,6 +53,7 @@ const giScroll = @import("view_math.zig").giScroll;
 const halton = @import("view_math.zig").halton;
 const prepareLights = @import("scene_update.zig").prepareLights;
 const prepareScene = @import("scene_update.zig").prepareScene;
+const applySceneUpdate = @import("scene_update.zig").applySceneUpdate;
 const renderDrawLists = @import("canvas.zig").renderDrawLists;
 const targetWritten = @import("views.zig").targetWritten;
 
@@ -361,12 +362,12 @@ const SceneGraph = struct {
         const scene = p.scene;
         const volume = c.gi orelse return;
         if (scene.gi_updated_frame == self.frame_index) return;
-        try gi_passes.updateGi(self, p.cmd, scene, volume, p.scene_frame, p.frame_address, p.settings, 0);
+        try gi_passes.updateGi(self, p.cmd, scene, volume, p.scene_frame, p.arena, p.frame_address, p.settings, 0);
         if (scene.gi_coarse) |*coarse| {
             if (coarse.frames < 64 or self.frame_index % @max(p.settings.gi_coarse_interval, 1) == 0)
-                try gi_passes.updateGi(self, p.cmd, scene, coarse, p.scene_frame, p.frame_address, p.settings, 1);
+                try gi_passes.updateGi(self, p.cmd, scene, coarse, p.scene_frame, p.arena, p.frame_address, p.settings, 1);
         }
-        if (scene.gi_middle) |*middle| try gi_passes.updateGi(self, p.cmd, scene, middle, p.scene_frame, p.frame_address, p.settings, 2);
+        if (scene.gi_middle) |*middle| try gi_passes.updateGi(self, p.cmd, scene, middle, p.scene_frame, p.arena, p.frame_address, p.settings, 2);
         scene.gi_updated_frame = self.frame_index;
     }
 
@@ -507,8 +508,9 @@ fn renderScene(
     cmd.beginScope("scene update");
     const fresh_scene = scene.prepared_frame != self.frame_index;
     if (fresh_scene) {
-        scene.prepared = try prepareScene(self, scene, arena, @intCast(frame.index % rhi.frames_in_flight));
+        scene.prepared = try prepareScene(self, scene, arena);
         scene.prepared_frame = self.frame_index;
+        applySceneUpdate(self, cmd, scene, scene.prepared.update);
     }
     const scene_frame = scene.prepared;
     try cmd.flushUploads();
@@ -544,6 +546,8 @@ fn renderScene(
         view_data.camera_known = false;
     }
     const view = &view_data.state.?;
+    std.mem.swap(rhi.Texture, &view.depth, &view.previous_depth);
+    std.mem.swap(rhi.Texture, &view.motion, &view.previous_motion);
     if (view_data.last_frame +% 1 != self.frame_index) {
         view_data.camera_known = false;
         view.history_valid = false;

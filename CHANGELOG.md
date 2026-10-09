@@ -4,13 +4,20 @@
 
 ### Added
 - Validation of glTF files and font glyph sizes (`-Dvalidate_input=false` leaves it out).
+- `entities.setTransforms`, and entity setters that do not wait for a frame being recorded.
 
 ### Changed
 - Breaking: handles are 64 bits, so a reused slot no longer revives a stale handle.
 - Breaking: `views.targetImage` fails with `error.InvalidTarget` for a destroyed target.
 - Breaking: `shaders.reload` needs `-Dshader_reload` outside Debug builds.
 - Breaking: `materials.createShader` takes a second shader, compiled with `PLAIN`, or null.
+- Breaking: setters and `destroy` ignore a destroyed handle instead of failing.
+- Breaking: `Options.pose_threads` is `worker_threads`, and instance records are written across threads too.
+- Breaking: `Options.mesh_shaders` is off by default; indirect draws are faster.
 - Only the FidelityFX shader permutations in use are compiled.
+- Only entities that changed are prepared each frame, and their moves are applied on the GPU.
+- Animation poses skip the nodes no clip moves.
+- Global illumination probes and texture streaming cost less.
 
 ### Removed
 - The verification scene and `zig build scene`.
@@ -21,6 +28,8 @@
 - Shadows of local lights and virtual shadow maps with several views or skipped frames.
 - Swapchain rebuilds that fail, and minimised windows.
 - Particle collision without temporal antialiasing.
+- Trails behind moving objects with temporal antialiasing.
+- Traced soft shadows lagging on surfaces the camera uncovers.
 - Texture streaming with an empty or unbounded view.
 - Malformed font, KTX2 and DDS files, and glTF image names with percent escapes.
 - The model cache missing a changed `.bin` file or `normal_maps_bc5`.

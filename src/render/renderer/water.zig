@@ -28,8 +28,8 @@ pub const Waters = struct {
     /// Adds a sheet of simulated water to a scene.
     pub fn create(waters: *Waters, scene: Scene, desc: WaterDesc) !Water {
         const self = waters.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
         if (data.waters.items.len == max_waters) return error.TooManyWaters;
         var state = WaterState{ .scene = scene, .desc = desc };
@@ -47,9 +47,9 @@ pub const Waters = struct {
     /// flattens it.
     pub fn set(waters: *Waters, water: Water, desc: WaterDesc) !void {
         const self = waters.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const state = self.waters.table.get(water) orelse return error.InvalidWater;
+        self.lock();
+        defer self.unlock();
+        const state = self.waters.table.get(water) orelse return;
         const resized = !std.mem.eql(u32, &desc.resolution, &state.desc.resolution);
         if (desc.splashes > 0 and state.splash == null) state.splash = try createEmitterLocked(self, state.scene, simulation_passes.splashDesc(desc));
         if (desc.splashes <= 0) if (state.splash) |emitter| {
@@ -67,8 +67,8 @@ pub const Waters = struct {
     /// units. At most 16 per frame; further ones are dropped.
     pub fn addRipple(waters: *Waters, water: Water, position: Vec3, radius: f32, depth: f32) void {
         const self = waters.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const state = self.waters.table.get(water) orelse return;
         if (state.ripple_count == state.ripples.len) return;
         const t = state.desc.transform;
@@ -92,8 +92,8 @@ pub const Waters = struct {
     /// Also frees the splash emitter it made. A stale handle is ignored.
     pub fn destroy(waters: *Waters, water: Water) void {
         const self = waters.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const removed = self.waters.table.remove(water) orelse return;
         if (removed.splash) |emitter| destroyEmitterLocked(self, emitter);
         for (removed.state) |texture| self.device.destroyTexture(texture);

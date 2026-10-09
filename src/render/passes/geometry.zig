@@ -34,7 +34,6 @@ pub fn resetCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total
     const cmd = p.cmd;
     const scene_handle = p.scene_handle;
     const scene = p.scene;
-    const scene_frame = p.scene_frame;
     const fresh_scene = p.fresh_scene;
     const view_data = p.view_data;
     const mark_seen = p.mark_seen;
@@ -108,8 +107,6 @@ pub fn resetCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total
         cmd.copyBuffer(draws.buffer, renderer.cull_mesh_draws, draws.offset, 0, view_count * 2 * @sizeOf(gpu.MeshDraw));
     }
     if (fresh_scene) cmd.fillBuffer(scene.seen.?, 0, (@as(u64, instance_total) + 1) * @sizeOf(u32), 0);
-    if (fresh_scene and scene_frame.staged_size != 0)
-        cmd.copyBuffer(scene_frame.staged_buffer, scene.instance_slots[0].buffer.?, scene_frame.staged_instances, 0, scene_frame.staged_size);
     if (visibility_reset) {
         if (view_data.visibility) |buffer| cmd.fillBuffer(buffer, 0, @as(u64, view_data.visibility_capacity) * @sizeOf(u32), 1);
         if (view_data.instance_visibility) |buffer| cmd.fillBuffer(buffer, 0, @as(u64, view_data.instance_visibility_capacity) * @sizeOf(u32), 1);

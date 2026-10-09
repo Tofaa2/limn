@@ -3,11 +3,12 @@
 #include "gi.glsl"
 
 layout(buffer_reference, scalar) readonly buffer Rays { vec4 data[]; };
+layout(buffer_reference, scalar) readonly buffer Directions { vec4 data[]; };
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     Rays rays;
-    vec4 rotation[3];
+    Directions directions;
     uint rays_per_probe;
     float hysteresis;
     float max_distance;
@@ -23,13 +24,6 @@ layout(push_constant, scalar) uniform Push {
 
 layout(location = 0) out vec4 out_offset;
 
-vec3 sphericalFibonacci(float i, float n) {
-    const float golden = 1.618033988749895;
-    float phi = 2.0 * PI * fract(i * (golden - 1.0));
-    float cos_theta = 1.0 - (2.0 * i + 1.0) / n;
-    float sin_theta = sqrt(clamp(1.0 - cos_theta * cos_theta, 0.0, 1.0));
-    return vec3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
-}
 
 void main() {
     FrameConstants frame = push.frame;
@@ -47,7 +41,6 @@ void main() {
     out_offset = vec4(offset, mark);
     if (uint(probe) % push.probe_stride != push.probe_phase) return;
 
-    mat3 rotation = mat3(push.rotation[0].xyz, push.rotation[1].xyz, push.rotation[2].xyz);
     float count = float(push.rays_per_probe);
     float backs = 0.0;
     float nearest_back = 1e30;
@@ -58,7 +51,7 @@ void main() {
     vec3 farthest_front_way = vec3(0.0);
     for (uint ray = 0u; ray < push.rays_per_probe; ray++) {
         float met = push.rays.data[uint(probe) * push.rays_per_probe + ray].w;
-        vec3 way = rotation * sphericalFibonacci(float(ray), count);
+        vec3 way = push.directions.data[ray].xyz;
         if (met < 0.0) {
             backs += 1.0;
             float distance_met = -met * 5.0;

@@ -1,0 +1,70 @@
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+const uint MOVE_MOVED = 1u;
+const uint MOVE_KEEP = 2u;
+
+struct Move {
+    uint instance;
+    uint tlas_slot;
+    uint flags;
+    uint move_pad;
+    mat4x3 transform;
+};
+
+struct Rewrite {
+    uint instance;
+    uint tlas_slot;
+    uint rewrite_pad0;
+    uint rewrite_pad1;
+    mat4x3 previous;
+    Instance record;
+};
+
+struct TlasInstance {
+    mat3x4 transform;
+    uint custom_index_and_mask;
+    uint offset_and_flags;
+    uint blas_low;
+    uint blas_high;
+};
+
+layout(buffer_reference, scalar) buffer Records { Instance data[]; };
+layout(buffer_reference, scalar) writeonly buffer Previous { mat4x3 data[]; };
+layout(buffer_reference, scalar) writeonly buffer TlasInstances { TlasInstance data[]; };
+#ifdef REWRITE
+layout(buffer_reference, scalar) readonly buffer Updates { Rewrite data[]; };
+#else
+layout(buffer_reference, scalar) readonly buffer Updates { Move data[]; };
+#endif
+
+layout(push_constant, scalar) uniform Push {
+    Records records;
+    Previous previous;
+    TlasInstances tlas;
+    Updates updates;
+    uint count;
+} push;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= push.count) return;
+#ifdef REWRITE
+    Rewrite change = push.updates.data[index];
+    mat4x3 transform = change.record.transform;
+    push.previous.data[change.instance] = change.previous;
+    push.records.data[change.instance] = change.record;
+#else
+    Move change = push.updates.data[index];
+    if (change.instance == INVALID_ID) return;
+    mat4x3 transform = change.transform;
+    push.previous.data[change.instance] = (change.flags & MOVE_KEEP) != 0u ? push.records.data[change.instance].transform : transform;
+    uint flags = push.records.data[change.instance].flags & ~(INSTANCE_MOVING | INSTANCE_PREVIOUS);
+    if ((change.flags & MOVE_MOVED) != 0u) flags |= INSTANCE_MOVING | INSTANCE_PREVIOUS;
+    push.records.data[change.instance].transform = transform;
+    push.records.data[change.instance].flags = flags;
+#endif
+    if (change.tlas_slot != INVALID_ID) push.tlas.data[change.tlas_slot].transform = transpose(transform);
+}
