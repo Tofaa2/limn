@@ -465,6 +465,8 @@ pub const MaterialTextures = struct {
     clearcoat_normal: ?Image = null,
     sheen_color: ?Image = null,
     sheen_roughness: ?Image = null,
+    /// Filtering and wrapping for all of them; null keeps the material's own.
+    sampler: ?gltf.SamplerData = null,
 };
 
 pub const ModelEntry = struct {

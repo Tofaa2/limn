@@ -222,6 +222,22 @@ pub const Allocator = struct {
         return offset;
     }
 
+    /// A device-local memory object of its own that another device can import.
+    pub fn allocateExported(self: *Allocator, requirements: vk.MemoryRequirements, handle_types: vk.ExternalMemoryHandleTypeFlags) !Allocation {
+        const memory_type = self.findMemoryType(requirements.memory_type_bits, .gpu) orelse
+            return error.MemoryTypeUnavailable;
+        const exported = vk.ExportMemoryAllocateInfo{ .handle_types = handle_types };
+        const memory = try self.device.allocateMemory(&.{
+            .p_next = &exported,
+            .allocation_size = requirements.size,
+            .memory_type_index = memory_type,
+        }, null);
+        self.used_bytes += requirements.size;
+        self.dedicated_allocations += 1;
+        self.dedicated_bytes += requirements.size;
+        return .{ .memory = memory, .offset = 0, .size = requirements.size, .mapped = null, .block_index = null };
+    }
+
     fn allocateMemory(self: *Allocator, size: u64, memory_type: u32) !vk.DeviceMemory {
         const flags = vk.MemoryAllocateFlagsInfo{ .flags = .{ .device_address_bit = true }, .device_mask = 0 };
         return self.device.allocateMemory(&.{

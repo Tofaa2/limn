@@ -37,6 +37,7 @@ pub const DeviceDispatch = struct {
     vkAllocateCommandBuffers: ?vk.PfnAllocateCommandBuffers = null,
     vkAllocateDescriptorSets: ?vk.PfnAllocateDescriptorSets = null,
     vkAllocateMemory: ?vk.PfnAllocateMemory = null,
+    vkGetMemoryFdKHR: ?vk.PfnGetMemoryFdKHR = null,
     vkBeginCommandBuffer: ?vk.PfnBeginCommandBuffer = null,
     vkBindBufferMemory: ?vk.PfnBindBufferMemory = null,
     vkBindImageMemory: ?vk.PfnBindImageMemory = null,
