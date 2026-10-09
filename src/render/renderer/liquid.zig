@@ -35,9 +35,9 @@ pub const Liquids = struct {
     /// and the starting block keep their creation values.
     pub fn set(liquids: *Liquids, liquid: Liquid, desc: LiquidDesc) !void {
         const self = liquids.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const state = self.liquids.table.get(liquid) orelse return error.InvalidLiquid;
+        self.lock();
+        defer self.unlock();
+        const state = self.liquids.table.get(liquid) orelse return;
         const radius = state.desc.particle_radius;
         state.desc = desc;
         state.desc.particle_radius = radius;
@@ -47,8 +47,8 @@ pub const Liquids = struct {
     /// Particles of a liquid currently in use.
     pub fn particles(liquids: *Liquids, liquid: Liquid) u32 {
         const self = liquids.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const state = self.liquids.table.get(liquid) orelse return 0;
         return state.live;
     }
@@ -58,8 +58,8 @@ pub const Liquids = struct {
         const self = liquids.renderer();
         var proxy: ?Entity = null;
         defer if (proxy) |entity| self.entities.despawn(entity);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         var removed = self.liquids.table.remove(liquid) orelse return;
         proxy = removed.proxy;
         removed.deinit(self.device);
@@ -78,14 +78,14 @@ fn attachLiquidProxy(self: *Renderer, scene: Scene, liquid: Liquid, desc: Liquid
         const positions = [8][3]f32{ .{ -0.5, -0.5, -0.5 }, .{ 0.5, -0.5, -0.5 }, .{ 0.5, 0.5, -0.5 }, .{ -0.5, 0.5, -0.5 }, .{ -0.5, -0.5, 0.5 }, .{ 0.5, -0.5, 0.5 }, .{ 0.5, 0.5, 0.5 }, .{ -0.5, 0.5, 0.5 } };
         const indices = [36]u32{ 0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 6, 2, 3, 7, 6, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5 };
         const created = try self.models.create(&.{.{ .positions = &positions, .indices = &indices, .material = .{ .base_color = .{ 1, 1, 1, 0.7 }, .metallic = 0, .roughness = 0.05, .alpha_mode = .blend, .double_sided = true } }});
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         if (self.liquid_proxy_model == null) self.liquid_proxy_model = created;
         break :made self.liquid_proxy_model.?;
     };
     const entity = try self.entities.spawn(scene, .{ .model = model, .transform = desc.transform, .visible = false, .tint = desc.color });
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
+    self.lock();
+    defer self.unlock();
     const data = self.entities.table.get(entity) orelse return;
     data.rays_only = true;
     data.visible = true;
@@ -94,8 +94,8 @@ fn attachLiquidProxy(self: *Renderer, scene: Scene, liquid: Liquid, desc: Liquid
 }
 
 fn createLiquidAlone(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
+    self.lock();
+    defer self.unlock();
     const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
     if (data.liquids.items.len == max_liquids) return error.TooManyLiquids;
     const device = self.device;

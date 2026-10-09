@@ -12,6 +12,8 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/fullscreen.vert", .name = "fullscreen.vert.spv" },
     .{ .src = shader_dir ++ "/skin.comp", .name = "skin.comp.spv" },
     .{ .src = shader_dir ++ "/skin_bounds.comp", .name = "skin_bounds.comp.spv" },
+    .{ .src = shader_dir ++ "/instance_update.comp", .name = "instance_moves.comp.spv" },
+    .{ .src = shader_dir ++ "/instance_update.comp", .name = "instance_rewrites.comp.spv", .defines = &.{"REWRITE"} },
     .{ .src = shader_dir ++ "/cull.comp", .name = "cull.comp.spv" },
     .{ .src = shader_dir ++ "/cull_instances.comp", .name = "cull_instances.comp.spv" },
     .{ .src = shader_dir ++ "/visibility.task", .name = "visibility.task.spv" },

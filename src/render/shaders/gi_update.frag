@@ -3,11 +3,12 @@
 #include "gi.glsl"
 
 layout(buffer_reference, scalar) readonly buffer Rays { vec4 data[]; };
+layout(buffer_reference, scalar) readonly buffer Directions { vec4 data[]; };
 
 layout(push_constant, scalar) uniform Push {
     FrameConstants frame;
     Rays rays;
-    vec4 rotation[3];
+    Directions directions;
     uint rays_per_probe;
     float hysteresis;
     float max_distance;
@@ -31,13 +32,6 @@ const int texels = GI_VISIBILITY_TEXELS;
 const int texels = GI_IRRADIANCE_TEXELS;
 #endif
 
-vec3 sphericalFibonacci(float i, float n) {
-    const float golden = 1.618033988749895;
-    float phi = 2.0 * PI * fract(i * (golden - 1.0));
-    float cos_theta = 1.0 - (2.0 * i + 1.0) / n;
-    float sin_theta = sqrt(clamp(1.0 - cos_theta * cos_theta, 0.0, 1.0));
-    return vec3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
-}
 
 ivec2 interiorTexel(ivec2 t) {
     int last = texels - 1;
@@ -67,17 +61,19 @@ void main() {
     if (!giProbeDue(frame, giProbePosition(probe_grid, grid), uint(probe), push.turn, push.far_distance)) discard;
     ivec2 local = interiorTexel(pixel - tile * texels);
     vec3 direction = decodeNormal((vec2(local) - 0.5) / float(texels - 2));
-    mat3 rotation = mat3(push.rotation[0].xyz, push.rotation[1].xyz, push.rotation[2].xyz);
 
     vec3 total = vec3(0.0);
     float weight_total = 0.0;
     uint first = uint(probe) * push.rays_per_probe;
     for (uint i = 0u; i < push.rays_per_probe; i++) {
+        float weight = max(dot(direction, push.directions.data[i].xyz), 0.0);
         vec4 ray = push.rays.data[first + i];
-        vec3 ray_direction = rotation * sphericalFibonacci(float(i), float(push.rays_per_probe));
-        float weight = max(dot(direction, ray_direction), 0.0);
 #ifdef VISIBILITY
-        weight = pow(weight, 50.0);
+        float squared = weight * weight;
+        float sixteenth = squared * squared;
+        sixteenth *= sixteenth;
+        sixteenth *= sixteenth;
+        weight = sixteenth * sixteenth * sixteenth * squared;
         float distance = min(abs(ray.a), push.max_distance);
         total.rg += vec2(distance, distance * distance) * weight;
 #else

@@ -9,6 +9,7 @@ layout(push_constant, scalar) uniform Push {
     uint depth_texture;
     uint history_valid;
     float settled;
+    uint previous_motion_texture;
 } push;
 
 layout(location = 0) in vec2 in_uv;
@@ -51,6 +52,21 @@ vec3 sampleHistory(FrameConstants frame, vec2 uv) {
         vec4(textureLod(TEX(push.history_texture, s), vec2(tc3.x, tc12.y), 0.0).rgb, 1.0) * (w3.x * w12.y) +
         vec4(textureLod(TEX(push.history_texture, s), vec2(tc12.x, tc3.y), 0.0).rgb, 1.0) * (w12.x * w3.y);
     return max(result.rgb / result.a, vec3(0.0));
+}
+
+/// How fast, in pixels a frame, anything near the reprojected pixel moved last frame.
+float speedBefore(FrameConstants frame, vec2 history_uv) {
+    if (push.previous_motion_texture == INVALID_ID) return 0.0;
+    ivec2 at = ivec2(history_uv * frame.resolution);
+    ivec2 limit = ivec2(frame.resolution) - 1;
+    float fastest = 0.0;
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            vec2 moved = texelFetch(TEX(push.previous_motion_texture, frame.sampler_nearest_clamp), clamp(at + ivec2(x, y), ivec2(0), limit), 0).rg * frame.resolution;
+            fastest = max(fastest, dot(moved, moved));
+        }
+    }
+    return sqrt(fastest);
 }
 
 void main() {
@@ -122,7 +138,8 @@ void main() {
     vec3 offset = history - box_center;
     vec3 unit = abs(offset / box_extent);
     float max_unit = max(unit.x, max(unit.y, unit.z));
-    if (max_unit > 1.0) history = mix(history, box_center + offset / max_unit, max(clamp(speed * 4.0, 0.0, 1.0), 0.1));
+    float stale = clamp(max(speed, speedBefore(frame, history_uv)) * 4.0, 0.1, 1.0);
+    if (max_unit > 1.0) history = mix(history, box_center + offset / max_unit, stale);
 
     float blend = mix(0.05, 0.2, clamp(speed / 24.0, 0.0, 1.0)) * max(confidence, 0.15);
     float flicker = abs(current_ycocg.x - history.x) / max(max(current_ycocg.x, history.x), 1e-3);

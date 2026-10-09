@@ -1,5 +1,6 @@
-//! Checks of what no example shows: picking, a pass that fails, shader
-//! reloading, texture streaming from the asset cache, geometry compaction and
+//! Checks of what no example shows: picking, stale handles, moved entities,
+//! other threads editing a scene, a pass that fails, shader reloading, texture
+//! streaming from the asset cache, geometry compaction and
 //! running out of memory. Draws without a window, with validation on, and
 //! fails on the first check that does not hold. `zig build verify` runs it.
 const std = @import("std");
@@ -28,6 +29,7 @@ const Checks = struct {
     target: gfx.rhi.Texture,
     camera: gfx.Camera,
     box: gfx.Entity,
+    box_model: gfx.Model,
 
     fn draw(self: *Checks, frames: usize) !void {
         for (0..frames) |_| _ = try self.renderer.render(.{
@@ -54,6 +56,137 @@ const Checks = struct {
         if (@abs(hit.distance - 4.5) > 0.2) return error.PickDistanceWrong;
         if (try self.pickAt(.{ 4, 4 }) != null) return error.PickHitTheSky;
         std.log.info("picking: the box {d:.2} m away, and nothing in the sky", .{hit.distance});
+    }
+
+    /// Setters and `destroy` ignore a handle whose object is gone, queries
+    /// answer empty, and only making something from one fails.
+    fn staleHandles(self: *Checks) !void {
+        const renderer = self.renderer;
+        const scene = try renderer.scenes.create();
+        const triangle = [_][3]f32{ .{ 0, 0, 0 }, .{ 1, 0, 0 }, .{ 0, 1, 0 } };
+        const model = try renderer.models.create(&.{.{ .positions = &triangle, .indices = &.{ 0, 1, 2 } }});
+        const entity = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.identity });
+        const group = try renderer.instances.create(scene, model, &.{math.identity});
+        renderer.instances.destroy(group);
+        renderer.entities.despawn(entity);
+        renderer.scenes.destroy(scene);
+        try renderer.models.destroy(model);
+
+        renderer.entities.despawn(entity);
+        renderer.entities.setTransform(entity, math.identity);
+        renderer.entities.setTransforms(&.{entity}, &.{math.identity});
+        renderer.entities.setVisible(entity, false);
+        try renderer.entities.bakeLightmap(entity, null);
+        try renderer.instances.set(group, &.{math.identity});
+        renderer.instances.destroy(group);
+        try renderer.scenes.setLights(scene, &.{});
+        try renderer.scenes.setDecals(scene, &.{});
+        renderer.scenes.setSun(scene, .{ .direction = .{ 0, -1, 0 }, .color = .{ 1, 1, 1 }, .intensity = 1 });
+        renderer.scenes.destroy(scene);
+        try renderer.materials.setShader(model, null, null, .{ 0, 0, 0, 0 });
+        try renderer.models.destroy(model);
+
+        if (renderer.models.state(model) != .failed) return error.StaleModelHasState;
+        if (renderer.models.info(model) != null) return error.StaleModelHasInfo;
+        if (renderer.entities.lightmapProgress(entity) != null) return error.StaleEntityAnswered;
+        if (renderer.entities.spawn(scene, .{ .model = self.box_model, .transform = math.identity }) != error.InvalidScene) return error.SpawnedInStaleScene;
+        if (renderer.entities.spawn(self.scene, .{ .model = model, .transform = math.identity }) != error.InvalidModel) return error.SpawnedStaleModel;
+        try self.draw(2);
+        std.log.info("stale handles: ignored by setters, empty to queries, refused by spawn", .{});
+    }
+
+    /// Other threads move and spawn entities while frames are drawn. The crowd
+    /// is large enough for its instance records to be written across threads.
+    fn threads(self: *Checks) !void {
+        const renderer = self.renderer;
+        const crowd = try self.gpa.alloc(gfx.Entity, 12_000);
+        defer self.gpa.free(crowd);
+        const home = try self.gpa.alloc(math.Mat4, crowd.len);
+        defer self.gpa.free(home);
+        for (crowd, home, 0..) |*entity, *at, index| {
+            at.* = math.translation(.{ @floatFromInt(index % 32), 0, -4 - @as(f32, @floatFromInt(index / 32)) });
+            entity.* = try renderer.entities.spawn(self.scene, .{ .model = self.box_model, .transform = at.* });
+        }
+        var stop: std.atomic.Value(bool) = .init(false);
+        var failed: std.atomic.Value(bool) = .init(false);
+        const Worker = struct {
+            fn move(checks: *Checks, entities: []const gfx.Entity, places: []const math.Mat4, done: *std.atomic.Value(bool)) void {
+                var step: f32 = 0;
+                while (!done.load(.acquire)) : (step += 0.01) {
+                    for (entities, 0..) |entity, index| {
+                        const at = math.translation(.{ @floatFromInt(index % 32), @sin(step), -4 - @as(f32, @floatFromInt(index / 32)) });
+                        checks.renderer.entities.setTransform(entity, at);
+                        checks.renderer.entities.setTint(entity, .{ 1, 0.5 + 0.5 * @sin(step), 1 });
+                    }
+                    checks.renderer.entities.setTransforms(entities, places);
+                }
+            }
+            fn churn(checks: *Checks, done: *std.atomic.Value(bool), broke: *std.atomic.Value(bool)) void {
+                while (!done.load(.acquire)) {
+                    const entity = checks.renderer.entities.spawn(checks.scene, .{ .model = checks.box_model, .transform = math.translation(.{ 0, 3, 0 }) }) catch return broke.store(true, .release);
+                    checks.renderer.entities.setTransform(entity, math.translation(.{ 0, 4, 0 }));
+                    _ = checks.renderer.getStats();
+                    checks.renderer.entities.despawn(entity);
+                    checks.renderer.entities.setTransform(entity, math.identity);
+                }
+            }
+        };
+        var group: std.Io.Group = .init;
+        try group.concurrent(self.io, Worker.move, .{ self, crowd, home, &stop });
+        const alone = self.draw(30);
+        const churned = group.concurrent(self.io, Worker.churn, .{ self, &stop, &failed });
+        const drawn = self.draw(60);
+        stop.store(true, .release);
+        group.await(self.io) catch {};
+        try alone;
+        try churned;
+        try drawn;
+        if (failed.load(.acquire)) return error.SpawnFailedWhileDrawing;
+        for (crowd) |entity| renderer.entities.despawn(entity);
+        try self.draw(2);
+        std.log.info("threads: 90 frames of {d} entities drawn while other threads edited them", .{crowd.len});
+    }
+
+    fn levelsApart(before: []const u8, after: []const u8) f32 {
+        var total: u64 = 0;
+        for (before, after) |a, b| total += @abs(@as(i32, a) - @as(i32, b));
+        return @as(f32, @floatFromInt(total)) / @as(f32, @floatFromInt(before.len));
+    }
+
+    /// Entities that are moved, teleported and tinted have only their own
+    /// records brought up to date. The picture must be the one that writing
+    /// every record again gives.
+    fn moves(self: *Checks) !void {
+        const renderer = self.renderer;
+        var row: [24]gfx.Entity = undefined;
+        for (&row, 0..) |*entity, index| {
+            const x = @as(f32, @floatFromInt(index)) * 0.25 - 2.9;
+            entity.* = try renderer.entities.spawn(self.scene, .{ .model = self.box_model, .transform = math.mul(math.translation(.{ x, 1.2, -1 }), math.scaling(.{ 0.24, 0.5, 0.24 })) });
+        }
+        try self.draw(30);
+        const pixels_before = try renderer.device.readTexture(self.gpa, self.target);
+        defer self.gpa.free(pixels_before);
+        for (row, 0..) |entity, index| {
+            const x = @as(f32, @floatFromInt(index)) * 0.25 - 2.9;
+            const at = math.mul(math.translation(.{ x, 1.8 + 0.3 * @sin(@as(f32, @floatFromInt(index))), -1 }), math.scaling(.{ 0.24, 0.5, 0.24 }));
+            if (index % 3 == 1) renderer.entities.teleport(entity, at) else renderer.entities.setTransform(entity, at);
+            if (index % 3 == 2) renderer.entities.setTint(entity, .{ 1, 0.2, 0.2 });
+        }
+        try self.draw(30);
+        const pixels_moved = try renderer.device.readTexture(self.gpa, self.target);
+        defer self.gpa.free(pixels_moved);
+        renderer.entities.setVisible(row[0], false);
+        renderer.entities.setVisible(row[0], true);
+        try self.draw(30);
+        const pixels_whole = try renderer.device.readTexture(self.gpa, self.target);
+        defer self.gpa.free(pixels_whole);
+        const changed = levelsApart(pixels_before, pixels_moved);
+        const apart = levelsApart(pixels_moved, pixels_whole);
+        if (changed < 0.05) return error.MovedEntitiesDrawnWhereTheyWere;
+        if (apart > changed * 0.3) return error.MovedEntitiesDrawnWrong;
+        for (row) |entity| renderer.entities.despawn(entity);
+        try self.draw(2);
+        std.log.info("moves: the picture changed by {d:.2} levels, and differs by {d:.2} from one drawn afresh", .{ changed, apart });
     }
 
     fn failedPass(self: *Checks) !void {
@@ -309,6 +442,7 @@ pub fn main(init: std.process.Init) !void {
     const renderer = try gfx.Renderer.init(failing.allocator(), init.io, .{
         .application_name = "limn checks",
         .validation = true,
+        .mesh_shaders = true,
         .job_allocator = failing.allocator(),
         .asset_cache_dir = cache_dir,
         .texture_streaming = .{ .budget_bytes = 4 * 1024 * 1024, .evict_delay_frames = 8, .from_cache = true },
@@ -339,11 +473,15 @@ pub fn main(init: std.process.Init) !void {
         .scene = scene,
         .target = target,
         .camera = gfx.Camera.lookAt(.{ 0, 0.5, 5 }, .{ 0, 0.5, 0 }),
+        .box_model = box,
         .box = try renderer.entities.spawn(scene, .{ .model = box, .transform = math.identity }),
     };
     try renderer.waitUntilLoaded();
     try checks.draw(8);
     try checks.picking();
+    try checks.staleHandles();
+    try checks.moves();
+    try checks.threads();
     try checks.failedPass();
     try checks.shaderReload();
     try checks.streaming();

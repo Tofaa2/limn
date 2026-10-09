@@ -29,8 +29,8 @@ pub const Fluids = struct {
     /// Adds a box of GPU-simulated smoke and fire to a scene.
     pub fn create(fluids: *Fluids, scene: Scene, desc: FluidDesc) !Fluid {
         const self = fluids.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
         if (data.fluids.items.len == max_fluids) return error.TooManyFluids;
         if (desc.sources.len > gpu.max_fluid_sources) return error.TooManyFluidSources;
@@ -49,9 +49,9 @@ pub const Fluids = struct {
     /// simulation.
     pub fn set(fluids: *Fluids, fluid: Fluid, desc: FluidDesc) !void {
         const self = fluids.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
+        self.lock();
+        defer self.unlock();
+        const state = self.fluids.table.get(fluid) orelse return;
         if (desc.sources.len > gpu.max_fluid_sources) return error.TooManyFluidSources;
         if (desc.obstacles.len > gpu.max_fluid_obstacles) return error.TooManyFluidObstacles;
         const resized = !std.mem.eql(u32, &desc.resolution, &state.desc.resolution);
@@ -66,8 +66,8 @@ pub const Fluids = struct {
     /// Empties a fluid: no smoke, no heat, no motion.
     pub fn reset(fluids: *Fluids, fluid: Fluid) void {
         const self = fluids.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         if (self.fluids.table.get(fluid)) |state| state.cleared = false;
     }
 
@@ -76,8 +76,8 @@ pub const Fluids = struct {
     /// lasts as long as the fluid.
     pub fn image(fluids: *Fluids, fluid: Fluid) !Image {
         const self = fluids.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
         if (state.picture == null) {
             state.picture = try self.device.createTexture(.{
@@ -96,8 +96,8 @@ pub const Fluids = struct {
     /// between frames, after `fluids.image` and at least one rendered frame.
     pub fn saveImage(fluids: *Fluids, fluid: Fluid, path: []const u8) !void {
         const self = fluids.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
         const picture = state.picture orelse return error.NoFluidImage;
         try saveHdrPicture(self, picture, state.size[0], state.size[1], path);
@@ -109,8 +109,8 @@ pub const Fluids = struct {
     /// restarts it.
     pub fn recordFlipbook(fluids: *Fluids, fluid: Fluid, desc: FluidFlipbookDesc) !Image {
         const self = fluids.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
         if (desc.columns == 0 or desc.rows == 0) return error.InvalidFlipbook;
         const frame = desc.frame_size orelse [2]u32{ state.size[0], state.size[1] };
@@ -139,8 +139,8 @@ pub const Fluids = struct {
     /// Flipbook frames recorded so far; `columns * rows` when full.
     pub fn flipbookFrames(fluids: *Fluids, fluid: Fluid) u32 {
         const self = fluids.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const state = self.fluids.table.get(fluid) orelse return 0;
         return state.flipbook_recorded;
     }
@@ -149,8 +149,8 @@ pub const Fluids = struct {
     /// the GPU; call between frames.
     pub fn saveFlipbook(fluids: *Fluids, fluid: Fluid, path: []const u8) !void {
         const self = fluids.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
         const sheet = state.flipbook orelse return error.NoFluidImage;
         if (state.flipbook_recorded == 0) return error.NoFluidImage;
@@ -160,8 +160,8 @@ pub const Fluids = struct {
     /// A stale handle is ignored.
     pub fn destroy(fluids: *Fluids, fluid: Fluid) void {
         const self = fluids.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         var removed = self.fluids.table.remove(fluid) orelse return;
         destroyFluidTextures(self, &removed);
         const scene = self.scenes.table.get(removed.scene) orelse return;

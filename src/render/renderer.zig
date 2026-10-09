@@ -173,7 +173,9 @@ pub const cloud_noise_size = renderer_state.cloud_noise_size;
 pub const cloud_noise_tiles = renderer_state.cloud_noise_tiles;
 pub const packTint = renderer_state.packTint;
 pub const max_fluids = renderer_state.max_fluids;
-const max_pose_threads = renderer_state.max_pose_threads;
+const max_worker_threads = renderer_state.max_worker_threads;
+const EntityEdit = renderer_state.EntityEdit;
+const EntityMark = renderer_state.EntityMark;
 pub const liquid_cell_slots = renderer_state.liquid_cell_slots;
 pub const max_hair_colliders = renderer_state.max_hair_colliders;
 pub const hair_density_size = renderer_state.hair_density_size;
@@ -207,7 +209,14 @@ const updateGeometryStreaming = streaming_module.updateGeometryStreaming;
 const updateTextureStreaming = streaming_module.updateTextureStreaming;
 
 /// Owns the device and everything made through it. Methods lock internally
-/// (see `lock`), so other threads may load and edit while one renders.
+/// (see `lock`), so other threads may load and edit while one renders; the
+/// entity setters do not wait for a frame that is being recorded.
+///
+/// A handle whose object was destroyed is never an error to set or destroy:
+/// setters and `destroy` do nothing, and queries answer null, 0 or `.failed`.
+/// Only making something from one fails, with `error.InvalidScene` and the
+/// like.
+///
 /// Everything about one kind of object is under its field: `models`, `scenes`,
 /// `entities` and so on. Those, `device` and `options` are the public fields.
 pub const Renderer = struct {
@@ -240,15 +249,27 @@ pub const Renderer = struct {
     /// Shading pass builds, one per feature set seen.
     shade_variants: std.ArrayList(ShadeVariant) = .empty,
     /// This frame's animated entities.
-    posed: std.ArrayList(Entity) = .empty,
     /// Progress through the round of acceleration structure refits.
     refit_cursor: usize = 0,
     /// Count of loaded models with per-texture UV transforms.
     texture_transform_users: u32 = 0,
-    pose_scratch: [max_pose_threads]std.ArrayList(animation.Local) = @splat(.empty),
+    pose_scratch: [max_worker_threads]std.ArrayList(animation.Local) = @splat(.empty),
+    prepare_chunks: std.ArrayList(renderer_state.PrepareChunk) = .empty,
     draw_pipelines: std.ArrayList(DrawPipelines) = .empty,
     /// Guards all renderer and device state; see `lock`.
     mutex: std.Io.Mutex = .init,
+    /// Each entity's transform by slot, now and as of the last prepared
+    /// frame, and its bookkeeping. Apart from `EntityData` so that moving
+    /// many entities touches little memory.
+    entity_transforms: std.array_list.Aligned(Mat4, .@"64") = .empty,
+    entity_previous: std.array_list.Aligned(Mat4, .@"64") = .empty,
+    entity_marks: std.ArrayList(EntityMark) = .empty,
+    /// Entity edits made while the lock was taken, and the ones being made;
+    /// see `queueEdit`.
+    pending: std.ArrayList(EntityEdit) = .empty,
+    applying: std.ArrayList(EntityEdit) = .empty,
+    pending_mutex: std.Io.Mutex = .init,
+    pending_any: std.atomic.Value(bool) = .init(false),
     sampler_linear_clamp: rhi.Sampler,
     sampler_nearest_clamp: rhi.Sampler,
     sampler_linear_repeat: rhi.Sampler,
@@ -342,6 +363,8 @@ pub const Renderer = struct {
     blas_jobs: std.ArrayList(BlasJob) = .empty,
     scratch_locals: std.ArrayList(animation.Local) = .empty,
     scratch_refs: std.ArrayList(gpu.MeshletRef) = .empty,
+    scratch_settling: std.ArrayList([2]u32) = .empty,
+    scratch_moved: std.ArrayList([2]u32) = .empty,
     scratch_instances: std.ArrayList(gpu.Instance) = .empty,
     scratch_static_cull: std.ArrayList(gpu.StaticCull) = .empty,
 
@@ -498,6 +521,11 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         const device = self.device;
         device.waitIdle() catch {};
+        self.pending.deinit(self.gpa);
+        self.applying.deinit(self.gpa);
+        self.entity_transforms.deinit(self.gpa);
+        self.entity_previous.deinit(self.gpa);
+        self.entity_marks.deinit(self.gpa);
         while (self.entities.table.popAny()) |entity| freeEntityStorage(self, entity);
         while (self.scenes.table.popAny()) |scene_value| {
             var scene = scene_value;
@@ -555,8 +583,8 @@ pub const Renderer = struct {
         }
         dropShadeVariants(self);
         self.shade_variants.deinit(self.gpa);
-        self.posed.deinit(self.gpa);
         for (&self.pose_scratch) |*scratch| scratch.deinit(self.gpa);
+        self.prepare_chunks.deinit(self.gpa);
         for (self.tonemap_pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
         self.tonemap_pipelines.deinit(self.gpa);
         for (self.draw_pipelines.items) |entry| {
@@ -614,6 +642,8 @@ pub const Renderer = struct {
         self.blas_jobs.deinit(self.gpa);
         self.scratch_locals.deinit(self.gpa);
         self.scratch_refs.deinit(self.gpa);
+        self.scratch_settling.deinit(self.gpa);
+        self.scratch_moved.deinit(self.gpa);
         self.scratch_instances.deinit(self.gpa);
         self.scratch_static_cull.deinit(self.gpa);
         pipelines_module.releaseOverrides();
@@ -627,8 +657,8 @@ pub const Renderer = struct {
     /// Records the new framebuffer size in pixels; the swapchain is rebuilt
     /// at the next frame. Safe from any thread.
     pub fn resize(self: *Renderer, width: u32, height: u32) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         self.device.resize(width, height);
     }
 
@@ -642,8 +672,8 @@ pub const Renderer = struct {
     /// Last frame's counters, with current loading count and GPU memory use.
     /// Safe from any thread.
     pub fn getStats(self: *Renderer) Stats {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         var stats = self.stats;
         stats.models_loading = self.loading_count;
         stats.gpu_memory_bytes = self.device.memoryStats().used_bytes;
@@ -652,8 +682,8 @@ pub const Renderer = struct {
 
     /// True while any model or environment is still streaming in.
     pub fn isLoading(self: *Renderer) bool {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         return self.loading_count != 0;
     }
 
@@ -661,8 +691,8 @@ pub const Renderer = struct {
     pub fn waitUntilLoaded(self: *Renderer) !void {
         while (true) {
             {
-                self.mutex.lockUncancelable(self.io);
-                defer self.mutex.unlock(self.io);
+                self.lock();
+                defer self.unlock();
                 if (self.loading_count == 0) return;
                 if (self.anyJobFinished()) {
                     var cmd = try self.device.beginImmediate();
@@ -740,6 +770,7 @@ pub const Renderer = struct {
     /// renderer methods while holding it.
     pub fn lock(self: *Renderer) void {
         self.mutex.lockUncancelable(self.io);
+        if (self.pending_any.load(.acquire)) self.applyPending();
     }
 
     /// Must be called from the thread that took the lock.
@@ -747,19 +778,140 @@ pub const Renderer = struct {
         self.mutex.unlock(self.io);
     }
 
+    /// Takes the lock if nothing holds it. The entity setters use it so as
+    /// not to wait for a frame that is being recorded; see `queueEdit`.
+    pub fn tryLock(self: *Renderer) bool {
+        if (!self.mutex.tryLock()) return false;
+        if (self.pending_any.load(.acquire)) self.applyPending();
+        return true;
+    }
+
+    /// Leaves an entity edit to be made, in order, before anything else next
+    /// uses the lock, so that the caller does not wait for a frame.
+    pub fn queueEdit(self: *Renderer, entity: Entity, change: EntityEdit.Change) void {
+        self.queueEdits(&.{.{ .entity = entity, .change = change }});
+    }
+
+    /// `queueEdit` for several edits under one lock of the queue.
+    pub fn queueEdits(self: *Renderer, edits: []const EntityEdit) void {
+        const queued = queued: {
+            self.pending_mutex.lockUncancelable(self.io);
+            defer self.pending_mutex.unlock(self.io);
+            self.pending.appendSlice(self.gpa, edits) catch break :queued false;
+            self.pending_any.store(true, .release);
+            break :queued true;
+        };
+        if (queued) return;
+        self.lock();
+        defer self.unlock();
+        for (edits) |edit| applyEdit(self, edit);
+    }
+
+    fn applyPending(self: *Renderer) void {
+        {
+            self.pending_mutex.lockUncancelable(self.io);
+            defer self.pending_mutex.unlock(self.io);
+            std.mem.swap(std.ArrayList(EntityEdit), &self.pending, &self.applying);
+            self.pending_any.store(false, .release);
+        }
+        for (self.applying.items) |edit| applyEdit(self, edit);
+        self.applying.clearRetainingCapacity();
+    }
+
+    fn applyEdit(self: *Renderer, edit: EntityEdit) void {
+        switch (edit.change) {
+            .transform => |transform| self.moveEntity(edit.entity, transform, false),
+            .teleport => |transform| self.moveEntity(edit.entity, transform, true),
+            .tint => |tint| if (self.entities.table.get(edit.entity)) |data| {
+                if (data.tint == tint) return;
+                data.tint = tint;
+                self.restyleEntity(edit.entity);
+            },
+            .params => |params| if (self.entities.table.get(edit.entity)) |data| {
+                if (std.mem.eql(f32, &data.params, &params)) return;
+                data.params = params;
+                self.restyleEntity(edit.entity);
+            },
+            .pose => |pose| if (self.entities.table.get(edit.entity)) |data| {
+                data.pose = pose;
+            },
+        }
+    }
+
+    /// The bookkeeping of a live entity. Needs the lock, as do the calls below.
+    pub fn markOf(self: *Renderer, entity: Entity) ?*EntityMark {
+        if (entity.index >= self.entity_marks.items.len) return null;
+        const mark = &self.entity_marks.items[entity.index];
+        return if (mark.handle == @as(u64, @bitCast(entity))) mark else null;
+    }
+
+    /// An entity's transform; the identity for a stale handle.
+    pub fn transformOf(self: *Renderer, entity: Entity) Mat4 {
+        return if (self.markOf(entity) != null) self.entity_transforms.items[entity.index] else math.identity;
+    }
+
+    /// Gives an entity a transform. A teleport is not motion.
+    pub fn moveEntity(self: *Renderer, entity: Entity, transform: Mat4, teleport: bool) void {
+        const mark = self.markOf(entity) orelse return;
+        const slot = &self.entity_transforms.items[entity.index];
+        if (teleport) {
+            self.entity_previous.items[entity.index] = transform;
+        } else if (std.mem.eql(f32, slot, &transform)) return;
+        slot.* = transform;
+        self.noteEdited(entity.index, mark, if (teleport) EntityMark.teleported else EntityMark.moved);
+    }
+
+    /// Has an entity's instance records written again.
+    pub fn restyleEntity(self: *Renderer, entity: Entity) void {
+        const mark = self.markOf(entity) orelse return;
+        self.noteEdited(entity.index, mark, EntityMark.restyled);
+    }
+
+    fn noteEdited(self: *Renderer, index: u32, mark: *EntityMark, change: u32) void {
+        const wanted = change | EntityMark.listed;
+        if (mark.bits & wanted == wanted) return;
+        const scene = self.scenes.table.get(mark.scene) orelse return;
+        const whole = EntityMark.restyled | EntityMark.teleported;
+        if (change & whole != 0 and mark.bits & whole == 0) scene.restyled_entries += mark.layout_count;
+        mark.bits |= change;
+        if (mark.bits & EntityMark.listed != 0) return;
+        scene.edited.append(self.gpa, index) catch {
+            scene.records_valid = false;
+            return;
+        };
+        scene.edited_entries += mark.layout_count;
+        mark.bits |= EntityMark.listed;
+    }
+
+    /// Starts the bookkeeping of a new entity.
+    pub fn markEntity(self: *Renderer, entity: Entity, scene: Scene, transform: Mat4) !void {
+        const needed = @as(usize, entity.index) + 1;
+        if (self.entity_marks.items.len < needed) {
+            try self.entity_transforms.ensureTotalCapacity(self.gpa, needed);
+            try self.entity_previous.ensureTotalCapacity(self.gpa, needed);
+            try self.entity_marks.ensureTotalCapacity(self.gpa, needed);
+            @memset(self.entity_transforms.addManyAsSliceAssumeCapacity(needed - self.entity_transforms.items.len), math.identity);
+            @memset(self.entity_previous.addManyAsSliceAssumeCapacity(needed - self.entity_previous.items.len), math.identity);
+            @memset(self.entity_marks.addManyAsSliceAssumeCapacity(needed - self.entity_marks.items.len), .{});
+        }
+        self.entity_transforms.items[entity.index] = transform;
+        self.entity_previous.items[entity.index] = transform;
+        self.entity_marks.items[entity.index] = .{ .handle = @bitCast(entity), .scene = scene };
+    }
+
     /// Asks which entity is under `pixel` (in the view's pixels; null is the
     /// main view). The answer arrives through `takePick` a few frames later.
     /// A new request replaces an unserved one. Blended surfaces do not pick.
     pub fn requestPick(self: *Renderer, view: ?View, pixel: [2]u32) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         self.pick_request = .{ .view = view orelse self.main_view, .pixel = pixel };
     }
 
     /// Returns the answer to a `requestPick` once, when it is ready.
     pub fn takePick(self: *Renderer) ?PickResult {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         defer self.pick_result = null;
         return self.pick_result;
     }
@@ -809,14 +961,14 @@ pub const Renderer = struct {
         var failure: ?anyerror = null;
         try device.waitForFrame();
         {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
+            self.lock();
+            defer self.unlock();
             if (!try device.prepareSurface()) return false;
         }
         if (!try device.acquireImage()) return false;
         {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
+            self.lock();
+            defer self.unlock();
             const cpu_start = std.Io.Clock.Timestamp.now(self.io, .awake);
             const frame = try device.startFrame();
             self.renderFrame(frame, desc) catch |err| {
@@ -900,8 +1052,8 @@ pub const Renderer = struct {
 
     /// True when the window surface is HDR10.
     pub fn hdrActive(self: *Renderer) bool {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         return self.device.hdr_active;
     }
 };

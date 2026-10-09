@@ -23,16 +23,16 @@ pub const Views = struct {
     /// allocated on first use and follow the size it is drawn at.
     pub fn create(views: *Views) !View {
         const self = views.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         return insertView(self);
     }
 
     /// The main view cannot be destroyed.
     pub fn destroy(views: *Views, view: View) void {
         const self = views.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         if (std.meta.eql(view, self.main_view)) return;
         var removed = self.views.table.remove(view) orelse return;
         removed.deinit(self.device);
@@ -42,8 +42,8 @@ pub const Views = struct {
     /// lists can show (`targetImage`).
     pub fn createTarget(views: *Views, width: u32, height: u32) !rhi.Texture {
         const self = views.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const texture = try self.device.createTexture(.{
             .name = "view target",
             .width = width,
@@ -63,8 +63,8 @@ pub const Views = struct {
     /// Its `targetImage` images must not be drawn afterwards.
     pub fn destroyTarget(views: *Views, target: rhi.Texture) void {
         const self = views.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         self.device.destroyTexture(target);
     }
 
@@ -73,8 +73,8 @@ pub const Views = struct {
     /// the target is destroyed.
     pub fn targetImage(views: *Views, target: rhi.Texture) !Image {
         const self = views.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         if (!self.device.textureExists(target)) return error.InvalidTarget;
         const info = self.device.textureInfo(target);
         return .{ .index = self.device.textureIndex(target), .width = info.width, .height = info.height };

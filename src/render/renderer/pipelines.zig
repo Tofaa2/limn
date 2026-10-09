@@ -25,8 +25,8 @@ pub const Shaders = struct {
     pub fn reload(shaders: *Shaders) !u32 {
         if (!shader_sources.reload) return error.ShaderReloadDisabled;
         const self = shaders.renderer();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const gpa = self.gpa;
         const device = self.device;
         var compiled: std.ArrayList([]u8) = .empty;
@@ -99,8 +99,8 @@ pub const Shaders = struct {
         const self = shaders.renderer();
         while (true) {
             {
-                self.mutex.lockUncancelable(self.io);
-                defer self.mutex.unlock(self.io);
+                self.lock();
+                defer self.unlock();
                 var pending = false;
                 for (self.shade_variants.items) |variant| {
                     if (variant.job) |job| if (!job.done.load(.acquire)) {
@@ -152,6 +152,8 @@ pub fn createPipelines(device: *rhi.Device) !Pipelines {
     return .{
         .skin = try device.createComputePipeline(.{ .name = "skin", .shader = shaderCode("skin.comp.spv") }),
         .skin_bounds = try device.createComputePipeline(.{ .name = "skin bounds", .shader = shaderCode("skin_bounds.comp.spv") }),
+        .instance_moves = try device.createComputePipeline(.{ .name = "instance moves", .shader = shaderCode("instance_moves.comp.spv") }),
+        .instance_rewrites = try device.createComputePipeline(.{ .name = "instance rewrites", .shader = shaderCode("instance_rewrites.comp.spv") }),
         .cull = try device.createComputePipeline(.{ .name = "cull", .shader = shaderCode("cull.comp.spv") }),
         .cull_instances = try device.createComputePipeline(.{ .name = "cull instances", .shader = shaderCode("cull_instances.comp.spv") }),
         .cluster = try device.createComputePipeline(.{ .name = "light clusters", .shader = shaderCode("cluster.comp.spv") }),

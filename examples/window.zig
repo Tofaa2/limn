@@ -88,6 +88,41 @@ pub const Window = struct {
     }
 };
 
+/// CPU time of the renderer's zones, for `--timings`.
+const Zones = struct {
+    io: std.Io = undefined,
+    names: [32][]const u8 = undefined,
+    totals: [32]f64 = @splat(0),
+    depths: [32]usize = undefined,
+    count: usize = 0,
+    open: [8]struct { zone: usize, start: std.Io.Clock.Timestamp } = undefined,
+    depth: usize = 0,
+
+    fn begin(_: ?*anyopaque, name: [:0]const u8) u64 {
+        if (zones.depth == zones.open.len) return 0;
+        const zone = for (zones.names[0..zones.count], 0..) |known, index| {
+            if (known.ptr == name.ptr) break index;
+        } else new: {
+            if (zones.count == zones.names.len) return 0;
+            zones.names[zones.count] = name;
+            zones.depths[zones.count] = @min(zones.depth, 3);
+            zones.count += 1;
+            break :new zones.count - 1;
+        };
+        zones.open[zones.depth] = .{ .zone = zone, .start = std.Io.Clock.Timestamp.now(zones.io, .awake) };
+        zones.depth += 1;
+        return 1;
+    }
+
+    fn end(_: ?*anyopaque, opened: u64) void {
+        if (opened == 0) return;
+        zones.depth -= 1;
+        const entry = zones.open[zones.depth];
+        zones.totals[entry.zone] += @as(f64, @floatFromInt(entry.start.untilNow(zones.io).raw.nanoseconds)) / 1e6;
+    }
+};
+var zones: Zones = .{};
+
 /// `--frames N` makes an example exit after N frames, for smoke tests.
 pub fn frameLimit(init: std.process.Init) !?u64 {
     var args = try init.minimal.args.iterateAllocator(init.gpa);
@@ -106,6 +141,8 @@ pub fn frameLimit(init: std.process.Init) !?u64 {
 ///   --frames N           exit after N frames
 ///   --screenshot f.png   render without a window (with validation on) and
 ///                        write the last frame, to check the picture
+///   --timings            render without a window and print the average
+///                        GPU time of each pass and the CPU time of a frame
 ///   --validation         turn the Vulkan validation layers on
 ///   --names              name GPU objects and label passes for debuggers
 ///                        such as RenderDoc; always on in a debug build
@@ -128,6 +165,15 @@ pub const Stage = struct {
     gpu_ms: f32 = 0,
     meter_time: f32 = 0,
     meter_frames: u32 = 0,
+    timings: bool = false,
+    timed_frames: u32 = 0,
+    timed_cpu: f64 = 0,
+    timed: [128]Timed = undefined,
+    timed_count: usize = 0,
+
+    const Timed = struct { name: []const u8, depth: u32, total: f64 };
+    /// Frames left out of `--timings`, while pipelines compile and history fills.
+    const timing_warmup = 60;
 
     pub const width = 1280;
     pub const height = 720;
@@ -145,6 +191,7 @@ pub const Stage = struct {
         var screenshot: ?[]const u8 = null;
         var debug_names = builtin.mode == .Debug;
         var validation = false;
+        var timings = false;
         var args = try init.minimal.args.iterateAllocator(init.gpa);
         defer args.deinit();
         _ = args.skip();
@@ -161,26 +208,34 @@ pub const Stage = struct {
                 debug_names = true;
             } else if (std.mem.eql(u8, arg, "--validation")) {
                 validation = true;
+            } else if (std.mem.eql(u8, arg, "--timings")) {
+                timings = true;
             } else if (std.mem.startsWith(u8, arg, "--")) {
                 own_value = true;
             } else return error.InvalidArgument;
         }
-        if (screenshot != null and frame_limit == null) frame_limit = 240;
+        const headless = screenshot != null or timings;
+        if (headless and frame_limit == null) frame_limit = 240;
 
-        const window: ?Window = if (screenshot != null) null else try Window.init(width, height, title);
+        const window: ?Window = if (headless) null else try Window.init(width, height, title);
         var renderer_options = options;
         renderer_options.application_name = title;
         renderer_options.surface = if (window) |value| try value.surface(false) else null;
         if (screenshot != null or validation) renderer_options.validation = true;
         if (debug_names) renderer_options.debug_names = true;
         if (renderer_options.pipeline_cache_path == null) renderer_options.pipeline_cache_path = "zig-out/pipeline.cache";
+        if (timings and renderer_options.profiler == null) {
+            zones.io = init.io;
+            renderer_options.profiler = .{ .begin = Zones.begin, .end = Zones.end };
+        }
         const renderer = try gfx.Renderer.init(init.gpa, init.io, renderer_options);
         return .{
             .init = init,
             .window = window,
             .renderer = renderer,
-            .offscreen = if (screenshot != null) try renderer.views.createTarget(width, height) else null,
+            .offscreen = if (headless) try renderer.views.createTarget(width, height) else null,
             .screenshot = screenshot,
+            .timings = timings,
             .frame_limit = frame_limit,
             .last = if (window) |value| value.time() else 0,
         };
@@ -225,6 +280,8 @@ pub const Stage = struct {
         if (!presented) return self.init.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
         self.frames += 1;
         self.meter_frames += 1;
+        if (self.timings and self.frames == timing_warmup) zones.totals = @splat(0);
+        if (self.timings and self.frames > timing_warmup) self.noteTimings();
         if (self.time - self.meter_time >= 0.5) {
             self.fps = @as(f32, @floatFromInt(self.meter_frames)) / (self.time - self.meter_time);
             const images = self.renderer.device.presented.load(.monotonic);
@@ -239,10 +296,40 @@ pub const Stage = struct {
         }
     }
 
+    fn noteTimings(self: *Stage) void {
+        self.timed_frames += 1;
+        self.timed_cpu += self.renderer.getStats().cpu_ms;
+        for (self.renderer.device.passTimings()) |timing| {
+            const entry = for (self.timed[0..self.timed_count]) |*entry| {
+                if (entry.depth == timing.depth and std.mem.eql(u8, entry.name, timing.name)) break entry;
+            } else new: {
+                if (self.timed_count == self.timed.len) continue;
+                self.timed[self.timed_count] = .{ .name = timing.name, .depth = timing.depth, .total = 0 };
+                self.timed_count += 1;
+                break :new &self.timed[self.timed_count - 1];
+            };
+            entry.total += timing.milliseconds;
+        }
+    }
+
+    fn printTimings(self: *Stage) void {
+        const frames: f64 = @floatFromInt(@max(self.timed_frames, 1));
+        var gpu: f64 = 0;
+        for (self.timed[0..self.timed_count]) |entry| {
+            if (entry.depth == 0) gpu += entry.total;
+            std.debug.print("{d:8.3} ms  {s}{s}\n", .{ entry.total / frames, "        "[0..@min(entry.depth * 2, 8)], entry.name });
+        }
+        std.debug.print("{d:8.3} ms  GPU\n{d:8.3} ms  CPU\n", .{ gpu / frames, self.timed_cpu / frames });
+        for (zones.names[0..zones.count], zones.totals[0..zones.count], zones.depths[0..zones.count]) |name, total, depth| {
+            std.debug.print("{d:8.3} ms  {s}{s}\n", .{ total / frames, "        "[0 .. depth * 2 + 2], name });
+        }
+    }
+
     /// Writes the screenshot if one was asked for, and shuts down.
     pub fn finish(self: *Stage) !void {
         const gpa = self.init.gpa;
         try self.renderer.device.waitIdle();
+        if (self.timings) self.printTimings();
         if (self.screenshot) |path| {
             const pixels = try self.renderer.device.readTexture(gpa, self.offscreen.?);
             defer gpa.free(pixels);

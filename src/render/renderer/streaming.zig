@@ -13,6 +13,7 @@ const Mat4 = math.Mat4;
 const Vec3 = math.Vec3;
 const StreamFrustum = renderer_state.StreamFrustum;
 const TextureStream = renderer_state.TextureStream;
+const StreamPart = renderer_state.StreamPart;
 const Zone = renderer_state.Zone;
 const Camera = api.Camera;
 const FrameDesc = api.FrameDesc;
@@ -39,8 +40,8 @@ pub fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
             if (!entity.visible) continue;
             const model = self.models.table.get(entity.model) orelse continue;
             if (model.state != .ready) continue;
-            const center = math.transformPoint(entity.transform, model.info.bounds_center);
-            const radius = model.info.bounds_radius * math.maxScale(entity.transform);
+            const center = math.transformPoint(self.transformOf(item), model.info.bounds_center);
+            const radius = model.info.bounds_radius * math.maxScale(self.transformOf(item));
             model.stream_distance = @min(model.stream_distance, @max(math.length(math.sub(center, eye)) - radius, 0));
         }
         for (scene.groups.items) |item| {
@@ -234,41 +235,71 @@ fn readStreamLevels(self: *Renderer, stream: *const TextureStream, offset: usize
     return bytes;
 }
 
-/// Lowers the wanted mip level of each texture a model's meshes use, for
-/// one copy of the model and the on-screen size of a meter at distance 1.
-fn wantModelTextures(
-    model: *ModelEntry,
-    transform: Mat4,
+/// Builds what `wantPart` reads of each mesh of a ready model, once.
+fn streamParts(self: *Renderer, model: *ModelEntry) ![]const StreamPart {
+    const source = &model.source.?;
+    if (model.stream_parts.len == source.instances.len) return model.stream_parts;
+    const parts = try self.gpa.alloc(StreamPart, source.instances.len);
+    for (parts, source.instances) |*part, instance| {
+        const mesh = &source.meshes[instance.mesh];
+        const material = &source.materials[mesh.material];
+        part.* = .{
+            .density = mesh.uv_density * @max(@abs(material.uv_scale[0]), @abs(material.uv_scale[1])),
+            .center = mesh.bounds_center,
+            .radius = mesh.bounds_radius,
+            .node = if (instance.skin != null) null else instance.node,
+        };
+        inline for (.{ "base_color_texture", "normal_texture", "metallic_roughness_texture", "occlusion_texture", "emissive_texture" }, 0..) |field, slot| {
+            if (@field(material, field)) |ref| if (model.streams[ref.image].data.len != 0) {
+                const stream = model.streams[ref.image];
+                part.streams[slot] = ref.image;
+                part.log_sizes[slot] = @log2(@as(f32, @floatFromInt(@max(stream.width, stream.height, 1))));
+            };
+        }
+    }
+    model.stream_parts = parts;
+    return parts;
+}
+
+const StreamView = struct {
     camera: Camera,
     pixels_at_one_meter: f32,
     bias: f32,
     frustum: ?StreamFrustum,
+};
+
+/// Lowers the wanted mip level of each texture one mesh of a model uses,
+/// for a copy with the given world-space bounds and scale.
+fn wantPart(model: *ModelEntry, part: StreamPart, center: Vec3, radius: f32, scale: f32, view: StreamView) void {
+    if (part.density <= 0) return;
+    const distance = @max(math.length(math.sub(center, view.camera.position)) - radius, view.camera.near);
+    if (view.frustum) |seen| if (!seen.touches(center, radius)) return;
+    const level_base = @log2(@max(part.density / @max(scale, 1e-6) * distance / view.pixels_at_one_meter, 1e-12)) + view.bias;
+    for (part.streams, part.log_sizes) |index, log_size| {
+        if (index == gpu.invalid_id) continue;
+        const stream = &model.streams[index];
+        if (stream.wanted == 0) continue;
+        const level = level_base + log_size;
+        const wanted: u32 = if (!(level > 0)) 0 else if (level >= @as(f32, @floatFromInt(stream.floor))) stream.floor else @intFromFloat(level);
+        stream.wanted = @min(stream.wanted, wanted);
+    }
+}
+
+/// `wantPart` for every mesh of one copy of a model.
+fn wantModelTextures(
+    model: *ModelEntry,
+    parts: []const StreamPart,
+    transform: Mat4,
+    view: StreamView,
     /// Per mesh, whether a camera drew it; null asks for all.
     drawn: ?[]const u32,
 ) void {
-    const source = &model.source.?;
-    for (source.instances, 0..) |instance, part| {
-        if (drawn) |parts| if (parts[part] == 0) continue;
-        const mesh = source.meshes[instance.mesh];
-        if (mesh.uv_density <= 0) continue;
-        const world = if (instance.skin != null) transform else math.mul(transform, model.node_world[instance.node]);
+    for (parts, 0..) |part, index| {
+        if (drawn) |seen| if (seen[index] == 0) continue;
+        if (part.density <= 0) continue;
+        const world = if (part.node) |node| math.mul(transform, model.node_world[node]) else transform;
         const scale = @max(math.maxScale(world), 1e-6);
-        const center = math.transformPoint(world, mesh.bounds_center);
-        const distance = @max(math.length(math.sub(center, camera.position)) - mesh.bounds_radius * scale, camera.near);
-        if (frustum) |seen| if (!seen.touches(center, mesh.bounds_radius * scale)) continue;
-        const material = source.materials[mesh.material];
-        const uv_per_pixel = mesh.uv_density * @max(@abs(material.uv_scale[0]), @abs(material.uv_scale[1])) / scale * distance / pixels_at_one_meter;
-        inline for (.{ "base_color_texture", "normal_texture", "metallic_roughness_texture", "occlusion_texture", "emissive_texture" }) |field| {
-            if (@field(material, field)) |ref| {
-                const stream = &model.streams[ref.image];
-                if (stream.data.len != 0) {
-                    const texels = uv_per_pixel * @as(f32, @floatFromInt(@max(stream.width, stream.height)));
-                    const level = @log2(@max(texels, 1e-6)) + bias;
-                    const wanted: u32 = if (!(level > 0)) 0 else if (level >= @as(f32, @floatFromInt(stream.floor))) stream.floor else @intFromFloat(level);
-                    stream.wanted = @min(stream.wanted, wanted);
-                }
-            }
-        }
+        wantPart(model, part, math.transformPoint(world, part.center), part.radius * scale, scale, view);
     }
 }
 
@@ -316,6 +347,8 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
             };
         } else null;
         const seen: ?[]const u32 = if (streaming.skip_occluded) seenInstances(device, scene, frame) else null;
+        const view = StreamView{ .camera = camera, .pixels_at_one_meter = pixels_at_one_meter, .bias = bias, .frustum = frustum };
+        const laid_out = scene.records_valid and !scene.layout_dirty and scene.layout_generation == self.asset_generation;
         self.seen_round += 1;
         if (seen != null) for (scene.layout.items, 0..) |placed, index| {
             if (!placed.first_of_entity) continue;
@@ -334,7 +367,22 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
                 if (entity.seen_first + count > drawn.len) continue;
                 break :blk drawn[entity.seen_first..][0..count];
             } else null;
-            wantModelTextures(model, entity.transform, camera, pixels_at_one_meter, bias, frustum, parts);
+            const model_parts = try streamParts(self, model);
+            const mark = self.markOf(item) orelse continue;
+            if (!laid_out or mark.layout_count != model_parts.len) {
+                wantModelTextures(model, model_parts, self.transformOf(item), view, parts);
+                continue;
+            }
+            for (model_parts, scene.spheres.items[mark.layout_first..][0..mark.layout_count], 0..) |part, sphere, index| {
+                if (parts) |drawn| if (drawn[index] == 0) continue;
+                if (part.node != null and part.radius > 0) {
+                    wantPart(model, part, sphere[0..3].*, sphere[3], sphere[3] / part.radius, view);
+                    continue;
+                }
+                const world = self.transformOf(item);
+                const scale = @max(math.maxScale(world), 1e-6);
+                wantPart(model, part, math.transformPoint(world, part.center), part.radius * scale, scale, view);
+            }
         }
         for (scene.groups.items) |item| {
             const group = self.instances.table.get(item) orelse continue;
@@ -358,7 +406,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
                     nearest = index;
                 }
             }
-            wantModelTextures(model, group.transforms[nearest orelse continue], camera, pixels_at_one_meter, bias, null, null);
+            wantModelTextures(model, try streamParts(self, model), group.transforms[nearest orelse continue], .{ .camera = camera, .pixels_at_one_meter = pixels_at_one_meter, .bias = bias, .frustum = null }, null);
         }
     }
 

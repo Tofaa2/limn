@@ -13,6 +13,7 @@ layout(push_constant, scalar) uniform Push {
     uint shadow_history;
     uint bounce_texture;
     float bounce_strength;
+    uint shadow_depth;
 } push;
 
 layout(location = 0) in vec2 in_uv;
@@ -404,30 +405,11 @@ void main() {
         }
         gathered = vec4(total.rgb / max(weight_total, 1e-6), 1.0);
     }
-    if (push.shadow_history != INVALID_ID) {
-        vec2 previous_uv = in_uv - out_motion;
-        if (all(greaterThanEqual(previous_uv, vec2(0.0))) && all(lessThanEqual(previous_uv, vec2(1.0)))) {
-            ivec2 history_size = textureSize(TEX(push.shadow_history, frame.sampler_nearest_clamp), 0);
-            ivec2 at = ivec2(previous_uv * vec2(history_size));
-            ivec2 last = history_size - 1;
-            const ivec2 offsets[5] = ivec2[](ivec2(0, 0), ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
-            float here = frame.contact_depth != INVALID_ID ? linearDepth(texelFetch(TEX(frame.contact_depth, frame.sampler_nearest_clamp), pixel, 0).r, frame.near) : 0.0;
-            float total = 0.0;
-            float weight = 0.0;
-            for (int i = 0; i < 5; i++) {
-                float value = texelFetch(TEX(push.shadow_history, frame.sampler_nearest_clamp), clamp(at + offsets[i], ivec2(0), last), 0).a;
-                if (value > 1.0) continue;
-                if (i != 0 && here > 0.0) {
-                    float there = linearDepth(texelFetch(TEX(frame.contact_depth, frame.sampler_nearest_clamp), clamp(pixel + offsets[i], ivec2(0), ivec2(frame.resolution) - 1), 0).r, frame.near);
-                    if (abs(there - here) > 0.03 * here) continue;
-                }
-                float tap = i == 0 ? 2.0 : 1.0;
-                total += value * tap;
-                weight += tap;
-            }
-            if (weight > 0.0) soft_shadow_history = total / weight;
-        }
-    }
+    soft_history_texture = push.shadow_history;
+    soft_history_uv = in_uv - out_motion;
+    soft_history_depth_texture = push.shadow_depth;
+    soft_history_depth = linearDepth(previous_clip.z / previous_clip.w, frame.near);
+    soft_history_slack = 0.05 * soft_history_depth + 2.0 * fwidth(soft_history_depth);
     if (instance.lightmap != INVALID_ID) gathered = vec4(textureLod(TEX(instance.lightmap, frame.sampler_linear_clamp), raw1, 0.0).rgb, 1.0);
     vec3 lit = emissive + shadeSurface(frame, surface, gl_FragCoord.xy, noise, gathered);
     if ((SHADE_FEATURES & FEATURE_AERIAL) != 0u && frame.aerial != 0.0 && (frame.flags & FRAME_ENVIRONMENT) != 0u) {

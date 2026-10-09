@@ -144,8 +144,8 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             if (!entity.visible) continue;
             const model = renderer.models.table.get(entity.model) orelse continue;
             if (model.state != .ready) continue;
-            const center = math.sub(math.transformPoint(entity.transform, model.info.bounds_center), box.corner);
-            const reach = model.info.bounds_radius * math.maxScale(entity.transform);
+            const center = math.sub(math.transformPoint(renderer.transformOf(entity_handle), model.info.bounds_center), box.corner);
+            const reach = model.info.bounds_radius * math.maxScale(renderer.transformOf(entity_handle));
             const local = Vec3{ math.dot(center, box.axes[0]), math.dot(center, box.axes[1]), math.dot(center, box.axes[2]) };
             var inside = true;
             inline for (0..3) |axis| {
@@ -243,8 +243,11 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
         if (state.proxy) |stand_in| if (renderer.entities.table.get(stand_in)) |proxy| {
             const volume = @as(f32, @floatFromInt(state.live)) * spacing * spacing * spacing;
             const filled = std.math.clamp(volume / (box.extent[0] * box.extent[1] * box.extent[2]), 0.002, 1);
-            proxy.transform = math.mul(desc.transform, math.mul(math.translation(.{ 0, -0.5 + filled * 0.5, 0 }), math.scaling(.{ 1, filled, 1 })));
-            proxy.tint = packTint(desc.color);
+            renderer.moveEntity(stand_in, math.mul(desc.transform, math.mul(math.translation(.{ 0, -0.5 + filled * 0.5, 0 }), math.scaling(.{ 1, filled, 1 }))), false);
+            if (proxy.tint != packTint(desc.color)) {
+                proxy.tint = packTint(desc.color);
+                renderer.restyleEntity(stand_in);
+            }
         };
     }
 }
@@ -292,16 +295,16 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             for (scene.entities.items) |entity_handle| {
                 if (state.ripple_count == state.ripples.len) break;
                 const entity = renderer.entities.table.get(entity_handle) orelse continue;
-                if (!entity.visible or entity.travelled < 1e-4) continue;
+                if (!entity.visible or renderer.entity_marks.items[entity_handle.index].travelled < 1e-4) continue;
                 const model = renderer.models.table.get(entity.model) orelse continue;
                 if (model.state != .ready) continue;
-                const center = math.transformPoint(entity.transform, model.info.bounds_center);
-                const radius = model.info.bounds_radius * math.maxScale(entity.transform);
+                const center = math.transformPoint(renderer.transformOf(entity_handle), model.info.bounds_center);
+                const radius = model.info.bounds_radius * math.maxScale(renderer.transformOf(entity_handle));
                 const local = math.transformPoint(to_sheet, center);
                 const above = local[1] * up;
                 if (@abs(above) >= radius or @abs(local[0]) > 0.5 or @abs(local[2]) > 0.5) continue;
                 const cut = @sqrt(radius * radius - above * above);
-                const speed = entity.travelled / @max(delta_time, 1e-4);
+                const speed = renderer.entity_marks.items[entity_handle.index].travelled / @max(delta_time, 1e-4);
                 if (speed * cut > splash_strength) {
                     splash_strength = speed * cut;
                     splash_at = math.transformPoint(t, .{ local[0], 0, local[2] });
@@ -311,7 +314,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
                 state.ripples[state.ripple_count] = .{
                     .position = .{ local[0] + 0.5, local[2] + 0.5 },
                     .radius = @min(cut, radius) / width,
-                    .depth = @min(entity.travelled * 0.35 * desc.object_ripples, radius * 0.5) / up,
+                    .depth = @min(renderer.entity_marks.items[entity_handle.index].travelled * 0.35 * desc.object_ripples, radius * 0.5) / up,
                 };
                 state.ripple_count += 1;
             }

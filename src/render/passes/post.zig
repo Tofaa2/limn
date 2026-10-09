@@ -149,9 +149,10 @@ pub fn resolveTemporal(renderer: *Renderer, p: *const ScenePass, path_traced: bo
             return current;
         }
         cmd.beginScope("temporal antialiasing");
+        if (view.history_valid) cmd.transition(view.previous_motion, .shader_read);
         try cmd.beginRendering(.{ .color = &.{.{ .texture = current, .load = .discard }} });
         cmd.bindPipeline(renderer.pipelines.taa);
-        cmd.pushConstants(extern struct { frame: u64, color: u32, history: u32, motion: u32, depth: u32, history_valid: u32, settled: f32 }{
+        cmd.pushConstants(extern struct { frame: u64, color: u32, history: u32, motion: u32, depth: u32, history_valid: u32, settled: f32, previous_motion: u32 }{
             .frame = frame_address,
             .color = device.textureIndex(view.hdr),
             .history = device.textureIndex(previous),
@@ -159,6 +160,7 @@ pub fn resolveTemporal(renderer: *Renderer, p: *const ScenePass, path_traced: bo
             .depth = device.textureIndex(view.depth),
             .history_valid = @intFromBool(view.history_valid),
             .settled = settled,
+            .previous_motion = if (view.history_valid) device.textureIndex(view.previous_motion) else gpu.invalid_id,
         });
         cmd.drawFullscreen();
         cmd.endRendering();
