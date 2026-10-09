@@ -214,6 +214,10 @@ pub fn encodeMaterial(self: *Renderer, entry: *ModelEntry, material: gltf.Materi
         }) |pair| {
             if (@field(images, pair[0])) |image| @field(encoded, pair[1]) = image.index;
         }
+        if (images.sampler) |sampler| {
+            encoded.sampler_index = device.samplerIndex(try materialSampler(self, sampler, true));
+            encoded.detail_sampler = device.samplerIndex(try materialSampler(self, sampler, false));
+        }
     }
     return encoded;
 }

@@ -353,14 +353,15 @@ pub const CommandEncoder = struct {
             .texture => |copy| {
                 const resource = device.textureResource(copy.destination);
                 self.transitionMip(copy.destination, copy.mip, .copy_dst);
-                const extent = mipExtent(resource.info, copy.mip);
+                const whole = mipExtent(resource.info, copy.mip);
+                const region: [4]u32 = copy.region orelse .{ 0, 0, whole.width, whole.height };
                 device.vkd.cmdCopyBufferToImage(self.command, device.bufferResource(copy.staging).handle, resource.image, .transfer_dst_optimal, &.{.{
                     .buffer_offset = copy.offset,
                     .buffer_row_length = 0,
                     .buffer_image_height = 0,
                     .image_subresource = .{ .aspect_mask = resource.aspect, .mip_level = copy.mip, .base_array_layer = copy.layer, .layer_count = 1 },
-                    .image_offset = .{ .x = 0, .y = 0, .z = 0 },
-                    .image_extent = .{ .width = extent.width, .height = extent.height, .depth = 1 },
+                    .image_offset = .{ .x = @intCast(region[0]), .y = @intCast(region[1]), .z = 0 },
+                    .image_extent = .{ .width = region[2], .height = region[3], .depth = 1 },
                 }});
                 if (copy.last) device.destroyBuffer(copy.staging);
             },
@@ -377,6 +378,37 @@ pub const CommandEncoder = struct {
             .texture => |copy| self.transition(copy.destination, .shader_read),
             else => {},
         };
+    }
+
+    /// Copies the top-left `width` by `height` texels of a 32-bit float depth
+    /// texture into a 32-bit float color texture, by way of `staging`, which
+    /// must hold four bytes a texel. Leaves both in `shader_read`.
+    pub fn copyDepthToColor(self: *CommandEncoder, depth: types.Texture, staging: types.Buffer, color: types.Texture, width: u32, height: u32) void {
+        self.transition(depth, .copy_src);
+        self.transition(color, .copy_dst);
+        const from = self.device.textureResource(depth);
+        const to = self.device.textureResource(color);
+        const buffer = self.device.bufferResource(staging).handle;
+        const extent = vk.Extent3D{ .width = width, .height = height, .depth = 1 };
+        self.device.vkd.cmdCopyImageToBuffer(self.command, from.image, .transfer_src_optimal, buffer, &.{.{
+            .buffer_offset = 0,
+            .buffer_row_length = 0,
+            .buffer_image_height = 0,
+            .image_subresource = .{ .aspect_mask = .{ .depth_bit = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
+            .image_offset = .{ .x = 0, .y = 0, .z = 0 },
+            .image_extent = extent,
+        }});
+        self.sync(.transfer_to_all);
+        self.device.vkd.cmdCopyBufferToImage(self.command, buffer, to.image, .transfer_dst_optimal, &.{.{
+            .buffer_offset = 0,
+            .buffer_row_length = 0,
+            .buffer_image_height = 0,
+            .image_subresource = .{ .aspect_mask = .{ .color_bit = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
+            .image_offset = .{ .x = 0, .y = 0, .z = 0 },
+            .image_extent = extent,
+        }});
+        self.transition(depth, .shader_read);
+        self.transition(color, .shader_read);
     }
 
     /// Copies mip 0 of `source` to `destination` texel for texel: same size,

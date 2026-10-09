@@ -60,6 +60,29 @@ pub const Views = struct {
         return texture;
     }
 
+    /// As `createTarget`, in `format`, with memory another device can import;
+    /// see `rhi.Device.exportTexture`. `error.SharedTexturesUnavailable`
+    /// where the device cannot share.
+    pub fn createSharedTarget(views: *Views, width: u32, height: u32, format: rhi.Format) !rhi.Texture {
+        const self = views.renderer();
+        self.lock();
+        defer self.unlock();
+        const texture = try self.device.createSharedTexture(.{
+            .name = "shared view target",
+            .width = width,
+            .height = height,
+            .format = format,
+            .usage = .{ .sampled = true, .color_attachment = true, .copy_src = true, .copy_dst = true },
+        });
+        errdefer self.device.destroyTexture(texture);
+        var cmd = try self.device.beginImmediate();
+        try cmd.beginRendering(.{ .color = &.{.{ .texture = texture, .load = .clear, .clear = .{ 0, 0, 0, 1 } }} });
+        cmd.endRendering();
+        cmd.transition(texture, .shader_read);
+        try self.device.endImmediate();
+        return texture;
+    }
+
     /// Its `targetImage` images must not be drawn afterwards.
     pub fn destroyTarget(views: *Views, target: rhi.Texture) void {
         const self = views.renderer();

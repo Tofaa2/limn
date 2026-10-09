@@ -2,6 +2,7 @@
 //! table and the frame loop. Shaders reach textures and samplers through one
 //! global descriptor set and buffers through device addresses.
 const std = @import("std");
+const builtin = @import("builtin");
 const vk = @import("vulkan");
 const types = @import("types.zig");
 const loader = @import("loader.zig");
@@ -115,7 +116,16 @@ pub const PendingUpload = union(enum) {
     buffer: struct { staging: types.Buffer, destination: types.Buffer, offset: u64, size: u64 },
     /// `offset` is the level's start in the staging buffer, which levels
     /// may share; the entry marked `last` releases it.
-    texture: struct { staging: types.Buffer, destination: types.Texture, mip: u32, layer: u32, offset: u64 = 0, last: bool = true },
+    texture: struct {
+        staging: types.Buffer,
+        destination: types.Texture,
+        mip: u32,
+        layer: u32,
+        offset: u64 = 0,
+        last: bool = true,
+        /// X, Y, width and height of the part written; null for the whole level.
+        region: ?[4]u32 = null,
+    },
     mips: types.Texture,
     /// The source is destroyed afterwards.
     copy: struct { source: types.Buffer, destination: types.Buffer, size: u64 },
@@ -282,6 +292,8 @@ pub const Device = struct {
     /// Destroyed objects waiting out the frames in flight.
     deletions: std.ArrayList(PendingDeletion) = .empty,
     uploads: std.ArrayList(PendingUpload) = .empty,
+    /// Whether `createSharedTexture` works on this device.
+    shared_textures: bool = false,
     pending_upload_bytes: u64 = 0,
     timings: [max_timing_scopes]types.PassTiming = undefined,
     timing_count: u32 = 0,
@@ -476,7 +488,7 @@ pub const Device = struct {
             },
         };
         const queue_priorities = [2]f32{ 1, 0.5 };
-        var device_extensions: [8 + ngx_extensions.len][*:0]const u8 = undefined;
+        var device_extensions: [10 + ngx_extensions.len][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
         if (self.shading_rate_tile != 0) {
             device_extensions[device_extension_count] = vk.extensions.khr_fragment_shading_rate.name;
@@ -501,6 +513,12 @@ pub const Device = struct {
                 device_extensions[device_extension_count] = extension;
                 device_extension_count += 1;
             }
+        }
+        self.shared_textures = false;
+        if (builtin.os.tag == .linux and try deviceExtensionListed(gpa, self.instance, self.physical, vk.extensions.khr_external_memory_fd.name)) {
+            device_extensions[device_extension_count] = vk.extensions.khr_external_memory_fd.name;
+            device_extension_count += 1;
+            self.shared_textures = true;
         }
         for ([_][*:0]const u8{ vk.extensions.khr_get_memory_requirements_2.name, vk.extensions.khr_dedicated_allocation.name }) |extension| {
             if (try deviceExtensionListed(gpa, self.instance, self.physical, extension)) {
@@ -733,6 +751,9 @@ pub const Device = struct {
     pub const subView = textures_module.subView;
     pub const uploadTexture = textures_module.uploadTexture;
     pub const uploadTextureLevels = textures_module.uploadTextureLevels;
+    pub const uploadTextureRegion = textures_module.uploadTextureRegion;
+    pub const createSharedTexture = textures_module.createSharedTexture;
+    pub const exportTexture = textures_module.exportTexture;
     pub const queueBufferCopy = frames_module.queueBufferCopy;
     pub const generateMips = textures_module.generateMips;
 

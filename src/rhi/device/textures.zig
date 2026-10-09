@@ -218,6 +218,27 @@ pub fn uploadTexture(self: *Device, texture: types.Texture, mip: u32, layer: u32
     self.pending_upload_bytes += data.len;
 }
 
+/// Stages tightly packed pixel data for a rectangle of one mip of one layer;
+/// the rest of the level keeps what it holds.
+pub fn uploadTextureRegion(self: *Device, texture: types.Texture, mip: u32, layer: u32, region: [4]u32, data: []const u8) !void {
+    const info = self.textureInfo(texture);
+    const width = @max(info.width >> @intCast(mip), 1);
+    const height = @max(info.height >> @intCast(mip), 1);
+    if (info.format.isBlockCompressed()) return error.UnsupportedTextureFormat;
+    if (region[2] == 0 or region[3] == 0 or region[0] + region[2] > width or region[1] + region[3] > height) return error.InvalidTextureData;
+    if (data.len != info.format.dataSize(region[2], region[3])) return error.InvalidTextureData;
+    const staging = try createStaging(self, data);
+    errdefer self.destroyBuffer(staging);
+    try self.uploads.append(self.gpa, .{ .texture = .{
+        .staging = staging,
+        .destination = texture,
+        .mip = mip,
+        .layer = layer,
+        .region = region,
+    } });
+    self.pending_upload_bytes += data.len;
+}
+
 /// Stages consecutive mips of one layer, from `first_mip`, packed back to
 /// back in `data`.
 pub fn uploadTextureLevels(self: *Device, texture: types.Texture, first_mip: u32, layer: u32, data: []const u8) !void {
@@ -352,4 +373,61 @@ pub fn vkCompareOp(op: types.CompareOp) vk.CompareOp {
         .greater_or_equal => .greater_or_equal,
         .always => .always,
     };
+}
+
+/// A texture whose memory another device or API can import; see
+/// `exportTexture`. One mip, one layer, `error.SharedTexturesUnavailable`
+/// where `Device.shared_textures` is false.
+pub fn createSharedTexture(self: *Device, desc: types.TextureDesc) !types.Texture {
+    if (!self.shared_textures) return error.SharedTexturesUnavailable;
+    if (desc.width == 0 or desc.height == 0 or desc.mip_levels != 1 or desc.layers != 1 or desc.kind != .@"2d")
+        return error.InvalidTextureDesc;
+    const handle_types = vk.ExternalMemoryHandleTypeFlags{ .opaque_fd_bit = true };
+    const external = vk.ExternalMemoryImageCreateInfo{ .handle_types = handle_types };
+    const image = try self.vkd.createImage(&.{
+        .p_next = &external,
+        .flags = .{},
+        .image_type = .@"2d",
+        .format = vkFormat(desc.format),
+        .extent = .{ .width = desc.width, .height = desc.height, .depth = 1 },
+        .mip_levels = 1,
+        .array_layers = 1,
+        .samples = .{ .@"1_bit" = true },
+        .tiling = .optimal,
+        .usage = .{
+            .sampled_bit = true,
+            .color_attachment_bit = desc.usage.color_attachment,
+            .transfer_src_bit = true,
+            .transfer_dst_bit = true,
+        },
+        .sharing_mode = .exclusive,
+        .initial_layout = .undefined,
+    }, null);
+    setName(self, .image, @intFromEnum(image), desc.name);
+    errdefer self.vkd.destroyImage(image, null);
+    const allocation = try self.allocator.allocateExported(self.vkd.getImageMemoryRequirements(image), handle_types);
+    errdefer self.allocator.free(allocation);
+    try self.vkd.bindImageMemory(image, allocation.memory, 0);
+    return registerTexture(self, image, allocation, .{
+        .width = desc.width,
+        .height = desc.height,
+        .format = desc.format,
+        .mip_levels = 1,
+        .layers = 1,
+        .kind = .@"2d",
+    }, desc.usage.sampled);
+}
+
+/// A file descriptor for the memory of a `createSharedTexture` texture and
+/// the size of that memory. The descriptor is the caller's to import or
+/// close; each call makes a new one.
+pub fn exportTexture(self: *Device, texture: types.Texture) !struct { handle: i64, size: u64 } {
+    const resource = self.textureResource(texture);
+    const allocation = resource.allocation orelse return error.InvalidTexture;
+    if (allocation.block_index != null) return error.InvalidTexture;
+    const descriptor = try self.vkd.getMemoryFdKHR(&.{
+        .memory = allocation.memory,
+        .handle_type = .{ .opaque_fd_bit = true },
+    });
+    return .{ .handle = descriptor, .size = allocation.size };
 }

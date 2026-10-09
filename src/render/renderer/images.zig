@@ -137,6 +137,19 @@ pub const Images = struct {
         return self.images.createLightProfile(values);
     }
 
+    /// Replaces a rectangle of an image made by `create` with tightly packed
+    /// RGBA8 pixels. `region` is X, Y, width and height from the top-left
+    /// corner. The smaller mip levels keep what they hold.
+    pub fn update(images: *Images, image: Image, region: [4]u32, pixels: []const u8) !void {
+        const self = images.renderer();
+        self.lock();
+        defer self.unlock();
+        for (self.images.list.items) |owned| {
+            if (owned.id == image.id and owned.index == image.index) return self.device.uploadTextureRegion(owned.texture, 0, 0, region, pixels);
+        }
+        return error.InvalidImage;
+    }
+
     /// Frees an image. It must not be used in any later frame. Images the
     /// renderer does not own (such as a `views.targetImage`) are ignored.
     pub fn destroy(images: *Images, image: Image) void {
