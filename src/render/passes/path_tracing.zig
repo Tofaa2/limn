@@ -206,10 +206,15 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass) !bool {
         if (view_data.path_accum == null or view_data.path_size[0] != width or view_data.path_size[1] != height) {
             try makeTargets(device, cmd, view_data, width, height);
         }
-        var key = std.hash.Wyhash.init(content);
-        key.update(std.mem.asBytes(&scene.sun.direction));
-        key.update(std.mem.asBytes(&scene.sun.color));
-        key.update(std.mem.asBytes(&scene.sun.intensity));
+        // What moves without changing the lighting much: the things in the scene
+        // and the sun. Treated like a moving camera, which keeps more history
+        // than a change of lamps does.
+        var motion = std.hash.Wyhash.init(content);
+        motion.update(std.mem.asBytes(&scene.sun.direction));
+        motion.update(std.mem.asBytes(&scene.sun.color));
+        motion.update(std.mem.asBytes(&scene.sun.intensity));
+        const motion_key = motion.final();
+        var key = std.hash.Wyhash.init(0);
         key.update(std.mem.asBytes(&scene.environment_intensity));
         for (scene.lights.items) |light| {
             key.update(std.mem.asBytes(&light.position));
@@ -232,7 +237,9 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass) !bool {
         const changed = path_key != view_data.path_key;
         view_data.path_key = path_key;
         if (changed) view_data.path_gathered = @min(view_data.path_gathered, changed_history);
-        const moved = !std.meta.eql(view_data.path_camera, desc.camera) or changed;
+        const shifted = motion_key != view_data.path_motion_key;
+        view_data.path_motion_key = motion_key;
+        const moved = !std.meta.eql(view_data.path_camera, desc.camera) or changed or shifted;
         const previous_eye = view_data.path_camera.position;
         view_data.path_camera = desc.camera;
         view_data.path_still = if (moved or view_data.path_gathered == 0) 0 else view_data.path_still +| 1;
@@ -342,11 +349,23 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass) !bool {
             cmd.transition(view.hdr, .shader_read);
             cmd.endScope();
         }
+        if (reconstructing) {
+            // DLSS takes the raw picture. It goes through the scene color so the
+            // clouds, water, smoke, fog and particles drawn after this pass are
+            // in what DLSS is given.
+            try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .discard }} });
+            cmd.bindPipeline(renderer.pipelines.copy);
+            cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(accum) });
+            cmd.drawFullscreen();
+            cmd.endRendering();
+            cmd.transition(view.hdr, .shader_read);
+        }
         view_data.path_gathered = @min(view_data.path_gathered + 1, still_history);
         view_data.path_reusable = true;
         renderer.stats.path_traced_frames = view_data.path_gathered;
         renderer.stats.path_tracing_hardware = device.ray_tracing;
         path_traced = true;
     }
+    if (settings.path_tracing and !debugging and !path_traced) renderer.path_trace_misses +%= 1;
     return path_traced;
 }

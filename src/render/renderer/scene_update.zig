@@ -151,7 +151,11 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
                     .transmissive = material.transmission > 0,
                 });
             }
-            const glows = material.emissive_texture == null and (material.emissive[0] > 0 or material.emissive[1] > 0 or material.emissive[2] > 0) and mesh.lod0_index_count >= 3 and !mesh.coarse;
+            // A texture given through `Materials.setTextures` counts as well:
+            // only part of such a surface glows, which sampling it as a whole
+            // would overstate.
+            const emissive_image = bounds_of.material < model.material_images.len and model.material_images[bounds_of.material].emissive != null;
+            const glows = material.emissive_texture == null and !emissive_image and (material.emissive[0] > 0 or material.emissive[1] > 0 or material.emissive[2] > 0) and mesh.lod0_index_count >= 3 and !mesh.coarse;
             if (glows and scene.glowing.items.len < max_glowing) {
                 try scene.glowing.append(gpa, .{ .instance = instance_index, .triangles = mesh.lod0_index_count / 3 });
                 if (!skinned) info.bits |= EntryInfo.glows;
@@ -1313,8 +1317,14 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
 /// Builds acceleration structures of newly loaded models. With
 /// `frame_index` and a second GPU queue they build asynchronously and are
 /// adopted when done; otherwise `cmd` builds them at once. Must run after
-/// their geometry uploads have been recorded.
+/// their geometry uploads have been recorded, and waits for a geometry pool
+/// that moved to a new buffer to be filled.
 pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: ?u64) !void {
+    if (frame_index) |frame_now| if (self.vertices.replaced or self.indices.replaced) {
+        self.vertices.replaced = false;
+        self.indices.replaced = false;
+        self.geometry_replaced = frame_now;
+    };
     if (self.blas_pending == 0) return;
     const device = self.device;
     var still_pending: u32 = 0;
@@ -1354,6 +1364,9 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
             continue;
         };
         if (frame_now < carried + rhi.frames_in_flight) continue;
+        // A pool that has just moved holds nothing yet for the second queue
+        // to read. Its contents may be copied a frame after the move is seen.
+        if (self.geometry_replaced) |replaced| if (frame_now <= replaced + rhi.frames_in_flight) continue;
         var encoder = (try device.beginDetached()).?;
         for (entry.meshes) |mesh| if (mesh.blas_building) |blas| try encoder.buildBlas(blas, geometry_passes.blasDesc(self, mesh));
         entry.blas_job = try device.submitDetached(encoder);

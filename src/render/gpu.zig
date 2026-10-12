@@ -108,6 +108,8 @@ pub const material_blend: u32 = 4;
 /// `Material.roughness` is a glossiness factor, `params` the specular factor,
 /// and the metallic-roughness texture holds specular and glossiness.
 pub const material_specular_glossiness: u32 = 8;
+/// See `gltf.Material.sway_weights`.
+pub const material_sway_weights: u32 = 16;
 
 /// Cascades of the sun's shadow map. Shaders hard-code 4.
 pub const cascade_count = 4;
@@ -813,7 +815,8 @@ pub const Water = extern struct {
     caustics: f32 = 0,
     /// Steepness of the fine wind ripples used for shading.
     detail: f32 = 0,
-    water_pad: f32 = 0,
+    /// Texture whose red channel says where there is water, or `invalid_id`.
+    mask: u32 = invalid_id,
     ripples: [max_water_ripples]WaterRipple,
 };
 

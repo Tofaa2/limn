@@ -33,7 +33,7 @@ const encodeMaterial = @import("materials.zig").encodeMaterial;
 const freeMeshGeometry = @import("streaming.zig").freeMeshGeometry;
 
 fn lodOptions(self: *const Renderer) gltf.LodOptions {
-    return .{ .clusters = self.options.cluster_lods, .normal_weight = self.options.lod_normal_weight, .uv_weight = self.options.lod_uv_weight };
+    return .{ .levels = self.options.mesh_lods, .clusters = self.options.cluster_lods, .normal_weight = self.options.lod_normal_weight, .uv_weight = self.options.lod_uv_weight };
 }
 
 /// Shared geometry, materials and animations.
@@ -323,6 +323,7 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
             .material = entry.material_base + mesh.material,
             .blend = source.materials[mesh.material].alpha_mode == .blend or source.materials[mesh.material].transmission > 0,
             .masked = source.materials[mesh.material].alpha_mode != .@"opaque" or source.materials[mesh.material].transmission > 0 or source.materials[mesh.material].double_sided,
+            .alpha_tested = source.materials[mesh.material].alpha_mode == .mask,
             .blas = null,
             .coarse_vertex_count = mesh.coarse_vertex_count,
             .coarse_error = mesh.coarse_error,

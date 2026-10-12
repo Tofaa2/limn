@@ -10,10 +10,17 @@ struct TraceHit {
 
 #ifdef RAY_TRACED
 
+#include "ray_alpha.glsl"
+
+FrameConstants traceFrame();
+
+// These rays take cut-out surfaces whole. The path tracer lets a path
+// through them itself, which its denoiser follows better than a hit that
+// was never reported, and shadow rays through cut-outs add fine grain.
 bool traceClosest(vec3 origin, vec3 direction, float max_distance, out TraceHit hit) {
     rayQueryEXT query;
     rayQueryInitializeEXT(query, accelerationStructureEXT(traceScene()), gl_RayFlagsOpaqueEXT, 0xffu, origin, 0.0, direction, max_distance);
-    while (rayQueryProceedEXT(query)) {}
+    RAY_PROCEED(traceFrame(), query)
     if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) return false;
     hit.t = rayQueryGetIntersectionTEXT(query, true);
     hit.instance = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true));
@@ -25,7 +32,7 @@ bool traceClosest(vec3 origin, vec3 direction, float max_distance, out TraceHit 
 bool traceAny(vec3 origin, vec3 direction, float max_distance) {
     rayQueryEXT query;
     rayQueryInitializeEXT(query, accelerationStructureEXT(traceScene()), gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xffu, origin, 0.0, direction, max_distance);
-    while (rayQueryProceedEXT(query)) {}
+    RAY_PROCEED(traceFrame(), query)
     return rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 

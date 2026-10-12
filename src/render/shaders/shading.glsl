@@ -245,7 +245,7 @@ float tracedShadow(FrameConstants frame, Light light, vec3 position, vec3 normal
         for (uint ray = 0u; ray < rays; ray++) {
             float angle = fract(noise + float(ray) * 0.61803399) * 6.2831853;
             float reach_out = light.source_radius * sqrt(fract(noise * 7.31 + 0.37 + float(ray) * 0.75487767));
-            lit += rtOccluded(tlas, origin, normalize(l + (side * cos(angle) + up * sin(angle)) * reach_out), reach) ? 0.0 : 1.0;
+            lit += rtOccluded(frame, tlas, origin, normalize(l + (side * cos(angle) + up * sin(angle)) * reach_out), reach) ? 0.0 : 1.0;
         }
         return lit / float(rays);
     }
@@ -267,11 +267,11 @@ float tracedShadow(FrameConstants frame, Light light, vec3 position, vec3 normal
             }
             vec3 toward = target - origin;
             float distance_there = length(toward);
-            lit += rtOccluded(tlas, origin, toward / max(distance_there, 1e-5), distance_there - 0.06) ? 0.0 : 1.0;
+            lit += rtOccluded(frame, tlas, origin, toward / max(distance_there, 1e-5), distance_there - 0.06) ? 0.0 : 1.0;
         }
         return lit / float(rays);
     }
-    return rtOccluded(tlas, origin, l, reach) ? 0.0 : 1.0;
+    return rtOccluded(frame, tlas, origin, l, reach) ? 0.0 : 1.0;
 #else
     return 1.0;
 #endif

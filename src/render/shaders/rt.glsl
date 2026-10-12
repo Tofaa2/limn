@@ -2,6 +2,7 @@
 #define RT_GLSL
 #include "gi.glsl"
 #include "fluid.glsl"
+#include "ray_alpha.glsl"
 
 const int RT_MISS = 0;
 const int RT_HIT = 1;
@@ -9,10 +10,10 @@ const uint RT_SOLID = 0x01u;
 const uint RT_ALL = 0x03u;
 const int RT_BACK = 2;
 
-bool rtOccluded(uint64_t tlas, vec3 origin, vec3 direction, float max_distance) {
+bool rtOccluded(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 direction, float max_distance) {
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, accelerationStructureEXT(tlas), gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, RT_SOLID, origin, 0.0, direction, max_distance);
-    while (rayQueryProceedEXT(query)) {}
+    rayQueryInitializeEXT(query, accelerationStructureEXT(tlas), gl_RayFlagsTerminateOnFirstHitEXT, RT_SOLID, origin, 0.0, direction, max_distance);
+    RAY_PROCEED(frame, query)
     return rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
@@ -21,8 +22,8 @@ int rtTraceMasked(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 directi
     radiance = vec3(0.0);
     distance_hit = max_distance;
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, accelerationStructureEXT(tlas), gl_RayFlagsOpaqueEXT, mask, origin, 0.0, direction, max_distance);
-    while (rayQueryProceedEXT(query)) {}
+    rayQueryInitializeEXT(query, accelerationStructureEXT(tlas), gl_RayFlagsNoneEXT, mask, origin, 0.0, direction, max_distance);
+    RAY_PROCEED(frame, query)
     if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) return RT_MISS;
 
     float t = rayQueryGetIntersectionTEXT(query, true);
@@ -74,7 +75,7 @@ int rtTraceMasked(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 directi
     radiance = emissive;
     float n_dot_l = dot(normal, frame.sun_direction);
     if (n_dot_l > 0.0 && dot(frame.sun_radiance, vec3(1.0)) > 0.0) {
-        if (!rtOccluded(tlas, position + normal * 0.02, frame.sun_direction, 1e4))
+        if (!rtOccluded(frame, tlas, position + normal * 0.02, frame.sun_direction, 1e4))
             radiance += albedo / PI * frame.sun_radiance * n_dot_l;
     }
     if ((frame.flags & FRAME_GI_LOCAL_LIGHTS) != 0u) {
@@ -116,7 +117,7 @@ int rtTraceMasked(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 directi
             }
             float facing = dot(normal, l);
             if (facing <= 0.0 || attenuation <= 1e-5) continue;
-            if (rtOccluded(tlas, position + normal * 0.02, l, reach - 0.04)) continue;
+            if (rtOccluded(frame, tlas, position + normal * 0.02, l, reach - 0.04)) continue;
             radiance += albedo / PI * light.color * tint * (attenuation * facing);
         }
     }

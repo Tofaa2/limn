@@ -228,6 +228,12 @@ pub const Material = struct {
     /// origin moves at the peak of a gust; grows with the square of height. 0
     /// disables. Shadows sway along; ray tracing does not.
     sway: f32 = 0,
+    /// Takes each vertex's sway from its second texture coordinates in place
+    /// of its height above the origin: x scales the lean with the gusts, y a
+    /// flutter in every direction, both in units of `sway`. Gusts then follow
+    /// the vertex's place in the world, so one model can hold many plants.
+    /// Textures of such a material cannot use the second coordinates.
+    sway_weights: bool = false,
 
     /// Texture references in shader order: base color, normal,
     /// metallic-roughness, occlusion, emissive, coat, coat roughness, coat
@@ -1214,6 +1220,9 @@ extern fn meshopt_simplifyScale(vertex_positions: [*]const f32, vertex_count: us
 const cluster_lod_min_triangles: usize = 8192;
 
 pub const LodOptions = struct {
+    /// Build coarser levels at all. False keeps each mesh at full detail
+    /// alone, which loads faster and suits geometry that does not simplify.
+    levels: bool = true,
     /// Build a cluster hierarchy instead of a few levels of each whole mesh.
     clusters: bool = false,
     /// A fully reversed normal counts as a shape error of twice this fraction
@@ -1817,7 +1826,7 @@ fn finishMesh(
     for (attributes, fat) |*attribute, value| attribute.* = value.vertex.normal ++ value.vertex.uv;
     const uv_length: f32 = if (uv_density > 0) lods.uv_weight / uv_density else 0;
 
-    if (lods.clusters and !skinned and cache_indices.len / 3 >= cluster_lod_min_triangles) {
+    if (lods.levels and lods.clusters and !skinned and cache_indices.len / 3 >= cluster_lod_min_triangles) {
         const built = try buildClusterHierarchy(gpa, arena, fat, cache_indices, minimum, maximum, attributes, lods.normal_weight, uv_length);
         return .{
             .vertices = vertices,
@@ -1843,7 +1852,7 @@ fn finishMesh(
     const scale = meshopt_simplifyScale(positions, fat.len, @sizeOf(FatVertex));
     const weights = simplifyWeights(lods.normal_weight, if (scale > 0) uv_length / scale else 0);
     const attribute_count: usize = if (lods.normal_weight > 0 or uv_length > 0) weights.len else 0;
-    while (level_count < max_lods) {
+    while (lods.levels and level_count < max_lods) {
         const previous = levels[level_count - 1];
         if (previous.len / 3 < 192) break;
         const target = previous.len / 6 * 3;

@@ -25,7 +25,7 @@ struct WaterData {
     float foam;
     float caustics;
     float detail;
-    float water_pad;
+    uint mask;
     WaterRipple ripples[16];
 };
 

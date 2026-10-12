@@ -157,9 +157,9 @@ void main() {
     float sway = frame.materials.data[instance.material].sway;
     if (sway != 0.0) {
         vec3 stands = instance.transform[3].xyz;
-        w0 += swayOffset(sway, stands, w0, frame.time);
-        w1 += swayOffset(sway, stands, w1, frame.time);
-        w2 += swayOffset(sway, stands, w2, frame.time);
+        w0 += swayOffset(sway, material.flags, stands, w0, v0.uv1, frame.time);
+        w1 += swayOffset(sway, material.flags, stands, w1, v1.uv1, frame.time);
+        w2 += swayOffset(sway, material.flags, stands, w2, v2.uv1, frame.time);
     }
     vec4 clip0 = frame.view_proj * vec4(w0, 1.0);
     vec4 clip1 = frame.view_proj * vec4(w1, 1.0);
@@ -315,7 +315,7 @@ void main() {
         vec3 p2 = frame.vertices.data[instance.previous_vertex_offset + i2].position;
         previous_world = previousTransform(frame, instance, ref.instance) * vec4(p0 * lambda.x + p1 * lambda.y + p2 * lambda.z, 1.0);
     }
-    if (sway != 0.0) previous_world += swayOffset(sway, previousTransform(frame, instance, ref.instance)[3], previous_world, frame.time - frame.delta_time) - swayOffset(sway, previousTransform(frame, instance, ref.instance)[3], previous_world, frame.time);
+    if (sway != 0.0) previous_world += swayOffset(sway, material.flags, previousTransform(frame, instance, ref.instance)[3], previous_world, raw1, frame.time - frame.delta_time) - swayOffset(sway, material.flags, previousTransform(frame, instance, ref.instance)[3], previous_world, raw1, frame.time);
     vec4 current_clip = frame.view_proj_unjittered * vec4(world_position, 1.0);
     vec4 previous_clip = frame.prev_view_proj_unjittered * vec4(previous_world, 1.0);
     out_motion = (current_clip.xy / current_clip.w - previous_clip.xy / previous_clip.w) * 0.5;

@@ -29,6 +29,7 @@ void main() {
     float surface_distance = (frame.view_proj * vec4(in_position, 1.0)).w;
     float scene_distance = scene_depth > 0.0 ? linearDepth(scene_depth, frame.near) : 1e9;
     if (scene_distance < surface_distance) discard;
+    if (water.data.mask != 0xffffffffu && textureLod(TEX(water.data.mask, nearest), in_uv, 0.0).r < 0.5) discard;
 
     vec2 texel = 1.0 / vec2(water.data.size);
     vec3 right = waterPoint(water, in_uv + vec2(texel.x, 0.0), frame.time) - waterPoint(water, in_uv - vec2(texel.x, 0.0), frame.time);

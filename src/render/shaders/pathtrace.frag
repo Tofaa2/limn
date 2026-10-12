@@ -48,12 +48,14 @@ uint64_t traceScene() { return push.scene; }
 #else
 #endif
 #include "trace.glsl"
+#include "clouds.glsl"
+#include "fluid.glsl"
+FrameConstants traceFrame() { return push.frame; }
 #ifndef RAY_TRACED
 BvhNodes traceSceneNodes() { return BvhNodes(push.scene); }
 BvhInstances traceSceneInstances() { return BvhInstances(push.scene_instances); }
 BvhNodes traceMeshNodes() { return BvhNodes(push.mesh_nodes); }
 BvhItems traceMeshItems() { return BvhItems(push.mesh_items); }
-FrameConstants traceFrame() { return push.frame; }
 #endif
 
 struct Glowing {
@@ -136,6 +138,9 @@ struct Surface {
     float metallic;
     float roughness;
     float through;
+    /// Index of refraction of a surface that bends what passes through it; 0
+    /// for one that does not.
+    float bend;
 };
 
 float detailLevel(uint texture_index, uint sampler_index, float spread) {
@@ -208,6 +213,7 @@ Surface surfaceAt(FrameConstants frame, TraceHit hit, vec3 origin, vec3 directio
     if ((material.flags & MATERIAL_ALPHA_TEST) != 0u && base_color.a < material.alpha_cutoff) surface.through = 1.0;
     else if ((material.flags & MATERIAL_BLEND) != 0u) surface.through = clamp(1.0 - base_color.a * (1.0 - material.transmission), 0.0, 1.0);
     if ((instance.flags & INSTANCE_PROXY) != 0u) surface.through = 1.0;
+    surface.bend = (material.flags & MATERIAL_BLEND) != 0u && material.transmission > 0.0 ? max(material.ior, 1.0) : 0.0;
     return surface;
 }
 
@@ -357,6 +363,14 @@ vec3 sampleLight(FrameConstants frame, Surface surface, vec3 view, LightSample p
             }
             if ((light.flags & LIGHT_RECTANGLE) != 0u) attenuation *= clamp(dot(-toward, light.direction), 0.0, 1.0);
             reach -= 0.004;
+            // Whatever lies inside the source is the lamp's own fitting, which
+            // lets its light out.
+            if (light.source_radius > 0.0) {
+                vec3 to_center = light.position - surface.position;
+                float along = dot(to_center, toward);
+                float inside = light.source_radius * light.source_radius - (dot(to_center, to_center) - along * along);
+                if (inside > 0.0) reach = min(reach, max(along - sqrt(inside), 0.0));
+            }
         }
         if (attenuation <= 1e-5 || dot(surface.flat_normal, toward) <= 0.0) return vec3(0.0);
         vec3 response = surfaceResponse(surface, view, toward, shine);
@@ -563,7 +577,7 @@ vec3 directLight(FrameConstants frame, Surface surface, vec3 view, bool reusing,
         vec3 toward = normalize(basis * vec3(cos(turn) * reach, sin(turn) * reach, 1.0));
         vec3 response = surfaceResponse(surface, view, toward, sun_shine);
         if (dot(response, vec3(1.0)) > 0.0 && dot(surface.flat_normal, toward) > 0.0 && !traceAny(start, toward, 1e4))
-            total += response * frame.sun_radiance;
+            total += response * frame.sun_radiance * cloudShadow(frame, surface.position) * fluidShadow(frame, surface.position);
     }
     if (min(frame.light_count, push.light_count) == 0u && push.glowing_count == 0u) return total;
     if (reusing) {
@@ -572,8 +586,9 @@ vec3 directLight(FrameConstants frame, Surface surface, vec3 view, bool reusing,
     }
     Resampling fresh = freshCandidates(frame, surface, view);
     if (fresh.reservoir.worth > 0.0 && !traceAny(start, fresh.toward, fresh.reach)) {
-        lamps = fresh.light * fresh.reservoir.worth;
-        shine = fresh.shine * fresh.reservoir.worth;
+        float through_smoke = fluidShadowToward(frame, start, fresh.toward, fresh.reach);
+        lamps = fresh.light * fresh.reservoir.worth * through_smoke;
+        shine = fresh.shine * fresh.reservoir.worth * through_smoke;
     }
     return total;
 }
@@ -616,7 +631,19 @@ vec3 tracePath(FrameConstants frame, vec3 origin, vec3 direction, bool scatterin
     float cone_angle = 2.0 / (abs(frame.proj[1][1]) * frame.resolution.y);
     for (uint bounce = 0u; bounce <= push.bounces; bounce++) {
         TraceHit hit;
-        bool met = traceClosest(origin, direction, 1e5, hit);
+        bool met;
+        Surface surface;
+        // Holes in cut-out surfaces are stepped through here, so that
+        // layers of foliage do not use up the path's bounces.
+        for (uint holes = 0u;; holes++) {
+            met = traceClosest(origin, direction, 1e5, hit);
+            if (!met) break;
+            surface = surfaceAt(frame, hit, origin, direction, cone_width + cone_angle * hit.t);
+            if (surface.through < 1.0 || holes >= 16u) break;
+            cone_width += cone_angle * hit.t;
+            travelled += hit.t;
+            origin = surface.position + direction * 0.002;
+        }
         if (awaiting_reach) {
             gloss_reach = met ? hit.t : 1000.0;
             awaiting_reach = false;
@@ -629,11 +656,33 @@ vec3 tracePath(FrameConstants frame, vec3 origin, vec3 direction, bool scatterin
             break;
         }
         cone_width += cone_angle * hit.t;
-        Surface surface = surfaceAt(frame, hit, origin, direction, cone_width);
         travelled += hit.t;
         if (rough_bounce) surface.roughness = max(surface.roughness, softened_mirror);
-        if (surface.through > 0.0 && random() < surface.through) {
+        float pass = surface.through;
+        float mirrored = 0.0;
+        if (surface.bend > 0.0) {
+            // More is mirrored and less let through as the view grazes the surface.
+            float facing = clamp(dot(surface.normal, -direction), 0.0, 1.0);
+            float head_on = (surface.bend - 1.0) / (surface.bend + 1.0);
+            head_on *= head_on;
+            float bounced_off = head_on + (1.0 - head_on) * pow(1.0 - facing, 5.0);
+            mirrored = pass * bounced_off;
+            pass -= mirrored;
+        }
+        float chosen = pass + mirrored > 0.0 ? random() : 1.0;
+        if (chosen >= pass && chosen < pass + mirrored) {
+            direction = reflect(direction, surface.normal);
             origin = surface.position + direction * 0.002;
+            continue;
+        }
+        if (chosen < pass) {
+            origin = surface.position + direction * 0.002;
+            if (surface.bend > 0.0) {
+                vec3 bent = refract(direction, surface.normal, 1.0 / surface.bend);
+                if (dot(bent, bent) > 0.0) direction = normalize(bent);
+                origin = surface.position - surface.flat_normal * 0.002;
+                carried *= mix(vec3(1.0), surface.albedo, 0.5);
+            }
             continue;
         }
         bool glows = luminance(surface.emissive) > lit_by_itself;

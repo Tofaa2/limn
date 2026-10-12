@@ -20,7 +20,7 @@ void main() {
     Vertex vertex = push.frame.vertices.data[instance.vertex_offset + gl_VertexIndex];
     vec4 world = vec4(instance.transform * vec4(vertex.position, 1.0), 1.0);
     float sway = push.frame.materials.data[instance.material].sway;
-    if (sway != 0.0) world.xyz += swayOffset(sway, instance.transform[3], world.xyz, push.frame.time);
+    if (sway != 0.0) world.xyz += swayOffset(sway, push.frame.materials.data[instance.material].flags, instance.transform[3], world.xyz, vertex.uv1, push.frame.time);
     mat3 normal_matrix = transpose(inverse(mat3(instance.transform)));
     out_position = world.xyz;
     out_normal = normal_matrix * vertexNormal(vertex);
@@ -34,6 +34,6 @@ void main() {
     out_clip = push.frame.view_proj_unjittered * world;
     mat4x3 was = previousTransform(push.frame, instance, push.instance_index);
     vec4 previous_world = vec4(was * vec4(previous.position, 1.0), 1.0);
-    if (sway != 0.0) previous_world.xyz += swayOffset(sway, was[3], previous_world.xyz, push.frame.time - push.frame.delta_time);
+    if (sway != 0.0) previous_world.xyz += swayOffset(sway, push.frame.materials.data[instance.material].flags, was[3], previous_world.xyz, previous.uv1, push.frame.time - push.frame.delta_time);
     out_previous_clip = push.frame.prev_view_proj_unjittered * previous_world;
 }

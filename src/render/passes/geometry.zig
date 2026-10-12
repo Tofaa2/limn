@@ -124,6 +124,7 @@ pub fn blasDesc(renderer: *Renderer, mesh: ModelMesh) rhi.BlasDesc {
         .indices = renderer.indices.buffer,
         .index_offset = @as(u64, mesh.index_offset) * @sizeOf(u32),
         .index_count = mesh.lod0_index_count,
+        .solid = !mesh.alpha_tested,
     };
 }
 

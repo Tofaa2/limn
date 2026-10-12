@@ -17,7 +17,7 @@ VisibilityVertex visibilityVertex(uint ref_index, uint vertex_index) {
     Vertex vertex = push.frame.vertices.data[instance.vertex_offset + vertex_index];
     vec4 world = vec4(instance.transform * vec4(vertex.position, 1.0), 1.0);
     float sway = push.frame.materials.data[instance.material].sway;
-    if (sway != 0.0) world.xyz += swayOffset(sway, instance.transform[3], world.xyz, push.frame.time);
+    if (sway != 0.0) world.xyz += swayOffset(sway, push.frame.materials.data[instance.material].flags, instance.transform[3], world.xyz, vertex.uv1, push.frame.time);
     result.position = push.view_proj * world;
     result.inside = vec4(1.0);
     if (push.paged != 0u) {

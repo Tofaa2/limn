@@ -112,7 +112,18 @@ pub const Scenes = struct {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        if (self.scenes.table.get(scene)) |data| data.sun = sun;
+        const data = self.scenes.table.get(scene) orelse return;
+        // Probes forget slowly, and light bounced between bright surfaces
+        // more slowly still, so a sun that jumps starts them over.
+        const change = @abs(sun.intensity - data.sun.intensity);
+        const strongest = @max(sun.intensity, data.sun.intensity);
+        const turned = math.dot(math.normalize(sun.direction), math.normalize(data.sun.direction)) < 0.9;
+        if ((change > 1 and change > 0.5 * strongest) or (turned and @min(sun.intensity, data.sun.intensity) > 1)) {
+            inline for (.{ "gi", "gi_coarse", "gi_middle" }) |name| {
+                if (@field(data, name)) |*volume| volume.frames = 0;
+            }
+        }
+        data.sun = sun;
     }
 
     /// Sets the HDR environment used for the sky and image-based lighting.

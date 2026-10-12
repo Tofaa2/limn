@@ -12,7 +12,7 @@ const scratch_alignment = device_module.scratch_alignment;
 fn blasGeometry(self: *Device, desc: types.BlasDesc) vk.AccelerationStructureGeometryKHR {
     return .{
         .geometry_type = .triangles_khr,
-        .flags = .{ .opaque_bit_khr = true },
+        .flags = .{ .opaque_bit_khr = desc.solid },
         .geometry = .{ .triangles = .{
             .vertex_format = .r32g32b32_sfloat,
             .vertex_data = .{ .device_address = self.bufferAddress(desc.vertices) + desc.vertex_offset },
