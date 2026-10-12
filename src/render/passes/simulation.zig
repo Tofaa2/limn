@@ -347,6 +347,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             .foam = std.math.clamp(desc.foam, 0, 1),
             .caustics = std.math.clamp(desc.caustics, 0, 1),
             .detail = std.math.clamp(desc.ripple_detail, 0, 2),
+            .mask = if (desc.mask) |image| image.index else gpu.invalid_id,
             .ripples = state.ripples,
         };
         state.ripple_count = 0;

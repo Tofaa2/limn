@@ -148,6 +148,10 @@ pub const Pool = struct {
     usage: rhi.BufferUsage,
     /// Initial size; the pool never shrinks below it.
     minimum: u32,
+    /// Set when the pool moves to a new buffer, whose contents arrive with
+    /// the next frame's uploads. Whoever reads the buffer outside the
+    /// frame's commands clears it.
+    replaced: bool = false,
 
     pub fn init(device: *rhi.Device, name: [:0]const u8, stride: u32, capacity: u32, usage: rhi.BufferUsage) !Pool {
         return .{
@@ -181,6 +185,7 @@ pub const Pool = struct {
             try device.queueBufferCopy(self.buffer, new_buffer, @as(u64, self.ranges.top) * self.stride);
         } else device.destroyBuffer(self.buffer);
         self.buffer = new_buffer;
+        self.replaced = true;
         self.ranges.capacity = new_capacity;
         return self.ranges.alloc(count).?;
     }
@@ -208,6 +213,7 @@ pub const Pool = struct {
             try device.queueBufferCopy(self.buffer, new_buffer, @as(u64, self.ranges.top) * self.stride);
         } else device.destroyBuffer(self.buffer);
         self.buffer = new_buffer;
+        self.replaced = true;
         self.ranges.capacity = new_capacity;
     }
 
@@ -431,6 +437,8 @@ pub const ModelMesh = struct {
     blend: bool,
     /// Cut out, blended or two-sided.
     masked: bool = false,
+    /// Drawn only where its alpha passes the material's cutoff.
+    alpha_tested: bool = false,
     /// Its tree in `bvh_nodes` and leaf triangles in `bvh_items`, when built
     /// (`Options.path_tracing_fallback`).
     bvh_nodes: ?u32 = null,
@@ -1157,6 +1165,8 @@ pub const ViewData = struct {
     path_traced: bool = false,
     path_still: u32 = 0,
     path_key: u64 = 0,
+    /// Hash of where things and the sun were when the view was last traced.
+    path_motion_key: u64 = 0,
     /// The sun's virtual shadow map state, once the view has used one.
     vsm: ?@import("passes/virtual_shadows.zig").State = null,
     /// One word per meshlet reference: was it visible last frame.

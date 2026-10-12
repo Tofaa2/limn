@@ -168,7 +168,7 @@ fn resolveWithDlss(renderer: *Renderer, p: *const ScenePass, output: rhi.Texture
     if (!try dlssFor(renderer, p, if (reconstructing) .ray_reconstruction else .super_resolution)) return false;
     const reset = !view.history_valid or view_data.dlss_frame +% 1 != renderer.frame_index;
     view_data.dlss_frame = renderer.frame_index;
-    const color = if (reconstructing) view_data.path_accum.? else view.hdr;
+    const color = view.hdr;
     cmd.beginScope(if (reconstructing) "dlss ray reconstruction" else "dlss super resolution");
     defer cmd.endScope();
     cmd.transition(color, .shader_read);
@@ -372,7 +372,7 @@ pub fn bloomAndExposure(renderer: *Renderer, p: *const ScenePass, resolved: rhi.
         .source = device.textureIndex(view.bloom[bloom_count - 1]),
         .automatic = @intFromBool(settings.automatic_exposure),
         .compensation = std.math.pow(f32, 2, settings.exposure_compensation),
-        .min_luminance = 0.002,
+        .min_luminance = std.math.clamp(settings.exposure_darkest, 1e-5, 64),
         .max_luminance = 64,
         .speed = @max(settings.exposure_speed, 0.01),
         .reset = @intFromBool(view_data.exposure_reset),

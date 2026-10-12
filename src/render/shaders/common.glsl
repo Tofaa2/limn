@@ -61,6 +61,7 @@ const uint FEATURE_GI_RELOCATION = 256u;
 const uint FEATURE_AERIAL = 512u;
 const uint MATERIAL_BLEND = 4u;
 const uint MATERIAL_SPECULAR_GLOSSINESS = 8u;
+const uint MATERIAL_SWAY_WEIGHTS = 16u;
 
 struct Vertex {
     vec3 position;
@@ -518,7 +519,17 @@ float linearDepth(float depth, float near) {
     return near / max(depth, 1e-9);
 }
 
-vec3 swayOffset(float sway, vec3 origin, vec3 world, float time) {
+vec3 swayOffset(float sway, uint flags, vec3 origin, vec3 world, vec2 weights, float time) {
+    if ((flags & MATERIAL_SWAY_WEIGHTS) != 0u) {
+        if (weights == vec2(0.0)) return vec3(0.0);
+        float place = dot(world.xz, vec2(0.37, 0.23));
+        float gust = 0.35 + 0.45 * sin(time * 1.3 + place) + 0.2 * sin(time * 2.7 + place * 2.3);
+        vec3 flutter = vec3(
+            sin(time * 2.3 + world.x * 1.9 + world.y * 1.3),
+            0.5 * sin(time * 1.9 + world.z * 2.3 + world.x * 0.7),
+            sin(time * 2.9 + world.z * 1.7 + world.y * 1.1));
+        return sway * (vec3(0.8, 0.0, 0.6) * (weights.x * gust) + flutter * weights.y);
+    }
     float height = max(world.y - origin.y, 0.0);
     float place = dot(origin.xz, vec2(0.11, 0.07));
     float gust = 0.35 + 0.45 * sin(time * 1.3 + place) + 0.2 * sin(time * 2.7 + place * 2.3 + origin.x * 0.9) + 0.08 * sin(time * 6.1 + origin.z * 3.1 + world.y * 2.0);

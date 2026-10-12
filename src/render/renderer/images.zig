@@ -42,6 +42,13 @@ pub const Images = struct {
     /// Creates an image for draw lists from tightly packed RGBA8 pixels.
     /// `srgb`: true for color, false for data.
     pub fn create(images: *Images, width: u32, height: u32, pixels: []const u8, srgb: bool) !Image {
+        return images.createLimited(width, height, pixels, srgb, 0);
+    }
+
+    /// Like `create`, with at most `levels` mips; 0 means the full chain. An
+    /// atlas wants no more than its smallest cell can be halved, or cells
+    /// run into each other in the small mips.
+    pub fn createLimited(images: *Images, width: u32, height: u32, pixels: []const u8, srgb: bool, levels: u32) !Image {
         const self = images.renderer();
         self.lock();
         defer self.unlock();
@@ -52,7 +59,7 @@ pub const Images = struct {
             .height = height,
             .format = if (srgb) .rgba8_srgb else .rgba8_unorm,
             .usage = .{ .sampled = true, .copy_dst = true },
-            .mip_levels = rhi.TextureDesc.fullMipCount(width, height),
+            .mip_levels = if (levels == 0) rhi.TextureDesc.fullMipCount(width, height) else @min(levels, rhi.TextureDesc.fullMipCount(width, height)),
         });
         errdefer device.destroyTexture(texture);
         try device.uploadTexture(texture, 0, 0, pixels);

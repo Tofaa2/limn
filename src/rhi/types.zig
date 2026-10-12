@@ -471,6 +471,9 @@ pub const BlasDesc = struct {
     index_count: u32,
     /// Rebuilt every frame: built for speed, scratch memory kept.
     dynamic: bool = false,
+    /// False sends every ray that meets the geometry through the shader's
+    /// candidate test, as alpha tested surfaces need.
+    solid: bool = true,
 };
 
 /// Layout of `VkAccelerationStructureInstanceKHR`.

@@ -136,6 +136,10 @@ pub const Options = struct {
     /// Compute per-meshlet bounds of skinned and morphed meshes on the GPU each
     /// frame, so they are culled per meshlet instead of per mesh.
     skinned_meshlet_bounds: bool = false,
+    /// Build coarser levels of detail for models. False loads them faster and
+    /// draws every mesh at full detail, which suits geometry made of flat
+    /// textured faces that does not simplify.
+    mesh_lods: bool = true,
     /// Build cluster-hierarchy LODs, chosen per meshlet. Meshes under about
     /// 8000 triangles and skinned meshes keep whole-mesh LODs.
     cluster_lods: bool = true,
@@ -373,6 +377,9 @@ pub const WaterDesc = struct {
     underwater: bool = true,
     /// Write depth, so fog, particles and transparents treat it as a surface.
     write_depth: bool = true,
+    /// Stretched over the sheet; where its red channel is below one half no
+    /// water is drawn. Null draws the whole sheet. Not applied to `write_depth`.
+    mask: ?Image = null,
 };
 
 /// What happens at the sides of a fluid's box.
@@ -642,7 +649,8 @@ pub const Light = struct {
     cast_shadows: bool = false,
     /// Radius of the emitting sphere; 0 is an ideal point. For a directional
     /// light, the tangent of the angle its disc spans from the center: the
-    /// sun's is about 0.005.
+    /// sun's is about 0.005. Path tracing lets light out through anything
+    /// inside the sphere, so a lamp may sit within the model of its fitting.
     source_radius: f32 = 0,
     /// Point lights only: makes the source a tube this long along `direction`,
     /// `source_radius` thick. Shadows are still cast from the center.
@@ -992,6 +1000,10 @@ pub const Settings = struct {
     /// Stops added on top of automatic exposure, or the absolute exposure
     /// (as 2^EV) when automatic exposure is off.
     exposure_compensation: f32 = 0,
+    /// Dimmest average brightness automatic exposure adapts to. Pictures
+    /// darker than this stay dark instead of being brightened further, which
+    /// is what keeps a night looking like one.
+    exposure_darkest: f32 = 0.002,
     /// Extinction of the volumetric fog per world unit; 0 disables it.
     fog_density: f32 = 0,
     /// How quickly the fog thins with height.
@@ -1062,9 +1074,9 @@ pub const Settings = struct {
     motion_blur_spread: bool = true,
     /// Path trace the view, accumulating frames while camera, scene and lights
     /// are still. Uses hardware ray tracing, or a shader with
-    /// `Options.path_tracing_fallback`; see `Renderer.pathTracing`. Not traced:
-    /// skinned meshes without ray tracing, water, liquids, smoke, clouds,
-    /// particles, decals and refraction.
+    /// `Options.path_tracing_fallback`; see `Renderer.pathTracing`. Clouds, water,
+    /// smoke, fog and particles are drawn over the traced picture. Not traced:
+    /// skinned meshes without ray tracing, liquids, hair, impostors and decals.
     path_tracing: bool = false,
     /// Maximum bounces per path, 1..16; 1 is direct light only.
     path_tracing_bounces: u32 = 4,

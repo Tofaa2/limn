@@ -141,6 +141,8 @@ pub const Materials = struct {
             images.* = textures;
         }
         if (entry.state != .ready) return;
+        // Which instances are sampled as glowing depends on these textures.
+        self.asset_generation += 1;
         for (source.materials, 0..) |item, index| {
             if (material) |only| if (only != index) continue;
             const encoded = try encodeMaterial(self, entry, item, index);
@@ -158,6 +160,7 @@ pub fn encodeMaterial(self: *Renderer, entry: *ModelEntry, material: gltf.Materi
     if (material.alpha_mode == .blend or material.transmission > 0) flags |= gpu.material_blend;
     if (material.double_sided) flags |= gpu.material_double_sided;
     if (material.specular_glossiness) flags |= gpu.material_specular_glossiness;
+    if (material.sway_weights) flags |= gpu.material_sway_weights;
     var encoded: gpu.Material = .{
         .base_color = material.base_color,
         .emissive = material.emissive,

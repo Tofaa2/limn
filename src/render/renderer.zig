@@ -317,6 +317,10 @@ pub const Renderer = struct {
     transparent_order: std.ArrayList(TransparentDraw) = .empty,
     gi_pipelines: ?GiPipelines = null,
     blas_pending: u32 = 0,
+    /// Frame in which a geometry pool last moved to a new buffer.
+    geometry_replaced: ?u64 = null,
+    /// Frames a view asked for path tracing and was drawn without it.
+    path_trace_misses: u32 = 0,
     brdf_lut: rhi.Texture,
 
     /// Ray-tracing stand-in box for liquids; made with the first liquid.

@@ -185,6 +185,9 @@ const SceneGraph = struct {
         particles,
         transparent_done,
         traced,
+        /// The path traced picture before clouds, water, smoke, fog and
+        /// particles are drawn over it.
+        traced_base,
         resolved,
         lensed,
         bloom,
@@ -246,21 +249,25 @@ const SceneGraph = struct {
             .{ .name = "lightmaps", .reads = set(.{.probes}), .writes = set(.{.lightmaps}), .always = true, .run = lightmaps },
             .{ .name = "probe gather", .reads = set(.{.probes}), .writes = set(.{.gathered_probes}), .run = gatherProbes },
             .{ .name = "shading", .reads = set(.{ .visibility, .sun_shadows, .virtual_shadows, .local_shadows, .light_clusters, .occlusion, .gathered_probes }), .writes = set(.{.lit}), .run = shade },
-            .{ .name = "clouds", .reads = set(.{.lit}), .writes = set(.{.clouded}), .run = clouds },
+            .{ .name = "clouds", .reads = if (tracing) set(.{.traced_base}) else set(.{.lit}), .writes = set(.{.clouded}), .run = clouds },
             .{ .name = "reflections", .reads = set(.{.clouded}), .writes = set(.{.reflected}), .run = reflect },
             .{ .name = "after opaque", .reads = set(.{.reflected}), .writes = set(.{.opaque_done}), .run = afterOpaque },
             .{ .name = "impostor pictures", .reads = set(.{.cull_buffers}), .writes = set(.{.impostor_pictures}), .always = true, .run = impostorPictures },
             .{ .name = "impostors", .reads = set(.{ .opaque_done, .impostor_pictures }), .writes = set(.{.impostors}), .run = impostors },
             .{ .name = "hair", .reads = set(.{.impostors}), .writes = set(.{.hair}), .run = hair },
             .{ .name = "liquids", .reads = set(.{ .hair, .particles_stepped }), .writes = set(.{.liquids}), .run = liquids },
-            .{ .name = "water", .reads = set(.{.liquids}), .writes = set(.{.water}), .run = water },
+            .{ .name = "water", .reads = if (tracing) set(.{.clouded}) else set(.{.liquids}), .writes = set(.{.water}), .run = water },
             .{ .name = "transparency", .reads = set(.{.water}), .writes = set(.{.transparent}), .run = transparency },
-            .{ .name = "smoke", .reads = set(.{.transparent}), .writes = set(.{.smoke}), .run = smoke },
+            .{ .name = "smoke", .reads = if (tracing) set(.{.water}) else set(.{.transparent}), .writes = set(.{.smoke}), .run = smoke },
             .{ .name = "fog", .reads = set(.{.smoke}), .writes = set(.{.fogged}), .run = fog },
             .{ .name = "particles", .reads = set(.{.fogged}), .writes = set(.{.particles}), .run = particles },
             .{ .name = "after transparency", .reads = set(.{.particles}), .writes = set(.{.transparent_done}), .run = afterTransparency },
-            .{ .name = "path tracing", .reads = if (tracing) set(.{ .lit, .probes }) else set(.{ .transparent_done, .probes }), .writes = set(.{.traced}), .run = trace },
-            .{ .name = "temporal antialiasing", .reads = set(.{.traced}), .writes = set(.{.resolved}), .run = resolve },
+            // A traced view is drawn in a different order: the tracer replaces the
+            // surfaces, then clouds, water, smoke, fog and particles go over its
+            // picture. Reflections, hair, impostors, liquids and blended meshes
+            // are left to the tracer.
+            .{ .name = "path tracing", .reads = if (tracing) set(.{ .lit, .probes }) else set(.{ .transparent_done, .probes }), .writes = if (tracing) set(.{.traced_base}) else set(.{.traced}), .run = trace },
+            .{ .name = "temporal antialiasing", .reads = if (tracing) set(.{.transparent_done}) else set(.{.traced}), .writes = set(.{.resolved}), .run = resolve },
             .{ .name = "lens", .reads = set(.{.resolved}), .writes = set(.{.lensed}), .run = lens },
             .{ .name = "bloom and exposure", .reads = set(.{.lensed}), .writes = set(.{.bloom}), .run = bloom },
             .{ .name = "tone mapping", .reads = set(.{.bloom}), .writes = set(.{.picture}), .run = tonemap },

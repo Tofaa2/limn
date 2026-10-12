@@ -52,6 +52,15 @@ pub const Emitters = struct {
         if (self.emitters.table.get(emitter)) |data| data.desc = desc;
     }
 
+    /// Adds `count` births at once, on top of `rate`, at the emitter's
+    /// position when it is next simulated. A stale handle is ignored.
+    pub fn burst(emitters: *Emitters, emitter: Emitter, count: u32) void {
+        const self = emitters.renderer();
+        self.lock();
+        defer self.unlock();
+        if (self.emitters.table.get(emitter)) |data| data.pending += @floatFromInt(count);
+    }
+
     /// Live particles vanish at once. A stale handle is ignored.
     pub fn destroy(emitters: *Emitters, emitter: Emitter) void {
         const self = emitters.renderer();
