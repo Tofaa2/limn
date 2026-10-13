@@ -423,6 +423,23 @@ pub const CommandEncoder = struct {
         try self.device.buildBlasCommand(self.command, blas, desc);
     }
 
+    /// Asks for the size a structure built earlier in these commands compacts
+    /// to; `Device.compactedBlasSize` has it once they have run.
+    pub fn measureBlas(self: *CommandEncoder, blas: types.AccelerationStructure) !void {
+        std.debug.assert(!self.rendering);
+        self.accelerationBarrier();
+        try self.device.measureBlasCommand(self.command, blas);
+    }
+
+    /// Copies `source` into `destination`, made by
+    /// `Device.createCompactBlas`, leaving out what it does not need.
+    pub fn compactBlas(self: *CommandEncoder, source: types.AccelerationStructure, destination: types.AccelerationStructure) void {
+        std.debug.assert(!self.rendering);
+        self.accelerationBarrier();
+        self.device.compactBlasCommand(self.command, source, destination);
+        self.accelerationBarrier();
+    }
+
     /// Rebuilds from `instance_count` `AccelerationInstance` records at
     /// `instances_address`.
     pub fn buildTlas(self: *CommandEncoder, tlas: types.AccelerationStructure, instances_address: u64, instance_count: u32) void {

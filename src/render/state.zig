@@ -526,6 +526,8 @@ pub const ModelEntry = struct {
     /// Frame the geometry was uploaded in; structures are built after it.
     blas_frame: ?u64 = null,
     blas_job: ?rhi.Detached = null,
+    /// Some of the model's structures wait to be replaced by smaller copies.
+    blas_compacting: bool = false,
     /// Whether vertices and indices are in GPU memory (geometry streaming);
     /// while not, what is drawn with the model is left out of its scene.
     geometry_resident: bool = true,
@@ -773,6 +775,12 @@ pub const SceneData = struct {
     prepared: SceneFrame = undefined,
     gi_frame: u64 = std.math.maxInt(u64),
     gi_updated_frame: u64 = std.math.maxInt(u64),
+    /// What the probes last saw of the scene's geometry and of its lights,
+    /// and for how many frames each has stayed the same.
+    gi_geometry_key: u64 = 0,
+    gi_geometry_still: u32 = 0,
+    gi_lighting_key: u64 = 0,
+    gi_lighting_still: u32 = 0,
     ref_count: u32 = 0,
     joint_count: u32 = 0,
     triangle_count: u64 = 0,

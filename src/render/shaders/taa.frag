@@ -54,6 +54,12 @@ vec3 sampleHistory(FrameConstants frame, vec2 uv) {
     return max(result.rgb / result.a, vec3(0.0));
 }
 
+/// Share of this frame in what moves `moving_speed` pixels a frame or
+/// faster. History is resampled every frame it is kept, which softens it,
+/// so what moves keeps less of it than what stands still.
+const float moving_blend = 0.5;
+const float moving_speed = 2.0;
+
 /// How fast, in pixels a frame, anything near the reprojected pixel moved last frame.
 float speedBefore(FrameConstants frame, vec2 history_uv) {
     if (push.previous_motion_texture == INVALID_ID) return 0.0;
@@ -141,7 +147,7 @@ void main() {
     float stale = clamp(max(speed, speedBefore(frame, history_uv)) * 4.0, 0.1, 1.0);
     if (max_unit > 1.0) history = mix(history, box_center + offset / max_unit, stale);
 
-    float blend = mix(0.05, 0.2, clamp(speed / 24.0, 0.0, 1.0)) * max(confidence, 0.15);
+    float blend = (upscaling ? mix(0.05, 0.2, clamp(speed / 24.0, 0.0, 1.0)) : mix(0.05, moving_blend, clamp(speed / moving_speed, 0.0, 1.0))) * max(confidence, 0.15);
     float flicker = abs(current_ycocg.x - history.x) / max(max(current_ycocg.x, history.x), 1e-3);
     blend *= 1.0 - 0.85 * flicker * (1.0 - clamp(speed, 0.0, 1.0));
     vec3 resolved = expand(fromYCoCg(mix(history, current_ycocg, blend)));

@@ -137,6 +137,16 @@ pub const Graph = struct {
     color_count: usize = 0,
     slots: std.EnumArray(Slot, ?Target) = .initFill(null),
 
+    /// Empties a graph in place. Unlike assigning `Graph{}`, it does not
+    /// write the storage of passes and targets that are not there yet.
+    pub fn clear(self: *Graph) void {
+        self.node_count = 0;
+        self.pass_count = 0;
+        self.link_count = 0;
+        self.color_count = 0;
+        self.slots = .initFill(null);
+    }
+
     fn node(self: *Graph, value: Node) !Target {
         if (self.node_count == max_targets) return error.TooManyTargets;
         self.nodes[self.node_count] = value;

@@ -23,8 +23,9 @@ bool rayOccluded(Tracer tracer, float3 origin, float3 direction, float reach) {
 
 /// Light of one of the frame's lamps on a surface before shadowing, with the
 /// direction and distance a shadow ray toward it takes. False where the lamp
-/// does not reach.
-bool lampOnHit(FrameConstants frame, Light light, float3 position, float3 normal, out float3 toward, out float reach, out float3 arriving) {
+/// does not reach. The lamp is read through a pointer: a copy would load
+/// every field of it before the first test.
+bool lampOnHit(FrameConstants frame, Light* light, float3 position, float3 normal, out float3 toward, out float reach, out float3 arriving) {
     toward = float3(0.0);
     reach = 1e4;
     arriving = float3(0.0);
@@ -73,7 +74,13 @@ float3 lightsOnHit(Tracer tracer, float3 position, float3 normal, float3 albedo)
         float3 toward;
         float reach;
         float3 arriving;
-        if (lampOnHit(frame, frame.lights.data[i], position, normal, toward, reach, arriving)) {
+        Light* lamp = &frame.lights.data[i];
+        if ((lamp.flags & LIGHT_DIRECTIONAL) == 0u) {
+            float3 to_lamp = lamp.position - position;
+            float range = lamp.range;
+            if (dot(to_lamp, to_lamp) > range * range || dot(normal, to_lamp) <= 0.0) continue;
+        }
+        if (lampOnHit(frame, lamp, position, normal, toward, reach, arriving)) {
             if (!rayOccluded(tracer, position + normal * 0.02, toward, reach - 0.04)) radiance += albedo / PI * arriving;
         }
     }

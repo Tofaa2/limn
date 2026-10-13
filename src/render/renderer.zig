@@ -200,6 +200,7 @@ pub const Renderer = struct {
 
     pipelines: Pipelines,
     tonemap_pipelines: std.ArrayList(FormatPipeline) = .empty,
+    edge_pipelines: std.ArrayList(FormatPipeline) = .empty,
     /// Shading pass builds, one per feature set seen.
     shade_variants: std.ArrayList(ShadeVariant) = .empty,
     /// This frame's animated entities.
@@ -277,6 +278,8 @@ pub const Renderer = struct {
     clusters: rhi.Buffer = undefined,
     transparent_order: std.ArrayList(TransparentDraw) = .empty,
     blas_pending: u32 = 0,
+    /// Models with acceleration structures waiting for smaller copies.
+    blas_compacting: u32 = 0,
     /// Frame in which a geometry pool last moved to a new buffer.
     geometry_replaced: ?u64 = null,
     /// Frames a view asked for path tracing and was drawn without it.
@@ -585,6 +588,8 @@ pub const Renderer = struct {
         self.prepare_chunks.deinit(self.gpa);
         for (self.tonemap_pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
         self.tonemap_pipelines.deinit(self.gpa);
+        for (self.edge_pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
+        self.edge_pipelines.deinit(self.gpa);
         self.canvas.deinit(self.gpa, device);
         self.target_pool.deinit(self.gpa, device);
         for (self.fonts.list.items, self.fonts.textures.items) |font, texture| {

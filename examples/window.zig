@@ -168,12 +168,16 @@ pub const Stage = struct {
     timings: bool = false,
     timed_frames: u32 = 0,
     timed_cpu: f64 = 0,
+    /// GPU time of the slowest frame once the scene has settled.
+    timed_worst: f64 = 0,
     timed: [128]Timed = undefined,
     timed_count: usize = 0,
 
     const Timed = struct { name: []const u8, depth: u32, total: f64 };
     /// Frames left out of `--timings`, while pipelines compile and history fills.
     const timing_warmup = 60;
+    /// Frames left out of the slowest frame, while lighting is first gathered.
+    const timing_settle = 300;
 
     pub const width = 1280;
     pub const height = 720;
@@ -299,6 +303,11 @@ pub const Stage = struct {
     fn noteTimings(self: *Stage) void {
         self.timed_frames += 1;
         self.timed_cpu += self.renderer.getStats().cpu_ms;
+        var frame_gpu: f64 = 0;
+        for (self.renderer.device.passTimings()) |timing| {
+            if (timing.depth == 0) frame_gpu += timing.milliseconds;
+        }
+        if (self.frames > timing_settle) self.timed_worst = @max(self.timed_worst, frame_gpu);
         for (self.renderer.device.passTimings()) |timing| {
             const entry = for (self.timed[0..self.timed_count]) |*entry| {
                 if (entry.depth == timing.depth and std.mem.eql(u8, entry.name, timing.name)) break entry;
@@ -319,7 +328,7 @@ pub const Stage = struct {
             if (entry.depth == 0) gpu += entry.total;
             std.debug.print("{d:8.3} ms  {s}{s}\n", .{ entry.total / frames, "        "[0..@min(entry.depth * 2, 8)], entry.name });
         }
-        std.debug.print("{d:8.3} ms  GPU\n{d:8.3} ms  CPU\n", .{ gpu / frames, self.timed_cpu / frames });
+        std.debug.print("{d:8.3} ms  GPU\n{d:8.3} ms  GPU slowest frame\n{d:8.3} ms  CPU\n", .{ gpu / frames, self.timed_worst, self.timed_cpu / frames });
         const stats = self.renderer.getStats();
         std.debug.print("{d:8.1} MiB GPU memory\n{d:8} pipelines\n", .{ @as(f64, @floatFromInt(stats.gpu_memory_bytes)) / (1024 * 1024), stats.pipelines });
         for (stats.downgraded()) |downgrade| {

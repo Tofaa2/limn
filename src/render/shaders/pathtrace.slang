@@ -2,6 +2,7 @@
 #include "brdf.slang"
 #include "gi.slang"
 #include "clouds.slang"
+#include "path_history.slang"
 
 struct Glowing {
     uint instance;
@@ -29,40 +30,54 @@ struct Push {
     uint light_count;
     Glowing* glowing;
     uint glowing_count;
-    uint history_color;
-    uint history_guide;
-    uint history_soft;
-    uint history_gloss;
     uint moved;
     float3 previous_camera;
-    uint reset;
     uint centered;
     uint history_facing;
-    uint history_surface;
     uint history_reservoir;
     uint reusable;
     uint motion;
     uint depth;
-    float history_limit;
-    uint history_lamp;
-    float lamp_limit;
     uint probes;
     uint reconstructed;
-    /// Compute only: the storage images the fields of `Output` go to, in order.
+    uint pad;
+    /// Compute only: the storage images the fields of `Output` and then
+    /// of `Guides` go to, in order.
     uint* targets;
 };
 
 [[vk::push_constant]] Push push;
 
+/// What one frame's paths found at a pixel. Nothing in it comes from
+/// earlier frames: gathering over frames and filtering are the denoiser's.
 struct Output {
+    /// Light that needs no filtering, as it reaches the eye; alpha is 1
+    /// where the first surface is a mirror.
     float4 color : SV_Target0;
+    /// Color of the surface seen, through mirrors, and how far its
+    /// reflections reach.
     float4 guide : SV_Target1;
+    /// Bounced light on that surface, over its color.
     float4 soft : SV_Target2;
+    /// Its normal and distance; the distance is negative through a mirror.
     float4 facing : SV_Target3;
+    /// Lamp and glow light on it, over its color.
     float4 lamp : SV_Target4;
-    float4 gloss_gathered : SV_Target5;
+    /// Glossy reflections in it.
+    float4 gloss : SV_Target5;
+    /// Normal, roughness and distance of the first surface on the ray.
     float4 surface : SV_Target6;
+    /// The light sample the pixel keeps; the tracer's own.
     float4 reservoir : SV_Target7;
+};
+
+/// What a denoiser that works from the whole picture is given besides.
+struct Guides {
+    /// What the surface seen scatters, and what it reflects.
+    float4 scatter;
+    float4 reflect;
+    /// Its normal, with roughness in alpha.
+    float4 normal_roughness;
 };
 
 static Tracer tracer;
@@ -171,8 +186,6 @@ static const float glossy_roughness = 0.4;
 static const float softened_mirror = 0.3;
 static const float lit_by_itself = 0.5;
 static const float lamp_clamp = 8.0;
-static const float moving_steady_weight = 1.0 / 3.0;
-static const float moving_mirror_weight = 0.5;
 
 /// Share of light from all directions a surface of reflectance `f0` reflects
 /// toward the eye, by Karis's fit. DLSS Ray Reconstruction reads it as the
@@ -451,25 +464,8 @@ static const float reused_frames = 20.0;
 static const int reused_neighbours = 3;
 static const float reused_radius = 24.0;
 
-/// Where on last frame's screen `spot` was, which this pixel sees at `reach`
-/// along its ray. Follows a moving object where the rasterized picture shows
-/// the same surface.
 bool seenBefore(FrameConstants frame, float3 spot, float reach, bool mirrored, out float2 was_at) {
-    was_at = fragment * frame.inv_resolution;
-    if (push.moved == 0u) return true;
-    float4 clip = mul(frame.prev_view_proj_unjittered, float4(spot, 1.0));
-    if (clip.w <= 0.0) return false;
-    was_at = clip.xy / clip.w * 0.5 + 0.5 + frame.prev_jitter;
-    if (!mirrored) {
-        int2 pixel = int2(fragment);
-        float depth = fetchTexel(push.depth, pixel).r;
-        float3 drawn = worldPositionFromDepth(fragment * frame.inv_resolution, depth, frame.inv_view_proj);
-        if (depth > 0.0 && abs(distance(drawn, frame.camera_position) - reach) <= 0.02 * reach + 0.01) {
-            float4 now = mul(frame.view_proj_unjittered, float4(spot, 1.0));
-            was_at += (now.xy / now.w - clip.xy / clip.w) * 0.5 - fetchTexel(push.motion, pixel).rg;
-        }
-    }
-    return all(was_at > 0.0) && all(was_at < 1.0);
+    return seenLastFrame(frame, fragment, push.moved != 0u, push.depth, push.motion, spot, reach, mirrored, was_at);
 }
 
 /// Whether the surface a pixel showed last frame is close enough to `surface`
@@ -773,43 +769,8 @@ float3 tracePath(FrameConstants frame, float3 origin, float3 direction, bool sca
     return gathered;
 }
 
-float3 historySharp(uint texture_index, uint sampler_index, float2 uv, float2 size) {
-    float2 place = uv * size;
-    float2 base = floor(place - 0.5) + 0.5;
-    float2 f = place - base;
-    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
-    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
-    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
-    float2 w3 = f * f * (-0.5 + 0.5 * f);
-    float2 w12 = w1 + w2;
-    float2 close = (base + w2 / w12) / size;
-    float2 before = (base - 1.0) / size;
-    float2 after = (base + 2.0) / size;
-    float3 total = sampleTextureLod(texture_index, sampler_index, float2(close.x, before.y), 0.0).rgb * (w12.x * w0.y);
-    total += sampleTextureLod(texture_index, sampler_index, float2(before.x, close.y), 0.0).rgb * (w0.x * w12.y);
-    total += sampleTextureLod(texture_index, sampler_index, float2(close.x, close.y), 0.0).rgb * (w12.x * w12.y);
-    total += sampleTextureLod(texture_index, sampler_index, float2(after.x, close.y), 0.0).rgb * (w3.x * w12.y);
-    total += sampleTextureLod(texture_index, sampler_index, float2(close.x, after.y), 0.0).rgb * (w12.x * w3.y);
-    float weight = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
-    int2 corner = int2(base - 0.5);
-    int2 last = int2(size) - 1;
-    float3 a = fetchTexel(texture_index, clamp(corner, int2(0), last)).rgb;
-    float3 b = fetchTexel(texture_index, clamp(corner + int2(1, 0), int2(0), last)).rgb;
-    float3 c = fetchTexel(texture_index, clamp(corner + int2(0, 1), int2(0), last)).rgb;
-    float3 d = fetchTexel(texture_index, clamp(corner + int2(1, 1), int2(0), last)).rgb;
-    return clamp(total / weight, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));
-}
-
-bool broken(float3 value) {
-    return any(isnan(value)) || any(isinf(value));
-}
-
-bool broken(float4 value) {
-    return any(isnan(value)) || any(isinf(value));
-}
-
 /// Traces the pixel whose center is `position`.
-Output tracePixel(float4 position) {
+Output tracePixel(float4 position, out Guides guides) {
     FrameConstants frame = push.frame;
     fragment = position.xy;
     tracer.frame = frame;
@@ -830,7 +791,6 @@ Output tracePixel(float4 position) {
     float3 total = float3(0.0);
     float3 total_soft = float3(0.0);
     float3 total_lamp = float3(0.0);
-    float3 total_raw = float3(0.0);
     float3 total_scatter = float3(0.0);
     float3 total_reflect = float3(0.0);
     float4 total_facing = float4(0.0);
@@ -892,100 +852,35 @@ Output tracePixel(float4 position) {
         float3 tint = dot(first_color, float3(1.0)) > 0.0 ? first_color : float3(1.0);
         total_soft += indirect / tint;
         total_lamp += soft / tint;
-        total_raw += light + soft + indirect + gloss;
         total_scatter += first_scatter;
         total_reflect += first_reflect;
         total_facing += float4(first_met ? first_facing : float3(0.0), first_roughness);
         total_gloss += gloss;
         guide += first_color;
     }
-    float3 light = total / float(samples);
-    float3 grainy = total_soft / float(samples);
     float3 shown = guide / float(samples);
-    float count = 0.0;
-    float3 light_before = float3(0.0);
-    float4 grainy_before = float4(0.0);
-    float3 shown_before = float3(0.0);
-    float4 facing_before = float4(0.0);
-    float3 lamp_before = float3(0.0);
-    if (push.reset == 0u) {
-        if (push.moved == 0u) {
-            float4 before = fetchTexel(push.history_color, pixel);
-            count = before.a;
-            light_before = before.rgb;
-            grainy_before = fetchTexel(push.history_soft, pixel);
-            shown_before = fetchTexel(push.history_guide, pixel).rgb;
-            facing_before = fetchTexel(push.history_facing, pixel);
-            lamp_before = fetchTexel(push.history_lamp, pixel).rgb;
-        } else {
-            float2 center = (float2(pixel) + 0.5) * frame.inv_resolution;
-            float3 toward = normalize(worldPositionFromDepth(center, 0.5, frame.inv_view_proj) - frame.camera_position);
-            float3 spot = frame.camera_position + toward * first_distance;
-            float2 was_at;
-            if (seenBefore(frame, spot, first_distance, first_mirrored, was_at)) {
-                uint linear_sampler = frame.sampler_linear_clamp;
-                float4 guide_before = sampleTextureLod(push.history_guide, linear_sampler, was_at, 0.0);
-                float4 facing_seen = sampleTextureLod(push.history_facing, linear_sampler, was_at, 0.0);
-                float expected = distance(push.previous_camera, spot);
-                bool was_mirrored = facing_seen.a < 0.0;
-                float3 unlike = abs(guide_before.rgb - shown);
-                if (was_mirrored == first_mirrored && abs(abs(facing_seen.a) - expected) <= 0.03 * expected + 0.02 && max(unlike.r, max(unlike.g, unlike.b)) < 0.2) {
-                    count = sampleTextureLod(push.history_color, linear_sampler, was_at, 0.0).a;
-                    light_before = historySharp(push.history_color, linear_sampler, was_at, frame.resolution);
-                    grainy_before = sampleTextureLod(push.history_soft, linear_sampler, was_at, 0.0);
-                    shown_before = guide_before.rgb;
-                    facing_before = facing_seen;
-                    lamp_before = sampleTextureLod(push.history_lamp, linear_sampler, was_at, 0.0).rgb;
-                }
-            }
-            count = min(count, dot(shown, float3(1.0)) > 0.0 && !first_mirrored ? push.history_limit : 6.0);
-        }
-    }
-    if (broken(light_before) || broken(grainy_before) || broken(shown_before) || broken(facing_before) || broken(lamp_before) || isnan(count) || isinf(count)) {
-        count = 0.0;
-        light_before = float3(0.0);
-        lamp_before = float3(0.0);
-        grainy_before = float4(0.0);
-        shown_before = float3(0.0);
-        facing_before = float4(0.0);
-    }
     if (broken(shown)) shown = float3(0.0);
     if (isnan(first_distance) || isinf(first_distance)) first_distance = 60000.0;
-    count = min(count, 8192.0);
-    float weight = 1.0 / (count + 1.0);
-    float steady_weight = push.moved != 0u ? max(weight, primary_mirror ? moving_mirror_weight : moving_steady_weight) : weight;
-    Output result;
-    result.color = float4(lerp(light_before, light, steady_weight), count + 1.0);
-    float brightness = min(luminance(grainy), 240.0);
-    result.soft = lerp(grainy_before, float4(grainy, brightness * brightness), weight);
-    float shown_weight = push.moved != 0u ? max(weight, 0.7) : weight;
     float shown_distance = min(first_distance, 60000.0);
-    result.facing = lerp(facing_before, float4(first_facing, first_mirrored ? -shown_distance : shown_distance), shown_weight);
-    float4 surface_now = float4(unpackSnormPair(packDirection(primary_facing)), primary_roughness, min(primary_distance, 60000.0));
-    float4 surface_before = surface_now;
-    if (push.reset == 0u && push.moved == 0u) surface_before = fetchTexel(push.history_surface, pixel);
-    if (broken(surface_before)) surface_before = surface_now;
-    result.surface = lerp(surface_before, surface_now, weight);
-    float3 gloss_now = min(total_gloss / float(samples), float3(60000.0));
-    float4 gloss_before = float4(0.0);
-    if (push.reset == 0u && push.moved == 0u) gloss_before = fetchTexel(push.history_gloss, pixel);
-    if (broken(gloss_before)) gloss_before = float4(0.0);
-    result.gloss_gathered = float4(lerp(gloss_before.rgb, gloss_now, 1.0 / (gloss_before.a + 1.0)), min(gloss_before.a + 1.0, 8192.0));
-    result.guide = float4(lerp(shown_before, shown, shown_weight), gloss_reach);
-    result.lamp = float4(lerp(lamp_before, min(total_lamp / float(samples), float3(60000.0)), max(weight, 1.0 / push.lamp_limit)), 1.0);
+    Output result;
+    result.color = float4(total / float(samples), primary_mirror ? 1.0 : 0.0);
+    result.guide = float4(shown, gloss_reach);
+    result.soft = float4(total_soft / float(samples), 0.0);
+    result.facing = float4(first_facing, first_mirrored ? -shown_distance : shown_distance);
+    result.lamp = float4(min(total_lamp / float(samples), float3(60000.0)), 1.0);
+    result.gloss = float4(min(total_gloss / float(samples), float3(60000.0)), 1.0);
+    result.surface = float4(unpackSnormPair(packDirection(primary_facing)), primary_roughness, min(primary_distance, 60000.0));
     result.reservoir = reservoir_kept;
-    if (push.reconstructed != 0u) {
-        result.color = float4(min(total_raw / float(samples), float3(60000.0)), 1.0);
-        result.guide = float4(total_scatter / float(samples), gloss_reach);
-        result.lamp = float4(total_reflect / float(samples), 1.0);
-        result.soft = total_facing / float(samples);
-    }
+    guides.scatter = float4(total_scatter / float(samples), 1.0);
+    guides.reflect = float4(total_reflect / float(samples), 1.0);
+    guides.normal_roughness = total_facing / float(samples);
     return result;
 }
 
 [shader("fragment")]
 Output fragmentMain(float4 position : SV_Position) {
-    return tracePixel(position);
+    Guides guides;
+    return tracePixel(position, guides);
 }
 
 #ifdef STORAGE_IMAGES
@@ -993,14 +888,19 @@ Output fragmentMain(float4 position : SV_Position) {
 [numthreads(8, 8, 1)]
 void computeMain(uint3 id : SV_DispatchThreadID) {
     if (any(float2(id.xy) >= push.frame.resolution)) return;
-    Output result = tracePixel(float4(float2(id.xy) + 0.5, 0.0, 1.0));
+    Guides guides;
+    Output result = tracePixel(float4(float2(id.xy) + 0.5, 0.0, 1.0), guides);
     storage_2d[push.targets[0]][id.xy] = result.color;
     storage_2d[push.targets[1]][id.xy] = result.guide;
     storage_2d[push.targets[2]][id.xy] = result.soft;
     storage_2d[push.targets[3]][id.xy] = result.facing;
     storage_2d[push.targets[4]][id.xy] = result.lamp;
-    storage_2d[push.targets[5]][id.xy] = result.gloss_gathered;
+    storage_2d[push.targets[5]][id.xy] = result.gloss;
     storage_2d[push.targets[6]][id.xy] = result.surface;
     storage_2d[push.targets[7]][id.xy] = result.reservoir;
+    if (push.reconstructed == 0u) return;
+    storage_2d[push.targets[8]][id.xy] = guides.scatter;
+    storage_2d[push.targets[9]][id.xy] = guides.reflect;
+    storage_2d[push.targets[10]][id.xy] = guides.normal_roughness;
 }
 #endif

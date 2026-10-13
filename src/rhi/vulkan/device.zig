@@ -108,6 +108,12 @@ pub const AccelerationResource = struct {
     built: bool = false,
     /// Triangles (bottom level) or instances (top level) it was sized for.
     capacity: u32 = 0,
+    /// Bytes of `buffer` the structure takes.
+    size: u64 = 0,
+    /// Built so that a smaller copy can be made of it.
+    compactable: bool = false,
+    /// Where the size of that copy is written; see `measureBlasCommand`.
+    compaction_slot: ?u32 = null,
 };
 
 /// From `Device.pipelineResource`.
@@ -263,6 +269,9 @@ pub const Device = struct {
     /// HDR output was requested; `hdr_active` says whether it was granted.
     hdr_wanted: bool = false,
     accelerations: HandleTable(AccelerationResource, types.AccelerationTag),
+    /// Sizes that bottom-level structures compact to, made on first use.
+    compaction_pool: vk.QueryPool = .null_handle,
+    compaction_slots: std.StaticBitSet(acceleration_module.compaction_capacity) = .initEmpty(),
     /// Read with `validationErrorCount`.
     validation_errors: std.atomic.Value(u32) = .init(0),
     surface: vk.SurfaceKHR = .null_handle,
@@ -625,6 +634,7 @@ pub const Device = struct {
         persistPipelineCache(self) catch |err| std.log.warn("could not persist pipeline cache: {}", .{err});
         destroySwapchain(self);
         while (self.pipelines.popAny()) |pipeline| self.vkd.destroyPipeline(pipeline.handle, null);
+        if (self.compaction_pool != .null_handle) self.vkd.destroyQueryPool(self.compaction_pool, null);
         while (self.accelerations.popAny()) |acceleration| {
             self.vkd.destroyAccelerationStructureKHR(acceleration.handle, null);
             self.destroyBuffer(acceleration.buffer);
@@ -765,6 +775,11 @@ pub const Device = struct {
     pub const accelerationAddress = acceleration_module.accelerationAddress;
     pub const accelerationBuilt = acceleration_module.accelerationBuilt;
     pub const buildBlasCommand = acceleration_module.buildBlasCommand;
+    pub const measureBlasCommand = acceleration_module.measureBlasCommand;
+    pub const compactedBlasSize = acceleration_module.compactedBlasSize;
+    pub const blasMeasured = acceleration_module.blasMeasured;
+    pub const createCompactBlas = acceleration_module.createCompactBlas;
+    pub const compactBlasCommand = acceleration_module.compactBlasCommand;
     pub const buildTlasCommand = acceleration_module.buildTlasCommand;
     pub const createSampler = textures_module.createSampler;
     pub const destroySampler = textures_module.destroySampler;

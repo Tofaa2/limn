@@ -91,6 +91,8 @@ pub const Shaders = struct {
         self.pipelines.reset();
         for (self.tonemap_pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
         self.tonemap_pipelines.clearRetainingCapacity();
+        for (self.edge_pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
+        self.edge_pipelines.clearRetainingCapacity();
         self.canvas.resetPipelines(device);
         return @intCast(shader_sources.names.len);
     }
@@ -185,6 +187,7 @@ pub const PipelineId = enum {
     liquid_sim,
     path_trace,
     path_trace_compute,
+    path_gather,
     path_denoise,
     path_denoise_final,
     reflection_reproject,
@@ -404,6 +407,7 @@ fn makePipeline(device: *rhi.Device, id: PipelineId) anyerror!rhi.Pipeline {
         .underwater => Local.pass(device, "underwater", shaderCode("underwater.frag.spv"), &.{.{ .format = hdr_format }}),
         .liquid_sim => device.createComputePipeline(.{ .name = "liquid simulation", .shader = shaderCode("liquid_sim.comp.spv") }),
         .path_trace_compute => device.createComputePipeline(.{ .name = "path tracing", .shader = if (device.caps.ray_tracing) shaderCode("pathtrace_rt.comp.spv") else shaderCode("pathtrace.comp.spv") }),
+        .path_gather => Local.pass(device, "path tracing gather", shaderCode("pathtrace_gather.frag.spv"), &.{ .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float }, .{ .format = .rgba16_float } }),
         .path_trace => Local.pass(device, "path tracing", if (device.caps.ray_tracing) shaderCode("pathtrace_rt.frag.spv") else shaderCode("pathtrace.frag.spv"), &.{ .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float } }),
         .path_denoise => Local.pass(device, "path tracing denoise", shaderCode("pathtrace_denoise.frag.spv"), &.{.{ .format = .rgba16_float }}),
         .path_denoise_final => Local.pass(device, "path tracing denoise (last)", shaderCode("pathtrace_denoise.frag.spv"), &.{.{ .format = hdr_format }}),
