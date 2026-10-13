@@ -1,14 +1,15 @@
-//! Render hardware interface: a thin, explicit Vulkan 1.3 device layer.
+//! Render hardware interface: a thin, explicit device layer. Everything that
+//! knows the graphics API is in the backend directory chosen here.
 const types = @import("types.zig");
-const device = @import("device.zig");
+const device = @import("vulkan/device.zig");
 
 pub const Device = device.Device;
 pub const FrameGenerator = device.FrameGenerator;
-pub const deviceProcAddr = @import("loader.zig").deviceProcAddr;
-pub const instanceProcAddr = @import("loader.zig").instanceProcAddr;
+/// Native handles for external SDKs.
+pub const native = @import("vulkan/native.zig");
 pub const Detached = device.Detached;
 pub const Frame = device.Frame;
-pub const CommandEncoder = @import("command.zig").CommandEncoder;
+pub const CommandEncoder = @import("vulkan/command.zig").CommandEncoder;
 pub const frames_in_flight = device.frames_in_flight;
 pub const push_constant_size = device.push_constant_size;
 
@@ -51,6 +52,7 @@ pub const IndexType = types.IndexType;
 pub const PassTiming = types.PassTiming;
 pub const MemoryStats = types.MemoryStats;
 pub const AdapterInfo = types.AdapterInfo;
+pub const Capabilities = types.Capabilities;
 pub const AdapterKind = types.AdapterKind;
 pub const AccelerationStructure = types.AccelerationStructure;
 pub const BlasDesc = types.BlasDesc;

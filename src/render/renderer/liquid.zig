@@ -1,10 +1,10 @@
 //! Liquid volumes. Internal to the renderer.
 const std = @import("std");
+const simulation_feature = @import("../features/simulation.zig");
 const handle = @import("../../handle.zig");
 const gpu = @import("../gpu.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
-const simulation_passes = @import("../passes/simulation.zig");
 const render = @import("../renderer.zig");
 
 const Renderer = render.Renderer;
@@ -73,7 +73,7 @@ pub const Liquids = struct {
 
 /// Gives a liquid the see-through box that rays hit in its place.
 fn attachLiquidProxy(self: *Renderer, scene: Scene, liquid: Liquid, desc: LiquidDesc) !void {
-    if (!self.device.ray_tracing) return;
+    if (!self.device.caps.ray_tracing) return;
     const model = self.liquid_proxy_model orelse made: {
         const positions = [8][3]f32{ .{ -0.5, -0.5, -0.5 }, .{ 0.5, -0.5, -0.5 }, .{ 0.5, 0.5, -0.5 }, .{ -0.5, 0.5, -0.5 }, .{ -0.5, -0.5, 0.5 }, .{ 0.5, -0.5, 0.5 }, .{ 0.5, 0.5, 0.5 }, .{ -0.5, 0.5, 0.5 } };
         const indices = [36]u32{ 0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 6, 2, 3, 7, 6, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5 };
@@ -101,7 +101,7 @@ fn createLiquidAlone(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
     const device = self.device;
     const radius = std.math.clamp(desc.particle_radius, 0.002, 10);
     const reach = radius * 4;
-    const box = simulation_passes.liquidBox(desc.transform);
+    const box = simulation_feature.liquidBox(desc.transform);
     var grid: [3]i32 = undefined;
     var cell_count: u64 = 1;
     inline for (0..3) |axis| {

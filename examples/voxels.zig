@@ -462,7 +462,7 @@ pub fn main(init: std.process.Init) !void {
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
     const environment = try renderer.environments.createSky(.{ .sun_direction = .{ 0, 1, 0 }, .stars = 40 });
-    renderer.scenes.setEnvironment(scene, environment, 0.6);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 0.6 });
 
     var world = try World.create(gpa, init.io, renderer, scene);
     defer world.deinit();
@@ -570,14 +570,13 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = .{ .position = eye, .forward = forward, .up = up, .near = 0.5 },
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = .{
-                    .shadow_distance = 420,
-                    .shadow_softness = 0.25,
-                    .global_illumination = false,
-                    .automatic_exposure = false,
-                    .aerial_perspective = 0.0002,
+                    .shadows = .{ .distance = 420, .softness = 0.25 },
+                    .global_illumination = null,
+                    .post = .{ .automatic_exposure = false },
+                    .shading = .{ .aerial_perspective = 0.0002 },
                     .debug_view = debug_view,
                 },
             }},

@@ -31,9 +31,9 @@ void main() {
     vec3 down = worldAt(frame, uv + vec2(0.0, frame.inv_resolution.y), dd);
     vec3 dx = abs(dl - depth) < abs(dr - depth) ? position - left : right - position;
     vec3 dy = abs(du - depth) < abs(dd - depth) ? position - up : down - position;
-    vec3 view = normalize(frame.camera_position - position);
+    vec3 view = normalize(eyePoint(frame, position) - position);
     vec3 normal = normalize(cross(dx, dy));
     if (dot(normal, view) < 0.0) normal = -normal;
 
-    out_gi = vec4(giIrradiance(frame, position, normal, view) * frame.gi_intensity, linearDepth(depth, frame.near));
+    out_gi = vec4(giIrradiance(frame, position, normal, view) * frame.gi_intensity, linearDepth(depth, frame.depth_terms));
 }

@@ -33,7 +33,7 @@ void main() {
     float scale = length(instance.transform[0]);
     mat3 turn = mat3(instance.transform[0] / scale, instance.transform[1] / scale, instance.transform[2] / scale);
     vec3 middle = instance.transform * vec4(impostor.center, 1.0);
-    vec3 seen_from = normalize(transpose(turn) * (frame.camera_position - middle));
+    vec3 seen_from = normalize(transpose(turn) * (eyePoint(frame, middle) - middle));
     vec2 tile = min(floor(impostorFold(seen_from) * impostor_frames), vec2(impostor_frames - 1.0));
     vec3 toward = impostorUnfold((tile + 0.5) / impostor_frames);
     vec3 right;

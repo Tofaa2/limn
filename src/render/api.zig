@@ -16,6 +16,7 @@ const draw_list = @import("draw_list.zig");
 const font_module = @import("font_baker").font;
 const text_layout = @import("text_layout.zig");
 const render = @import("renderer.zig");
+const features = @import("core/features.zig");
 
 const Mat4 = render.Mat4;
 const Vec3 = render.Vec3;
@@ -76,6 +77,91 @@ pub const Image = draw_list.Image;
 /// A font baked into a distance-field atlas; see `Renderer.fonts.load`.
 pub const Font = font_module.Font;
 
+/// Ray tracing and what is built for it; see `Options.ray_tracing.hardware`.
+pub const RayTracingOptions = struct {
+    /// Use hardware ray tracing where available. False disables ray-traced
+    /// effects; path tracing then runs in a shader.
+    hardware: bool = true,
+    /// Build a BVH per model at load so `Settings.path_tracing` works without
+    /// hardware ray tracing. No effect where the GPU traces rays.
+    software_path_tracing: bool = false,
+    /// Maximum probes along X, Y and Z in one light probe grid.
+    max_probes: [3]u32 = .{ 32, 12, 32 },
+    /// Include skinned and morphed meshes in the ray-tracing structure, at one
+    /// structure build per such mesh per frame.
+    dynamic_geometry: bool = true,
+    /// How many of those structures are updated per frame, in turn; 0 for all.
+    /// New ones are always built at once.
+    dynamic_refits: u32 = 0,
+    /// Instance groups join the ray-tracing structure while the scene holds at
+    /// most this many group instances; 0 never.
+    instance_limit: u32 = 65536,
+};
+
+/// Shadow map sizes; see `Options.shadows`.
+pub const ShadowOptions = struct {
+    /// Size of each of the four sun shadow cascades, in texels per side.
+    resolution: u32 = 2048,
+    /// Size per side of the spot and point light shadow atlas, in texels.
+    local_resolution: u32 = 2048,
+    /// Tiles per side of the local-light shadow atlas, 1..4. A spot light uses
+    /// one tile, a point light six.
+    local_tiles_per_side: u32 = 4,
+};
+
+/// How textures are stored and sampled; see `Options.textures`.
+pub const TextureOptions = struct {
+    /// Anisotropic filtering for color and normal maps (1 disables).
+    anisotropy: f32 = 8,
+    /// Anisotropic filtering for roughness/metalness, occlusion and emissive.
+    data_anisotropy: f32 = 1,
+    /// GPU storage of material textures. `.bc7` takes a quarter of the memory
+    /// of `.none`; falls back to `.none` without BC format support.
+    compression: TextureCompression = .bc7,
+    /// With compression on, store normal maps as BC5; false uses BC7.
+    normal_maps_bc5: bool = true,
+    /// Null keeps every texture fully loaded.
+    streaming: ?TextureStreaming = null,
+};
+
+/// How meshes are built and drawn; see `Options.geometry`.
+pub const GeometryOptions = struct {
+    /// Draw meshlets with mesh shaders where available instead of indirect
+    /// draws. Off by default: indirect draws share vertices between
+    /// triangles and are the faster of the two.
+    mesh_shaders: bool = false,
+    /// Compute per-meshlet bounds of skinned and morphed meshes on the GPU each
+    /// frame, so they are culled per meshlet instead of per mesh.
+    skinned_meshlet_bounds: bool = false,
+    /// Build coarser levels of detail for models. False loads them faster and
+    /// draws every mesh at full detail, which suits geometry made of flat
+    /// textured faces that does not simplify.
+    lods: bool = true,
+    /// Build cluster-hierarchy LODs, chosen per meshlet. Meshes under about
+    /// 8000 triangles and skinned meshes keep whole-mesh LODs.
+    cluster_lods: bool = true,
+    /// Weight of normal deviation when LODs are built; 0 uses shape alone. See
+    /// `gltf.LodOptions.normal_weight`.
+    lod_normal_weight: f32 = gltf.default_lod_normal_weight,
+    /// Weight of UV deviation when LODs are built: 1 counts a UV shift as a
+    /// shape error of the same distance, 0 ignores it.
+    lod_uv_weight: f32 = gltf.default_lod_uv_weight,
+    /// Keep a model's geometry on the GPU only while something drawn with it is
+    /// near a camera. Null keeps all geometry loaded.
+    streaming: ?GeometryStreaming = null,
+};
+
+/// What is kept on disk between runs; see `Options.cache`.
+pub const CacheOptions = struct {
+    /// File for the driver's pipeline cache. Null keeps none.
+    pipelines: ?[]const u8 = null,
+    /// Directory for processed assets; null caches nothing.
+    assets: ?[]const u8 = null,
+    /// Size the asset cache is trimmed to at startup, oldest files first; 0
+    /// never trims. See `trimAssetCache`.
+    assets_max_bytes: u64 = 0,
+};
+
 /// Creation-time options for `Renderer.init`; fixed for its lifetime.
 pub const Options = struct {
     /// Name reported to the Vulkan driver.
@@ -86,86 +172,26 @@ pub const Options = struct {
     surface: ?rhi.Surface = null,
     /// Substring of the name of the GPU to prefer.
     preferred_device: ?[]const u8 = null,
-    /// File for the driver's pipeline cache. Null keeps none.
-    pipeline_cache_path: ?[]const u8 = null,
+    cache: CacheOptions = .{},
     /// Name GPU objects and label passes; needs `VK_EXT_debug_utils`.
     debug_names: bool = false,
     /// Ask for an HDR10 surface; see `Renderer.hdrActive` for the result.
     hdr_output: bool = false,
-    /// Use hardware ray tracing where available. False disables ray-traced
-    /// effects; path tracing then runs in a shader.
-    ray_tracing: bool = true,
-    /// Draw meshlets with mesh shaders where available instead of indirect
-    /// draws. Off by default: indirect draws share vertices between
-    /// triangles and are the faster of the two.
-    mesh_shaders: bool = false,
-    /// Build a BVH per model at load so `Settings.path_tracing` works without
-    /// hardware ray tracing. No effect where the GPU traces rays.
-    path_tracing_fallback: bool = false,
+    ray_tracing: RayTracingOptions = .{},
+    geometry: GeometryOptions = .{},
     /// CPU profiler hooks.
     profiler: ?Profiler = null,
-    /// Size of each of the four sun shadow cascades, in texels per side.
-    shadow_resolution: u32 = 2048,
-    /// Size per side of the spot and point light shadow atlas, in texels.
-    local_shadow_resolution: u32 = 2048,
-    /// Anisotropic filtering for color and normal maps (1 disables).
-    texture_anisotropy: f32 = 8,
-    /// Anisotropic filtering for roughness/metalness, occlusion and emissive.
-    data_texture_anisotropy: f32 = 1,
-    /// Maximum probes along X, Y and Z in one light probe grid.
-    gi_max_probes: [3]u32 = .{ 32, 12, 32 },
-    /// Tiles per side of the local-light shadow atlas, 1..4. A spot light uses
-    /// one tile, a point light six.
-    local_shadow_tiles_per_side: u32 = 4,
-    /// GPU storage of material textures. `.bc7` takes a quarter of the memory
-    /// of `.none`; falls back to `.none` without BC format support.
-    texture_compression: TextureCompression = .bc7,
-    /// With compression on, store normal maps as BC5; false uses BC7.
-    normal_maps_bc5: bool = true,
-    /// Directory for processed assets; null caches nothing.
-    asset_cache_dir: ?[]const u8 = null,
-    /// Size the asset cache is trimmed to at startup, oldest files first; 0
-    /// never trims. See `trimAssetCache`.
-    asset_cache_max_bytes: u64 = 0,
+    shadows: ShadowOptions = .{},
+    textures: TextureOptions = .{},
     /// Allocator for worker-thread asset decoding and the resulting models;
     /// must be thread-safe. Null uses a general-purpose one.
     job_allocator: ?std.mem.Allocator = null,
     /// Compile a shading-pass variant per set of features a view uses, on a
     /// worker thread. False always uses the full pass.
     shader_variants: bool = true,
-    /// Compute per-meshlet bounds of skinned and morphed meshes on the GPU each
-    /// frame, so they are culled per meshlet instead of per mesh.
-    skinned_meshlet_bounds: bool = false,
-    /// Build coarser levels of detail for models. False loads them faster and
-    /// draws every mesh at full detail, which suits geometry made of flat
-    /// textured faces that does not simplify.
-    mesh_lods: bool = true,
-    /// Build cluster-hierarchy LODs, chosen per meshlet. Meshes under about
-    /// 8000 triangles and skinned meshes keep whole-mesh LODs.
-    cluster_lods: bool = true,
-    /// Weight of normal deviation when LODs are built; 0 uses shape alone. See
-    /// `gltf.LodOptions.normal_weight`.
-    lod_normal_weight: f32 = gltf.default_lod_normal_weight,
-    /// Weight of UV deviation when LODs are built: 1 counts a UV shift as a
-    /// shape error of the same distance, 0 ignores it.
-    lod_uv_weight: f32 = gltf.default_lod_uv_weight,
     /// Threads for animation poses and instance records, including the render
     /// thread: 0 picks automatically (at most 8), 1 uses no other thread.
     worker_threads: u32 = 0,
-    /// Include skinned and morphed meshes in the ray-tracing structure, at one
-    /// structure build per such mesh per frame.
-    gi_dynamic_geometry: bool = true,
-    /// How many of those structures are updated per frame, in turn; 0 for all.
-    /// New ones are always built at once.
-    gi_dynamic_refits: u32 = 0,
-    /// Instance groups join the ray-tracing structure while the scene holds at
-    /// most this many group instances; 0 never.
-    gi_instance_limit: u32 = 65536,
-    /// Null keeps every texture fully loaded.
-    texture_streaming: ?TextureStreaming = null,
-    /// Keep a model's geometry on the GPU only while something drawn with it is
-    /// near a camera. Null keeps all geometry loaded.
-    geometry_streaming: ?GeometryStreaming = null,
 };
 
 /// Where liquid pours into a `LiquidDesc` volume.
@@ -220,7 +246,7 @@ pub const LiquidDesc = struct {
     time_scale: f32 = 1,
 };
 
-/// See `Options.geometry_streaming`.
+/// See `Options.geometry.streaming`.
 pub const GeometryStreaming = struct {
     /// Geometry is loaded while anything drawn with it is within this distance
     /// of a camera. Whatever uses a released model is left out of the scene,
@@ -257,11 +283,11 @@ pub const TextureStreaming = struct {
     skip_occluded: bool = false,
     /// Keep only the always-loaded mips in system memory and read the rest from
     /// the asset cache on demand, on the rendering thread. Needs
-    /// `Options.asset_cache_dir` and compressed textures.
+    /// `Options.cache.assets` and compressed textures.
     from_cache: bool = false,
 };
 
-/// See `Options.texture_compression`. `.none` is RGBA8.
+/// See `Options.textures.compression`. `.none` is RGBA8.
 pub const TextureCompression = enum { none, bc7 };
 /// See `Renderer.entities.bakeLightmap`.
 pub const LightmapDesc = struct {
@@ -433,8 +459,8 @@ pub const FluidDesc = struct {
     sources: []const FluidSource = &.{},
     /// Up to 8.
     obstacles: []const FluidObstacle = &.{},
-    /// Treat scene geometry inside the box as solid. Needs ray tracing and a
-    /// view with global illumination; six short rays per cell per frame.
+    /// Treat scene geometry inside the box as solid. Needs ray tracing;
+    /// six short rays per cell per frame.
     scene_obstacles: bool = false,
     walls: FluidWalls = .floor,
     /// Lift per unit of heat and sink per unit of smoke, in box heights per
@@ -473,7 +499,7 @@ pub const FluidDesc = struct {
     /// How far that light reaches; 0 picks three times the box's height.
     light_range: f32 = 0,
     /// Size of that light as a share of the box's height; above 0 softens its
-    /// ray-traced shadows (see `Settings.light_shadow_rays`).
+    /// ray-traced shadows (see `Settings.shadows.light_rays`).
     light_size: f32 = 0,
     /// Height of that light: 1 is a line as tall as the glow, 0 a point.
     light_tall: f32 = 1,
@@ -528,24 +554,24 @@ pub const CloudDesc = struct {
 /// A lightning flash in a cloud layer; see `Renderer.scenes.cloudFlash`.
 pub const CloudFlash = struct { position: Vec3, brightness: f32 };
 
-/// See `Settings.transparency`.
+/// See `Settings.transparency.mode`.
 pub const TransparencyMode = enum {
     /// Whole meshes, back to front.
     sorted,
     /// Weighted blended: one pass, approximate layering.
     weighted,
-    /// Depth peeling: exact for the nearest `Settings.transparency_layers`
+    /// Depth peeling: exact for the nearest `Settings.transparency.layers`
     /// surfaces, one pass per layer.
     peeled,
 };
 
-/// Haze model of aerial perspective; see `Settings.aerial_model`.
+/// Haze model of aerial perspective; see `Settings.shading.aerial_model`.
 pub const AerialModel = enum { atmosphere, sky };
 
-/// LOD used for local light shadows; see `Settings.shadow_lod`.
+/// LOD used for local light shadows; see `Settings.shadows.lod`.
 pub const ShadowLod = enum { camera, light };
 
-/// See `Settings.output_encoding`.
+/// See `Settings.output.encoding`.
 pub const OutputEncoding = enum { auto, srgb, hdr10 };
 
 /// Hooks for an external CPU profiler such as Tracy. `begin` gets a static zone
@@ -581,6 +607,9 @@ pub const Camera = struct {
     /// Shifts the picture off the camera's axis, right and down, in halves of
     /// the picture's height. See `stereo`.
     lens_shift: [2]f32 = .{ 0, 0 },
+    /// Null is a perspective camera with `fov_y`. Set for a parallel one, as
+    /// in isometric and 2.5D views.
+    orthographic: ?Orthographic = null,
 
     /// A camera at `position` looking toward `target`, which must differ.
     pub fn lookAt(position: Vec3, target: Vec3) Camera {
@@ -605,6 +634,14 @@ pub const Camera = struct {
         right_eye.lens_shift[0] = self.lens_shift[0] - shift;
         return .{ left_eye, right_eye };
     }
+};
+
+/// A parallel projection; see `Camera.orthographic`.
+pub const Orthographic = struct {
+    /// World units the picture spans from top to bottom.
+    height: f32 = 10,
+    /// Far plane distance, in world units. Nothing beyond it is drawn.
+    far: f32 = 1000,
 };
 
 /// The scene's one shadow-casting directional light; see `Renderer.scenes.setSun`.
@@ -742,358 +779,88 @@ pub const Quality = enum {
     }
 };
 
+/// `Settings.ambient_occlusion`.
+pub const AmbientOcclusion = @import("features/ambient_occlusion.zig").Settings;
+/// `Settings.canvas`.
+pub const Canvas = @import("features/canvas.zig").Settings;
+
+/// `Settings.geometry`.
+pub const Geometry = @import("features/geometry.zig").Settings;
+/// `Settings.shading`.
+pub const Shading = @import("features/shading.zig").Settings;
+/// `Settings.shadows`.
+pub const Shadows = @import("features/shadows.zig").Settings;
+/// `Settings.reflections`.
+pub const Reflections = @import("features/reflections.zig").Settings;
+/// `Settings.global_illumination`.
+pub const GlobalIllumination = @import("features/global_illumination.zig").Settings;
+/// `Settings.path_tracing`.
+pub const PathTracing = @import("features/path_tracing.zig").Settings;
+/// `Settings.transparency.mode`.
+pub const Transparency = @import("features/transparency.zig").Settings;
+/// `Settings.fog`.
+pub const Fog = @import("features/fog.zig").Settings;
+/// `Settings.clouds`.
+pub const Clouds = @import("features/clouds.zig").Settings;
+/// `Settings.fluids`.
+pub const Fluids = @import("features/fluids.zig").Settings;
+/// `Settings.post`.
+pub const Post = @import("features/post.zig").Settings;
+/// `Settings.resolution`.
+pub const Resolution = @import("features/resolution.zig").Settings;
+/// `Settings.output`.
+pub const Output = @import("features/output.zig").Settings;
+/// `Settings.post.depth_of_field`.
+pub const DepthOfField = @import("features/post.zig").DepthOfField;
+/// `Settings.post.motion_blur`.
+pub const MotionBlur = @import("features/post.zig").MotionBlur;
+
+/// The settings of a feature that can be switched off, or its defaults while
+/// it is off.
+pub fn filled(setting: anytype) @typeInfo(@TypeOf(setting)).optional.child {
+    return setting orelse .{};
+}
+
 /// Per-view quality and look (`ViewDesc.settings`); may change every frame.
 /// Distances are in world units.
 pub const Settings = struct {
     /// The settings of a quality level; only cost-related fields differ.
     pub fn preset(quality: Quality) Settings {
-        return switch (quality) {
-            .ultra => .{},
-            .high => .{ .reflection_resolution = .half },
-            .medium => .{
-                .global_illumination = false,
-                .ao_bounce = 0,
-                .reflection_resolution = .half,
-                .shadow_samples = 8,
-                .light_shadow_rays = 2,
-                .cloud_steps = 32,
-                .fluid_steps = 32,
-            },
-            .low => .{
-                .render_scale = 0.75,
-                .global_illumination = false,
-                .ao_bounce = 0,
-                .ao_slices = 1,
-                .screen_space_reflections = false,
-                .shadow_cascades = 3,
-                .shadow_samples = 4,
-                .light_shadow_rays = 1,
-                .cloud_resolution = .quarter,
-                .cloud_steps = 24,
-                .fluid_resolution = .quarter,
-                .fluid_steps = 24,
-                .fog_steps = 8,
-                .dof_resolution = .half,
-                .motion_blur_samples = 6,
-            },
-        };
+        var settings = Settings{};
+        features.preset(&settings, quality);
+        return settings;
     }
 
-    /// Sun and local light shadows.
-    shadows: bool = true,
-    /// Distance from the camera covered by the shadow cascades.
-    shadow_distance: f32 = 60,
-    /// Penumbra radius in world units.
-    shadow_softness: f32 = 0.035,
-    /// Number of sun shadow cascades, 1..4.
-    shadow_cascades: u32 = 4,
-    /// Leave out of each sun cascade meshes smaller than this many of its
-    /// texels across. 0 draws everything; around 2 is rarely visible.
-    shadow_small_feature_texels: f32 = 0,
-    /// Cull sun shadow casters whose shadow cannot reach anything the camera
-    /// sees. Applies to cascades redrawn every frame: all without
-    /// `shadow_cascade_stagger`, only the nearest with it.
-    shadow_receiver_culling: bool = true,
-    /// Reach of screen-space contact shadows for the sun, in world units; 0.2
-    /// to 0.5 is typical, 0 is off. Opaque surfaces only.
-    contact_shadows: f32 = 0,
-    /// Ray trace the shadows of shadow-casting lights that have no shadow map
-    /// (directional, rectangle, lights past the tile budget). Needs ray tracing
-    /// and `global_illumination`.
-    ray_traced_light_shadows: bool = true,
-    /// Rays per pixel toward each ray-shadowed light that has a size, 1..15.
-    light_shadow_rays: u32 = 4,
-    /// Accumulate soft light shadows over frames; moving shadows trail by a few
-    /// frames. Needs `temporal_antialiasing`.
-    light_shadow_filter: bool = true,
-    /// Sun shadow filter samples: 4, 8 or 16.
-    shadow_samples: u32 = 16,
-    /// Screen-space ambient occlusion (GTAO).
-    ambient_occlusion: bool = true,
-    /// World-space radius searched for occluders.
-    ao_radius: f32 = 1.2,
-    /// Blend occlusion over frames; it then lags fast motion slightly.
-    ao_temporal_filter: bool = true,
-    /// Strength of bounce light from nearby occluders; 0 for none. Needs
-    /// `ambient_occlusion` and `temporal_antialiasing`.
-    ao_bounce: f32 = 1,
-    /// Exponent applied to the occlusion term; higher is darker.
-    ao_intensity: f32 = 1.3,
-    /// Cull geometry hidden behind what was visible last frame. Never drops
-    /// visible geometry.
-    occlusion_culling: bool = true,
-    /// Use a virtual shadow map for the sun: four nested 4096-texel levels out
-    /// to `shadow_distance`, drawn page by page on demand and cached. Cascades
-    /// are used where pages are not yet drawn.
-    virtual_shadow_maps: bool = false,
-    /// Shade once per 2x2 pixels where last frame's picture was flat and
-    /// smooth. Needs GPU shading-rate support and `temporal_antialiasing`.
-    variable_rate_shading: bool = false,
-    /// Relative color variation a 16-pixel tile may have and still be shaded
-    /// coarsely.
-    variable_rate_contrast: f32 = 0.06,
-    /// Scene resolution as a fraction of the output size; above 1 supersamples.
-    /// Draw lists are always drawn at full size.
-    render_scale: f32 = 1,
-    /// Scaling of a picture rendered below output size. `.temporal`, `.fsr2`
-    /// and `.fsr3` need `temporal_antialiasing`; `.fsr2` and `.fsr3` also need
-    /// storage images and `-Dfidelityfx`, else fall back to `.temporal`. `.fsr`
-    /// is FSR 1, sharpened by `sharpen`.
-    /// `.dlss` is NVIDIA DLSS, also at full size, where it only antialiases;
-    /// a path traced view is denoised by its Ray Reconstruction in place of
-    /// `path_tracing_denoise`. It needs `temporal_antialiasing`, an NVIDIA GPU
-    /// and the DLSS SDK (`zig build dlss-sdk`), else falls back to `.temporal`.
-    upscaling: Upscaling = .temporal,
-    /// FSR 3 frame generation: shows a generated picture between every two
-    /// rendered. Needs `.fsr3` upscaling on a view that fills the backbuffer;
-    /// presentation is then vsynced. Draw lists are interpolated with the scene.
-    frame_generation: bool = false,
-    /// Screen-space error in pixels at which meshes switch to a coarser LOD; 0
-    /// always draws full detail.
-    lod_error_pixels: f32 = 1,
-    /// Cross-fade LODs by dithering over this share of the switching distance
-    /// (0.25 is typical); 0 switches at once.
-    lod_cross_fade: f32 = 0,
-    /// LOD used for local light shadows: `.camera` matches what the camera
-    /// sees, `.light` picks by distance from the light. Sun cascades always
-    /// follow the camera.
-    shadow_lod: ShadowLod = .camera,
-    /// How overlapping transparent surfaces are combined.
-    transparency: TransparencyMode = .sorted,
-    /// Layers of the `.peeled` mode, 1..16.
-    transparency_layers: u32 = 4,
-    /// Transparent surfaces cast shadows as dark as they are opaque.
-    transparent_shadows: bool = true,
-    /// Refractive surfaces also show the transparent surfaces behind them, at
-    /// one scene-color copy per such surface. `.sorted` transparency only.
-    layered_refraction: bool = false,
-    /// Transparent surfaces tint the sunlight passing through them. Sun shadows
-    /// only; needs `transparent_shadows`.
-    colored_shadows: bool = false,
-    /// Screen-space reflections; what is not on screen falls back to the sky.
-    screen_space_reflections: bool = true,
-    /// Resolution the reflection rays are traced at.
-    reflection_resolution: EffectResolution = .full,
-    /// Surfaces rougher than this reflect only the sky.
-    reflection_max_roughness: f32 = 0.5,
-    /// Samples along each reflection ray, 4..256.
-    reflection_steps: u32 = 32,
-    /// How far a reflection ray travels, in world units.
-    reflection_distance: f32 = 30,
-    /// Assumed thickness of surfaces a ray passes behind.
-    reflection_thickness: f32 = 0.3,
-    /// Average reflections over frames; moving reflections trail slightly.
-    reflection_temporal_filter: bool = true,
-    /// Trace a ray where the screen has no reflection. Needs ray tracing and
-    /// `global_illumination`. Hits are shaded with sun and probe light, without
-    /// highlights. Animated meshes are hit only with
-    /// `Options.gi_dynamic_geometry`, transparent ones with `reflect_transparent`.
-    reflection_ray_tracing: bool = true,
-    /// Ray-traced reflections show the nearest transparent surface along the
-    /// ray, at a second ray where one is hit.
-    reflect_transparent: bool = true,
-    /// Roughness blur samples, 0..32; 0 leaves reflections sharp.
-    reflection_blur_samples: u32 = 8,
-    /// Draw the scene's fluids; they are simulated either way.
-    fluids: bool = true,
-    fluid_resolution: EffectResolution = .half,
-    /// Samples along each ray through a fluid, 4..256, and toward the sun from
-    /// each, 1..32.
-    fluid_steps: u32 = 48,
-    fluid_light_steps: u32 = 6,
-    /// Smoke shadows what the sun lights behind it.
-    fluid_shadows: bool = true,
-    /// Fluids write motion vectors, so temporal antialiasing follows them.
-    fluid_motion_vectors: bool = true,
-    /// Ray-traced reflections and probe rays see smoke and fire.
-    fluid_rays: bool = true,
-    /// Draw the scene's cloud layer.
-    clouds: bool = true,
-    cloud_resolution: EffectResolution = .half,
-    /// Samples along each cloud ray, 8..256, and toward the sun from each,
-    /// 1..16.
-    cloud_steps: u32 = 48,
-    cloud_light_steps: u32 = 6,
-    /// How far clouds are drawn, in world units; they fade out before it.
-    cloud_distance: f32 = 60_000,
-    /// Average clouds over frames; without it they are grainy.
-    cloud_temporal_filter: bool = true,
-    /// Diffuse global illumination from ray-traced irradiance probes. Without
-    /// ray queries, sky light is used instead.
-    global_illumination: bool = true,
-    /// Distance between probes; grows automatically for large scenes.
-    gi_probe_spacing: f32 = 1.5,
-    /// Rays traced per probe per frame, 16..256.
-    gi_rays: u32 = 128,
-    /// Multiplies the probes' indirect light.
-    gi_intensity: f32 = 1,
-    /// Resolution probe irradiance is evaluated at. Below `.full` it uses
-    /// geometric normals, losing normal-map detail in indirect light.
-    gi_resolution: EffectResolution = .full,
-    /// Each probe is re-traced once every this many frames, 1..16.
-    gi_update_interval: u32 = 4,
-    /// Probes farther than this from the camera are re-traced an eighth as
-    /// often, which is what pays for `gi_rays`. 0 treats all alike.
-    gi_far_distance: f32 = 30,
-    /// Share of a probe's previous value kept each frame, 0..1. Large changes
-    /// bypass it; see `gi_change_tolerance`.
-    gi_hysteresis: f32 = 0.998,
-    /// In a scene too large for the grid at `gi_probe_spacing`: true keeps that
-    /// spacing in a grid that follows the camera, plus a coarse grid over the
-    /// whole scene; false uses only the coarse grid.
-    gi_follow_camera: bool = true,
-    /// How much wider than `gi_probe_spacing` the spacing must get to cover the
-    /// scene before the following grid is used.
-    gi_follow_threshold: f32 = 1.25,
-    /// Frames between updates of the coarse grid behind a following one.
-    gi_coarse_interval: u32 = 1,
-    /// When the coarse grid's spacing exceeds this multiple of the main grid's,
-    /// a third following grid at the geometric mean spacing is added. 0 never
-    /// adds one.
-    gi_middle_ratio: f32 = 6,
-    /// Local lights light what probe and reflection rays hit, at a shadow ray
-    /// per light in range per hit.
-    gi_local_lights: bool = true,
-    /// Local lights whose light bounces: the first this many of the scene's
-    /// list, up to 1023.
-    gi_bounce_lights: u32 = 32,
-    /// Trace probes that sit inside geometry only every eighth turn.
-    gi_skip_buried_probes: bool = false,
-    /// Move probes out of walls and away from nearby surfaces, within their
-    /// cells. Costs a pass per probe update and eight texture fetches per
-    /// shaded pixel.
-    gi_probe_relocation: bool = false,
-    /// How far a probe's steady estimate may sit above its fast one (0.25 =
-    /// 25%) before it follows at once. It may sit two and a half times as far
-    /// below, so a ray that lands on a lamp does not flash the probe. 0 turns
-    /// it off.
-    gi_change_tolerance: f32 = 0.3,
-    /// Resolution of the ambient occlusion pass.
-    ao_resolution: EffectResolution = .half,
-    fog_resolution: EffectResolution = .half,
-    /// Samples along each fog ray, 4..128.
-    fog_steps: u32 = 12,
-    /// Ambient occlusion directions per pixel, 1..8.
-    ao_slices: u32 = 2,
-    /// Ambient occlusion samples per direction, 1..32.
-    ao_steps: u32 = 5,
-    /// Refresh the far sun cascades every 2nd, 4th and 8th frame. A cascade
-    /// with a moving caster is still redrawn every frame.
-    shadow_cascade_stagger: bool = false,
-    /// Temporal antialiasing (TAA). Several other settings rely on it to
-    /// average out their noise.
-    temporal_antialiasing: bool = true,
-    /// Mip bias for material textures under TAA; negative is sharper.
-    texture_mip_bias: f32 = -0.25,
-    /// Widen highlights where normals vary faster than pixels can show.
-    specular_antialiasing: bool = true,
-    /// Fraction of the image replaced by its blurred self; 0 disables bloom.
-    bloom: f32 = 0.04,
-    /// Bloom blur levels, 1..6; more spreads the glow wider.
-    bloom_levels: u32 = 6,
-    /// Adapt exposure to the picture's average brightness. False uses
-    /// `exposure_compensation` alone.
-    automatic_exposure: bool = true,
-    /// How fast automatic exposure follows the picture, per second; it
-    /// brightens at this rate and darkens 1.6 times faster.
-    exposure_speed: f32 = 3,
-    /// Stops added on top of automatic exposure, or the absolute exposure
-    /// (as 2^EV) when automatic exposure is off.
-    exposure_compensation: f32 = 0,
-    /// Dimmest average brightness automatic exposure adapts to. Pictures
-    /// darker than this stay dark instead of being brightened further, which
-    /// is what keeps a night looking like one.
-    exposure_darkest: f32 = 0.002,
-    /// Extinction of the volumetric fog per world unit; 0 disables it.
-    fog_density: f32 = 0,
-    /// How quickly the fog thins with height.
-    fog_height_falloff: f32 = 0.08,
-    /// Forward-scattering bias, 0 isotropic .. 1 all toward the viewer.
-    fog_anisotropy: f32 = 0.6,
-    /// Haze per world unit fading distant opaque surfaces into the sky (0.0005
-    /// shows at a kilometre); 0 for none. Needs an environment.
-    aerial_perspective: f32 = 0,
-    /// `.atmosphere` is air lit by sun and sky, scattering blue more than red;
-    /// `.sky` fades to the sky behind.
-    aerial_model: AerialModel = .atmosphere,
-    /// Strength of the post-TAA sharpening filter, 0..1.
-    sharpen: f32 = 0.35,
-    /// Draw text from a three-channel distance field, which keeps corners sharp
-    /// at large sizes. False uses the single-channel field.
-    sharp_text: bool = true,
-    /// Darkening toward the corners of the picture, 0..1.
-    vignette: f32 = 0,
-    /// Film grain strength, 0..1.
-    film_grain: f32 = 0,
-    /// 0 is black and white, 1 unchanged, above 1 more vivid.
-    saturation: f32 = 1,
-    /// Contrast around middle grey; 1 unchanged.
-    contrast: f32 = 1,
-    /// White balance: negative cooler (bluer), positive warmer, -1..1.
-    temperature: f32 = 0,
-    /// Multiplies the picture before tone mapping, like a lens filter.
-    color_filter: [3]f32 = .{ 1, 1, 1 },
-    /// Color lookup table applied to the finished picture: a strip of N slices,
-    /// N*N wide and N tall, in sRGB. Load it with `Renderer.images.create(..., false)`.
-    color_lut: ?Image = null,
-    /// Blend of the table's result, 0..1.
-    color_lut_strength: f32 = 1,
-    /// Red/blue fringing toward the corners, 0..1.
-    chromatic_aberration: f32 = 0,
-    /// Lens flare strength; 0 is none.
-    lens_flare: f32 = 0,
-    /// `.auto` is sRGB, or HDR10 for the window when `Options.hdr_output` got
-    /// an HDR surface.
-    output_encoding: OutputEncoding = .auto,
-    /// HDR10 only: brightness of white, in nits.
-    hdr_paper_white: f32 = 200,
-    /// HDR10 only: peak brightness of the display, in nits.
-    hdr_peak: f32 = 1000,
-    /// Depth of field aperture. 0 is off; 1 blurs distant things by about 24
-    /// pixels at 1080p when focused close.
-    dof_aperture: f32 = 0,
-    /// Distance in perfect focus.
-    dof_focus_distance: f32 = 10,
-    /// Focus on what is at the middle of the picture instead.
-    dof_autofocus: bool = false,
-    /// Autofocus rate, per second.
-    dof_autofocus_speed: f32 = 4,
-    /// Largest blur radius, in pixels at 1080p.
-    dof_max_blur: f32 = 16,
-    /// Depth of field samples per pixel, 4..128.
-    dof_samples: u32 = 32,
-    /// Resolution the blur is gathered at.
-    dof_resolution: EffectResolution = .full,
-    /// Aperture blades: bokeh gets this many sides; 0 is round.
-    dof_blades: u32 = 0,
-    /// Motion blur: fraction of a frame the shutter stays open; 0 is off.
-    motion_blur: f32 = 0,
-    /// Samples along each pixel's path, 2..64.
-    motion_blur_samples: u32 = 10,
-    /// Let moving things smear past their own outline.
-    motion_blur_spread: bool = true,
-    /// Path trace the view, accumulating frames while camera, scene and lights
-    /// are still. Uses hardware ray tracing, or a shader with
-    /// `Options.path_tracing_fallback`; see `Renderer.pathTracing`. Clouds, water,
-    /// smoke, fog and particles are drawn over the traced picture. Not traced:
-    /// skinned meshes without ray tracing, liquids, hair, impostors and decals.
-    path_tracing: bool = false,
-    /// Maximum bounces per path, 1..16; 1 is direct light only.
-    path_tracing_bounces: u32 = 4,
-    /// Paths per pixel per frame, 1..64.
-    path_tracing_samples: u32 = 1,
-    /// Most light a path may return through a rough bounce, before exposure.
-    /// Lamp light on the surface seen is limited to eight times this; directly
-    /// seen and mirrored light is not limited.
-    path_tracing_clamp: f32 = 12,
-    /// End a path in the bounce light probes at the first surface it reaches
-    /// after a rough bounce, where the GPU traces rays. Much less noise; false
-    /// follows every bounce, for a still picture left to gather.
-    path_tracing_probes: bool = true,
-    /// Denoise by averaging indirect light over neighbouring pixels of the same
-    /// surface, while a pixel still varies between frames. Lamp light is only
-    /// gathered over frames.
-    path_tracing_denoise: bool = true,
+    /// Which of a scene's geometry a view draws, and at what detail.
+    geometry: Geometry = .{},
+    /// How lit surfaces are shaded.
+    shading: Shading = .{},
+    /// Shadows of the sun and of local lights. Null for none.
+    shadows: ?Shadows = .{},
+    /// Screen-space ambient occlusion (GTAO); null for none.
+    ambient_occlusion: ?AmbientOcclusion = .{},
+    /// Reflections traced on screen and, where the GPU traces rays, through the scene. Null for none.
+    reflections: ?Reflections = .{},
+    /// Bounce light from grids of probes that trace the scene. Null for none.
+    global_illumination: ?GlobalIllumination = .{ .probes = .{} },
+    /// Path tracing in place of rasterized lighting. Null for none.
+    path_tracing: ?PathTracing = null,
+    /// How see-through surfaces are drawn.
+    transparency: Transparency = .{},
+    /// Height fog lit by the sun and local lights. Null for none.
+    fog: ?Fog = null,
+    /// Volumetric clouds of a scene that has them. Null for none.
+    clouds: ?Clouds = .{},
+    /// Smoke and fire of a scene's fluids. Null for none.
+    fluids: ?Fluids = .{},
+    /// Lens effects, bloom, exposure and color grading.
+    post: Post = .{},
+    /// The size a view is rendered at and how it is antialiased and brought to the size of its target.
+    resolution: Resolution = .{},
+    /// How a view's picture is encoded for its target.
+    output: Output = .{},
+    /// How draw lists are drawn.
+    canvas: Canvas = .{},
     /// Show one input of the shading instead of the lit picture.
     debug_view: DebugView = .none,
 };
@@ -1123,8 +890,19 @@ pub const DebugView = enum(u32) {
     triangles,
 };
 
-/// See `Settings.upscaling`.
-pub const Upscaling = enum { spatial, temporal, fsr, fsr2, fsr3, dlss };
+/// See `Settings.resolution.upscaler`.
+pub const Upscaler = enum { spatial, temporal, fsr, fsr2, fsr3, dlss };
+
+/// See `Settings.path_tracing.denoiser`.
+pub const Denoiser = enum { builtin, ray_reconstruction };
+
+/// How a path picks the lamp to light a surface with. `.ris` draws a few
+/// candidates and keeps one by its contribution, reusing last frame's and
+/// the neighbours' choices.
+pub const DirectSampling = enum { ris };
+
+/// See `Settings.resolution.frame_generation`.
+pub const FrameGeneration = enum { fsr3 };
 
 /// Fraction of the output resolution an effect is computed at; upsampled
 /// depth-aware.
@@ -1172,20 +950,32 @@ pub const PassContext = struct {
     cmd: *rhi.CommandEncoder,
     device: *rhi.Device,
     stage: PassStage,
-    /// GPU address of this view's `FrameConstants` (see `shaders/common.glsl`).
+    /// GPU address of this view's `FrameConstants` (see `shaders/common.glsl`);
+    /// 0 on a view without a scene that draws nothing before tone mapping.
     frame: u64,
     color: rhi.Texture,
     color_format: rhi.Format,
-    /// Reverse-Z scene depth (near plane at 1, far at 0).
-    depth: rhi.Texture,
+    /// Reverse-Z scene depth (near plane at 1, far at 0). Null on a view
+    /// without a scene.
+    depth: ?rhi.Texture,
     /// Screen-space motion vectors; write them for geometry that moves.
-    motion: rhi.Texture,
+    /// Null on a view without a scene.
+    motion: ?rhi.Texture,
     width: u32,
     height: u32,
+    camera: Camera,
+    /// World to view, view to clip with this frame's jitter, and both.
+    view: Mat4,
+    projection: Mat4,
+    view_projection: Mat4,
+    /// The view's settings as it got them; see `Stats.downgraded`.
+    settings: *const Settings,
 };
 
 /// Application code run at a `PassStage`, while the frame is recorded with the
-/// renderer locked: it must not call back into the `Renderer`.
+/// renderer locked: it must not call back into the `Renderer`. On a view
+/// without a scene the stages before tone mapping run together, after the
+/// draw lists of `DrawStage.scene`.
 pub const Pass = struct {
     stage: PassStage,
     context: ?*anyopaque = null,
@@ -1208,6 +998,42 @@ pub const Pick = struct {
     position: Vec3,
     /// Distance from the camera plane.
     distance: f32,
+};
+
+/// See `Renderer.images.create`.
+pub const ImageDesc = struct {
+    width: u32,
+    height: u32,
+    /// Tightly packed RGBA8, top row first.
+    pixels: []const u8,
+    /// True for color, false for data.
+    srgb: bool = true,
+    /// Most mips made; 0 is the full chain. An atlas wants no more than its
+    /// smallest cell can be halved.
+    mip_levels: u32 = 0,
+};
+
+/// See `Renderer.environments.load`.
+pub const EnvironmentOptions = struct {
+    /// Radiance is clamped to this, which keeps a small sun from sparkling.
+    max_radiance: f32 = 64,
+};
+
+/// See `Renderer.scenes.setEnvironment`.
+pub const SceneEnvironment = struct {
+    /// Null for none.
+    environment: ?Environment,
+    /// Multiplies its radiance.
+    intensity: f32 = 1,
+};
+
+/// See `Renderer.materials.setShader`.
+pub const ShaderAssignment = struct {
+    /// Index of the material; null for every material of the model.
+    material: ?u32 = null,
+    /// Null restores the standard shader.
+    shader: ?MaterialShader = null,
+    params: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 /// See `Renderer.materials.createShader`.
@@ -1453,6 +1279,23 @@ pub const EmitterDesc = struct {
     image: ?Image = null,
 };
 
+/// When in a view's frame a draw list is drawn; see `DrawLayer`.
+pub const DrawStage = enum {
+    /// Into the picture before lens effects, bloom, exposure and tone
+    /// mapping, so it is lit and graded like a scene. A view without a
+    /// scene gets those effects when any of its lists is drawn here, and
+    /// needs a `View` of its own.
+    scene,
+    /// Over the finished picture, in the colors given.
+    overlay,
+};
+
+/// A draw list and when it is drawn; see `ViewDesc.draw_lists`.
+pub const DrawLayer = struct {
+    list: *const DrawList,
+    stage: DrawStage = .overlay,
+};
+
 /// One camera's picture: what to draw, from where, and where it goes.
 pub const ViewDesc = struct {
     /// Persistent view state to use; null is the built-in main view. Every
@@ -1460,9 +1303,9 @@ pub const ViewDesc = struct {
     view: ?View = null,
     /// Null for a purely 2D view.
     scene: ?Scene = null,
-    /// Drawn over the scene, in order. Must not be modified until `render`
-    /// returns.
-    draw_lists: []const *const DrawList = &.{},
+    /// Drawn in order within each stage. The lists must not be modified
+    /// until `render` returns.
+    draw_lists: []const DrawLayer = &.{},
     /// Background without a scene, linear RGBA. Only the first view drawn to a
     /// target in a frame clears it.
     clear_color: [4]f32 = .{ 0, 0, 0, 1 },
@@ -1483,26 +1326,88 @@ pub const FrameDesc = struct {
     delta_time: f32 = 1.0 / 60.0,
 };
 
-/// How path tracing follows rays on this device; see `Renderer.pathTracing`.
-pub const PathTracing = enum {
+/// How path tracing follows rays on this device; see `Capabilities`.
+pub const PathTracingSupport = enum {
     /// Hardware ray tracing.
     hardware,
-    /// A shader walking CPU-built trees; needs `Options.path_tracing_fallback`.
+    /// A shader walking CPU-built trees; needs `Options.ray_tracing.software_path_tracing`.
     shader,
     /// `Settings.path_tracing` has no effect.
     unavailable,
 };
 
-/// What NVIDIA DLSS offers on this device; see `Renderer.dlssSupport`.
-pub const Dlss = struct {
-    /// `Upscaling.dlss` upscales and antialiases.
-    super_resolution: bool = false,
-    /// `Upscaling.dlss` denoises a path traced view.
-    ray_reconstruction: bool = false,
+/// Whether something can run here and, if not, what is in the way.
+pub const Support = enum {
+    available,
+    /// The GPU, its driver or the display cannot do it.
+    no_device_support,
+    /// Left out of this build (`-Dfidelityfx`, `zig build dlss-sdk`).
+    not_built,
+    /// Not asked for in `Options`.
+    off,
 };
+
+/// What this renderer can do on this device; see `Renderer.capabilities`.
+/// A view that asks for more gets the nearest thing and says so in
+/// `Stats.downgraded`.
+pub const Capabilities = struct {
+    /// Probe lighting, traced reflections and traced light shadows.
+    ray_tracing: Support,
+    path_tracing: PathTracingSupport,
+    mesh_shaders: Support,
+    variable_rate_shading: Support,
+    /// `Upscaler.fsr2`, `Upscaler.fsr3` and `FrameGeneration.fsr3`.
+    fidelityfx: Support,
+    /// `Upscaler.dlss`.
+    dlss: Support,
+    /// `Denoiser.ray_reconstruction`.
+    dlss_ray_reconstruction: Support,
+    /// The window surface is HDR10.
+    hdr_output: Support,
+
+    pub fn upscaler(self: Capabilities, technique: Upscaler) Support {
+        return switch (technique) {
+            .spatial, .temporal, .fsr => .available,
+            .fsr2, .fsr3 => self.fidelityfx,
+            .dlss => self.dlss,
+        };
+    }
+};
+
+/// Why a view did not get what its settings asked for.
+pub const DowngradeReason = enum {
+    /// The GPU cannot trace rays.
+    no_ray_tracing,
+    /// `Settings.resolution.temporal_antialiasing` is off.
+    needs_temporal_antialiasing,
+    /// The GPU or its driver lacks what the feature needs.
+    unsupported,
+    /// The library the feature comes from is not there or would not start.
+    unavailable,
+};
+
+/// A setting of a view that was asked for and replaced; see
+/// `Stats.downgraded`.
+pub const Downgrade = struct {
+    /// The setting, as it is spelled in `Settings`.
+    feature: []const u8,
+    requested: []const u8,
+    used: []const u8,
+    reason: DowngradeReason,
+};
+
+pub const max_downgrades = 16;
 
 /// Counters describing the last frame; see `Renderer.getStats`.
 pub const Stats = struct {
+    /// What the views of the last frame asked for and did not get.
+    pub fn downgraded(self: *const Stats) []const Downgrade {
+        return self.downgrades[0..self.downgrade_count];
+    }
+
+    downgrades: [max_downgrades]Downgrade = undefined,
+    downgrade_count: u32 = 0,
+
     /// Views drawn. Scene numbers below describe the first view with a scene.
     views: u32 = 0,
     /// Particle slots drawn (alive or not) in the first scene view.
@@ -1526,7 +1431,9 @@ pub const Stats = struct {
     models_loading: u32 = 0,
     /// GPU memory allocated by the device, in bytes.
     gpu_memory_bytes: u64 = 0,
-    /// Textures under `Options.texture_streaming`, the GPU memory they
+    /// Built-in pipelines built so far.
+    pipelines: u32 = 0,
+    /// Textures under `Options.textures.streaming`, the GPU memory they
     /// take now, and how many are waiting to load more detail.
     streamed_textures: u32 = 0,
     streamed_texture_bytes: u64 = 0,

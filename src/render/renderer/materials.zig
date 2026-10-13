@@ -36,7 +36,7 @@ fn materialSampler(self: *Renderer, data: gltf.SamplerData, anisotropic: bool) !
         .mag_filter = filter,
         .address_u = addressMode(data.repeat_u),
         .address_v = addressMode(data.repeat_v),
-        .max_anisotropy = if (anisotropic) self.options.texture_anisotropy else self.options.data_texture_anisotropy,
+        .max_anisotropy = if (anisotropic) self.options.textures.anisotropy else self.options.textures.data_anisotropy,
     });
     self.material_samplers[key] = sampler;
     return sampler;
@@ -99,10 +99,12 @@ pub const Materials = struct {
         self.materials.shaders[shader.slot] = null;
     }
 
-    /// Sets a loaded model's material shader and parameters. `material` null
-    /// applies to all materials; `shader` null restores the standard one. The
+    /// Sets the shader and parameters of a loaded model's materials. The
     /// model must have finished loading.
-    pub fn setShader(materials: *Materials, model: Model, material: ?u32, shader: ?MaterialShader, params: [4]f32) !void {
+    pub fn setShader(materials: *Materials, model: Model, assignment: api.ShaderAssignment) !void {
+        const material = assignment.material;
+        const shader = assignment.shader;
+        const params = assignment.params;
         const self = materials.renderer();
         self.lock();
         defer self.unlock();

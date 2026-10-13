@@ -30,109 +30,66 @@ const view_render_module = @import("renderer/view_render.zig");
 const view_math_module = @import("renderer/view_math.zig");
 
 const api = @import("api.zig");
+pub const max_curve_keys = api.max_curve_keys;
+pub const EffectResolution = api.EffectResolution;
+pub const Settings = api.Settings;
+pub const ViewDesc = api.ViewDesc;
+pub const Region = api.Region;
+pub const CloudDesc = api.CloudDesc;
+pub const DecalDesc = api.DecalDesc;
+pub const InstanceGroup = api.InstanceGroup;
+pub const Liquid = api.Liquid;
+pub const Hair = api.Hair;
+pub const Water = api.Water;
+pub const Fluid = api.Fluid;
+pub const AssetState = api.AssetState;
+pub const Capabilities = api.Capabilities;
+pub const Emitter = api.Emitter;
+pub const EmitterDesc = api.EmitterDesc;
+pub const Entity = api.Entity;
+pub const Environment = api.Environment;
+pub const FluidDesc = api.FluidDesc;
+pub const FluidFlipbookDesc = api.FluidFlipbookDesc;
+pub const FluidObstacle = api.FluidObstacle;
+pub const FluidSource = api.FluidSource;
+pub const Font = api.Font;
+pub const FrameDesc = api.FrameDesc;
+pub const HairDesc = api.HairDesc;
+pub const HairSimulation = api.HairSimulation;
+pub const Image = api.Image;
+pub const Light = api.Light;
+pub const LiquidDesc = api.LiquidDesc;
+pub const LiquidSource = api.LiquidSource;
+pub const Model = api.Model;
+pub const ModelInfo = api.ModelInfo;
+pub const Options = api.Options;
+pub const PathTracingSupport = api.PathTracingSupport;
+pub const PickResult = api.PickResult;
+pub const Pose = api.Pose;
+pub const Profiler = api.Profiler;
+pub const Quality = api.Quality;
+pub const ReflectionProbe = api.ReflectionProbe;
+pub const ReflectionProbeDesc = api.ReflectionProbeDesc;
+pub const Scene = api.Scene;
+pub const SkyDesc = api.SkyDesc;
+pub const Stats = api.Stats;
+pub const Sun = api.Sun;
+pub const View = api.View;
+pub const WaterDesc = api.WaterDesc;
+pub const scene_color_format = api.scene_color_format;
 const renderer_state = @import("state.zig");
 const scene_pass = @import("scene_pass.zig");
+const features = @import("core/features.zig");
+const canvas_feature = @import("features/canvas.zig");
+const targets = @import("core/targets.zig");
 
 pub const Mat4 = math.Mat4;
 pub const Vec3 = math.Vec3;
 pub const SceneFrame = scene_pass.SceneFrame;
 
-pub const ModelTag = api.ModelTag;
-pub const EnvironmentTag = api.EnvironmentTag;
-pub const SceneTag = api.SceneTag;
-pub const EntityTag = api.EntityTag;
-pub const ViewTag = api.ViewTag;
-pub const EmitterTag = api.EmitterTag;
-pub const ReflectionProbeTag = api.ReflectionProbeTag;
-pub const FluidTag = api.FluidTag;
-pub const WaterTag = api.WaterTag;
-pub const LiquidTag = api.LiquidTag;
-pub const InstanceGroupTag = api.InstanceGroupTag;
-pub const Model = api.Model;
-pub const Environment = api.Environment;
-pub const Scene = api.Scene;
-pub const Entity = api.Entity;
-pub const View = api.View;
-pub const Emitter = api.Emitter;
-pub const ReflectionProbe = api.ReflectionProbe;
-pub const Fluid = api.Fluid;
-pub const Water = api.Water;
-pub const Hair = api.Hair;
-pub const HairDesc = api.HairDesc;
-pub const HairSimulation = api.HairSimulation;
-pub const ImpostorDesc = api.ImpostorDesc;
-pub const LightmapDesc = api.LightmapDesc;
-pub const CollisionField = api.CollisionField;
-pub const Liquid = api.Liquid;
-pub const InstanceGroup = api.InstanceGroup;
-pub const Pose = api.Pose;
-pub const MeshDesc = api.MeshDesc;
-pub const Material = api.Material;
-pub const DrawList = api.DrawList;
-pub const Image = api.Image;
-pub const Font = api.Font;
-pub const Options = api.Options;
-pub const LiquidSource = api.LiquidSource;
-pub const LiquidDesc = api.LiquidDesc;
-pub const GeometryStreaming = api.GeometryStreaming;
-pub const TextureStreaming = api.TextureStreaming;
 pub const TextureStream = renderer_state.TextureStream;
-pub const TextureCompression = api.TextureCompression;
-pub const WaterDesc = api.WaterDesc;
-pub const FluidWalls = api.FluidWalls;
-pub const FluidSource = api.FluidSource;
-pub const FluidObstacle = api.FluidObstacle;
-pub const FluidFlipbookDesc = api.FluidFlipbookDesc;
-pub const FluidDesc = api.FluidDesc;
-pub const CloudDesc = api.CloudDesc;
-pub const CloudFlash = api.CloudFlash;
-pub const TransparencyMode = api.TransparencyMode;
-pub const AerialModel = api.AerialModel;
-pub const ShadowLod = api.ShadowLod;
-pub const OutputEncoding = api.OutputEncoding;
-pub const Profiler = api.Profiler;
 const Zone = renderer_state.Zone;
-pub const AssetState = api.AssetState;
-pub const Camera = api.Camera;
-pub const Sun = api.Sun;
-pub const LightKind = api.LightKind;
-pub const Light = api.Light;
-pub const EntityDesc = api.EntityDesc;
-pub const AnimationInfo = api.AnimationInfo;
-pub const ModelInfo = api.ModelInfo;
-pub const EnvironmentInfo = api.EnvironmentInfo;
-pub const Settings = api.Settings;
-pub const Quality = api.Quality;
-pub const DebugView = api.DebugView;
-pub const Upscaling = api.Upscaling;
-pub const EffectResolution = api.EffectResolution;
 pub const EffectScales = renderer_state.EffectScales;
-pub const Target = api.Target;
-pub const Region = api.Region;
-pub const PassStage = api.PassStage;
-pub const PassContext = api.PassContext;
-pub const Pass = api.Pass;
-pub const scene_color_format = api.scene_color_format;
-pub const Pick = api.Pick;
-pub const MaterialShader = api.MaterialShader;
-pub const PickResult = api.PickResult;
-pub const DecalDesc = api.DecalDesc;
-pub const max_decals = api.max_decals;
-pub const SkyDesc = api.SkyDesc;
-pub const skySun = api.skySun;
-pub const ParticleBlend = api.ParticleBlend;
-pub const max_curve_keys = api.max_curve_keys;
-pub const max_trail_points = api.max_trail_points;
-pub const ColorCurve = api.ColorCurve;
-pub const SizeCurve = api.SizeCurve;
-pub const ReflectionProbeDesc = api.ReflectionProbeDesc;
-pub const max_reflection_probes = api.max_reflection_probes;
-pub const EmitterDesc = api.EmitterDesc;
-pub const ViewDesc = api.ViewDesc;
-pub const FrameDesc = api.FrameDesc;
-pub const PathTracing = api.PathTracing;
-pub const Dlss = api.Dlss;
-pub const Stats = api.Stats;
 
 pub const hdr_format = renderer_state.hdr_format;
 pub const bloom_levels = renderer_state.bloom_levels;
@@ -161,13 +118,12 @@ pub const SkinJob = renderer_state.SkinJob;
 pub const MadeTextures = renderer_state.MadeTextures;
 pub const ViewState = renderer_state.ViewState;
 pub const ViewData = renderer_state.ViewData;
-const Pipelines = renderer_state.Pipelines;
-const GiPipelines = renderer_state.GiPipelines;
+const Pipelines = pipelines_module.Pipelines;
 pub const GiVolume = renderer_state.GiVolume;
 pub const gi_irradiance_texels = renderer_state.gi_irradiance_texels;
 pub const gi_visibility_texels = renderer_state.gi_visibility_texels;
 pub const gi_probe_limit = renderer_state.gi_probe_limit;
-const TonemapPipeline = renderer_state.TonemapPipeline;
+const FormatPipeline = renderer_state.FormatPipeline;
 const PickRequest = renderer_state.PickRequest;
 pub const ReflectionTargets = renderer_state.ReflectionTargets;
 pub const cloud_noise_size = renderer_state.cloud_noise_size;
@@ -184,15 +140,12 @@ pub const CollisionFieldState = renderer_state.CollisionFieldState;
 pub const water_quads = renderer_state.water_quads;
 pub const EmitterData = renderer_state.EmitterData;
 const PickPending = renderer_state.PickPending;
-const DrawPipelines = renderer_state.DrawPipelines;
 
 const bakeLoadedClouds = environments_module.bakeLoadedClouds;
 const bakeSky = environments_module.bakeSky;
 const buildPendingBlas = scene_update_module.buildPendingBlas;
 const captureProbes = probes_module.captureProbes;
 const compactGeometry = scene_update_module.compactGeometry;
-const createGiPipelines = pipelines_module.createGiPipelines;
-const createPipelines = pipelines_module.createPipelines;
 const destroyFluidTextures = fluid_module.destroyFluidTextures;
 const dropShadeVariants = pipelines_module.dropShadeVariants;
 const finalizeEnvironment = environments_module.finalizeEnvironment;
@@ -246,7 +199,7 @@ pub const Renderer = struct {
     shaders: pipelines_module.Shaders = .{},
 
     pipelines: Pipelines,
-    tonemap_pipelines: std.ArrayList(TonemapPipeline) = .empty,
+    tonemap_pipelines: std.ArrayList(FormatPipeline) = .empty,
     /// Shading pass builds, one per feature set seen.
     shade_variants: std.ArrayList(ShadeVariant) = .empty,
     /// This frame's animated entities.
@@ -256,7 +209,12 @@ pub const Renderer = struct {
     texture_transform_users: u32 = 0,
     pose_scratch: [max_worker_threads]std.ArrayList(animation.Local) = @splat(.empty),
     prepare_chunks: std.ArrayList(renderer_state.PrepareChunk) = .empty,
-    draw_pipelines: std.ArrayList(DrawPipelines) = .empty,
+    /// Custom draw list shaders.
+    canvas: canvas_feature.Canvas = .{},
+    /// Short-lived render targets, lent to the passes of every view.
+    target_pool: targets.Pool = .{},
+    /// What the views of this frame asked for and did not get.
+    downgrades: features.Downgrades = .{},
     /// Guards all renderer and device state; see `lock`.
     mutex: std.Io.Mutex = .init,
     /// Each entity's transform by slot, now and as of the last prepared
@@ -298,30 +256,32 @@ pub const Renderer = struct {
     /// Draws each view's second list (masked, two-sided, LOD-fading) has
     /// room for; the first has `cull_capacity`.
     cull_masked_capacity: u32 = 0,
-    cull_counts: rhi.Buffer,
+    /// The buffers and textures only scenes use have been made; see
+    /// `ensureSceneResources`.
+    scene_ready: bool = false,
+    cull_counts: rhi.Buffer = undefined,
     /// One `gpu.CullDispatch` per view of a frame.
-    cull_dispatch: rhi.Buffer,
+    cull_dispatch: rhi.Buffer = undefined,
     /// The `gpu.DrawIndirect` that draws a view's impostors.
-    impostor_draw: rhi.Buffer,
+    impostor_draw: rhi.Buffer = undefined,
     scratch_impostors: std.ArrayList(gpu.Impostor) = .empty,
     /// Two `gpu.MeshDraw`s per view, one per meshlet list; mesh shaders only.
-    cull_mesh_draws: rhi.Buffer,
+    cull_mesh_draws: rhi.Buffer = undefined,
     count_readback: [rhi.frames_in_flight]rhi.Buffer = undefined,
     /// Texture streaming round counter (see `EntityData.seen_round`).
     seen_round: u64 = 0,
     /// Bound in place of cascades for views drawn without shadows.
-    shadow_map: rhi.Texture,
+    shadow_map: rhi.Texture = undefined,
     /// Shadow atlas for spot and point lights.
-    local_shadow_map: rhi.Texture,
-    clusters: rhi.Buffer,
+    local_shadow_map: rhi.Texture = undefined,
+    clusters: rhi.Buffer = undefined,
     transparent_order: std.ArrayList(TransparentDraw) = .empty,
-    gi_pipelines: ?GiPipelines = null,
     blas_pending: u32 = 0,
     /// Frame in which a geometry pool last moved to a new buffer.
     geometry_replaced: ?u64 = null,
     /// Frames a view asked for path tracing and was drawn without it.
     path_trace_misses: u32 = 0,
-    brdf_lut: rhi.Texture,
+    brdf_lut: rhi.Texture = undefined,
 
     /// Ray-tracing stand-in box for liquids; made with the first liquid.
     liquid_proxy_model: ?Model = null,
@@ -339,7 +299,7 @@ pub const Renderer = struct {
     /// its history was reset.
     /// What DLSS offers on this device.
     dlss: @import("dlss.zig").Library = .{},
-    generating: ?@import("ffx.zig").Upscaler = null,
+    generating: ?@import("techniques/upscaling.zig").Generator = null,
     generating_reset: bool = false,
     generating_failed: bool = false,
     /// Scene whose lights the local shadow atlas currently holds.
@@ -384,11 +344,11 @@ pub const Renderer = struct {
             .validation = options.validation,
             .surface = options.surface,
             .preferred_device = options.preferred_device,
-            .pipeline_cache_path = options.pipeline_cache_path,
+            .pipeline_cache_path = options.cache.pipelines,
             .debug_names = options.debug_names,
             .hdr_output = options.hdr_output,
-            .ray_tracing = options.ray_tracing,
-            .mesh_shaders = options.mesh_shaders,
+            .ray_tracing = options.ray_tracing.hardware,
+            .mesh_shaders = options.geometry.mesh_shaders,
             .nvidia_ngx = @import("dlss.zig").available,
         });
         errdefer device.deinit();
@@ -407,7 +367,7 @@ pub const Renderer = struct {
             .io = io,
             .device = device,
             .dlss = @import("dlss.zig").Library.start(device),
-            .pipelines = try createPipelines(device),
+            .pipelines = .init(device),
             .sampler_linear_clamp = try device.createSampler(.{ .address_u = .clamp_to_edge, .address_v = .clamp_to_edge, .address_w = .clamp_to_edge }),
             .sampler_nearest_clamp = try device.createSampler(.{
                 .min_filter = .nearest,
@@ -425,50 +385,22 @@ pub const Renderer = struct {
                 .mip_filter = .nearest,
                 .compare = .less_or_equal,
             }),
-            .vertices = try Pool.init(device, "vertices", @sizeOf(gpu.Vertex), 1 << 20, geometry),
-            .skin_vertices = try Pool.init(device, "skin vertices", @sizeOf(gpu.SkinVertex), 1 << 16, storage),
-            .morph_deltas = try Pool.init(device, "morph deltas", @sizeOf(gltf.MorphDelta), 1 << 14, storage),
-            .indices = try Pool.init(device, "indices", @sizeOf(u32), 1 << 22, geometry),
-            .meshlets = try Pool.init(device, "meshlets", @sizeOf(gpu.Meshlet), 1 << 16, storage),
-            .bvh_nodes = try Pool.init(device, "bvh nodes", @sizeOf(bvh.Node), 1 << 10, storage),
-            .bvh_items = try Pool.init(device, "bvh items", @sizeOf(u32), 1 << 10, storage),
-            .meshes = try Pool.init(device, "meshes", @sizeOf(gpu.Mesh), 1 << 12, storage),
-            .materials = .{ .pool = try Pool.init(device, "materials", @sizeOf(gpu.Material), 1 << 12, storage) },
+            .vertices = .init("vertices", @sizeOf(gpu.Vertex), 1 << 20, geometry),
+            .skin_vertices = .init("skin vertices", @sizeOf(gpu.SkinVertex), 1 << 16, storage),
+            .morph_deltas = .init("morph deltas", @sizeOf(gltf.MorphDelta), 1 << 14, storage),
+            .indices = .init("indices", @sizeOf(u32), 1 << 22, geometry),
+            .meshlets = .init("meshlets", @sizeOf(gpu.Meshlet), 1 << 16, storage),
+            .bvh_nodes = .init("bvh nodes", @sizeOf(bvh.Node), 1 << 10, storage),
+            .bvh_items = .init("bvh items", @sizeOf(u32), 1 << 10, storage),
+            .meshes = .init("meshes", @sizeOf(gpu.Mesh), 1 << 12, storage),
+            .materials = .{ .pool = .init("materials", @sizeOf(gpu.Material), 1 << 12, storage) },
             .arenas = undefined,
-            .cull_counts = try device.createBuffer(.{ .name = "cull counts", .size = view_count * 2 * @sizeOf(u32), .usage = .{ .storage = true, .indirect = true, .copy_src = true } }),
-            .cull_mesh_draws = try device.createBuffer(.{ .name = "cull mesh draws", .size = view_count * 2 * @sizeOf(gpu.MeshDraw), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } }),
-            .impostor_draw = try device.createBuffer(.{ .name = "impostor draw", .size = @sizeOf(gpu.DrawIndirect), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } }),
-            .cull_dispatch = try device.createBuffer(.{ .name = "cull dispatch", .size = view_count * @sizeOf(gpu.CullDispatch), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } }),
             .sampler_local_shadow = try device.createSampler(.{
                 .address_u = .clamp_to_edge,
                 .address_v = .clamp_to_edge,
                 .address_w = .clamp_to_edge,
                 .mip_filter = .nearest,
                 .compare = .greater_or_equal,
-            }),
-            .local_shadow_map = try device.createTexture(.{
-                .name = "local shadow atlas",
-                .width = options.local_shadow_resolution,
-                .height = options.local_shadow_resolution,
-                .format = .depth32_float,
-                .usage = .{ .sampled = true, .depth_attachment = true },
-            }),
-            .clusters = try device.createBuffer(.{ .name = "light clusters", .size = gpu.cluster_count * @sizeOf(gpu.Cluster), .usage = .{ .storage = true } }),
-            .shadow_map = try device.createTexture(.{
-                .name = "shadow fallback",
-                .width = 1,
-                .height = 1,
-                .format = .depth32_float,
-                .usage = .{ .sampled = true, .depth_attachment = true },
-                .layers = gpu.cascade_count,
-                .kind = .@"2d_array",
-            }),
-            .brdf_lut = try device.createTexture(.{
-                .name = "brdf lut",
-                .width = 128,
-                .height = 128,
-                .format = .rg16_float,
-                .usage = .{ .sampled = true, .color_attachment = true },
             }),
             .models = .{ .table = .init(gpa) },
             .environments = .{ .table = .init(gpa) },
@@ -484,45 +416,110 @@ pub const Renderer = struct {
             .instances = .{ .table = .init(gpa) },
         };
         for (&self.arenas) |*arena| arena.* = try FrameArena.init(device, 4 * 1024 * 1024);
-        if (device.ray_tracing) self.gi_pipelines = try createGiPipelines(device);
-        for (&self.count_readback) |*buffer| {
-            buffer.* = try device.createBuffer(.{ .name = "cull count readback", .size = (view_count * 2 + 1) * @sizeOf(u32), .usage = .{}, .memory = .gpu_to_cpu });
-            @memset(device.mapped(buffer.*), 0);
-        }
         self.main_view = try insertView(self);
         errdefer self.views.table.deinit();
-        self.pick_buffer = try device.createBuffer(.{ .name = "pick", .size = @sizeOf(gpu.Pick), .usage = .{ .storage = true, .copy_src = true } });
-        for (&self.pick_readback) |*buffer| {
-            buffer.* = try device.createBuffer(.{ .name = "pick readback", .size = @sizeOf(gpu.Pick), .usage = .{}, .memory = .gpu_to_cpu });
-            @memset(device.mapped(buffer.*), 0);
-        }
 
         self.fonts.default_font = try gpa.create(Font);
         errdefer gpa.destroy(self.fonts.default_font);
         self.fonts.default_font.* = try font_module.load(gpa, @embedFile("fonts/DejaVuSans.ttf"), font_module.default_ranges);
         errdefer self.fonts.default_font.deinit();
         try registerFont(self, self.fonts.default_font);
-        if (options.asset_cache_max_bytes != 0) if (options.asset_cache_dir) |directory| {
-            _ = gltf.trimCache(gpa, self.io, directory, options.asset_cache_max_bytes) catch |err| std.log.warn("asset cache not trimmed: {}", .{err});
+        if (options.cache.assets_max_bytes != 0) if (options.cache.assets) |directory| {
+            _ = gltf.trimCache(gpa, self.io, directory, options.cache.assets_max_bytes) catch |err| std.log.warn("asset cache not trimmed: {}", .{err});
         };
 
         var cmd = try device.beginImmediate();
         try cmd.flushUploads();
-        try cmd.beginRendering(.{ .color = &.{.{ .texture = self.brdf_lut, .load = .discard }} });
-        cmd.bindPipeline(self.pipelines.brdf_lut);
-        cmd.drawFullscreen();
-        cmd.endRendering();
-        cmd.transition(self.brdf_lut, .shader_read);
-        for (0..gpu.cascade_count) |cascade| {
-            try cmd.beginRendering(.{ .depth = .{ .texture = self.shadow_map, .layer = @intCast(cascade), .clear = 1 } });
-            cmd.endRendering();
-        }
-        cmd.transition(self.shadow_map, .shader_read);
-        try cmd.beginRendering(.{ .depth = .{ .texture = self.local_shadow_map, .clear = 0 } });
-        cmd.endRendering();
-        cmd.transition(self.local_shadow_map, .shader_read);
         try device.endImmediate();
         return self;
+    }
+
+    /// Makes what only scenes use, the first time a scene is drawn: the
+    /// geometry pools, culling and picking buffers, shadow maps, light
+    /// clusters and the BRDF table. A renderer that draws no scene has none.
+    pub fn ensureSceneResources(self: *Renderer, cmd: *rhi.CommandEncoder) !void {
+        if (self.scene_ready) return;
+        const device = self.device;
+        inline for (.{ "vertices", "skin_vertices", "morph_deltas", "indices", "meshlets", "bvh_nodes", "bvh_items", "meshes" }) |name| try @field(self, name).ensure(device);
+        try self.materials.pool.ensure(device);
+
+        var made: std.ArrayList(rhi.Buffer) = .empty;
+        defer made.deinit(self.gpa);
+        errdefer for (made.items) |buffer| device.destroyBuffer(buffer);
+        try made.ensureTotalCapacity(self.gpa, 6 + 2 * rhi.frames_in_flight);
+        const Local = struct {
+            fn buffer(d: *rhi.Device, list: *std.ArrayList(rhi.Buffer), desc: rhi.BufferDesc) !rhi.Buffer {
+                const result = try d.createBuffer(desc);
+                list.appendAssumeCapacity(result);
+                if (desc.memory == .gpu_to_cpu) @memset(d.mapped(result), 0);
+                return result;
+            }
+        };
+        const cull_counts = try Local.buffer(device, &made, .{ .name = "cull counts", .size = view_count * 2 * @sizeOf(u32), .usage = .{ .storage = true, .indirect = true, .copy_src = true } });
+        const cull_mesh_draws = try Local.buffer(device, &made, .{ .name = "cull mesh draws", .size = view_count * 2 * @sizeOf(gpu.MeshDraw), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } });
+        const impostor_draw = try Local.buffer(device, &made, .{ .name = "impostor draw", .size = @sizeOf(gpu.DrawIndirect), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } });
+        const cull_dispatch = try Local.buffer(device, &made, .{ .name = "cull dispatch", .size = view_count * @sizeOf(gpu.CullDispatch), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } });
+        const clusters = try Local.buffer(device, &made, .{ .name = "light clusters", .size = gpu.cluster_count * @sizeOf(gpu.Cluster), .usage = .{ .storage = true } });
+        const pick_buffer = try Local.buffer(device, &made, .{ .name = "pick", .size = @sizeOf(gpu.Pick), .usage = .{ .storage = true, .copy_src = true } });
+        var count_readback: [rhi.frames_in_flight]rhi.Buffer = undefined;
+        for (&count_readback) |*buffer| buffer.* = try Local.buffer(device, &made, .{ .name = "cull count readback", .size = (view_count * 2 + 1) * @sizeOf(u32), .usage = .{}, .memory = .gpu_to_cpu });
+        var pick_readback: [rhi.frames_in_flight]rhi.Buffer = undefined;
+        for (&pick_readback) |*buffer| buffer.* = try Local.buffer(device, &made, .{ .name = "pick readback", .size = @sizeOf(gpu.Pick), .usage = .{}, .memory = .gpu_to_cpu });
+
+        const local_shadow_map = try device.createTexture(.{
+            .name = "local shadow atlas",
+            .width = self.options.shadows.local_resolution,
+            .height = self.options.shadows.local_resolution,
+            .format = .depth32_float,
+            .usage = .{ .sampled = true, .depth_attachment = true },
+        });
+        errdefer device.destroyTexture(local_shadow_map);
+        const shadow_map = try device.createTexture(.{
+            .name = "shadow fallback",
+            .width = 1,
+            .height = 1,
+            .format = .depth32_float,
+            .usage = .{ .sampled = true, .depth_attachment = true },
+            .layers = gpu.cascade_count,
+            .kind = .@"2d_array",
+        });
+        errdefer device.destroyTexture(shadow_map);
+        const brdf_lut = try device.createTexture(.{
+            .name = "brdf lut",
+            .width = 128,
+            .height = 128,
+            .format = .rg16_float,
+            .usage = .{ .sampled = true, .color_attachment = true },
+        });
+        errdefer device.destroyTexture(brdf_lut);
+
+        const brdf_pipeline = try self.pipelines.get(.brdf_lut);
+        try cmd.beginRendering(.{ .color = &.{.{ .texture = brdf_lut, .load = .discard }} });
+        cmd.bindPipeline(brdf_pipeline);
+        cmd.drawFullscreen();
+        cmd.endRendering();
+        cmd.transition(brdf_lut, .shader_read);
+        for (0..gpu.cascade_count) |cascade| {
+            try cmd.beginRendering(.{ .depth = .{ .texture = shadow_map, .layer = @intCast(cascade), .clear = 1 } });
+            cmd.endRendering();
+        }
+        cmd.transition(shadow_map, .shader_read);
+        try cmd.beginRendering(.{ .depth = .{ .texture = local_shadow_map, .clear = 0 } });
+        cmd.endRendering();
+        cmd.transition(local_shadow_map, .shader_read);
+
+        self.cull_counts = cull_counts;
+        self.cull_mesh_draws = cull_mesh_draws;
+        self.impostor_draw = impostor_draw;
+        self.cull_dispatch = cull_dispatch;
+        self.clusters = clusters;
+        self.pick_buffer = pick_buffer;
+        self.count_readback = count_readback;
+        self.pick_readback = pick_readback;
+        self.local_shadow_map = local_shadow_map;
+        self.shadow_map = shadow_map;
+        self.brdf_lut = brdf_lut;
+        self.scene_ready = true;
     }
 
     /// Waits for the GPU, then destroys everything, including the device and
@@ -579,28 +576,17 @@ pub const Renderer = struct {
         self.environments.table.deinit();
         while (self.views.table.popAny()) |view_value| {
             var view = view_value;
-            view.deinit(device);
+            view.deinit(self.gpa, device);
         }
         self.views.table.deinit();
-        if (self.gi_pipelines) |pipelines| {
-            device.destroyPipeline(pipelines.trace);
-            device.destroyPipeline(pipelines.irradiance);
-            device.destroyPipeline(pipelines.clamp_upper);
-            device.destroyPipeline(pipelines.clamp_lower);
-            device.destroyPipeline(pipelines.relocate);
-            device.destroyPipeline(pipelines.visibility);
-        }
         dropShadeVariants(self);
         self.shade_variants.deinit(self.gpa);
         for (&self.pose_scratch) |*scratch| scratch.deinit(self.gpa);
         self.prepare_chunks.deinit(self.gpa);
         for (self.tonemap_pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
         self.tonemap_pipelines.deinit(self.gpa);
-        for (self.draw_pipelines.items) |entry| {
-            device.destroyPipeline(entry.flat);
-            device.destroyPipeline(entry.depth_tested);
-        }
-        self.draw_pipelines.deinit(self.gpa);
+        self.canvas.deinit(self.gpa, device);
+        self.target_pool.deinit(self.gpa, device);
         for (self.fonts.list.items, self.fonts.textures.items) |font, texture| {
             device.destroyTexture(texture);
             font.deinit();
@@ -610,40 +596,32 @@ pub const Renderer = struct {
         self.fonts.textures.deinit(self.gpa);
         for (self.images.list.items) |entry| device.destroyTexture(entry.texture);
         self.images.list.deinit(self.gpa);
-        inline for (@typeInfo(Pipelines).@"struct".fields) |field| {
-            const pipeline = @field(self.pipelines, field.name);
-            if (@typeInfo(@TypeOf(pipeline)) == .optional) {
-                if (pipeline) |made| device.destroyPipeline(made);
-            } else device.destroyPipeline(pipeline);
-        }
+        self.pipelines.reset();
         for (self.material_samplers) |sampler| if (sampler) |value| device.destroySampler(value);
         device.destroySampler(self.sampler_linear_clamp);
         device.destroySampler(self.sampler_nearest_clamp);
         device.destroySampler(self.sampler_linear_repeat);
         device.destroySampler(self.sampler_shadow);
         device.destroySampler(self.sampler_local_shadow);
-        device.destroyTexture(self.local_shadow_map);
-        device.destroyBuffer(self.clusters);
         self.transparent_order.deinit(self.gpa);
         inline for (.{ "vertices", "skin_vertices", "morph_deltas", "indices", "meshlets", "bvh_nodes", "bvh_items", "meshes" }) |name| @field(self, name).deinit(self);
         self.materials.pool.deinit(self);
         self.mesh_boxes.deinit(self.gpa);
         for (&self.arenas) |*arena| arena.deinit(device);
-        device.destroyBuffer(self.cull_counts);
-        device.destroyBuffer(self.cull_dispatch);
-        device.destroyBuffer(self.impostor_draw);
         self.scratch_impostors.deinit(self.gpa);
-        device.destroyBuffer(self.cull_mesh_draws);
-        for (self.count_readback) |buffer| device.destroyBuffer(buffer);
-        device.destroyBuffer(self.pick_buffer);
         for (self.materials.shaders) |shader| if (shader) |pipelines| {
             device.destroyPipeline(pipelines.plain);
             device.destroyPipeline(pipelines.reflective);
         };
-        for (self.pick_readback) |buffer| device.destroyBuffer(buffer);
         if (self.cull_commands) |buffer| device.destroyBuffer(buffer);
-        device.destroyTexture(self.shadow_map);
-        device.destroyTexture(self.brdf_lut);
+        if (self.scene_ready) {
+            for ([_]rhi.Buffer{ self.cull_counts, self.cull_dispatch, self.impostor_draw, self.cull_mesh_draws, self.clusters, self.pick_buffer }) |buffer| device.destroyBuffer(buffer);
+            for (self.count_readback) |buffer| device.destroyBuffer(buffer);
+            for (self.pick_readback) |buffer| device.destroyBuffer(buffer);
+            device.destroyTexture(self.local_shadow_map);
+            device.destroyTexture(self.shadow_map);
+            device.destroyTexture(self.brdf_lut);
+        }
         if (self.cloud_noise) |texture| device.destroyTexture(texture);
         self.skin_jobs.deinit(self.gpa);
         self.skin_weights.deinit(self.gpa);
@@ -672,17 +650,36 @@ pub const Renderer = struct {
         self.device.resize(width, height);
     }
 
-    /// How `Settings.path_tracing` would run on this device. Safe from any
-    /// thread.
-    pub fn pathTracing(self: *const Renderer) PathTracing {
-        if (self.device.ray_tracing) return .hardware;
-        return if (self.options.path_tracing_fallback) .shader else .unavailable;
+    /// What this renderer can do on this device. Safe from any thread.
+    pub fn capabilities(self: *Renderer) Capabilities {
+        const device = self.device;
+        const built = struct {
+            fn in(present: bool, runs: bool) api.Support {
+                return if (!present) .not_built else if (runs) .available else .no_device_support;
+            }
+        }.in;
+        const offered = struct {
+            fn by(asked: bool, has: bool) api.Support {
+                return if (!asked) .off else if (has) .available else .no_device_support;
+            }
+        }.by;
+        self.lock();
+        defer self.unlock();
+        return .{
+            .ray_tracing = offered(self.options.ray_tracing.hardware, device.caps.ray_tracing),
+            .path_tracing = self.pathTracing(),
+            .mesh_shaders = offered(self.options.geometry.mesh_shaders, device.caps.mesh_shaders),
+            .variable_rate_shading = if (device.caps.shading_rate_tile != 0) .available else .no_device_support,
+            .fidelityfx = built(@import("ffx.zig").available, device.caps.storage_images),
+            .dlss = built(@import("dlss.zig").available, device.caps.storage_images and self.dlss.super_resolution),
+            .dlss_ray_reconstruction = built(@import("dlss.zig").available, device.caps.storage_images and self.dlss.ray_reconstruction),
+            .hdr_output = offered(self.options.hdr_output, device.hdr_active),
+        };
     }
 
-    /// What `Upscaling.dlss` would do on this device: nothing without
-    /// the DLSS SDK built in, an NVIDIA GPU and a driver that runs it. Safe from any thread.
-    pub fn dlssSupport(self: *const Renderer) Dlss {
-        return .{ .super_resolution = self.dlss.super_resolution, .ray_reconstruction = self.dlss.ray_reconstruction };
+    pub fn pathTracing(self: *const Renderer) PathTracingSupport {
+        if (self.device.caps.ray_tracing) return .hardware;
+        return if (self.options.ray_tracing.software_path_tracing) .shader else .unavailable;
     }
 
     /// Last frame's counters, with current loading count and GPU memory use.
@@ -693,6 +690,7 @@ pub const Renderer = struct {
         var stats = self.stats;
         stats.models_loading = self.loading_count;
         stats.gpu_memory_bytes = self.device.memoryStats().used_bytes;
+        stats.pipelines = self.pipelines.count();
         return stats;
     }
 
@@ -777,7 +775,7 @@ pub const Renderer = struct {
     /// Deletes the oldest-written asset cache files until at most `max_bytes`
     /// remain; returns the bytes freed.
     pub fn trimAssetCache(self: *Renderer, max_bytes: u64) !u64 {
-        const directory = self.options.asset_cache_dir orelse return 0;
+        const directory = self.options.cache.assets orelse return 0;
         return gltf.trimCache(self.gpa, self.io, directory, max_bytes);
     }
 
@@ -954,7 +952,7 @@ pub const Renderer = struct {
                     .copy = offset / group.per_copy,
                     .mesh_instance = offset % group.per_copy,
                     .position = raw.position,
-                    .distance = pending.near / @max(raw.depth, 1e-9),
+                    .distance = view_math_module.viewDepth(pending.depth_terms, raw.depth),
                 };
                 return;
             }
@@ -965,7 +963,7 @@ pub const Renderer = struct {
             .entity = entry.entity,
             .mesh_instance = entry.model_instance,
             .position = raw.position,
-            .distance = pending.near / @max(raw.depth, 1e-9),
+            .distance = view_math_module.viewDepth(pending.depth_terms, raw.depth),
         };
     }
 
@@ -1014,9 +1012,9 @@ pub const Renderer = struct {
 
     fn generateFrame(context: *anyopaque, cmd: *rhi.CommandEncoder, shown: rhi.Texture, output: rhi.Texture) bool {
         const self: *Renderer = @ptrCast(@alignCast(context));
-        const upscaler = self.generating orelse return false;
-        return upscaler.generate(self.device, cmd, shown, output, self.generating_reset) catch {
-            if (!self.generating_failed) std.log.warn("FidelityFX frame generation failed; frames are shown without it", .{});
+        const generator = self.generating orelse return false;
+        return generator.generate(self.device, cmd, shown, output, self.generating_reset) catch {
+            if (!self.generating_failed) std.log.warn("frame generation failed; frames are shown without it", .{});
             self.generating_failed = true;
             return false;
         };
@@ -1033,6 +1031,9 @@ pub const Renderer = struct {
         arena.reset(self.device);
         self.frame_target_count = 0;
         self.frame_scene_views = 0;
+        self.downgrades.count = 0;
+        self.canvas.beginFrame(self.device, self.frame_index);
+        self.target_pool.collect(self.device, self.frame_index);
         self.generating = null;
         self.resolvePick(@intCast(frame.index % rhi.frames_in_flight));
 
@@ -1055,6 +1056,8 @@ pub const Renderer = struct {
 
         for (desc.views) |view_desc| try renderView(self, frame, view_desc, desc.delta_time, arena);
         try captureProbes(self, frame, desc.delta_time, arena);
+        self.stats.downgrades = self.downgrades.items;
+        self.stats.downgrade_count = self.downgrades.count;
         if (frame.backbuffer) |backbuffer| if (!targetWritten(self, backbuffer)) {
             try cmd.beginRendering(.{ .color = &.{.{ .texture = backbuffer, .load = .clear, .clear = .{ 0, 0, 0, 1 } }} });
             cmd.endRendering();
@@ -1064,13 +1067,6 @@ pub const Renderer = struct {
     /// See `Quality.recommended`. Safe from any thread.
     pub fn recommendedQuality(self: *const Renderer) Quality {
         return Quality.recommended(self.device.adapterInfo());
-    }
-
-    /// True when the window surface is HDR10.
-    pub fn hdrActive(self: *Renderer) bool {
-        self.lock();
-        defer self.unlock();
-        return self.device.hdr_active;
     }
 };
 
@@ -1101,3 +1097,4 @@ test "range allocator reuses and coalesces freed ranges" {
 }
 
 pub const shaderCode = pipelines_module.shaderCode;
+pub const PipelineId = pipelines_module.PipelineId;

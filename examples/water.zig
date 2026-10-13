@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     var sky = gfx.SkyDesc{ .sun_direction = .{ -0.5 * @cos(sun_height), -@sin(sun_height), -0.6 } };
     renderer.scenes.setSun(scene, gfx.skySun(sky));
     const environment = try renderer.environments.createSky(sky);
-    renderer.scenes.setEnvironment(scene, environment, 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 1 });
 
     var positions: [1][24][3]f32 = undefined;
     var indices: [1][36]u32 = undefined;
@@ -117,9 +117,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, if (dive) .{ 0, -0.9, 0 } else .{ 0, -0.4, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 50 },
+                .settings = .{ .shadows = .{ .distance = 50 } },
             }},
             .delta_time = tick.dt,
         }));

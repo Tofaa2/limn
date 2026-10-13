@@ -83,7 +83,7 @@ const Checks = struct {
         try renderer.scenes.setDecals(scene, &.{});
         renderer.scenes.setSun(scene, .{ .direction = .{ 0, -1, 0 }, .color = .{ 1, 1, 1 }, .intensity = 1 });
         renderer.scenes.destroy(scene);
-        try renderer.materials.setShader(model, null, null, .{ 0, 0, 0, 0 });
+        try renderer.materials.setShader(model, .{ .params = .{ 0, 0, 0, 0 } });
         try renderer.models.destroy(model);
 
         if (renderer.models.state(model) != .failed) return error.StaleModelHasState;
@@ -197,6 +197,20 @@ const Checks = struct {
         std.log.info("failed pass: reported, and the next frame drew", .{});
     }
 
+    fn plainViewPasses(self: *Checks) !void {
+        var calls: u32 = 0;
+        for ([_]gfx.PassStage{ .after_tonemap, .after_opaque }) |stage| {
+            const passes: []const gfx.Pass = &.{.{ .stage = stage, .context = &calls, .run = fillingPass }};
+            for (0..2) |_| _ = try self.renderer.render(.{ .views = &.{.{ .target = .{ .texture = self.target }, .passes = passes }} });
+            const pixels = try self.renderer.device.readTexture(self.gpa, self.target);
+            defer self.gpa.free(pixels);
+            if (pixels[1] < 100 or pixels[0] > 100) return error.PassOnPlainViewNotDrawn;
+        }
+        if (calls != 4) return error.PassOnPlainViewNotRun;
+        try self.draw(2);
+        std.log.info("passes on a view without a scene: drawn before and after tone mapping", .{});
+    }
+
     fn shaderReload(self: *Checks) !void {
         const count = self.renderer.shaders.reload() catch |err| {
             if (@as(anyerror, err) != error.ShaderReloadDisabled) return err;
@@ -301,7 +315,7 @@ const Checks = struct {
                 list.text(renderer.fonts.default(), "out of memory", .{ 20, 20 }, .{ .size = 18 }) catch |err| break :blk err;
                 const lights = [_]gfx.Light{.{ .position = .{ 2, 2, 0 }, .color = .{ 1, 1, 1 }, .intensity = 5, .range = 6 }};
                 renderer.scenes.setLights(self.scene, &lights) catch |err| break :blk err;
-                _ = renderer.render(.{ .views = &.{.{ .scene = self.scene, .camera = self.camera, .draw_lists = &.{&list}, .target = .{ .texture = self.target } }} }) catch |err| break :blk err;
+                _ = renderer.render(.{ .views = &.{.{ .scene = self.scene, .camera = self.camera, .draw_lists = &.{.{ .list = &list }}, .target = .{ .texture = self.target } }} }) catch |err| break :blk err;
             };
             failing.failNever();
             if (outcome) |_| {} else |err| {
@@ -371,7 +385,7 @@ const Checks = struct {
                     .usage = .{ .color_attachment = true, .sampled = true, .copy_src = true },
                 }) catch |err| break :blk err;
                 defer device.destroyTexture(small);
-                const image = renderer.images.create(16, 16, &pixels, true) catch |err| break :blk err;
+                const image = renderer.images.create(.{ .width = 16, .height = 16, .pixels = &pixels }) catch |err| break :blk err;
                 defer renderer.images.destroy(image);
                 const model = renderer.models.create(&.{.{ .positions = &triangle, .indices = &indices }}) catch |err| break :blk err;
                 defer renderer.models.destroy(model) catch {};
@@ -390,6 +404,14 @@ const Checks = struct {
         std.log.info("out of GPU memory: {d} of {d} rounds hit a failure, all recovered", .{ failures, rounds });
     }
 };
+
+fn fillingPass(context: ?*anyopaque, pass: gfx.PassContext) anyerror!void {
+    const calls: *u32 = @ptrCast(@alignCast(context.?));
+    calls.* += 1;
+    if (pass.depth != null) return error.DepthWithoutScene;
+    try pass.cmd.beginRendering(.{ .color = &.{.{ .texture = pass.color, .load = .clear, .clear = .{ 0, 1, 0, 1 } }} });
+    pass.cmd.endRendering();
+}
 
 fn failingPass(_: ?*anyopaque, pass: gfx.PassContext) anyerror!void {
     try pass.cmd.beginRendering(.{ .color = &.{.{ .texture = pass.color, .load = .load }} });
@@ -442,10 +464,10 @@ pub fn main(init: std.process.Init) !void {
     const renderer = try gfx.Renderer.init(failing.allocator(), init.io, .{
         .application_name = "limn checks",
         .validation = true,
-        .mesh_shaders = true,
+        .geometry = .{ .mesh_shaders = true },
         .job_allocator = failing.allocator(),
-        .asset_cache_dir = cache_dir,
-        .texture_streaming = .{ .budget_bytes = 4 * 1024 * 1024, .evict_delay_frames = 8, .from_cache = true },
+        .cache = .{ .assets = cache_dir },
+        .textures = .{ .streaming = .{ .budget_bytes = 4 * 1024 * 1024, .evict_delay_frames = 8, .from_cache = true } },
     });
     defer renderer.deinit();
     const target = try renderer.device.createTexture(.{
@@ -459,7 +481,7 @@ pub fn main(init: std.process.Init) !void {
 
     const scene = try renderer.scenes.create();
     const sky = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.3, -0.6 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky), .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky));
     const corners = [8][3]f32{ .{ -0.5, 0, -0.5 }, .{ 0.5, 0, -0.5 }, .{ 0.5, 1, -0.5 }, .{ -0.5, 1, -0.5 }, .{ -0.5, 0, 0.5 }, .{ 0.5, 0, 0.5 }, .{ 0.5, 1, 0.5 }, .{ -0.5, 1, 0.5 } };
     const faces = [36]u32{ 0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5 };
@@ -483,6 +505,7 @@ pub fn main(init: std.process.Init) !void {
     try checks.moves();
     try checks.threads();
     try checks.failedPass();
+    try checks.plainViewPasses();
     try checks.shaderReload();
     try checks.streaming();
     try checks.compaction();

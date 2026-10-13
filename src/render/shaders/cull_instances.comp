@@ -56,7 +56,7 @@ void main() {
     float radius = instance.sphere.w;
     bool as_impostor = false;
     if (push.impostor_view != 0u && instance.impostor != 0u) {
-        float across = radius * abs(push.view.p11) * push.frame.resolution.y / max(distance(push.view.camera_position, center), push.view.near);
+        float across = radius * abs(push.view.p11) * push.frame.resolution.y / (push.view.far > 0.0 ? 1.0 : max(distance(push.view.camera_position, center), push.view.near));
         as_impostor = across < push.impostors.data[instance.impostor - 1u].pixels;
         if (as_impostor && push.phase == PHASE_EARLY) return;
     }

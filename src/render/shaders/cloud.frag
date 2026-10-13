@@ -20,8 +20,9 @@ void main() {
     CloudData clouds = push.clouds.data;
     uint linear = frame.sampler_linear_clamp;
     uint nearest = frame.sampler_nearest_clamp;
-    vec3 camera = frame.camera_position;
-    vec3 direction = normalize(worldPositionFromDepth(in_uv, 1e-6, frame.inv_view_proj) - camera);
+    vec3 far_point = worldPositionFromDepth(in_uv, 1e-6, frame.inv_view_proj);
+    vec3 camera = eyePoint(frame, far_point);
+    vec3 direction = normalize(far_point - camera);
     vec2 segment = cloudSegment(clouds, camera.y, direction.y);
     segment.y = min(segment.y, clouds.max_distance);
     out_clouds = vec4(0.0, 0.0, 0.0, 1.0);

@@ -30,8 +30,9 @@ bool mirroredAt(FrameConstants frame, ivec2 pixel) {
 vec3 positionAt(FrameConstants frame, ivec2 pixel, out float reach) {
     reach = abs(texelFetch(TEX(push.facing_texture, frame.sampler_nearest_clamp), pixel, 0).a);
     vec2 uv = (vec2(pixel) + 0.5) * frame.inv_resolution;
-    vec3 toward = normalize(worldPositionFromDepth(uv, 0.5, frame.inv_view_proj) - frame.camera_position);
-    return frame.camera_position + toward * reach;
+    vec3 through = worldPositionFromDepth(uv, 0.5, frame.inv_view_proj);
+    vec3 eye = eyePoint(frame, through);
+    return eye + normalize(through - eye) * reach;
 }
 
 vec3 facingAt(FrameConstants frame, ivec2 pixel) {

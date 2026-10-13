@@ -40,14 +40,14 @@ void main() {
     vec3 beside = hairCopyOffset(strand, uint(gl_InstanceIndex)) * push.spread * mix(0.3, 1.0, along);
     vec3 position = worldPoint(here) + beside;
     vec3 tangent = normalize(worldPoint(after) - worldPoint(before));
-    vec3 toward = frame.camera_position - position;
+    vec3 toward = eyePoint(frame, position) - position;
     float distance_to = max(length(toward), 1e-4);
     vec3 across = cross(tangent, toward / distance_to);
     float across_length = length(across);
     across = across_length > 1e-4 ? across / across_length : vec3(0.0);
 
     float width = mix(push.root_width, push.tip_width, along) * length(push.transform[0].xyz);
-    float pixel = 2.0 * distance_to / (abs(frame.proj[1][1]) * frame.resolution.y);
+    float pixel = 2.0 * (frame.parallel != 0.0 ? 1.0 : distance_to) / (abs(frame.proj[1][1]) * frame.resolution.y);
     float coverage = clamp(width / pixel, 0.0, 1.0);
     vec3 offset = across * side * 0.5 * max(width, pixel);
     vec3 previous = (push.previous_transform * vec4(push.previous_points.data[here].position, 1.0)).xyz + beside + offset;

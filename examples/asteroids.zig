@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
     const sun_direction = math.normalize(math.Vec3{ -0.55, -0.35, -0.6 });
     renderer.scenes.setSun(scene, .{ .direction = sun_direction, .color = .{ 1, 0.96, 0.9 }, .intensity = 6 });
     const environment = try renderer.environments.createSky(.{ .sun_direction = .{ 0, 1, 0 }, .stars = 40 });
-    renderer.scenes.setEnvironment(scene, environment, 0.35);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 0.35 });
 
     var models: [kinds.len]gfx.Model = undefined;
     for (kinds, &models, 0..) |kind, *model, index| {
@@ -310,16 +310,14 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = .{ .position = eye, .forward = forward, .near = 0.5 },
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = .{
-                    .occlusion_culling = occlusion,
-                    .lod_error_pixels = if (detail) 1 else 0,
-                    .shadows = shadows,
-                    .shadow_distance = 1500,
-                    .global_illumination = false,
-                    .ambient_occlusion = false,
-                    .automatic_exposure = false,
+                    .geometry = .{ .occlusion_culling = occlusion, .lod_error_pixels = if (detail) 1 else 0 },
+                    .shadows = if (shadows) .{ .distance = 1500 } else null,
+                    .global_illumination = null,
+                    .post = .{ .automatic_exposure = false },
+                    .ambient_occlusion = null,
                     .debug_view = if (meshlet_view) .meshlets else .none,
                 },
             }},

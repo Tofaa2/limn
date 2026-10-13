@@ -24,7 +24,7 @@ pub const Assets = struct {
         try renderer.fonts.prepareLigatures(renderer.fonts.default());
         try renderer.fonts.prepareTextWith(renderer.fonts.default(), "бгдпт i\u{30a} j\u{303}", "SRB ".*, &.{});
         try renderer.fonts.prepareTextWith(renderer.fonts.default(), "ag", null, &.{"salt".*});
-        return .{ .checker = try renderer.images.create(8, 8, &pixels, true) };
+        return .{ .checker = try renderer.images.create(.{ .width = 8, .height = 8, .pixels = &pixels }) };
     }
 
     pub fn deinit(self: Assets, renderer: *gfx.Renderer) void {

@@ -22,11 +22,11 @@ pub fn main(init: std.process.Init) !void {
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
 
-    const studio = try renderer.environments.load("examples/assets/studio_small_03_1k.hdr", 64);
+    const studio = try renderer.environments.load("examples/assets/studio_small_03_1k.hdr", .{ .max_radiance = 64 });
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.6, -0.45 } };
     const sky = try renderer.environments.createSky(sky_desc);
     var outdoors = false;
-    renderer.scenes.setEnvironment(scene, studio, 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = studio, .intensity = 1 });
     renderer.scenes.setSun(scene, .{ .direction = sky_desc.sun_direction, .intensity = 0 });
 
     var positions: [helpers.sphere_vertex_count][3]f32 = undefined;
@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_D)) orbit += tick.dt * 0.8;
         if (stage.keyPressed(glfw.GLFW_KEY_E)) {
             outdoors = !outdoors;
-            renderer.scenes.setEnvironment(scene, if (outdoors) sky else studio, 1);
+            renderer.scenes.setEnvironment(scene, .{ .environment = if (outdoors) sky else studio, .intensity = 1 });
             renderer.scenes.setSun(scene, if (outdoors) gfx.skySun(sky_desc) else .{ .direction = sky_desc.sun_direction, .intensity = 0 });
         }
 
@@ -102,9 +102,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0.6, 2.2, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 30 },
+                .settings = .{ .shadows = .{ .distance = 30 } },
             }},
             .delta_time = tick.dt,
         }));

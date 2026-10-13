@@ -2,7 +2,7 @@
 //! shaders. Used over a mesh's triangles and over a scene's instances.
 const std = @import("std");
 
-/// Matches `BvhNode` in trace.glsl, 32 bytes. Inner node: `count` 0,
+/// Matches `BvhNode` in trace.slang, 32 bytes. Inner node: `count` 0,
 /// children at `first` and `first + 1`. Leaf: `count` items starting at
 /// `first` in `Tree.order`.
 pub const Node = extern struct {

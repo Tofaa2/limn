@@ -25,7 +25,7 @@ fn drawImage(renderer: *gfx.Renderer, comptime shape: fn (x: f32, y: f32) f32) !
         const alpha = std.math.clamp(shape(u, v), 0, 1);
         pixels[(y * size + x) * 4 ..][0..4].* = .{ 255, 255, 255, @intFromFloat(alpha * 255) };
     };
-    return renderer.images.create(size, size, &pixels, true);
+    return renderer.images.create(.{ .width = size, .height = size, .pixels = &pixels });
 }
 
 fn arrow(x: f32, y: f32) f32 {
@@ -57,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.45, -0.7, -0.5 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
@@ -123,9 +123,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 0.8, -1 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 40 },
+                .settings = .{ .shadows = .{ .distance = 40 } },
             }},
             .delta_time = tick.dt,
         }));

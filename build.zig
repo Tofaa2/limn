@@ -1,10 +1,18 @@
 const std = @import("std");
+const shader_gen = @import("src/render/core/shader_gen.zig");
 
 const Shader = struct {
     src: []const u8,
     name: []const u8,
     defines: []const []const u8 = &.{},
+    /// Slang sources name the entry point to compile and its stage.
+    entry: []const u8 = "",
+    stage: []const u8 = "",
 };
+
+/// Arguments every Slang shader is compiled with; `shaders.reload` uses the
+/// same ones.
+const slang_arguments = [_][]const u8{ "-profile", "spirv_1_5", "-target", "spirv", "-fvk-use-scalar-layout", "-matrix-layout-column-major", "-O2", "-warnings-disable", "39001,41012,41035" };
 
 const shader_dir = "src/render/shaders";
 
@@ -25,7 +33,7 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/forward.frag", .name = "forward_weighted.frag.spv", .defines = &.{"WEIGHTED"} },
     .{ .src = shader_dir ++ "/forward.frag", .name = "forward_peel.frag.spv", .defines = &.{"PEEL"} },
     .{ .src = shader_dir ++ "/hiz.frag", .name = "hiz.frag.spv" },
-    .{ .src = shader_dir ++ "/gi_trace.comp", .name = "gi_trace.comp.spv" },
+    .{ .src = shader_dir ++ "/gi_trace.slang", .name = "gi_trace.comp.spv", .entry = "computeMain", .stage = "compute" },
     .{ .src = shader_dir ++ "/gi_relocate.frag", .name = "gi_relocate.frag.spv" },
     .{ .src = shader_dir ++ "/gi_gather.frag", .name = "gi_gather.frag.spv" },
     .{ .src = shader_dir ++ "/gi_clamp.frag", .name = "gi_clamp.frag.spv" },
@@ -41,7 +49,7 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/shade.frag", .name = "shade_plain.frag.spv", .defines = &.{"PLAIN"} },
     .{ .src = shader_dir ++ "/shade.frag", .name = "shade_rt_plain.frag.spv", .defines = &.{ "RAY_TRACED", "PLAIN" } },
     .{ .src = shader_dir ++ "/ao_depth.frag", .name = "ao_depth.frag.spv" },
-    .{ .src = shader_dir ++ "/gtao.frag", .name = "gtao.frag.spv" },
+    .{ .src = shader_dir ++ "/gtao.slang", .name = "gtao.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
     .{ .src = shader_dir ++ "/gtao_denoise.frag", .name = "gtao_denoise.frag.spv" },
     .{ .src = shader_dir ++ "/gtao_denoise.frag", .name = "gtao_bounce_denoise.frag.spv", .defines = &.{"BOUNCE"} },
     .{ .src = shader_dir ++ "/fog.frag", .name = "fog.frag.spv" },
@@ -59,8 +67,8 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/shading_rate.frag", .name = "shading_rate.frag.spv" },
     .{ .src = shader_dir ++ "/fsr_easu.frag", .name = "fsr_easu.frag.spv" },
     .{ .src = shader_dir ++ "/fsr_rcas.frag", .name = "fsr_rcas.frag.spv" },
-    .{ .src = shader_dir ++ "/ssr.frag", .name = "ssr.frag.spv" },
-    .{ .src = shader_dir ++ "/ssr.frag", .name = "ssr_rt.frag.spv", .defines = &.{"RAY_TRACED"} },
+    .{ .src = shader_dir ++ "/ssr.slang", .name = "ssr.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
+    .{ .src = shader_dir ++ "/ssr.slang", .name = "ssr_rt.frag.spv", .defines = &.{"RAY_TRACED"}, .entry = "fragmentMain", .stage = "fragment" },
     .{ .src = shader_dir ++ "/ssr_composite.frag", .name = "ssr_composite.frag.spv" },
     .{ .src = shader_dir ++ "/cloud_noise.frag", .name = "cloud_noise.frag.spv" },
     .{ .src = shader_dir ++ "/cloud.frag", .name = "cloud.frag.spv" },
@@ -88,13 +96,15 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/ffx_reflections_average.frag", .name = "ffx_reflections_average.frag.spv" },
     .{ .src = shader_dir ++ "/ffx_reflections_prefilter.frag", .name = "ffx_reflections_prefilter.frag.spv" },
     .{ .src = shader_dir ++ "/ffx_reflections_resolve.frag", .name = "ffx_reflections_resolve.frag.spv" },
-    .{ .src = shader_dir ++ "/pathtrace.frag", .name = "pathtrace.frag.spv" },
-    .{ .src = shader_dir ++ "/pathtrace.frag", .name = "pathtrace_rt.frag.spv", .defines = &.{"RAY_TRACED"} },
+    .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace.frag.spv", .defines = &.{"SOFTWARE_RAYS"}, .entry = "fragmentMain", .stage = "fragment" },
+    .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace_rt.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
+    .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace.comp.spv", .defines = &.{ "SOFTWARE_RAYS", "STORAGE_IMAGES" }, .entry = "computeMain", .stage = "compute" },
+    .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace_rt.comp.spv", .defines = &.{"STORAGE_IMAGES"}, .entry = "computeMain", .stage = "compute" },
     .{ .src = shader_dir ++ "/liquid_thickness.frag", .name = "liquid_thickness.frag.spv" },
     .{ .src = shader_dir ++ "/liquid_blur.frag", .name = "liquid_blur.frag.spv" },
     .{ .src = shader_dir ++ "/liquid.frag", .name = "liquid.frag.spv" },
-    .{ .src = shader_dir ++ "/fluid_solid.frag", .name = "fluid_solid.frag.spv" },
-    .{ .src = shader_dir ++ "/fluid_solid.frag", .name = "fluid_solid_rt.frag.spv", .defines = &.{"RAY_TRACED"} },
+    .{ .src = shader_dir ++ "/fluid_solid.slang", .name = "fluid_solid.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
+    .{ .src = shader_dir ++ "/fluid_solid.slang", .name = "fluid_solid_rt.frag.spv", .defines = &.{"RAY_TRACED"}, .entry = "fragmentMain", .stage = "fragment" },
     .{ .src = shader_dir ++ "/fluid_carry.frag", .name = "fluid_carry.frag.spv" },
     .{ .src = shader_dir ++ "/fluid.frag", .name = "fluid.frag.spv" },
     .{ .src = shader_dir ++ "/fluid_motion.frag", .name = "fluid_motion.frag.spv" },
@@ -109,8 +119,8 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/impostor.frag", .name = "impostor.frag.spv" },
     .{ .src = shader_dir ++ "/impostor_bake.vert", .name = "impostor_bake.vert.spv" },
     .{ .src = shader_dir ++ "/impostor_bake.frag", .name = "impostor_bake.frag.spv" },
-    .{ .src = shader_dir ++ "/lightmap_bake.vert", .name = "lightmap_bake.vert.spv" },
-    .{ .src = shader_dir ++ "/lightmap_bake.frag", .name = "lightmap_bake.frag.spv" },
+    .{ .src = shader_dir ++ "/lightmap_bake.slang", .name = "lightmap_bake.vert.spv", .entry = "vertexMain", .stage = "vertex" },
+    .{ .src = shader_dir ++ "/lightmap_bake.slang", .name = "lightmap_bake.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
     .{ .src = shader_dir ++ "/lightmap_dilate.frag", .name = "lightmap_dilate.frag.spv" },
     .{ .src = shader_dir ++ "/vsm_mark.comp", .name = "vsm_mark.comp.spv" },
     .{ .src = shader_dir ++ "/vsm_allocate.comp", .name = "vsm_allocate.comp.spv" },
@@ -123,8 +133,8 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/particle_mesh.frag", .name = "particle_mesh.frag.spv" },
     .{ .src = shader_dir ++ "/particle.frag", .name = "particle.frag.spv" },
     .{ .src = shader_dir ++ "/tonemap.frag", .name = "tonemap.frag.spv" },
-    .{ .src = shader_dir ++ "/draw.vert", .name = "draw.vert.spv" },
-    .{ .src = shader_dir ++ "/draw.frag", .name = "draw.frag.spv" },
+    .{ .src = shader_dir ++ "/draw.slang", .name = "draw.vert.spv", .entry = "vertexMain", .stage = "vertex" },
+    .{ .src = shader_dir ++ "/draw.slang", .name = "draw.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
     .{ .src = shader_dir ++ "/env_cube.frag", .name = "env_cube.frag.spv" },
     .{ .src = shader_dir ++ "/probe_face.frag", .name = "probe_face.frag.spv" },
     .{ .src = shader_dir ++ "/env_sky.frag", .name = "env_sky.frag.spv" },
@@ -157,6 +167,9 @@ const examples: []const Example = &.{
         .root = "examples/canvas.zig",
         .description = "A 2D-only application: shapes, sprites and text",
         .windowed = true,
+        .shaders = &.{
+            .{ .src = "examples/shaders/scanlines.slang", .name = "scanlines.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
+        },
     },
     .{
         .name = "meadow",
@@ -174,6 +187,12 @@ const examples: []const Example = &.{
         .name = "lights",
         .root = "examples/lights.zig",
         .description = "A hall at night: many drifting lamps, a shadowed spot light and a glowing panel",
+        .windowed = true,
+    },
+    .{
+        .name = "isometric",
+        .root = "examples/isometric.zig",
+        .description = "A terraced diorama through an orthographic camera, with markers drawn into the scene",
         .windowed = true,
     },
     .{
@@ -413,22 +432,34 @@ pub fn build(b: *std.Build) void {
     });
     font_baker.addImport("build_features", features_module);
     renderer.addImport("font_baker", font_baker);
-    addShaders(b, renderer, renderer_shaders, shaders_step);
+    const generated_shaders = b.addWriteFiles();
+    _ = generated_shaders.add("frame_constants.glsl", shader_gen.frame_glsl);
+    _ = generated_shaders.add("frame_constants.slang", shader_gen.frame_slang);
+    const generated_dir = generated_shaders.getDirectory();
+    addShaders(b, renderer, renderer_shaders, shaders_step, generated_dir);
     const shader_reload = b.option(bool, "shader_reload", "Keep the shader source paths in the library for `shaders.reload` (default: Debug only)") orelse (optimize == .Debug);
     const shader_options = b.addOptions();
     var shader_names: [renderer_shaders.len][]const u8 = undefined;
     var shader_sources: [renderer_shaders.len][]const u8 = undefined;
     var shader_defines: [renderer_shaders.len][]const u8 = undefined;
+    var shader_entries: [renderer_shaders.len][]const u8 = undefined;
+    var shader_stages: [renderer_shaders.len][]const u8 = undefined;
     for (renderer_shaders, 0..) |shader, index| {
         shader_names[index] = shader.name;
         shader_sources[index] = if (shader_reload) b.pathFromRoot(shader.src) else "";
         shader_defines[index] = "";
+        shader_entries[index] = shader.entry;
+        shader_stages[index] = shader.stage;
         for (shader.defines) |define| shader_defines[index] = b.fmt("{s} -D{s}", .{ shader_defines[index], define });
     }
     shader_options.addOption([]const []const u8, "names", &shader_names);
     shader_options.addOption([]const []const u8, "sources", &shader_sources);
     shader_options.addOption([]const []const u8, "defines", &shader_defines);
+    shader_options.addOption([]const []const u8, "entries", &shader_entries);
+    shader_options.addOption([]const []const u8, "stages", &shader_stages);
+    shader_options.addOption([]const []const u8, "slang_arguments", &slang_arguments);
     shader_options.addOption([]const u8, "include_dir", if (shader_reload) b.pathFromRoot(shader_dir) else "");
+    if (shader_reload) shader_options.addOptionPath("generated_dir", generated_dir) else shader_options.addOption([]const u8, "generated_dir", "");
     shader_options.addOption(bool, "reload", shader_reload);
     renderer.addOptions("shader_sources", shader_options);
     renderer.addImport("build_features", features_module);
@@ -517,7 +548,7 @@ pub fn build(b: *std.Build) void {
             module.addImport("glfw", glfw_module);
             module.addImport("window", window_module);
         }
-        addShaders(b, module, example.shaders, shaders_step);
+        addShaders(b, module, example.shaders, shaders_step, generated_dir);
         const exe = b.addExecutable(.{ .name = example.name, .root_module = module, .use_llvm = true });
         example_exes.put(b.allocator, example.name, exe) catch @panic("OOM");
         b.installArtifact(exe);
@@ -872,7 +903,7 @@ fn volkModule(
     source: *std.Build.Dependency,
 ) *std.Build.Module {
     const volk = b.addTranslateC(.{
-        .root_source_file = b.path("src/rhi/volk.h"),
+        .root_source_file = b.path("src/rhi/vulkan/volk.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -890,13 +921,31 @@ fn volkModule(
     return module;
 }
 
-/// Compiles each shader with glslc and exposes the SPIR-V to `module` as an
-/// anonymous import. `#include`d files are tracked through a depfile, so
-/// editing a shared header rebuilds exactly the shaders that use it.
-fn addShaders(b: *std.Build, module: *std.Build.Module, shaders: []const Shader, shaders_step: *std.Build.Step) void {
+/// Compiles each shader with glslc, or slangc for Slang sources, and exposes
+/// the SPIR-V to `module` as an anonymous import. Included files are tracked
+/// through a depfile, so editing a shared header rebuilds exactly the shaders
+/// that use it.
+fn addShaders(b: *std.Build, module: *std.Build.Module, shaders: []const Shader, shaders_step: *std.Build.Step, generated_dir: std.Build.LazyPath) void {
     for (shaders) |shader| {
+        if (shader.entry.len != 0) {
+            const command = b.addSystemCommand(&.{"slangc"});
+            command.addFileArg(b.path(shader.src));
+            command.addArgs(&slang_arguments);
+            command.addArgs(&.{ "-stage", shader.stage, "-entry", shader.entry });
+            command.addPrefixedDirectoryArg("-I", b.path(shader_dir));
+            command.addPrefixedDirectoryArg("-I", generated_dir);
+            for (shader.defines) |define| command.addArg(b.fmt("-D{s}", .{define}));
+            command.addArg("-depfile");
+            _ = command.addDepFileOutputArg(b.fmt("{s}.d", .{shader.name}));
+            command.addArg("-o");
+            const output = command.addOutputFileArg(shader.name);
+            module.addAnonymousImport(shader.name, .{ .root_source_file = output });
+            shaders_step.dependOn(&command.step);
+            continue;
+        }
         const command = b.addSystemCommand(&.{ "glslc", "--target-env=vulkan1.3", "-O", "-g" });
         command.addPrefixedDirectoryArg("-I", b.path(shader_dir));
+        command.addPrefixedDirectoryArg("-I", generated_dir);
         for (shader.defines) |define| command.addArg(b.fmt("-D{s}", .{define}));
         command.addArg("-MD");
         command.addArg("-MF");

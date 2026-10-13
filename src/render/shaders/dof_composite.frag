@@ -18,7 +18,7 @@ void main() {
     FrameConstants frame = push.frame;
     float focus_distance = push.focus_distance;
     if (focus_distance < 0.0) focus_distance = max(frame.exposure.focus, frame.near);
-    float view_depth = linearDepth(textureLod(TEX(push.depth_texture, frame.sampler_nearest_clamp), in_uv, 0.0).r, frame.near);
+    float view_depth = linearDepth(textureLod(TEX(push.depth_texture, frame.sampler_nearest_clamp), in_uv, 0.0).r, frame.depth_terms);
     float radius = min(push.strength * abs(view_depth - focus_distance) / max(view_depth, 1e-3), push.max_radius);
     vec3 sharp = texelFetch(TEX(push.color_texture, frame.sampler_nearest_clamp), ivec2(gl_FragCoord.xy), 0).rgb;
     vec4 blurred = textureLod(TEX(push.blurred_texture, frame.sampler_linear_clamp), in_uv, 0.0);

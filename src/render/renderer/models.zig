@@ -1,5 +1,6 @@
 //! Models: loading, building their GPU records and freeing them. Internal to the renderer.
 const std = @import("std");
+const geometry_feature = @import("../features/geometry.zig");
 const handle = @import("../../handle.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
@@ -9,7 +10,6 @@ const animation = @import("../animation.zig");
 const bvh = @import("../bvh.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
-const geometry_passes = @import("../passes/geometry.zig");
 const render = @import("../renderer.zig");
 
 const Renderer = render.Renderer;
@@ -33,7 +33,7 @@ const encodeMaterial = @import("materials.zig").encodeMaterial;
 const freeMeshGeometry = @import("streaming.zig").freeMeshGeometry;
 
 fn lodOptions(self: *const Renderer) gltf.LodOptions {
-    return .{ .levels = self.options.mesh_lods, .clusters = self.options.cluster_lods, .normal_weight = self.options.lod_normal_weight, .uv_weight = self.options.lod_uv_weight };
+    return .{ .levels = self.options.geometry.lods, .clusters = self.options.geometry.cluster_lods, .normal_weight = self.options.geometry.lod_normal_weight, .uv_weight = self.options.geometry.lod_uv_weight };
 }
 
 /// Shared geometry, materials and animations.
@@ -57,11 +57,11 @@ pub const Models = struct {
             .io = self.io,
             .path = try self.gpa.dupe(u8, path),
             .options = .{
-                .compress_textures = self.options.texture_compression == .bc7 and self.device.bc_textures,
-                .normal_maps_bc5 = self.options.normal_maps_bc5,
-                .raw_mips = self.options.texture_streaming != null,
+                .compress_textures = self.options.textures.compression == .bc7 and self.device.caps.bc_textures,
+                .normal_maps_bc5 = self.options.textures.normal_maps_bc5,
+                .raw_mips = self.options.textures.streaming != null,
                 .lods = lodOptions(self),
-                .cache_dir = self.options.asset_cache_dir,
+                .cache_dir = self.options.cache.assets,
             },
         };
         errdefer self.gpa.free(job.path);
@@ -212,13 +212,13 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
         if (image.compressed) |data| {
             const mips = if (image.mip_levels != 0) image.mip_levels else rhi.TextureDesc.fullMipCount(image.width, image.height);
             const compressed_format = blockFormat(image.block, image.one_channel, image.two_channel, image.srgb);
-            if (self.options.texture_streaming) |streaming| {
+            if (self.options.textures.streaming) |streaming| {
                 var floor: u32 = 0;
                 while (floor + 1 < mips and @max(image.width, image.height) >> @intCast(floor) > streaming.min_size) floor += 1;
                 const stream = &entry.streams[entry.next_image];
                 stream.* = .{ .data = source.takeCompressed(entry.next_image), .width = image.width, .height = image.height, .levels = mips, .srgb = image.srgb, .two_channel = image.two_channel, .one_channel = image.one_channel, .block = image.block, .floor = floor, .resident = floor, .wanted = floor };
                 stream.total = stream.data.len;
-                if (streaming.from_cache and floor > 0 and image.block == .bc7 and image.cache_key != 0) if (self.options.asset_cache_dir) |directory| {
+                if (streaming.from_cache and floor > 0 and image.block == .bc7 and image.cache_key != 0) if (self.options.cache.assets) |directory| {
                     const extension: []const u8 = if (image.two_channel) "bc5" else if (image.one_channel) "bc4" else "bc7";
                     const path = try std.fmt.allocPrint(self.gpa, "{s}/{x:0>16}.{s}", .{ directory, image.cache_key, extension });
                     errdefer self.gpa.free(path);
@@ -331,7 +331,7 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
         try self.vertices.write(device, out.vertex_offset, std.mem.sliceAsBytes(mesh.vertices));
         try self.indices.write(device, out.index_offset, std.mem.sliceAsBytes(mesh.indices));
         try self.meshlets.write(device, out.meshlet_offset, std.mem.sliceAsBytes(mesh.meshlets));
-        if (self.options.path_tracing_fallback and !device.ray_tracing and mesh.skin == null) try buildMeshTree(self, mesh, out, entry.mesh_base + @as(u32, @intCast((@intFromPtr(out) - @intFromPtr(entry.meshes.ptr)) / @sizeOf(ModelMesh))));
+        if (self.options.ray_tracing.software_path_tracing and !device.caps.ray_tracing and mesh.skin == null) try buildMeshTree(self, mesh, out, entry.mesh_base + @as(u32, @intCast((@intFromPtr(out) - @intFromPtr(entry.meshes.ptr)) / @sizeOf(ModelMesh))));
         if (mesh.skin) |skin| {
             out.skin_offset = try self.skin_vertices.alloc(self, @intCast(skin.len));
             try self.skin_vertices.write(device, out.skin_offset.?, std.mem.sliceAsBytes(skin));
@@ -433,10 +433,10 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
         .bounds_center = math.scale(math.add(minimum, maximum), 0.5),
         .bounds_radius = math.length(math.sub(maximum, minimum)) * 0.5,
     };
-    if (device.ray_tracing) {
+    if (device.caps.ray_tracing) {
         for (entry.meshes) |*mesh| {
             if (mesh.skin_offset != null) continue;
-            const made = try device.createBlas(geometry_passes.blasDesc(self, mesh.*));
+            const made = try device.createBlas(geometry_feature.blasDesc(self, mesh.*));
             if (device.detached_queue != null) mesh.blas_building = made else mesh.blas = made;
         }
         entry.blas_pending = true;
@@ -447,7 +447,7 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
     return true;
 }
 
-/// `BvhInstance` in trace.glsl.
+/// `BvhInstance` in trace.slang.
 const TraceInstance = extern struct {
     /// World to mesh space: 3 rows of each of 4 columns.
     to_mesh: [12]f32,
@@ -539,7 +539,7 @@ pub fn buildSceneTree(self: *Renderer, scene: *SceneData, entities: []const gpu.
 }
 
 /// Builds a mesh's full-detail triangle BVH into the BVH pools; see
-/// `Options.path_tracing_fallback`.
+/// `Options.ray_tracing.software_path_tracing`.
 fn buildMeshTree(self: *Renderer, mesh: gltf.Mesh, out: *ModelMesh, record: u32) !void {
     const gpa = self.gpa;
     const triangles = mesh.lod0_index_count / 3;

@@ -20,7 +20,7 @@ layout(location = 1) out vec4 out_motion;
 void main() {
     FrameConstants frame = push.frame;
     vec3 tangent = normalize(in_tangent);
-    vec3 view = normalize(frame.camera_position - in_position);
+    vec3 view = normalize(eyePoint(frame, in_position) - in_position);
     vec3 facing = view - tangent * dot(view, tangent);
     float facing_length = length(facing);
     vec3 normal = facing_length > 1e-4 ? facing / facing_length : view;

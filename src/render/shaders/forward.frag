@@ -110,7 +110,7 @@ void main() {
     Surface surface;
     surface.position = in_position;
     surface.normal = normal;
-    surface.view = normalize(frame.camera_position - in_position);
+    surface.view = normalize(eyePoint(frame, in_position) - in_position);
     surface.diffuse_color = base_color.rgb * (1.0 - metallic);
     surface.f0 = mix(vec3(0.04), base_color.rgb, metallic);
     surface.roughness = clamp(roughness, 0.045, 1.0);
@@ -165,7 +165,7 @@ void main() {
     if (frame.aerial != 0.0 && (frame.flags & FRAME_ENVIRONMENT) != 0u) {
         vec3 air_through;
         vec3 air;
-        aerialHaze(frame, surface.view, length(in_position - frame.camera_position), air_through, air);
+        aerialHaze(frame, surface.view, length(in_position - eyePoint(frame, in_position)), air_through, air);
         color = color * air_through + air * coverage * (1.0 - air_through);
     }
 #ifndef PEEL

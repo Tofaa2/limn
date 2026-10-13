@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.6, -0.4 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
@@ -98,25 +98,25 @@ pub fn main(init: std.process.Init) !void {
 
         try stage.end(try renderer.render(.{
             .views = &.{
-                .{ .view = chase_view, .scene = scene, .camera = chase, .target = .{ .texture = chase_target }, .settings = .{ .shadow_distance = 50 } },
+                .{ .view = chase_view, .scene = scene, .camera = chase, .target = .{ .texture = chase_target }, .settings = .{ .shadows = .{ .distance = 50 } } },
                 .{
                     .scene = scene,
                     .camera = overview,
-                    .draw_lists = &.{&list},
+                    .draw_lists = &.{.{ .list = &list }},
                     .target = stage.target(),
                     .region = .{ .x = 0, .y = 0, .width = half, .height = size[1] },
-                    .settings = .{ .shadow_distance = 70 },
+                    .settings = .{ .shadows = .{ .distance = 70 } },
                 },
                 .{
                     .view = right_view,
                     .scene = scene,
                     .camera = if (modes[mode].view == .none) behind else overview,
-                    .draw_lists = &.{&list},
+                    .draw_lists = &.{.{ .list = &list }},
                     .target = stage.target(),
                     .region = .{ .x = half, .y = 0, .width = size[0] - half, .height = size[1] },
-                    .settings = .{ .shadow_distance = 70, .debug_view = modes[mode].view },
+                    .settings = .{ .shadows = .{ .distance = 70 }, .debug_view = modes[mode].view },
                 },
-                .{ .draw_lists = &.{&overlay}, .target = stage.target() },
+                .{ .draw_lists = &.{.{ .list = &overlay }}, .target = stage.target() },
             },
             .delta_time = tick.dt,
         }));

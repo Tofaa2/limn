@@ -158,7 +158,7 @@ fn buildTuft(gpa: std.mem.Allocator, shape: *Shape, rng: std.Random) !void {
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    var stage = try Stage.create(init, "Limn meadow", .{ .asset_cache_dir = "zig-out/asset-cache" });
+    var stage = try Stage.create(init, "Limn meadow", .{ .cache = .{ .assets = "zig-out/asset-cache" } });
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
     var random = std.Random.DefaultPrng.init(7);
@@ -168,7 +168,7 @@ pub fn main(init: std.process.Init) !void {
     var sky = gfx.SkyDesc{ .sun_direction = .{ -0.55 * @cos(sun_height), -@sin(sun_height), -0.5 } };
     renderer.scenes.setSun(scene, gfx.skySun(sky));
     const environment = try renderer.environments.createSky(sky);
-    renderer.scenes.setEnvironment(scene, environment, 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 1 });
     var clouds_on = true;
     const clouds = gfx.CloudDesc{ .coverage = 0.42, .cirrus = 0.3 };
     try renderer.scenes.setClouds(scene, clouds);
@@ -422,13 +422,12 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, target),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = .{
-                    .shadow_distance = 90,
-                    .aerial_perspective = 0.004,
-                    .lens_flare = 0.15,
-                    .contact_shadows = 0.3,
+                    .shadows = .{ .distance = 90, .contact = 0.3 },
+                    .shading = .{ .aerial_perspective = 0.004 },
+                    .post = .{ .lens_flare = 0.15 },
                 },
             }},
             .delta_time = tick.dt,

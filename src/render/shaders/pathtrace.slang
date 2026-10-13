@@ -1,0 +1,1006 @@
+#include "surface.slang"
+#include "brdf.slang"
+#include "gi.slang"
+#include "clouds.slang"
+
+struct Glowing {
+    uint instance;
+    uint triangles;
+};
+
+struct Push {
+    FrameConstants frame;
+#ifdef SOFTWARE_RAYS
+    BvhNode* scene;
+    BvhInstance* scene_instances;
+    BvhNode* mesh_nodes;
+    uint* mesh_items;
+#else
+    uint64_t scene;
+    uint64_t scene_instances;
+    uint64_t mesh_nodes;
+    uint64_t mesh_items;
+#endif
+    uint gathered;
+    uint bounces;
+    uint samples;
+    float clamp_radiance;
+    float sun_radius;
+    uint light_count;
+    Glowing* glowing;
+    uint glowing_count;
+    uint history_color;
+    uint history_guide;
+    uint history_soft;
+    uint history_gloss;
+    uint moved;
+    float3 previous_camera;
+    uint reset;
+    uint centered;
+    uint history_facing;
+    uint history_surface;
+    uint history_reservoir;
+    uint reusable;
+    uint motion;
+    uint depth;
+    float history_limit;
+    uint history_lamp;
+    float lamp_limit;
+    uint probes;
+    uint reconstructed;
+    /// Compute only: the storage images the fields of `Output` go to, in order.
+    uint* targets;
+};
+
+[[vk::push_constant]] Push push;
+
+struct Output {
+    float4 color : SV_Target0;
+    float4 guide : SV_Target1;
+    float4 soft : SV_Target2;
+    float4 facing : SV_Target3;
+    float4 lamp : SV_Target4;
+    float4 gloss_gathered : SV_Target5;
+    float4 surface : SV_Target6;
+    float4 reservoir : SV_Target7;
+};
+
+static Tracer tracer;
+static float2 fragment;
+
+static float3 first_color;
+static bool first_met;
+static float first_distance;
+static bool first_mirrored;
+static float3 first_facing;
+static float3 first_scatter;
+static float3 first_reflect;
+static float first_roughness;
+static bool primary_met;
+static float3 primary_facing;
+static float primary_roughness;
+static float primary_distance;
+static bool primary_mirror;
+static float gloss_reach;
+static bool split_met;
+
+static uint random_state;
+
+uint pcg(uint value) {
+    uint state = value * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random() {
+    random_state = pcg(random_state);
+    return float(random_state >> 8) / 16777216.0;
+}
+
+static uint sequence_seed;
+static uint sequence_index;
+static uint sequence_dimension;
+
+uint scrambled(uint value, uint seed) {
+    value = reversebits(value) + seed;
+    value ^= value * 0x6c50b47cu;
+    value ^= value * 0xb82f1e52u;
+    value ^= value * 0xc7afe638u;
+    value ^= value * 0x8d22f6e6u;
+    return reversebits(value);
+}
+
+/// The next two numbers of this pixel's Owen-scrambled Sobol sequence, which
+/// cover the unit square evenly over the frames a pixel accumulates.
+float2 randomPair() {
+    uint seed = pcg(sequence_seed + sequence_dimension * 0x9e3779b9u);
+    sequence_dimension++;
+    uint index = scrambled(sequence_index, seed);
+    uint second = 0u;
+    uint bits = index;
+    uint direction = 0x80000000u;
+    while (bits != 0u) {
+        if ((bits & 1u) != 0u) second ^= direction;
+        bits >>= 1u;
+        direction ^= direction >> 1u;
+    }
+    uint2 spot = uint2(scrambled(reversebits(index), pcg(seed + 1u)), scrambled(second, pcg(seed + 2u)));
+    return float2(spot >> 8u) / 16777216.0;
+}
+
+struct Surface {
+    float3 position;
+    float3 flat_normal;
+    float3 normal;
+    float3 albedo;
+    float3 emissive;
+    bool even_glow;
+    float metallic;
+    float roughness;
+    float through;
+    /// Index of refraction of a surface that bends what passes through it; 0
+    /// for one that does not.
+    float bend;
+};
+
+Surface pathSurface(FrameConstants frame, TraceHit hit, float3 origin, float3 direction, float footprint) {
+    HitSurface met = surfaceAt(frame, hit, origin, direction, SurfaceDetail.matched(footprint));
+    Surface surface;
+    surface.position = met.position;
+    surface.flat_normal = met.back_face ? -met.geometric_normal : met.geometric_normal;
+    surface.normal = met.normal;
+    surface.albedo = met.base_color.rgb;
+    surface.emissive = met.emissive;
+    surface.even_glow = (met.instance_flags & INSTANCE_AIMED) != 0u;
+    surface.metallic = met.metallic;
+    surface.roughness = met.roughness;
+    surface.through = 0.0;
+    if ((met.material_flags & MATERIAL_ALPHA_TEST) != 0u && met.base_color.a < met.alpha_cutoff) surface.through = 1.0;
+    else if ((met.material_flags & MATERIAL_BLEND) != 0u) surface.through = clamp(1.0 - met.base_color.a * (1.0 - met.transmission), 0.0, 1.0);
+    if ((met.instance_flags & INSTANCE_PROXY) != 0u) surface.through = 1.0;
+    surface.bend = (met.material_flags & MATERIAL_BLEND) != 0u && met.transmission > 0.0 ? max(met.ior, 1.0) : 0.0;
+    return surface;
+}
+
+bool pathAny(float3 origin, float3 direction, float reach) {
+    return tracer.any(origin, direction, reach, RAY_EVERYTHING, Cutouts.whole);
+}
+
+static const float mirror_roughness = 0.08;
+static const float glossy_roughness = 0.4;
+static const float softened_mirror = 0.3;
+static const float lit_by_itself = 0.5;
+static const float lamp_clamp = 8.0;
+static const float moving_steady_weight = 1.0 / 3.0;
+static const float moving_mirror_weight = 0.5;
+
+/// Share of light from all directions a surface of reflectance `f0` reflects
+/// toward the eye, by Karis's fit. DLSS Ray Reconstruction reads it as the
+/// specular albedo.
+float3 reflectedOverall(float3 f0, float roughness, float n_dot_v) {
+    float4 fit = roughness * float4(-1.0, -0.0275, -0.572, 0.022) + float4(1.0, 0.0425, 1.04, -0.04);
+    float bent = min(fit.x * fit.x, exp2(-9.28 * n_dot_v)) * fit.x + fit.y;
+    float2 scale_bias = float2(-1.04, 1.04) * bent + fit.zw;
+    return f0 * scale_bias.x + scale_bias.y;
+}
+
+bool mirrorLike(Surface surface) {
+    return surface.roughness <= mirror_roughness;
+}
+
+/// Light reflected toward `view` per unit arriving from `light`; `shine` is the
+/// part of it that is specular.
+float3 surfaceResponse(Surface surface, float3 view, float3 light, out float3 shine) {
+    shine = float3(0.0);
+    float n_dot_l = dot(surface.normal, light);
+    float n_dot_v = max(dot(surface.normal, view), 1e-4);
+    if (n_dot_l <= 0.0) return float3(0.0);
+    float3 half_vector = normalize(view + light);
+    float alpha = surface.roughness * surface.roughness;
+    float3 f0 = lerp(float3(0.04), surface.albedo, surface.metallic);
+    float3 fresnel = fresnelSchlick(max(dot(view, half_vector), 0.0), f0);
+    float3 specular = mirrorLike(surface) ? float3(0.0) : fresnel * distributionGgx(max(dot(surface.normal, half_vector), 0.0), alpha) * visibilitySmithGgx(n_dot_l, n_dot_v, alpha);
+    float3 diffuse = surface.albedo * (1.0 - surface.metallic) * (1.0 - fresnel) / PI;
+    shine = specular * n_dot_l;
+    return (diffuse + specular) * n_dot_l;
+}
+
+float3 skyLight(FrameConstants frame, float3 direction, bool with_sun) {
+    if ((frame.flags & FRAME_ENVIRONMENT) == 0u) return float3(0.0);
+    if (!with_sun) {
+        const float disc_angle = 0.0175;
+        float texel_angle = 1.6 / cubeSize(frame.env_sky).x;
+        float kept_clear = disc_angle + 2.5 * texel_angle;
+        float toward_sun = dot(direction, frame.sun_direction);
+        if (toward_sun > cos(kept_clear)) {
+            float3 away = direction - frame.sun_direction * toward_sun;
+            float away_length = length(away);
+            away = away_length > 1e-6 ? away / away_length : tangentBasis(frame.sun_direction).side;
+            float beside = kept_clear + texel_angle;
+            direction = frame.sun_direction * cos(beside) + away * sin(beside);
+        }
+    }
+    return sampleCubeLod(frame.env_sky, frame.sampler_linear_clamp, direction, 0.0).rgb * frame.env_intensity;
+}
+
+/// One point on a lamp or on a glowing triangle. `source` is 0 for none, a
+/// lamp's index plus one, or `glow_source` plus a glowing instance's index plus
+/// one. `place` picks the point on it.
+struct LightSample {
+    uint source;
+    uint facet;
+    float2 place;
+};
+
+static const uint glow_source = 512u;
+static const float place_steps = 4096.0;
+
+/// The light sample a pixel keeps between frames: `worth` scales the sample's
+/// light into an estimate of all lamp light, `count` is how many candidates
+/// it was chosen from.
+struct Reservoir {
+    LightSample pick;
+    float worth;
+    float count;
+};
+
+static const float reservoir_count_limit = 255.0;
+
+float4 packReservoir(Reservoir reservoir) {
+    uint2 cell = min(uint2(reservoir.pick.place * place_steps), uint2(uint(place_steps) - 1u));
+    return float4(float(reservoir.pick.source) + 2048.0 * floor(min(reservoir.count, reservoir_count_limit)), float(reservoir.pick.facet), float(cell.x + cell.y * uint(place_steps)), reservoir.worth);
+}
+
+Reservoir unpackReservoir(float4 packed) {
+    Reservoir reservoir;
+    if (any(isnan(packed)) || any(isinf(packed)) || any(packed < 0.0)) packed = float4(0.0);
+    uint head = uint(packed.r);
+    uint cell = uint(packed.b);
+    reservoir.pick.source = head & 2047u;
+    reservoir.pick.facet = uint(packed.g);
+    reservoir.pick.place = (float2(cell % uint(place_steps), cell / uint(place_steps)) + 0.5) / place_steps;
+    reservoir.count = float(head >> 11u);
+    reservoir.worth = packed.a;
+    return reservoir;
+}
+
+float2 randomPlace() {
+    float first = random();
+    float second = random();
+    return (floor(float2(first, second) * place_steps) + 0.5) / place_steps;
+}
+
+LightSample lightSample(uint source, uint facet, float2 place) {
+    LightSample pick;
+    pick.source = source;
+    pick.facet = facet;
+    pick.place = place;
+    return pick;
+}
+
+/// Light `pick` sends to the eye off `surface` before shadowing. `rarity` is
+/// one over the chance that uniform picking lands on this sample.
+float3 sampleLight(FrameConstants frame, Surface surface, float3 view, LightSample pick, out float3 toward, out float reach, out float rarity, out float3 shine) {
+    shine = float3(0.0);
+    toward = float3(0.0);
+    reach = 0.0;
+    rarity = 0.0;
+    if (pick.source == 0u) return float3(0.0);
+    if (pick.source <= glow_source) {
+        uint light_count = min(frame.light_count, push.light_count);
+        if (pick.source > light_count) return float3(0.0);
+        Light light = frame.lights.data[pick.source - 1u];
+        rarity = float(light_count);
+        float attenuation = 1.0;
+        reach = 1e4;
+        if ((light.flags & LIGHT_DIRECTIONAL) != 0u) {
+            toward = -light.direction;
+        } else {
+            float3 target = light.position;
+            if (light.source_radius > 0.0) {
+                float height = 1.0 - 2.0 * pick.place.x;
+                float ring = sqrt(max(1.0 - height * height, 0.0));
+                float turn = 2.0 * PI * pick.place.y;
+                target += float3(ring * cos(turn), ring * sin(turn), height) * light.source_radius * 0.7;
+            }
+            float3 to_light = target - surface.position;
+            float distance_squared = dot(to_light, to_light);
+            float range_squared = light.range * light.range;
+            if (distance_squared >= range_squared) return float3(0.0);
+            float window = clamp(1.0 - (distance_squared * distance_squared) / (range_squared * range_squared), 0.0, 1.0);
+            attenuation = window * window / max(distance_squared, 0.01);
+            reach = sqrt(distance_squared);
+            toward = to_light / max(reach, 1e-5);
+            if ((light.flags & LIGHT_SPOT) != 0u) {
+                float cone = clamp(dot(-toward, light.direction) * light.cone_scale + light.cone_offset, 0.0, 1.0);
+                attenuation *= cone * cone;
+            }
+            if ((light.flags & LIGHT_RECTANGLE) != 0u) attenuation *= clamp(dot(-toward, light.direction), 0.0, 1.0);
+            reach -= 0.004;
+            if (light.source_radius > 0.0) {
+                float3 to_center = light.position - surface.position;
+                float along = dot(to_center, toward);
+                float inside = light.source_radius * light.source_radius - (dot(to_center, to_center) - along * along);
+                if (inside > 0.0) reach = min(reach, max(along - sqrt(inside), 0.0));
+            }
+        }
+        if (attenuation <= 1e-5 || dot(surface.flat_normal, toward) <= 0.0) return float3(0.0);
+        float3 response = surfaceResponse(surface, view, toward, shine);
+        shine *= light.color * attenuation;
+        return response * light.color * attenuation;
+    }
+    uint index = pick.source - glow_source - 1u;
+    if (index >= push.glowing_count) return float3(0.0);
+    Glowing chosen = push.glowing[index];
+    if (pick.facet >= chosen.triangles) return float3(0.0);
+    Instance instance = frame.instances.data[chosen.instance];
+    Mesh mesh = frame.meshes.data[instance.mesh];
+    uint base = mesh.index_offset + pick.facet * 3u;
+    float3 p0 = mul(instance.transform, float4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base]].position, 1.0));
+    float3 p1 = mul(instance.transform, float4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 1u]].position, 1.0));
+    float3 p2 = mul(instance.transform, float4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 2u]].position, 1.0));
+    float side = sqrt(pick.place.x);
+    float2 weights = float2(side * (1.0 - pick.place.y), side * pick.place.y);
+    float3 spot = p0 + (p1 - p0) * weights.x + (p2 - p0) * weights.y;
+    float3 across = cross(p1 - p0, p2 - p0);
+    float area = 0.5 * length(across);
+    float3 to_spot = spot - surface.position;
+    float distance_squared = dot(to_spot, to_spot);
+    if (area <= 0.0 || distance_squared <= 1e-8) return float3(0.0);
+    reach = sqrt(distance_squared);
+    toward = to_spot / reach;
+    reach -= 0.004;
+    float facing = abs(dot(across, toward)) / (2.0 * area);
+    if (facing <= 1e-4 || dot(surface.flat_normal, toward) <= 0.0) return float3(0.0);
+    rarity = area * float(chosen.triangles) * float(push.glowing_count);
+    float3 arriving = frame.materials.data[instance.material].emissive * (facing / max(distance_squared, 0.01));
+    float3 response = surfaceResponse(surface, view, toward, shine);
+    shine *= arriving;
+    return response * arriving;
+}
+
+/// A reservoir being filled, with the light of the sample it holds.
+struct Resampling {
+    Reservoir reservoir;
+    float3 light;
+    float3 shine;
+    float3 toward;
+    float reach;
+    float target;
+    float weight_sum;
+};
+
+Resampling emptyResampling() {
+    Resampling resampling;
+    resampling.reservoir.pick = lightSample(0u, 0u, float2(0.0));
+    resampling.reservoir.worth = 0.0;
+    resampling.reservoir.count = 0.0;
+    resampling.light = float3(0.0);
+    resampling.shine = float3(0.0);
+    resampling.toward = float3(0.0);
+    resampling.reach = 0.0;
+    resampling.target = 0.0;
+    resampling.weight_sum = 0.0;
+    return resampling;
+}
+
+/// Offers `pick`, which stands for `count` candidates each worth `worth`, and
+/// returns whether it replaced the sample held.
+bool offer(inout Resampling resampling, FrameConstants frame, Surface surface, float3 view, LightSample pick, float worth, float count) {
+    resampling.reservoir.count += count;
+    float3 toward;
+    float reach;
+    float rarity;
+    float3 shine;
+    float3 light = sampleLight(frame, surface, view, pick, toward, reach, rarity, shine);
+    float target = luminance(light);
+    float weight = target * (worth < 0.0 ? rarity : worth) * count;
+    if (!(weight > 0.0) || isinf(weight)) return false;
+    resampling.weight_sum += weight;
+    if (random() * resampling.weight_sum >= weight) return false;
+    resampling.reservoir.pick = pick;
+    resampling.light = light;
+    resampling.shine = shine;
+    resampling.toward = toward;
+    resampling.reach = reach;
+    resampling.target = target;
+    return true;
+}
+
+void settle(inout Resampling resampling) {
+    resampling.reservoir.worth = resampling.target > 0.0 && resampling.reservoir.count > 0.0 ? resampling.weight_sum / (resampling.reservoir.count * resampling.target) : 0.0;
+}
+
+static const uint lamp_candidates = 4u;
+static const uint glow_candidates = 4u;
+
+/// A reservoir of fresh candidates from the lamps and glowing triangles.
+/// Candidates of the two kinds are weighted for the share each is given.
+Resampling freshCandidates(FrameConstants frame, Surface surface, float3 view) {
+    Resampling resampling = emptyResampling();
+    uint light_count = min(frame.light_count, push.light_count);
+    uint lamps = light_count != 0u ? lamp_candidates : 0u;
+    uint glows = push.glowing_count != 0u ? glow_candidates : 0u;
+    float all = float(lamps + glows);
+    for (uint index = 0u; index < lamps; index++) {
+        uint source = 1u + min(uint(random() * float(light_count)), light_count - 1u);
+        LightSample pick = lightSample(source, 0u, randomPlace());
+        offer(resampling, frame, surface, view, pick, -1.0, all / float(lamps));
+        resampling.reservoir.count -= all / float(lamps) - 1.0;
+    }
+    for (uint index = 0u; index < glows; index++) {
+        uint chosen = min(uint(random() * float(push.glowing_count)), push.glowing_count - 1u);
+        uint triangles = push.glowing[chosen].triangles;
+        uint facet = min(uint(random() * float(triangles)), triangles - 1u);
+        LightSample pick = lightSample(glow_source + 1u + chosen, facet, randomPlace());
+        offer(resampling, frame, surface, view, pick, -1.0, all / float(glows));
+        resampling.reservoir.count -= all / float(glows) - 1.0;
+    }
+    settle(resampling);
+    return resampling;
+}
+
+static bool reuse_lamps;
+static float3 reuse_toward;
+static float3 reuse_point;
+static bool reuse_mirrored;
+static float reuse_reach;
+static float4 reservoir_kept;
+
+static const float reused_frames = 20.0;
+static const int reused_neighbours = 3;
+static const float reused_radius = 24.0;
+
+/// Where on last frame's screen `spot` was, which this pixel sees at `reach`
+/// along its ray. Follows a moving object where the rasterized picture shows
+/// the same surface.
+bool seenBefore(FrameConstants frame, float3 spot, float reach, bool mirrored, out float2 was_at) {
+    was_at = fragment * frame.inv_resolution;
+    if (push.moved == 0u) return true;
+    float4 clip = mul(frame.prev_view_proj_unjittered, float4(spot, 1.0));
+    if (clip.w <= 0.0) return false;
+    was_at = clip.xy / clip.w * 0.5 + 0.5 + frame.prev_jitter;
+    if (!mirrored) {
+        int2 pixel = int2(fragment);
+        float depth = fetchTexel(push.depth, pixel).r;
+        float3 drawn = worldPositionFromDepth(fragment * frame.inv_resolution, depth, frame.inv_view_proj);
+        if (depth > 0.0 && abs(distance(drawn, frame.camera_position) - reach) <= 0.02 * reach + 0.01) {
+            float4 now = mul(frame.view_proj_unjittered, float4(spot, 1.0));
+            was_at += (now.xy / now.w - clip.xy / clip.w) * 0.5 - fetchTexel(push.motion, pixel).rg;
+        }
+    }
+    return all(was_at > 0.0) && all(was_at < 1.0);
+}
+
+/// Whether the surface a pixel showed last frame is close enough to `surface`
+/// for its reservoir to be reused.
+bool alike(FrameConstants frame, int2 at, Surface surface, float expected, float slack) {
+    float4 before = fetchTexel(push.history_facing, at);
+    if (any(isnan(before)) || (before.a < 0.0) != reuse_mirrored) return false;
+    float size = length(before.rgb);
+    if (size < 1e-4 || dot(before.rgb / size, surface.normal) < 0.8) return false;
+    return abs(abs(before.a) - expected) <= slack * expected + 0.02;
+}
+
+/// Lamp and glow light on the surface the pixel shows, resampled from this
+/// frame's candidates, the pixel's reservoir of last frame and its neighbours'.
+float3 reusedLamps(FrameConstants frame, Surface surface, float3 view, float3 start, out float3 shine) {
+    Resampling fresh = freshCandidates(frame, surface, view);
+    if (fresh.reservoir.worth > 0.0) {
+        if (pathAny(start, fresh.toward, fresh.reach)) fresh.reservoir.worth = 0.0;
+    }
+    Resampling resampling = emptyResampling();
+    resampling.reservoir.pick = fresh.reservoir.pick;
+    resampling.reservoir.count = fresh.reservoir.count;
+    resampling.light = fresh.light;
+    resampling.shine = fresh.shine;
+    resampling.toward = fresh.toward;
+    resampling.reach = fresh.reach;
+    resampling.target = fresh.target;
+    resampling.weight_sum = fresh.target * fresh.reservoir.worth * fresh.reservoir.count;
+    bool reused = false;
+    float2 was_at;
+    bool seen = false;
+    was_at = float2(0.0);
+    if (push.reusable != 0u) seen = seenBefore(frame, reuse_point, reuse_reach, reuse_mirrored, was_at);
+    was_at *= frame.resolution;
+    if (seen) {
+        float expected = distance(push.previous_camera, reuse_point);
+        float limit = reused_frames * max(fresh.reservoir.count, 1.0);
+        int2 last = int2(frame.resolution) - 1;
+        for (int index = 0; index <= reused_neighbours; index++) {
+            float2 place = was_at;
+            if (index > 0) {
+                float turn = 2.0 * PI * random();
+                place += float2(cos(turn), sin(turn)) * (reused_radius * sqrt(random()));
+            }
+            int2 at = int2(floor(place));
+            if (any(at < 0) || any(at > last)) continue;
+            if (!alike(frame, at, surface, expected, index == 0 ? 0.03 : 0.1)) continue;
+            Reservoir before = unpackReservoir(fetchTexel(push.history_reservoir, at));
+            if (before.count <= 0.0) continue;
+            if (offer(resampling, frame, surface, view, before.pick, before.worth, min(before.count, limit))) reused = true;
+        }
+    }
+    settle(resampling);
+    if (reused && resampling.reservoir.worth > 0.0) {
+        if (pathAny(start, resampling.toward, resampling.reach)) resampling.reservoir.worth = 0.0;
+    }
+    reservoir_kept = packReservoir(resampling.reservoir);
+    shine = resampling.shine * resampling.reservoir.worth;
+    return resampling.light * resampling.reservoir.worth;
+}
+
+/// Sun light on `surface`. `lamps` is the light of lamps and glowing triangles
+/// and `shine` the specular part of that.
+float3 directLight(FrameConstants frame, Surface surface, float3 view, bool reusing, out float3 lamps, out float3 shine) {
+    float3 total = float3(0.0);
+    lamps = float3(0.0);
+    shine = float3(0.0);
+    float3 sun_shine;
+    float3 start = surface.position + surface.flat_normal * 0.002;
+    if (dot(frame.sun_radiance, float3(1.0)) > 0.0) {
+        TangentBasis basis = tangentBasis(frame.sun_direction);
+        float2 xi = randomPair();
+        float turn = 2.0 * PI * xi.x;
+        float reach = push.sun_radius * sqrt(xi.y);
+        float3 toward = normalize(basis.toWorld(float3(cos(turn) * reach, sin(turn) * reach, 1.0)));
+        float3 response = surfaceResponse(surface, view, toward, sun_shine);
+        if (dot(response, float3(1.0)) > 0.0 && dot(surface.flat_normal, toward) > 0.0) {
+            if (!pathAny(start, toward, 1e4)) total += response * frame.sun_radiance * cloudShadow(frame, surface.position) * fluidShadow(frame, surface.position);
+        }
+    }
+    if (min(frame.light_count, push.light_count) == 0u && push.glowing_count == 0u) return total;
+    if (reusing) {
+        lamps = reusedLamps(frame, surface, view, start, shine);
+        return total;
+    }
+    Resampling fresh = freshCandidates(frame, surface, view);
+    bool reached = false;
+    if (fresh.reservoir.worth > 0.0) reached = !pathAny(start, fresh.toward, fresh.reach);
+    if (reached) {
+        float through_smoke = fluidShadowToward(frame, start, fresh.toward, fresh.reach);
+        lamps = fresh.light * fresh.reservoir.worth * through_smoke;
+        shine = fresh.shine * fresh.reservoir.worth * through_smoke;
+    }
+    return total;
+}
+
+float3 visibleFacet(float3 view, float alpha, float2 xi) {
+    float3 stretched = normalize(float3(alpha * view.xy, view.z));
+    float across = dot(stretched.xy, stretched.xy);
+    float3 side = across > 0.0 ? float3(-stretched.y, stretched.x, 0.0) * rsqrt(across) : float3(1.0, 0.0, 0.0);
+    float3 other = cross(stretched, side);
+    float radius = sqrt(xi.x);
+    float turn = 2.0 * PI * xi.y;
+    float a = radius * cos(turn);
+    float b = radius * sin(turn);
+    float lean = 0.5 * (1.0 + stretched.z);
+    b = (1.0 - lean) * sqrt(max(1.0 - a * a, 0.0)) + lean * b;
+    float3 facet = a * side + b * other + sqrt(max(1.0 - a * a - b * b, 0.0)) * stretched;
+    return normalize(float3(alpha * facet.xy, max(facet.z, 1e-6)));
+}
+
+float reflectedShare(float n_dot_l, float n_dot_v, float alpha) {
+    float a2 = alpha * alpha;
+    float seen_out = sqrt(a2 + (1.0 - a2) * n_dot_l * n_dot_l);
+    float seen_in = sqrt(a2 + (1.0 - a2) * n_dot_v * n_dot_v);
+    return n_dot_l * (n_dot_v + seen_in) / max(n_dot_v * seen_out + n_dot_l * seen_in, 1e-6);
+}
+
+float3 tracePath(FrameConstants frame, float3 origin, float3 direction, bool scattering, out float3 soft, out float3 indirect, out float3 gloss) {
+    soft = float3(0.0);
+    indirect = float3(0.0);
+    gloss = float3(0.0);
+    bool glossy_first = false;
+    bool awaiting_reach = false;
+    float travelled = 0.0;
+    bool rough_bounce = false;
+    bool split = false;
+    bool unaimed = true;
+    float3 gathered = float3(0.0);
+    float3 carried = float3(1.0);
+    float cone_width = 0.0;
+    float cone_angle = 2.0 / (abs(frame.proj[1][1]) * frame.resolution.y);
+    for (uint bounce = 0u; bounce <= push.bounces; bounce++) {
+        TraceHit hit;
+        bool met;
+        Surface surface;
+        for (uint holes = 0u;; holes++) {
+            met = tracer.closest(origin, direction, 1e5, RAY_EVERYTHING, Cutouts.whole, hit);
+            if (!met) break;
+            surface = pathSurface(frame, hit, origin, direction, cone_width + cone_angle * hit.t);
+            if (surface.through < 1.0 || holes >= 16u) break;
+            cone_width += cone_angle * hit.t;
+            travelled += hit.t;
+            origin = surface.position + direction * 0.002;
+        }
+        if (awaiting_reach) {
+            gloss_reach = met ? hit.t : 1000.0;
+            awaiting_reach = false;
+        }
+        if (!met) {
+            float3 sky = carried * skyLight(frame, direction, unaimed);
+            if (glossy_first) gloss += sky;
+            else if (!rough_bounce) gathered += sky;
+            else indirect += sky;
+            break;
+        }
+        cone_width += cone_angle * hit.t;
+        travelled += hit.t;
+        if (rough_bounce) surface.roughness = max(surface.roughness, softened_mirror);
+        float let_through = surface.through;
+        float mirrored = 0.0;
+        if (surface.bend > 0.0) {
+            float facing = clamp(dot(surface.normal, -direction), 0.0, 1.0);
+            float head_on = (surface.bend - 1.0) / (surface.bend + 1.0);
+            head_on *= head_on;
+            float bounced_off = head_on + (1.0 - head_on) * pow(1.0 - facing, 5.0);
+            mirrored = let_through * bounced_off;
+            let_through -= mirrored;
+        }
+        float chosen = 1.0;
+        if (let_through + mirrored > 0.0) chosen = random();
+        if (chosen >= let_through && chosen < let_through + mirrored) {
+            direction = reflect(direction, surface.normal);
+            origin = surface.position + direction * 0.002;
+            continue;
+        }
+        if (chosen < let_through) {
+            origin = surface.position + direction * 0.002;
+            if (surface.bend > 0.0) {
+                float3 bent = refract(direction, surface.normal, 1.0 / surface.bend);
+                if (dot(bent, bent) > 0.0) direction = normalize(bent);
+                origin = surface.position - surface.flat_normal * 0.002;
+                carried *= lerp(float3(1.0), surface.albedo, 0.5);
+            }
+            continue;
+        }
+        bool glows = luminance(surface.emissive) > lit_by_itself;
+        bool pure_mirror = mirrorLike(surface) && surface.metallic > 0.5 && !glows;
+        if (!primary_met) {
+            primary_met = true;
+            primary_facing = surface.normal;
+            primary_roughness = surface.roughness;
+            primary_distance = travelled;
+            primary_mirror = pure_mirror;
+        }
+        bool first_here = !first_met && !pure_mirror;
+        if (first_here) {
+            first_met = true;
+            first_distance = travelled;
+            first_mirrored = bounce > 0u;
+            first_color = glows ? float3(0.0) : max(surface.albedo, float3(0.03));
+            first_facing = surface.normal;
+            first_scatter = surface.albedo * (1.0 - surface.metallic);
+            first_reflect = reflectedOverall(lerp(float3(0.04), surface.albedo, surface.metallic), surface.roughness, max(dot(surface.normal, -direction), 0.0));
+            first_roughness = surface.roughness;
+        }
+        if (unaimed || !surface.even_glow) {
+            if (glossy_first) gloss += carried * surface.emissive;
+            else if (!rough_bounce) gathered += carried * surface.emissive;
+            else indirect += carried * surface.emissive;
+        }
+        if (bounce == push.bounces) break;
+        float3 view = -direction;
+        float3 lamps;
+        float3 shine;
+        reuse_point = frame.camera_position + reuse_toward * travelled;
+        reuse_mirrored = first_mirrored;
+        reuse_reach = travelled;
+        float3 sun = carried * directLight(frame, surface, view, reuse_lamps && first_here && !scattering, lamps, shine);
+        lamps *= carried;
+        shine *= carried;
+        if (glossy_first) gloss += sun + lamps;
+        else if (rough_bounce) indirect += sun + lamps;
+        else {
+            gathered += sun;
+            soft += lamps - shine;
+            float shine_brightness = luminance(shine);
+            float most = lamp_clamp * push.clamp_radiance;
+            if (shine_brightness > most) shine *= most / shine_brightness;
+            gathered += shine;
+        }
+        if ((rough_bounce || glossy_first) && !mirrorLike(surface) && push.probes != 0u && (frame.flags & FRAME_GI) != 0u) {
+            float coverage = giCoverage(frame, surface.position);
+            bool ended = false;
+            if (coverage > 0.0) ended = random() < coverage;
+            if (ended) {
+                float3 bounced = carried * surface.albedo * giIrradiance(frame, surface.position, surface.normal, view);
+                if (glossy_first) gloss += bounced;
+                else indirect += bounced;
+                break;
+            }
+        }
+
+        float3 f0 = lerp(float3(0.04), surface.albedo, surface.metallic);
+        float n_dot_v = max(dot(surface.normal, view), 1e-4);
+        float3 fresnel_view = fresnelSchlick(n_dot_v, f0);
+        float3 scattered = surface.albedo * (1.0 - surface.metallic);
+        float mirror_share = luminance(scattered) > 1e-4 ? clamp(luminance(fresnel_view) / (luminance(fresnel_view) + luminance(scattered)), 0.1, 0.9) : 1.0;
+        if (!rough_bounce && !mirrorLike(surface) && surface.roughness < glossy_roughness) mirror_share = max(mirror_share, 0.5);
+        bool reflects;
+        if (!split && !rough_bounce && !glossy_first && mirrorLike(surface) && mirror_share < 1.0) {
+            split = true;
+            split_met = true;
+            reflects = !scattering;
+            mirror_share = reflects ? 1.0 : 0.0;
+            if (scattering) {
+                gathered = float3(0.0);
+                soft = float3(0.0);
+                indirect = float3(0.0);
+                gloss = float3(0.0);
+            }
+        } else {
+            reflects = random() < mirror_share;
+        }
+        TangentBasis basis = tangentBasis(surface.normal);
+        float3 next;
+        if (reflects) {
+            float alpha = surface.roughness * surface.roughness;
+            float3 view_local = basis.toLocal(view);
+            float3 half_vector = basis.toWorld(visibleFacet(float3(view_local.xy, max(view_local.z, 1e-3)), alpha, randomPair()));
+            next = reflect(direction, half_vector);
+            float n_dot_l = dot(surface.normal, next);
+            if (n_dot_l <= 0.0 || dot(surface.flat_normal, next) <= 0.0) break;
+            float3 fresnel = fresnelSchlick(max(dot(view, half_vector), 1e-4), f0);
+            carried *= fresnel * reflectedShare(n_dot_l, n_dot_v, alpha) / mirror_share;
+            unaimed = mirrorLike(surface);
+            if (!rough_bounce && !glossy_first && (unaimed ? mirror_share < 1.0 : surface.roughness < glossy_roughness)) {
+                glossy_first = true;
+                awaiting_reach = true;
+            }
+            if (!unaimed) rough_bounce = true;
+        } else {
+            float2 xi = randomPair();
+            float turn = 2.0 * PI * xi.x;
+            float radius = sqrt(xi.y);
+            next = normalize(basis.toWorld(float3(cos(turn) * radius, sin(turn) * radius, sqrt(max(1.0 - radius * radius, 0.0)))));
+            if (dot(surface.flat_normal, next) <= 0.0) break;
+            carried *= scattered * (1.0 - fresnel_view) / (1.0 - mirror_share);
+            unaimed = false;
+            rough_bounce = true;
+        }
+        cone_angle = max(cone_angle, unaimed ? cone_angle : 0.05 + 0.25 * surface.roughness);
+        if (bounce >= 2u) {
+            float keep = clamp(max(carried.r, max(carried.g, carried.b)), 0.05, 1.0);
+            if (random() > keep) break;
+            carried /= keep;
+        }
+        origin = surface.position + surface.flat_normal * 0.002;
+        direction = next;
+    }
+    return gathered;
+}
+
+float3 historySharp(uint texture_index, uint sampler_index, float2 uv, float2 size) {
+    float2 place = uv * size;
+    float2 base = floor(place - 0.5) + 0.5;
+    float2 f = place - base;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 close = (base + w2 / w12) / size;
+    float2 before = (base - 1.0) / size;
+    float2 after = (base + 2.0) / size;
+    float3 total = sampleTextureLod(texture_index, sampler_index, float2(close.x, before.y), 0.0).rgb * (w12.x * w0.y);
+    total += sampleTextureLod(texture_index, sampler_index, float2(before.x, close.y), 0.0).rgb * (w0.x * w12.y);
+    total += sampleTextureLod(texture_index, sampler_index, float2(close.x, close.y), 0.0).rgb * (w12.x * w12.y);
+    total += sampleTextureLod(texture_index, sampler_index, float2(after.x, close.y), 0.0).rgb * (w3.x * w12.y);
+    total += sampleTextureLod(texture_index, sampler_index, float2(close.x, after.y), 0.0).rgb * (w12.x * w3.y);
+    float weight = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    int2 corner = int2(base - 0.5);
+    int2 last = int2(size) - 1;
+    float3 a = fetchTexel(texture_index, clamp(corner, int2(0), last)).rgb;
+    float3 b = fetchTexel(texture_index, clamp(corner + int2(1, 0), int2(0), last)).rgb;
+    float3 c = fetchTexel(texture_index, clamp(corner + int2(0, 1), int2(0), last)).rgb;
+    float3 d = fetchTexel(texture_index, clamp(corner + int2(1, 1), int2(0), last)).rgb;
+    return clamp(total / weight, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));
+}
+
+bool broken(float3 value) {
+    return any(isnan(value)) || any(isinf(value));
+}
+
+bool broken(float4 value) {
+    return any(isnan(value)) || any(isinf(value));
+}
+
+/// Traces the pixel whose center is `position`.
+Output tracePixel(float4 position) {
+    FrameConstants frame = push.frame;
+    fragment = position.xy;
+    tracer.frame = frame;
+#ifdef SOFTWARE_RAYS
+    tracer.scene_nodes = push.scene;
+    tracer.scene_instances = push.scene_instances;
+    tracer.mesh_nodes = push.mesh_nodes;
+    tracer.mesh_items = push.mesh_items;
+#else
+    tracer.scene = push.scene;
+#endif
+    int2 pixel = int2(fragment);
+    random_state = pcg(uint(pixel.x) + pcg(uint(pixel.y) + pcg(push.gathered * 7919u + frame.frame_index)));
+    sequence_seed = pcg(uint(pixel.x) + pcg(uint(pixel.y)));
+    sequence_dimension = 0u;
+    reservoir_kept = float4(0.0);
+    reuse_toward = normalize(worldPositionFromDepth((float2(pixel) + 0.5) * frame.inv_resolution, 0.5, frame.inv_view_proj) - frame.camera_position);
+    float3 total = float3(0.0);
+    float3 total_soft = float3(0.0);
+    float3 total_lamp = float3(0.0);
+    float3 total_raw = float3(0.0);
+    float3 total_scatter = float3(0.0);
+    float3 total_reflect = float3(0.0);
+    float4 total_facing = float4(0.0);
+    float3 total_gloss = float3(0.0);
+    float3 guide = float3(0.0);
+    uint samples = max(push.samples, 1u);
+    for (uint index = 0u; index < samples; index++) {
+        sequence_index = frame.frame_index * samples + index;
+        float2 offset = float2(0.5);
+        if (push.centered == 0u) offset = randomPair();
+        float2 uv = (float2(pixel) + offset) * frame.inv_resolution;
+        float3 through = worldPositionFromDepth(uv, 0.5, frame.inv_view_proj);
+        float3 direction = normalize(through - frame.camera_position);
+        first_met = false;
+        first_distance = 60000.0;
+        first_mirrored = false;
+        first_color = float3(0.0);
+        first_facing = float3(0.0, 1.0, 0.0);
+        first_scatter = float3(0.0);
+        first_reflect = float3(0.0);
+        first_roughness = 1.0;
+        primary_met = false;
+        primary_facing = float3(0.0, 1.0, 0.0);
+        primary_roughness = 1.0;
+        primary_distance = 60000.0;
+        primary_mirror = false;
+        gloss_reach = 0.0;
+        float3 soft;
+        float3 indirect;
+        float3 gloss;
+        split_met = false;
+        reuse_lamps = index == 0u;
+        float3 light = tracePath(frame, frame.camera_position, direction, false, soft, indirect, gloss);
+        if (split_met) {
+            split_met = false;
+            reuse_lamps = false;
+            float3 scattered_soft;
+            float3 scattered_indirect;
+            float3 scattered_gloss;
+            float3 scattered_light = tracePath(frame, frame.camera_position, direction, true, scattered_soft, scattered_indirect, scattered_gloss);
+            if (split_met) {
+                light += scattered_light;
+                soft += scattered_soft;
+                indirect += scattered_indirect;
+                gloss += scattered_gloss;
+            }
+        }
+        if (broken(light)) light = float3(0.0);
+        if (broken(soft)) soft = float3(0.0);
+        if (broken(indirect)) indirect = float3(0.0);
+        if (broken(gloss)) gloss = float3(0.0);
+        float gloss_brightness = luminance(gloss);
+        if (gloss_brightness > push.clamp_radiance) gloss *= push.clamp_radiance / gloss_brightness;
+        float brightness = luminance(indirect);
+        if (brightness > push.clamp_radiance) indirect *= push.clamp_radiance / brightness;
+        float lamp_brightness = luminance(soft);
+        if (lamp_brightness > lamp_clamp * push.clamp_radiance) soft *= lamp_clamp * push.clamp_radiance / lamp_brightness;
+        total += light;
+        float3 tint = dot(first_color, float3(1.0)) > 0.0 ? first_color : float3(1.0);
+        total_soft += indirect / tint;
+        total_lamp += soft / tint;
+        total_raw += light + soft + indirect + gloss;
+        total_scatter += first_scatter;
+        total_reflect += first_reflect;
+        total_facing += float4(first_met ? first_facing : float3(0.0), first_roughness);
+        total_gloss += gloss;
+        guide += first_color;
+    }
+    float3 light = total / float(samples);
+    float3 grainy = total_soft / float(samples);
+    float3 shown = guide / float(samples);
+    float count = 0.0;
+    float3 light_before = float3(0.0);
+    float4 grainy_before = float4(0.0);
+    float3 shown_before = float3(0.0);
+    float4 facing_before = float4(0.0);
+    float3 lamp_before = float3(0.0);
+    if (push.reset == 0u) {
+        if (push.moved == 0u) {
+            float4 before = fetchTexel(push.history_color, pixel);
+            count = before.a;
+            light_before = before.rgb;
+            grainy_before = fetchTexel(push.history_soft, pixel);
+            shown_before = fetchTexel(push.history_guide, pixel).rgb;
+            facing_before = fetchTexel(push.history_facing, pixel);
+            lamp_before = fetchTexel(push.history_lamp, pixel).rgb;
+        } else {
+            float2 center = (float2(pixel) + 0.5) * frame.inv_resolution;
+            float3 toward = normalize(worldPositionFromDepth(center, 0.5, frame.inv_view_proj) - frame.camera_position);
+            float3 spot = frame.camera_position + toward * first_distance;
+            float2 was_at;
+            if (seenBefore(frame, spot, first_distance, first_mirrored, was_at)) {
+                uint linear_sampler = frame.sampler_linear_clamp;
+                float4 guide_before = sampleTextureLod(push.history_guide, linear_sampler, was_at, 0.0);
+                float4 facing_seen = sampleTextureLod(push.history_facing, linear_sampler, was_at, 0.0);
+                float expected = distance(push.previous_camera, spot);
+                bool was_mirrored = facing_seen.a < 0.0;
+                float3 unlike = abs(guide_before.rgb - shown);
+                if (was_mirrored == first_mirrored && abs(abs(facing_seen.a) - expected) <= 0.03 * expected + 0.02 && max(unlike.r, max(unlike.g, unlike.b)) < 0.2) {
+                    count = sampleTextureLod(push.history_color, linear_sampler, was_at, 0.0).a;
+                    light_before = historySharp(push.history_color, linear_sampler, was_at, frame.resolution);
+                    grainy_before = sampleTextureLod(push.history_soft, linear_sampler, was_at, 0.0);
+                    shown_before = guide_before.rgb;
+                    facing_before = facing_seen;
+                    lamp_before = sampleTextureLod(push.history_lamp, linear_sampler, was_at, 0.0).rgb;
+                }
+            }
+            count = min(count, dot(shown, float3(1.0)) > 0.0 && !first_mirrored ? push.history_limit : 6.0);
+        }
+    }
+    if (broken(light_before) || broken(grainy_before) || broken(shown_before) || broken(facing_before) || broken(lamp_before) || isnan(count) || isinf(count)) {
+        count = 0.0;
+        light_before = float3(0.0);
+        lamp_before = float3(0.0);
+        grainy_before = float4(0.0);
+        shown_before = float3(0.0);
+        facing_before = float4(0.0);
+    }
+    if (broken(shown)) shown = float3(0.0);
+    if (isnan(first_distance) || isinf(first_distance)) first_distance = 60000.0;
+    count = min(count, 8192.0);
+    float weight = 1.0 / (count + 1.0);
+    float steady_weight = push.moved != 0u ? max(weight, primary_mirror ? moving_mirror_weight : moving_steady_weight) : weight;
+    Output result;
+    result.color = float4(lerp(light_before, light, steady_weight), count + 1.0);
+    float brightness = min(luminance(grainy), 240.0);
+    result.soft = lerp(grainy_before, float4(grainy, brightness * brightness), weight);
+    float shown_weight = push.moved != 0u ? max(weight, 0.7) : weight;
+    float shown_distance = min(first_distance, 60000.0);
+    result.facing = lerp(facing_before, float4(first_facing, first_mirrored ? -shown_distance : shown_distance), shown_weight);
+    float4 surface_now = float4(unpackSnormPair(packDirection(primary_facing)), primary_roughness, min(primary_distance, 60000.0));
+    float4 surface_before = surface_now;
+    if (push.reset == 0u && push.moved == 0u) surface_before = fetchTexel(push.history_surface, pixel);
+    if (broken(surface_before)) surface_before = surface_now;
+    result.surface = lerp(surface_before, surface_now, weight);
+    float3 gloss_now = min(total_gloss / float(samples), float3(60000.0));
+    float4 gloss_before = float4(0.0);
+    if (push.reset == 0u && push.moved == 0u) gloss_before = fetchTexel(push.history_gloss, pixel);
+    if (broken(gloss_before)) gloss_before = float4(0.0);
+    result.gloss_gathered = float4(lerp(gloss_before.rgb, gloss_now, 1.0 / (gloss_before.a + 1.0)), min(gloss_before.a + 1.0, 8192.0));
+    result.guide = float4(lerp(shown_before, shown, shown_weight), gloss_reach);
+    result.lamp = float4(lerp(lamp_before, min(total_lamp / float(samples), float3(60000.0)), max(weight, 1.0 / push.lamp_limit)), 1.0);
+    result.reservoir = reservoir_kept;
+    if (push.reconstructed != 0u) {
+        result.color = float4(min(total_raw / float(samples), float3(60000.0)), 1.0);
+        result.guide = float4(total_scatter / float(samples), gloss_reach);
+        result.lamp = float4(total_reflect / float(samples), 1.0);
+        result.soft = total_facing / float(samples);
+    }
+    return result;
+}
+
+[shader("fragment")]
+Output fragmentMain(float4 position : SV_Position) {
+    return tracePixel(position);
+}
+
+#ifdef STORAGE_IMAGES
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void computeMain(uint3 id : SV_DispatchThreadID) {
+    if (any(float2(id.xy) >= push.frame.resolution)) return;
+    Output result = tracePixel(float4(float2(id.xy) + 0.5, 0.0, 1.0));
+    storage_2d[push.targets[0]][id.xy] = result.color;
+    storage_2d[push.targets[1]][id.xy] = result.guide;
+    storage_2d[push.targets[2]][id.xy] = result.soft;
+    storage_2d[push.targets[3]][id.xy] = result.facing;
+    storage_2d[push.targets[4]][id.xy] = result.lamp;
+    storage_2d[push.targets[5]][id.xy] = result.gloss_gathered;
+    storage_2d[push.targets[6]][id.xy] = result.surface;
+    storage_2d[push.targets[7]][id.xy] = result.reservoir;
+}
+#endif

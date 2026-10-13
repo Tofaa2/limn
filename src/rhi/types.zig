@@ -49,9 +49,9 @@ pub const DeviceDesc = struct {
     preferred_device: ?[]const u8 = null,
     /// Null for headless use.
     surface: ?Surface = null,
-    /// Enable ray queries when supported; check `Device.ray_tracing`.
+    /// Enable ray queries when supported; check `Device.caps`.
     ray_tracing: bool = true,
-    /// Use mesh shaders when supported; check `Device.mesh_shaders`.
+    /// Use mesh shaders when supported; check `Device.caps`.
     mesh_shaders: bool = true,
     /// File the driver pipeline cache is persisted to.
     pipeline_cache_path: ?[]const u8 = null,
@@ -60,7 +60,7 @@ pub const DeviceDesc = struct {
     /// Prefer an HDR10 surface (10-bit, PQ, Rec.2020) when there is one.
     hdr_output: bool = false,
     /// Enable the extensions NVIDIA's NGX asks for, when the device has them;
-    /// check `Device.nvidia_ngx`.
+    /// check `Device.caps`.
     nvidia_ngx: bool = false,
 };
 
@@ -88,12 +88,12 @@ pub const Format = enum {
     a2b10g10r10_unorm,
     depth16_unorm,
     depth32_float,
-    /// RGBA, 8 bits per texel. Needs `Device.bc_textures`.
+    /// RGBA, 8 bits per texel. Needs `Capabilities.bc_textures`.
     bc7_unorm,
     bc7_srgb,
-    /// Red and green, 8 bits per texel. Needs `Device.bc_textures`.
+    /// Red and green, 8 bits per texel. Needs `Capabilities.bc_textures`.
     bc5_unorm,
-    /// Red, 4 bits per texel. Needs `Device.bc_textures`.
+    /// Red, 4 bits per texel. Needs `Capabilities.bc_textures`.
     bc4_unorm,
     /// From KTX2 files: opaque color at 4 bits per texel, color with alpha
     /// at 8, HDR color at 8.
@@ -150,20 +150,27 @@ pub const TextureUsage = packed struct(u8) {
     copy_src: bool = false,
     /// Implied when the texture has more than one mip level.
     copy_dst: bool = false,
-    /// Storage image for compute shaders; see `Device.storageIndex`. Needs
-    /// `Device.storage_images`.
+    /// Storage image, read and written by shaders; see `Device.storageIndex`. Needs
+    /// `Capabilities.storage_images`.
     storage: bool = false,
     /// Usable as `RenderingDesc.shading_rate`. Needs
-    /// `Device.shading_rate_tile`.
+    /// `Capabilities.shading_rate_tile`.
     shading_rate: bool = false,
     _padding: u1 = 0,
 };
 
 /// Cube faces are in the order +X, -X, +Y, -Y, +Z, -Z. Rendering targets
 /// one layer or face at a time.
-pub const TextureKind = enum { @"2d", @"2d_array", cube };
+pub const TextureKind = enum {
+    @"2d",
+    @"2d_array",
+    cube,
+    /// A volume of `TextureDesc.depth` slices, with one mip and one layer.
+    /// Filled by shaders through `Device.storageIndex`.
+    @"3d",
+};
 
-/// Textures are 2D, single-sampled and device-local.
+/// Textures are single-sampled and device-local.
 pub const TextureDesc = struct {
     /// Debug name, shown when `DeviceDesc.debug_names` or validation is on.
     name: [:0]const u8 = "texture",
@@ -177,6 +184,8 @@ pub const TextureDesc = struct {
     mip_levels: u32 = 1,
     /// Cube textures always have six.
     layers: u32 = 1,
+    /// Slices of a `TextureKind.@"3d"` texture.
+    depth: u32 = 1,
     kind: TextureKind = .@"2d",
 
     /// Levels in a complete mip chain down to 1x1.
@@ -309,7 +318,7 @@ pub const GraphicsPipelineDesc = struct {
     /// Null for depth-only pipelines.
     fragment: ?[]const u8 = null,
     /// Mesh shader replacing `vertex`, and its task shader; drawn with
-    /// `CommandEncoder.drawMeshTasksIndirect`. Needs `Device.mesh_shaders`.
+    /// `CommandEncoder.drawMeshTasksIndirect`. Needs `Capabilities.mesh_shaders`.
     mesh: ?[]const u8 = null,
     task: ?[]const u8 = null,
     /// In attachment order; at most 8.
@@ -385,7 +394,7 @@ pub const RenderingDesc = struct {
     color: []const ColorAttachment = &.{},
     depth: ?DepthAttachment = null,
     /// An `r8_uint` texture of `shadingRate` values, one texel per
-    /// `Device.shading_rate_tile` pixels each way. Null shades every pixel.
+    /// `Capabilities.shading_rate_tile` pixels each way. Null shades every pixel.
     shading_rate: ?Texture = null,
 };
 
@@ -417,6 +426,7 @@ pub const TextureInfo = struct {
     /// 6 for cube textures.
     layers: u32,
     kind: TextureKind,
+    depth: u32 = 1,
 };
 
 /// GPU time of one `CommandEncoder.beginScope` region.
@@ -435,6 +445,28 @@ pub const AdapterKind = enum {
     /// A CPU rasterizer, such as Mesa's lavapipe.
     software,
     other,
+};
+
+/// What a device can do, in `Device.caps`. Each optional feature is used only
+/// where its field says it is there.
+pub const Capabilities = struct {
+    /// Ray queries and acceleration structures.
+    ray_tracing: bool = false,
+    /// Task and mesh shaders.
+    mesh_shaders: bool = false,
+    /// Shaders can read and write textures (`TextureUsage.storage`).
+    storage_images: bool = false,
+    /// BC texture formats.
+    bc_textures: bool = false,
+    /// Pixels per shading rate texel each way; 0 when unsupported.
+    shading_rate_tile: u32 = 0,
+    /// `Device.createSharedTexture` works.
+    shared_textures: bool = false,
+    /// The extensions NVIDIA's NGX asks for are enabled; see
+    /// `DeviceDesc.nvidia_ngx`.
+    nvidia_ngx: bool = false,
+    /// Largest width or height of a 2D texture.
+    max_texture_size: u32 = 0,
 };
 
 /// From `Device.adapterInfo`.

@@ -32,7 +32,7 @@ const scales = [_]f32{ 0.5, 0.59, 0.67, 0.77, 1.0 };
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    var mode: gfx.Upscaling = .fsr3;
+    var mode: gfx.Upscaler = .fsr3;
     var scale_index: usize = 1;
     var coarse_shading = false;
     var frame_generation = false;
@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
     const sky = gfx.SkyDesc{ .sun_direction = .{ -0.55, -0.6, -0.35 } };
     renderer.scenes.setSun(scene, gfx.skySun(sky));
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky), .intensity = 1 });
 
     var positions: [24][3]f32 = undefined;
     var indices: [36]u32 = undefined;
@@ -178,15 +178,13 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.0, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = .{
-                    .render_scale = scale,
-                    .upscaling = mode,
-                    .frame_generation = frame_generation,
-                    .variable_rate_shading = coarse_shading,
-                    .shadow_distance = 45,
-                    .global_illumination = false,
+                    .resolution = .{ .scale = scale, .upscaler = mode, .frame_generation = if (frame_generation) .fsr3 else null },
+                    .shading = .{ .variable_rate = coarse_shading },
+                    .shadows = .{ .distance = 45 },
+                    .global_illumination = null,
                 },
             }},
             .delta_time = tick.dt,

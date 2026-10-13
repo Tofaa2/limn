@@ -31,9 +31,9 @@ pub const Environments = struct {
     }
 
     /// Starts loading an environment: an equirectangular `.hdr`, or a KTX2
-    /// cube of half floats or BC6H. Radiance is clamped to `max_radiance`.
-    /// A BC6H cube's `brightest_direction` stays straight up.
-    pub fn load(environments: *Environments, path: []const u8, max_radiance: f32) !Environment {
+    /// cube of half floats or BC6H. A BC6H cube's `brightest_direction`
+    /// stays straight up.
+    pub fn load(environments: *Environments, path: []const u8, options: api.EnvironmentOptions) !Environment {
         const self = environments.renderer();
         self.lock();
         defer self.unlock();
@@ -41,7 +41,7 @@ pub const Environments = struct {
         errdefer self.gpa.destroy(job);
         job.* = .{ .gpa = self.options.job_allocator orelse std.heap.smp_allocator, .io = self.io, .path = try self.gpa.dupe(u8, path) };
         errdefer self.gpa.free(job.path);
-        const environment = try self.environments.table.insert(.{ .job = job, .max_radiance = max_radiance });
+        const environment = try self.environments.table.insert(.{ .job = job, .max_radiance = options.max_radiance });
         job.group.concurrent(self.io, runEnvironmentJob, .{job}) catch job.group.async(self.io, runEnvironmentJob, .{job});
         self.loading_count += 1;
         return environment;
@@ -138,7 +138,7 @@ pub fn bakeSky(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.CommandEncod
             clouds.depth = self.device.samplerIndex(self.sampler_linear_clamp);
         };
         try cmd.beginRendering(.{ .color = &.{.{ .texture = sky, .layer = face, .load = .discard }} });
-        cmd.bindPipeline(self.pipelines.env_sky);
+        cmd.bindPipeline(try self.pipelines.get(.env_sky));
         cmd.pushConstants(extern struct { to_sun: [3]f32, face: u32, ground_color: [3]f32, turbidity: f32, intensity: f32, max_radiance: f32, sun_disc: f32, stars: f32, to_moon: [3]f32, moon: f32, ozone: f32, clouds: gpu.Clouds }{
             .to_sun = math.scale(math.normalize(desc.sun_direction), -1),
             .face = @intCast(face),
@@ -181,7 +181,7 @@ pub fn finalizeEnvironment(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.
     var from_cube = false;
     const source = if (job.cube) |cube| blk: {
         from_cube = true;
-        if (cube.format == .bc6h and !device.bc_textures) return error.UnsupportedTextureFormat;
+        if (cube.format == .bc6h and !device.caps.bc_textures) return error.UnsupportedTextureFormat;
         if (job.cube_brightest) |direction| entry.brightest_direction = direction;
         const format: rhi.Format = if (cube.format == .bc6h) .bc6h_ufloat else .rgba16_float;
         const texture = try device.createTexture(.{
@@ -242,7 +242,7 @@ fn drawEnvironmentFace(self: *Renderer, cmd: *rhi.CommandEncoder, entry: *const 
         clouds.depth = device.samplerIndex(self.sampler_linear_clamp);
     }
     try cmd.beginRendering(.{ .color = &.{.{ .texture = target, .layer = face, .load = .discard }} });
-    cmd.bindPipeline(self.pipelines.env_cube);
+    cmd.bindPipeline(try self.pipelines.get(.env_cube));
     cmd.pushConstants(extern struct { source: u32, sampler: u32, face: u32, max_radiance: f32, from_cube: u32, to_sun: [3]f32, sunlight: [3]f32, clouds: gpu.Clouds }{
         .source = device.textureIndex(source),
         .sampler = device.samplerIndex(if (from_cube) self.sampler_linear_clamp else self.sampler_linear_repeat),
@@ -337,7 +337,7 @@ fn filterIrradiance(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.Command
     const irradiance = entry.irradiance.?;
     for (0..6) |face| {
         try cmd.beginRendering(.{ .color = &.{.{ .texture = irradiance, .layer = @intCast(face), .load = .discard }} });
-        cmd.bindPipeline(self.pipelines.env_irradiance);
+        cmd.bindPipeline(try self.pipelines.get(.env_irradiance));
         cmd.pushConstants(extern struct { source: u32, sampler: u32, face: u32, source_size: f32 }{
             .source = device.textureIndex(entry.sky.?),
             .sampler = device.samplerIndex(self.sampler_linear_clamp),
@@ -357,7 +357,7 @@ fn filterSpecularMip(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.Comman
     const roughness = @as(f32, @floatFromInt(mip)) / @as(f32, env_specular_mips - 1);
     for (0..6) |face| {
         try cmd.beginRendering(.{ .color = &.{.{ .texture = specular, .mip = mip, .layer = @intCast(face), .load = .discard }} });
-        cmd.bindPipeline(self.pipelines.env_prefilter);
+        cmd.bindPipeline(try self.pipelines.get(.env_prefilter));
         cmd.pushConstants(extern struct { source: u32, sampler: u32, face: u32, source_size: f32, roughness: f32 }{
             .source = device.textureIndex(entry.sky.?),
             .sampler = device.samplerIndex(self.sampler_linear_clamp),

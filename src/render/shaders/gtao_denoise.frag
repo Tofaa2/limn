@@ -21,7 +21,7 @@ void main() {
     FrameConstants frame = push.frame;
     uint nearest = frame.sampler_nearest_clamp;
     float raw_depth = texelFetch(TEX(push.depth_texture, nearest), ivec2(gl_FragCoord.xy), 0).r;
-    float center = linearDepth(raw_depth, frame.near);
+    float center = linearDepth(raw_depth, frame.depth_terms);
     float lowest = 1e9;
     float highest = 0.0;
     float total = 0.0;

@@ -1,10 +1,10 @@
 //! Instance groups. Internal to the renderer.
 const std = @import("std");
+const impostors_feature = @import("../features/impostors.zig");
 const handle = @import("../../handle.zig");
 const math = @import("../../math.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
-const impostor_passes = @import("../passes/impostors.zig");
 const render = @import("../renderer.zig");
 
 const Renderer = render.Renderer;
@@ -26,7 +26,7 @@ pub const Instances = struct {
 
     /// Places many static copies of a model, stored on the GPU. They do not
     /// animate and blended meshes are skipped. They take part in probe GI
-    /// while the scene holds at most `Options.gi_instance_limit` of them.
+    /// while the scene holds at most `Options.ray_tracing.instance_limit` of them.
     pub fn create(instances: *Instances, scene: Scene, model: Model, transforms: []const Mat4) !InstanceGroup {
         const self = instances.renderer();
         self.lock();
@@ -109,7 +109,7 @@ pub const Instances = struct {
         scene.static_version += 1;
         const wanted = desc orelse return;
         const resolution = std.math.clamp(wanted.resolution, 16, 256);
-        const size = resolution * impostor_passes.frames;
+        const size = resolution * impostors_feature.frames;
         const color = try self.device.createTexture(.{ .name = "impostor color", .width = size, .height = size, .format = .rgba8_srgb, .usage = .{ .sampled = true, .color_attachment = true } });
         errdefer self.device.destroyTexture(color);
         const normal = try self.device.createTexture(.{ .name = "impostor normal", .width = size, .height = size, .format = .rgba8_unorm, .usage = .{ .sampled = true, .color_attachment = true } });

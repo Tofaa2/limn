@@ -138,12 +138,13 @@ float contactShadow(FrameConstants frame, vec3 position, float noise) {
     for (int i = 0; i < steps; i++) {
         point += stride;
         vec4 clip = frame.view_proj * vec4(point, 1.0);
-        if (clip.w <= frame.near) break;
+        float along = clipDepth(frame, clip);
+        if (along <= frame.near) break;
         vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
         if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) break;
-        float scene = linearDepth(textureLod(TEX(frame.contact_depth, frame.sampler_nearest_clamp), uv, 0.0).r, frame.near);
-        float behind = clip.w - scene;
-        if (behind > 0.01 * clip.w + 0.005 && behind < frame.contact_length) return 0.0;
+        float scene = linearDepth(textureLod(TEX(frame.contact_depth, frame.sampler_nearest_clamp), uv, 0.0).r, frame.depth_terms);
+        float behind = along - scene;
+        if (behind > 0.01 * along + 0.005 && behind < frame.contact_length) return 0.0;
     }
 #endif
     return 1.0;
@@ -397,7 +398,7 @@ float softShadowHistory(FrameConstants frame) {
         float value = texelFetch(TEX(soft_history_texture, frame.sampler_nearest_clamp), clamp(at + offsets[i], ivec2(0), last), 0).a;
         if (value > 1.0) continue;
         if (expected > 0.0) {
-            float there = linearDepth(texelFetch(TEX(soft_history_depth_texture, frame.sampler_nearest_clamp), clamp(ivec2((vec2(at + offsets[i]) + 0.5) * scale), ivec2(0), depth_last), 0).r, frame.near);
+            float there = linearDepth(texelFetch(TEX(soft_history_depth_texture, frame.sampler_nearest_clamp), clamp(ivec2((vec2(at + offsets[i]) + 0.5) * scale), ivec2(0), depth_last), 0).r, frame.depth_terms);
             if (abs(there - expected) > soft_history_slack) continue;
         }
         float tap = i == 0 ? 2.0 : 1.0;

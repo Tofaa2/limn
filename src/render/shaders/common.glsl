@@ -11,14 +11,19 @@ layout(set = 0, binding = 0) uniform utexture2D textures_2d_uint[];
 layout(set = 0, binding = 0) uniform textureCube textures_cube[];
 layout(set = 0, binding = 0) uniform texture2DArray textures_2d_array[];
 layout(set = 0, binding = 1) uniform sampler samplers[];
+layout(set = 0, binding = 0) uniform texture3D textures_3d[];
 #ifdef STORAGE_IMAGES
-layout(set = 0, binding = 2) uniform writeonly image2D storage_2d[];
+#extension GL_EXT_shader_image_load_formatted : require
+layout(set = 0, binding = 2) uniform image2D storage_2d[];
+layout(set = 0, binding = 3) uniform image3D storage_3d[];
 #define STORAGE(index) storage_2d[index]
+#define STORAGE_3D(index) storage_3d[index]
 #endif
 layout(set = 0, binding = 1) uniform samplerShadow samplers_shadow[];
 
 #define TEX(texture_index, sampler_index) sampler2D(textures_2d[nonuniformEXT(texture_index)], samplers[nonuniformEXT(sampler_index)])
 #define TEX_UINT(texture_index, sampler_index) usampler2D(textures_2d_uint[nonuniformEXT(texture_index)], samplers[nonuniformEXT(sampler_index)])
+#define TEX_3D(texture_index, sampler_index) sampler3D(textures_3d[nonuniformEXT(texture_index)], samplers[nonuniformEXT(sampler_index)])
 #define TEX_CUBE(texture_index, sampler_index) samplerCube(textures_cube[nonuniformEXT(texture_index)], samplers[nonuniformEXT(sampler_index)])
 
 const float PI = 3.14159265358979;
@@ -33,32 +38,7 @@ const uint INSTANCE_PROXY = 8u;
 const uint INSTANCE_AIMED = 16u;
 const uint INSTANCE_PREVIOUS = 32u;
 
-const uint FRAME_SHADOWS = 1u;
-const uint FRAME_AMBIENT_OCCLUSION = 2u;
-const uint FRAME_ENVIRONMENT = 4u;
-const uint FRAME_TEMPORAL = 8u;
-const uint FRAME_GI = 16u;
-const uint FRAME_SPECULAR_AA = 32u;
-const uint FRAME_SSR = 64u;
-const uint FRAME_CLOUD_SHADOWS = 128u;
-const uint FRAME_GI_LOCAL_LIGHTS = 256u;
-const uint FRAME_FLUID_SHADOWS = 512u;
-const uint FRAME_COLORED_SHADOWS = 1024u;
-const uint FRAME_REFLECT_TRANSPARENT = 2048u;
-const uint FRAME_FLUID_RAYS = 4096u;
-const uint FRAME_VSM = 8192u;
-
 layout(constant_id = 0) const uint SHADE_FEATURES = 0xffffffffu;
-const uint FEATURE_LOCAL_LIGHTS = 1u;
-const uint FEATURE_SIZED_LIGHTS = 2u;
-const uint FEATURE_TRACED_LIGHT_SHADOWS = 4u;
-const uint FEATURE_FLUID_SHADOWS = 8u;
-const uint FEATURE_CLOUD_SHADOWS = 16u;
-const uint FEATURE_DECALS = 32u;
-const uint FEATURE_TEXTURE_TRANSFORMS = 64u;
-const uint FEATURE_COLORED_SHADOWS = 128u;
-const uint FEATURE_GI_RELOCATION = 256u;
-const uint FEATURE_AERIAL = 512u;
 const uint MATERIAL_BLEND = 4u;
 const uint MATERIAL_SPECULAR_GLOSSINESS = 8u;
 const uint MATERIAL_SWAY_WEIGHTS = 16u;
@@ -388,98 +368,7 @@ layout(buffer_reference, scalar) readonly buffer FluidList {
 
 layout(buffer_reference) buffer Vsm;
 
-layout(buffer_reference, scalar) readonly buffer FrameConstants {
-    mat4 view;
-    mat4 proj;
-    mat4 view_proj;
-    mat4 inv_view_proj;
-    mat4 view_proj_unjittered;
-    mat4 prev_view_proj_unjittered;
-    mat4 inv_view;
-    mat4 inv_proj;
-    mat4 cascade_view_proj[4];
-    vec4 cascade_splits;
-    vec4 cascade_texel_size;
-    vec3 camera_position;
-    float near;
-    vec3 sun_direction;
-    float shadow_softness;
-    vec3 sun_radiance;
-    float env_intensity;
-    vec2 resolution;
-    vec2 inv_resolution;
-    vec2 jitter;
-    vec2 prev_jitter;
-    uint frame_index;
-    float time;
-    float delta_time;
-    uint flags;
-    uint shadow_map;
-    uint shadow_sampler;
-    uint env_specular;
-    uint env_irradiance;
-    uint env_sky;
-    uint brdf_lut;
-    uint sampler_linear_clamp;
-    uint sampler_nearest_clamp;
-    float env_specular_mips;
-    uint light_count;
-    uint sampler_linear_repeat;
-    uint decal_count;
-    uint local_shadow_map;
-    uint local_shadow_sampler;
-    float cluster_z_scale;
-    float cluster_z_bias;
-    vec3 gi_origin;
-    float gi_spacing;
-    ivec3 gi_counts;
-    uint gi_irradiance;
-    uint gi_visibility;
-    float gi_intensity;
-    float texture_gradient_scale;
-    uint gi_scroll;
-    vec3 gi2_origin;
-    float gi2_spacing;
-    ivec3 gi2_counts;
-    uint gi2_irradiance;
-    uint gi2_visibility;
-    uint gi2_scroll;
-    uint shadow_taps;
-    uint contact_depth;
-    float contact_length;
-    uint tlas_low;
-    uint tlas_high;
-    float aerial;
-    uint shadow_color;
-    uint probe_count;
-    uint gi_offsets;
-    uint gi2_offsets;
-    vec3 gi3_origin;
-    float gi3_spacing;
-    ivec3 gi3_counts;
-    uint gi3_irradiance;
-    uint gi3_visibility;
-    uint gi3_scroll;
-    uint gi3_offsets;
-    uint gi3_pad;
-    Vertices vertices;
-    Indices indices;
-    Meshlets meshlets;
-    Meshes meshes;
-    Materials materials;
-    Instances instances;
-    PreviousTransforms previous_transforms;
-    Vsm vsm;
-    MeshletRefs meshlet_refs;
-    Lights lights;
-    Clusters clusters;
-    ShadowTiles shadow_tiles;
-    Exposure exposure;
-    Decals decals;
-    CloudRef clouds;
-    FluidList fluids;
-    ReflectionProbes probes;
-};
+#include "frame_constants.glsl"
 
 mat4x3 previousTransform(FrameConstants frame, Instance instance, uint index) {
     if ((instance.flags & INSTANCE_PREVIOUS) != 0u) return frame.previous_transforms.data[index];
@@ -515,8 +404,26 @@ vec3 hdr10Encode(vec3 nits) {
     return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), vec3(78.84375));
 }
 
-float linearDepth(float depth, float near) {
-    return near / max(depth, 1e-9);
+/// The point of the lens that sees `position`: the camera, or in a parallel
+/// view the point straight behind `position`.
+vec3 eyePoint(FrameConstants frame, vec3 position) {
+    if (frame.parallel == 0.0) return frame.camera_position;
+    return position - frame.eye_axis * dot(position - frame.camera_position, frame.eye_axis);
+}
+
+/// Distance along the view of a depth, by `FrameConstants.depth_terms`.
+float linearDepth(float depth, vec4 terms) {
+    return (terms.y + terms.x * depth) / max(terms.z * depth + terms.w, 1e-9);
+}
+
+/// Distance along the view of a point in clip space.
+float clipDepth(FrameConstants frame, vec4 clip) {
+    return frame.parallel != 0.0 ? linearDepth(clip.z, frame.depth_terms) : clip.w;
+}
+
+/// The depth of a point `distance` along the view; `linearDepth` undone.
+float depthAt(float distance, vec4 terms) {
+    return (terms.y - terms.w * distance) / (terms.z * distance - terms.x);
 }
 
 vec3 swayOffset(float sway, uint flags, vec3 origin, vec3 world, vec2 weights, float time) {

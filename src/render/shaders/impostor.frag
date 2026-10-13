@@ -38,7 +38,7 @@ void main() {
     Surface surface;
     surface.position = in_position;
     surface.normal = normal;
-    surface.view = normalize(frame.camera_position - in_position);
+    surface.view = normalize(eyePoint(frame, in_position) - in_position);
     surface.diffuse_color = color.rgb * unpackUnorm4x8(in_textures.z).rgb;
     surface.f0 = vec3(0.04);
     surface.roughness = 0.9;

@@ -25,7 +25,8 @@ layout(buffer_reference, scalar) readonly buffer CullView {
     float receiver_near;
     float receiver_pad;
     vec2 lens_shift;
-    vec2 view_pad;
+    float far;
+    float view_pad;
 };
 
 const uint PHASE_SINGLE = 0u;

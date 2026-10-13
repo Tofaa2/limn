@@ -17,9 +17,9 @@ void main() {
     float depth = texelFetch(TEX(clouds.depth_texture, frame.sampler_nearest_clamp), ivec2(gl_FragCoord.xy), 0).r;
     if (depth > 0.0) {
         vec3 position = worldPositionFromDepth(in_uv, depth, frame.inv_view_proj);
-        vec3 direction = normalize(position - frame.camera_position);
+        vec3 direction = normalize(position - eyePoint(frame, position));
         vec2 segment = cloudSegment(clouds, frame.camera_position.y, direction.y);
-        if (segment.y <= segment.x || length(position - frame.camera_position) <= segment.x) discard;
+        if (segment.y <= segment.x || length(position - eyePoint(frame, position)) <= segment.x) discard;
     }
     vec4 result = textureLod(TEX(push.cloud_texture, frame.sampler_linear_clamp), in_uv, 0.0);
     result.a = min(result.a, 1.0);

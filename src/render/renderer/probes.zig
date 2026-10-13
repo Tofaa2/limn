@@ -98,7 +98,7 @@ pub fn freeProbe(self: *Renderer, probe: *ProbeData) void {
     self.device.destroyTexture(probe.target);
     if (self.views.table.remove(probe.view)) |removed_view| {
         var removed = removed_view;
-        removed.deinit(self.device);
+        removed.deinit(self.gpa, self.device);
     }
 }
 
@@ -133,17 +133,14 @@ pub fn captureProbes(self: *Renderer, frame: rhi.Frame, delta_time: f32, arena: 
                 .camera = .{ .position = probe.desc.position, .forward = axes[0], .up = axes[1], .fov_y = std.math.pi * 0.5, .near = 0.05 },
                 .target = .{ .texture = probe.target },
                 .settings = .{
-                    .temporal_antialiasing = false,
-                    .screen_space_reflections = false,
-                    .occlusion_culling = false,
-                    .automatic_exposure = false,
-                    .gi_follow_camera = false,
-                    .ao_temporal_filter = false,
-                    .cloud_temporal_filter = false,
-                    .shadow_cascade_stagger = false,
-                    .light_shadow_filter = false,
-                    .bloom = 0,
-                    .sharpen = 0,
+                    .resolution = .{ .temporal_antialiasing = false, .sharpen = 0 },
+                    .reflections = null,
+                    .geometry = .{ .occlusion_culling = false },
+                    .post = .{ .automatic_exposure = false, .bloom = 0 },
+                    .global_illumination = .{ .probes = .{ .follow_camera = false } },
+                    .clouds = .{ .temporal_filter = false },
+                    .shadows = .{ .cascade_stagger = false, .light_filter = false },
+                    .ambient_occlusion = .{ .temporal_filter = false, .bounce = 0 },
                 },
             }, delta_time, arena);
             const state = &(self.views.table.get(probe.view).?.state orelse return);
@@ -152,7 +149,7 @@ pub fn captureProbes(self: *Renderer, frame: rhi.Frame, delta_time: f32, arena: 
             const right = math.normalize(math.cross(forward, axes[1]));
             const up = math.cross(right, forward);
             try cmd.beginRendering(.{ .color = &.{.{ .texture = probe.cubes.sky.?, .layer = @intCast(face), .load = .discard }} });
-            cmd.bindPipeline(self.pipelines.probe_face);
+            cmd.bindPipeline(try self.pipelines.get(.probe_face));
             cmd.pushConstants(extern struct { source: u32, sampler: u32, face: u32, max_radiance: f32, right: [3]f32, up: [3]f32, forward: [3]f32 }{
                 .source = device.textureIndex(state.hdr),
                 .sampler = device.samplerIndex(self.sampler_linear_clamp),

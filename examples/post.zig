@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ 0.55, -0.22, -0.8 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
@@ -105,23 +105,26 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const settings = gfx.Settings{
-            .shadow_distance = 60,
-            .bloom = if (on.get(.bloom)) 0.08 else 0,
-            .dof_aperture = if (on.get(.dof)) 1.2 else 0,
-            .dof_focus_distance = 7,
-            .motion_blur = if (on.get(.motion_blur)) 0.6 else 0,
-            .vignette = if (on.get(.vignette)) 0.45 else 0,
-            .film_grain = if (on.get(.grain)) 0.35 else 0,
-            .chromatic_aberration = if (on.get(.fringes)) 0.6 else 0,
-            .lens_flare = if (on.get(.flare)) 0.5 else 0,
-            .temperature = if (on.get(.grade)) 0.35 else 0,
-            .saturation = if (on.get(.grade)) 1.2 else 1,
-            .contrast = if (on.get(.grade)) 1.12 else 1,
-            .sharpen = if (on.get(.sharpen)) 0.35 else 0,
-            .temporal_antialiasing = on.get(.antialiasing),
-            .render_scale = if (on.get(.upscale)) 0.67 else 1,
-            .automatic_exposure = !on.get(.manual_exposure),
-            .exposure_compensation = if (on.get(.manual_exposure)) -0.5 else 0,
+            .shadows = .{ .distance = 60 },
+            .post = .{
+                .bloom = if (on.get(.bloom)) 0.08 else 0,
+                .vignette = if (on.get(.vignette)) 0.45 else 0,
+                .film_grain = if (on.get(.grain)) 0.35 else 0,
+                .chromatic_aberration = if (on.get(.fringes)) 0.6 else 0,
+                .lens_flare = if (on.get(.flare)) 0.5 else 0,
+                .temperature = if (on.get(.grade)) 0.35 else 0,
+                .saturation = if (on.get(.grade)) 1.2 else 1,
+                .contrast = if (on.get(.grade)) 1.12 else 1,
+                .automatic_exposure = !on.get(.manual_exposure),
+                .exposure_compensation = if (on.get(.manual_exposure)) -0.5 else 0,
+                .depth_of_field = if (on.get(.dof)) .{ .aperture = 1.2, .focus_distance = 7 } else null,
+                .motion_blur = if (on.get(.motion_blur)) .{ .strength = 0.6 } else null,
+            },
+            .resolution = .{
+                .sharpen = if (on.get(.sharpen)) 0.35 else 0,
+                .temporal_antialiasing = on.get(.antialiasing),
+                .scale = if (on.get(.upscale)) 0.67 else 1,
+            },
         };
 
         list.clear();
@@ -140,7 +143,7 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.2, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = settings,
             }},
