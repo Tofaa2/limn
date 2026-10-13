@@ -19,6 +19,8 @@ layout(push_constant, scalar) uniform Push {
     uint grid_index;
     float far_distance;
     uint turn;
+    vec3 axis;
+    float axis_pad;
     uint previous_offsets;
 } push;
 

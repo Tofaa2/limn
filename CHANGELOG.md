@@ -22,6 +22,9 @@
 - `Camera.orthographic`, for scenes and draw lists.
 - `Settings.global_illumination.probes.cascades`: up to four probe grids.
 - `Settings.path_tracing.direct`.
+- `Settings.resolution.edge_antialiasing`: antialiasing from the finished picture alone, for views without TAA.
+- `--timings` prints the slowest frame; the `bistro` example takes `--walk`.
+- `Settings.global_illumination.probes.idle_interval`: probes are re-traced less often while the scene and its lights are still.
 - `Pass` runs on views without a scene; `PassContext` has the camera, its matrices and the resolved settings.
 - The `isometric` example.
 - `rhi.TextureKind.@"3d"`; storage images can be read, used in any shader stage and bound per layer.
@@ -52,6 +55,12 @@
 - Breaking: `PassContext.depth` and `motion` are optional.
 - Breaking: `rhi.Device.storageIndex` takes a layer; `CommandEncoder.copyDepthToColor` is gone.
 - Path tracing runs in a compute shader where storage images are available.
+- Acceleration structures of static meshes are compacted after they are built.
+- The high preset traces 64 rays per probe.
+- Temporal antialiasing keeps less history of what moves, so motion blurs and trails less.
+- A probe grid that follows the camera to a new cell seeds the probes it moves onto from the coarser grid; it no longer re-traces every probe that frame.
+- The `pathtrace` example's walls no longer overlap, which showed as speckles in motion.
+- Path tracing: the tracer writes what one frame's paths found, and gathering it over frames is a step of the denoiser.
 - The Vulkan code of the RHI is in `src/rhi/vulkan/`.
 - Breaking: the `PathTracing` enum is `PathTracingSupport`.
 - Switching an effect on or off keeps the view's other targets and history.

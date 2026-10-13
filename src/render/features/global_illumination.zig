@@ -65,6 +65,12 @@ pub const Probes = struct {
     /// How much wider than `Settings.global_illumination.probe_spacing` the spacing must get to cover the
     /// scene before the following grid is used.
     follow_threshold: f32 = 1.25,
+    /// Once nothing the probes can see has moved and no light has changed
+    /// for a few seconds, each probe is re-traced once every this many
+    /// frames, 1..64; the usual rate returns with the first change. What
+    /// probes cannot be told has changed, such as a glowing texture that
+    /// plays, is followed at this rate. 0 never slows down.
+    idle_interval: u32 = 16,
     /// Frames between updates of the coarse grid behind a following one.
     coarse_interval: u32 = 1,
     /// Most grids used at once, 1..4: the following one, the coarse one and
@@ -95,7 +101,7 @@ pub const Probes = struct {
 pub fn preset(quality: api.Quality) ?Settings {
     return switch (quality) {
         .ultra => .{ .probes = .{} },
-        .high => .{ .probes = .{} },
+        .high => .{ .probes = .{ .rays = 64 } },
         .medium => null,
         .low => null,
     };
@@ -152,6 +158,7 @@ fn updateProbes(ctx: *ViewContext) !void {
     if (scene.gi_updated_frame == self.frame_index) return;
     const count = scene.gi_cascade_count;
     const last = count - 1;
+    noteChanges(scene, p.scene_frame.tlas_hash);
     try updateGi(self, p.cmd, scene, &scene.gi_cascades[0].?, p.arena, p.frame_address, p.settings, 0);
     if (last != 0) {
         const coarse = &scene.gi_cascades[last].?;
@@ -337,6 +344,40 @@ pub fn prepareGi(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame
     return &scene.gi_cascades[0].?;
 }
 
+/// Frames the scene must stay as it is before probes are updated less often.
+const frames_to_idle = 600;
+
+/// While geometry is still, the atlas of distances is blended once in this
+/// many rounds of probe updates.
+const idle_visibility_rounds = 8;
+
+/// Counts the frames since the geometry probes see, and the light on it,
+/// last changed.
+fn noteChanges(scene: *SceneData, geometry: u64) void {
+    var lighting = std.hash.Wyhash.init(0);
+    lighting.update(std.mem.asBytes(&scene.sun.direction));
+    lighting.update(std.mem.asBytes(&scene.sun.color));
+    lighting.update(std.mem.asBytes(&scene.sun.intensity));
+    lighting.update(std.mem.asBytes(&scene.environment));
+    lighting.update(std.mem.asBytes(&scene.environment_intensity));
+    for (scene.lights.items) |light| {
+        lighting.update(std.mem.asBytes(&light.position));
+        lighting.update(std.mem.asBytes(&light.direction));
+        lighting.update(std.mem.asBytes(&light.color));
+        lighting.update(std.mem.asBytes(&light.intensity));
+        lighting.update(std.mem.asBytes(&light.range));
+        lighting.update(std.mem.asBytes(&light.inner_angle));
+        lighting.update(std.mem.asBytes(&light.outer_angle));
+        lighting.update(&.{@intFromEnum(light.kind)});
+    }
+    const lighting_key = lighting.final();
+    const unsteady = scene.fluids.items.len != 0 or scene.clouds != null;
+    scene.gi_geometry_still = if (geometry == scene.gi_geometry_key) scene.gi_geometry_still +| 1 else 0;
+    scene.gi_geometry_key = geometry;
+    scene.gi_lighting_still = if (lighting_key == scene.gi_lighting_key and !unsteady) @min(scene.gi_lighting_still +| 1, scene.gi_geometry_still) else 0;
+    scene.gi_lighting_key = lighting_key;
+}
+
 fn everyCascadeLit(scene: *const SceneData) bool {
     for (scene.gi_cascades) |slot| {
         if (slot) |volume| if (volume.frames == 0) return false;
@@ -378,10 +419,15 @@ pub fn updateGi(
     const max_distance = volume.spacing * 1.75 * 1.5;
     const probe_count = volume.probeCount();
     const moved = volume.shift[0] != 0 or volume.shift[1] != 0 or volume.shift[2] != 0;
-    const stride: u32 = if (volume.frames < 200 or moved) 1 else std.math.clamp(probes(settings.global_illumination).update_interval, 1, 16);
+    const own = probes(settings.global_illumination);
+    const fresh = volume.frames < 200 or (moved and grid_index + 1 >= scene.gi_cascade_count);
+    const idle = !fresh and own.idle_interval != 0 and scene.gi_lighting_still >= frames_to_idle;
+    const usual = std.math.clamp(own.update_interval, 1, 16);
+    const stride: u32 = if (fresh) 1 else if (idle) @max(usual, @min(own.idle_interval, 64)) else usual;
+    const distances_due = fresh or scene.gi_geometry_still < frames_to_idle or (renderer.frame_index / stride) % idle_visibility_rounds == 0;
     const phase: u32 = @intCast(renderer.frame_index % stride);
 
-    const far_distance: f32 = if (moved or volume.frames < 200) 0 else @max(probes(settings.global_illumination).far_distance, 0);
+    const far_distance: f32 = if (fresh) 0 else @max(probes(settings.global_illumination).far_distance, 0);
     const update_turn: u32 = @truncate(renderer.frame_index / stride);
 
     cmd.beginScope("gi trace");
@@ -441,6 +487,10 @@ pub fn updateGi(
         grid: u32,
         far_distance: f32,
         turn: u32,
+        /// The direction the first ray points nearest and the last furthest
+        /// from, between which the others are ordered.
+        axis: [3]f32,
+        pad: f32 = 0,
     };
     const RelocatePush = extern struct { update: UpdatePush, previous_offsets: u32, pad: [3]u32 = .{ 0, 0, 0 } };
     const update_push = UpdatePush{
@@ -457,6 +507,7 @@ pub fn updateGi(
         .grid = grid_index,
         .far_distance = far_distance,
         .turn = update_turn,
+        .axis = math.transformDirection(rotation, .{ 0, 0, 1 }),
     };
     const load: rhi.LoadOp = if (volume.frames == 0) .clear else .load;
     cmd.beginScope("gi irradiance");
@@ -487,14 +538,16 @@ pub fn updateGi(
     }
     cmd.transition(volume.irradiance, .shader_read);
     cmd.endScope();
-    cmd.beginScope("gi visibility");
-    try cmd.beginRendering(.{ .color = &.{.{ .texture = volume.visibility, .load = load }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.gi_visibility));
-    cmd.pushConstants(update_push);
-    cmd.drawFullscreen();
-    cmd.endRendering();
-    cmd.transition(volume.visibility, .shader_read);
-    cmd.endScope();
+    if (distances_due) {
+        cmd.beginScope("gi visibility");
+        try cmd.beginRendering(.{ .color = &.{.{ .texture = volume.visibility, .load = load }} });
+        cmd.bindPipeline(try renderer.pipelines.get(.gi_visibility));
+        cmd.pushConstants(update_push);
+        cmd.drawFullscreen();
+        cmd.endRendering();
+        cmd.transition(volume.visibility, .shader_read);
+        cmd.endScope();
+    }
     if (probes(settings.global_illumination).probe_relocation) {
         cmd.beginScope("gi relocation");
         defer cmd.endScope();

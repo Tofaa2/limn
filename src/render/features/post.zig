@@ -530,8 +530,10 @@ pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textu
         cmd.endScope();
         resolved = upscaled;
     }
+    const smoothing = settings.resolution.edge_antialiasing and !debugging;
+    const drawn = if (smoothing) try p.keep(renderer, "tonemapped", p.output_width, p.output_height, target_format) else target;
     cmd.beginScope("tonemap");
-    try cmd.beginRendering(.{ .color = &.{.{ .texture = target, .load = .discard }} });
+    try cmd.beginRendering(.{ .color = &.{.{ .texture = drawn, .load = .discard }} });
     cmd.bindPipeline(try tonemapPipeline(renderer, target_format));
     var push = gradingPush(renderer, desc, target_format, debugging);
     push.frame = frame_address;
@@ -542,6 +544,30 @@ pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textu
     cmd.drawFullscreen();
     cmd.endRendering();
     cmd.endScope();
+    if (!smoothing) return;
+    cmd.transition(drawn, .shader_read);
+    cmd.beginScope("edge antialiasing");
+    try cmd.beginRendering(.{ .color = &.{.{ .texture = target, .load = .discard }} });
+    cmd.bindPipeline(try edgePipeline(renderer, target_format));
+    cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(drawn) });
+    cmd.drawFullscreen();
+    cmd.endRendering();
+    cmd.endScope();
+}
+
+/// The edge antialiasing pipeline for `format`, created on first use.
+fn edgePipeline(renderer: *Renderer, format: rhi.Format) !rhi.Pipeline {
+    for (renderer.edge_pipelines.items) |entry| if (entry.format == format) return entry.pipeline;
+    const pipeline = try renderer.device.createGraphicsPipeline(.{
+        .name = "edge antialiasing",
+        .vertex = render.shaderCode("fullscreen.vert.spv"),
+        .fragment = render.shaderCode("edge_antialiasing.frag.spv"),
+        .color_targets = &.{.{ .format = format }},
+        .cull = .none,
+    });
+    errdefer renderer.device.destroyPipeline(pipeline);
+    try renderer.edge_pipelines.append(renderer.gpa, .{ .format = format, .pipeline = pipeline });
+    return pipeline;
 }
 
 /// The view's bloom chain: each level half the size of the one before.

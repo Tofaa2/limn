@@ -19,6 +19,8 @@ layout(push_constant, scalar) uniform Push {
     uint grid_index;
     float far_distance;
     uint turn;
+    vec3 axis;
+    float axis_pad;
 } push;
 
 layout(location = 0) out vec4 out_value;
@@ -28,8 +30,16 @@ layout(location = 1) out vec4 out_fast;
 
 #ifdef VISIBILITY
 const int texels = GI_VISIBILITY_TEXELS;
+/// Rays further off a texel's direction than this weigh under a thousandth
+/// of one along it and are not read.
+const float least_cosine = 0.87;
+/// How far along `Push.axis` a ray that near can be from the texel. Rays
+/// are ordered by how far along the axis they point, the first furthest, so
+/// only a run of them needs visiting.
+const float reach_along = 0.51;
 #else
 const int texels = GI_IRRADIANCE_TEXELS;
+const float least_cosine = 0.0;
 #endif
 
 
@@ -43,6 +53,9 @@ ivec2 interiorTexel(ivec2 t) {
     return t;
 }
 
+/// Blends this frame's rays into the probes that were traced. A probe the
+/// grid has just moved onto starts from what the next coarser grid holds
+/// there, with nothing in its way, and is traced when its turn comes.
 void main() {
     FrameConstants frame = push.frame;
     ivec2 pixel = ivec2(gl_FragCoord.xy);
@@ -50,7 +63,6 @@ void main() {
     GiGrid probe_grid = giGrid(frame, push.grid_index);
     ivec3 counts = probe_grid.counts;
     int probe = tile.x % counts.x + tile.y * counts.x + (tile.x / counts.x) * counts.x * counts.y;
-    if (uint(probe) % push.probe_stride != push.probe_phase) discard;
     ivec3 grid = giGridCoord(probe_grid, ivec3(tile.x % counts.x, tile.y, tile.x / counts.x));
     bool fresh = false;
     for (int axis = 0; axis < 3; axis++) {
@@ -58,15 +70,37 @@ void main() {
         if (moved > 0 && grid[axis] >= counts[axis] - moved) fresh = true;
         if (moved < 0 && grid[axis] < -moved) fresh = true;
     }
-    if (!giProbeDue(frame, giProbePosition(probe_grid, grid), uint(probe), push.turn, push.far_distance)) discard;
+    bool seeded = fresh && push.grid_index + 1u < frame.gi_cascade_count;
+    bool due = uint(probe) % push.probe_stride == push.probe_phase &&
+        giProbeDue(frame, giProbePosition(probe_grid, grid), uint(probe), push.turn, push.far_distance);
+    if (!seeded && !due) discard;
     ivec2 local = interiorTexel(pixel - tile * texels);
     vec3 direction = decodeNormal((vec2(local) - 0.5) / float(texels - 2));
+    if (seeded) {
+#ifdef VISIBILITY
+        out_value = vec4(push.max_distance, push.max_distance * push.max_distance, 0.0, 1.0);
+#else
+        vec3 around = giGridIrradiance(frame, giGrid(frame, push.grid_index + 1u), giProbeGridPosition(probe_grid, grid), direction, direction);
+        out_value = vec4(around, 1.0);
+        out_fast = vec4(around, 1.0);
+#endif
+        return;
+    }
 
     vec3 total = vec3(0.0);
     float weight_total = 0.0;
     uint first = uint(probe) * push.rays_per_probe;
-    for (uint i = 0u; i < push.rays_per_probe; i++) {
-        float weight = max(dot(direction, push.directions.data[i].xyz), 0.0);
+    uint from = 0u;
+    uint to = push.rays_per_probe;
+#ifdef VISIBILITY
+    float along = dot(direction, push.axis);
+    float half_count = 0.5 * float(push.rays_per_probe);
+    from = uint(clamp(floor((1.0 - along - reach_along) * half_count), 0.0, float(push.rays_per_probe)));
+    to = uint(clamp(ceil((1.0 - along + reach_along) * half_count), 0.0, float(push.rays_per_probe)));
+#endif
+    for (uint i = from; i < to; i++) {
+        float weight = dot(direction, push.directions.data[i].xyz);
+        if (weight <= least_cosine) continue;
         vec4 ray = push.rays.data[first + i];
 #ifdef VISIBILITY
         float squared = weight * weight;

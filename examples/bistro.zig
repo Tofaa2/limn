@@ -10,7 +10,7 @@
 //!   W A S D  fly, Space/Ctrl up and down, Shift faster
 //!   P        pause the props' animations
 //!
-//! `--night 1`, `--view N`, `--at "x y z yaw pitch"` (as shown on screen),
+//! `--night 1`, `--walk 1` (the camera walks ahead), `--view N`, `--at "x y z yaw pitch"` (as shown on screen),
 //! `--frames N`, `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");
@@ -34,12 +34,14 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     var night = false;
     var view: usize = 0;
+    var walking = false;
     var start: ?[5]f32 = null;
     {
         var arguments = try init.minimal.args.iterateAllocator(gpa);
         defer arguments.deinit();
         while (arguments.next()) |argument| {
             if (std.mem.eql(u8, argument, "--night")) night = true;
+            if (std.mem.eql(u8, argument, "--walk")) walking = true;
             if (std.mem.eql(u8, argument, "--at")) {
                 var numbers = std.mem.tokenizeScalar(u8, arguments.next() orelse return error.MissingArgument, ' ');
                 var values: [5]f32 = undefined;
@@ -133,6 +135,7 @@ pub fn main(init: std.process.Init) !void {
         const forward = math.Vec3{ @sin(yaw) * @cos(pitch), @sin(pitch), -@cos(yaw) * @cos(pitch) };
         const right = math.normalize(math.cross(forward, .{ 0, 1, 0 }));
         const speed = tick.dt * @as(f32, if (stage.keyDown(glfw.GLFW_KEY_LEFT_SHIFT)) 12 else 4);
+        if (walking) eye = math.add(eye, math.scale(.{ forward[0], 0, forward[2] }, tick.dt * 3));
         if (stage.keyDown(glfw.GLFW_KEY_W)) eye = math.add(eye, math.scale(forward, speed));
         if (stage.keyDown(glfw.GLFW_KEY_S)) eye = math.add(eye, math.scale(forward, -speed));
         if (stage.keyDown(glfw.GLFW_KEY_D)) eye = math.add(eye, math.scale(right, speed));

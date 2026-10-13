@@ -584,6 +584,10 @@ pub fn freeModel(self: *Renderer, entry: *ModelEntry) void {
     const gpa = self.gpa;
     if (entry.blas_job) |job| self.device.releaseDetached(job);
     entry.blas_job = null;
+    if (entry.blas_compacting) {
+        entry.blas_compacting = false;
+        self.blas_compacting -= 1;
+    }
     if (entry.job) |job| {
         job.group.cancel(job.io);
         if (job.model) |*model| model.deinit();

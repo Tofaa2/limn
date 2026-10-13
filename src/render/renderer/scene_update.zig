@@ -1325,6 +1325,7 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
         self.indices.replaced = false;
         self.geometry_replaced = frame_now;
     };
+    if (self.blas_compacting != 0) try compactBuiltBlas(self, cmd);
     if (self.blas_pending == 0) return;
     const device = self.device;
     var still_pending: u32 = 0;
@@ -1335,8 +1336,13 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
             if (entry.blas_job) |job| {
                 device.releaseDetached(job);
                 entry.blas_job = null;
-            } else for (entry.meshes) |mesh| {
-                if (mesh.blas_building orelse mesh.blas) |blas| try cmd.buildBlas(blas, geometry_feature.blasDesc(self, mesh));
+            } else {
+                for (entry.meshes) |mesh| {
+                    if (mesh.blas_building orelse mesh.blas) |blas| try cmd.buildBlas(blas, geometry_feature.blasDesc(self, mesh));
+                }
+                for (entry.meshes) |mesh| {
+                    if (mesh.blas_building orelse mesh.blas) |blas| try cmd.measureBlas(blas);
+                }
             }
             finished = adoptBlas(self, entry) or finished;
             continue;
@@ -1356,6 +1362,8 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
         if (!detached) {
             entry.blas_pending = false;
             for (entry.meshes) |mesh| if (mesh.blas) |blas| try cmd.buildBlas(blas, geometry_feature.blasDesc(self, mesh));
+            for (entry.meshes) |mesh| if (mesh.blas) |blas| try cmd.measureBlas(blas);
+            markCompacting(self, entry);
             continue;
         }
         still_pending += 1;
@@ -1369,16 +1377,62 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
         if (self.geometry_replaced) |replaced| if (frame_now <= replaced + rhi.frames_in_flight) continue;
         var encoder = (try device.beginDetached()).?;
         for (entry.meshes) |mesh| if (mesh.blas_building) |blas| try encoder.buildBlas(blas, geometry_feature.blasDesc(self, mesh));
+        for (entry.meshes) |mesh| if (mesh.blas_building) |blas| try encoder.measureBlas(blas);
         entry.blas_job = try device.submitDetached(encoder);
     };
     self.blas_pending = still_pending;
     if (finished) self.asset_generation += 1;
 }
 
+/// Has `compactBuiltBlas` look at the model's structures.
+fn markCompacting(self: *Renderer, entry: *ModelEntry) void {
+    if (entry.blas_compacting) return;
+    entry.blas_compacting = true;
+    self.blas_compacting += 1;
+}
+
+/// Most structures replaced by smaller copies in one frame.
+const compactions_per_frame = 64;
+
+/// Replaces the built structures whose compacted size has come back from
+/// the GPU with copies of that size. The copy is made by `cmd`, ahead of
+/// anything that traces rays this frame.
+fn compactBuiltBlas(self: *Renderer, cmd: *rhi.CommandEncoder) !void {
+    const device = self.device;
+    var budget: u32 = compactions_per_frame;
+    var replaced = false;
+    for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
+        if (!entry.blas_compacting or entry.blas_pending) continue;
+        var waiting = false;
+        for (entry.meshes) |*mesh| {
+            const built = mesh.blas orelse continue;
+            if (!device.blasMeasured(built)) continue;
+            if (budget == 0) {
+                waiting = true;
+                continue;
+            }
+            const size = device.compactedBlasSize(built) orelse {
+                waiting = waiting or device.blasMeasured(built);
+                continue;
+            };
+            const compact = device.createCompactBlas(built, size) catch continue;
+            cmd.compactBlas(built, compact);
+            device.destroyAcceleration(built);
+            mesh.blas = compact;
+            replaced = true;
+            budget -= 1;
+        }
+        if (!waiting) {
+            entry.blas_compacting = false;
+            self.blas_compacting -= 1;
+        }
+    };
+    if (replaced) self.asset_generation += 1;
+}
+
 /// Makes a model's finished acceleration structures the live ones.
 /// Returns whether there were any.
 fn adoptBlas(self: *Renderer, entry: *ModelEntry) bool {
-    _ = self;
     var any = false;
     for (entry.meshes) |*mesh| if (mesh.blas_building) |built| {
         mesh.blas = built;
@@ -1387,5 +1441,6 @@ fn adoptBlas(self: *Renderer, entry: *ModelEntry) bool {
     };
     entry.blas_pending = false;
     entry.blas_frame = null;
+    markCompacting(self, entry);
     return any;
 }

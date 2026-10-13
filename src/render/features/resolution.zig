@@ -35,6 +35,12 @@ pub const Settings = struct {
     /// Temporal antialiasing (TAA). Several other settings rely on it to
     /// average out their noise.
     temporal_antialiasing: bool = true,
+    /// Smooths the stair steps of edges from the finished picture alone
+    /// (FXAA), so nothing smears or trails in motion. For a view with
+    /// `temporal_antialiasing` off; it does not average the noise of soft
+    /// shadows, reflections and the like as that does. Draw lists are drawn
+    /// after it and stay as sharp as they are.
+    edge_antialiasing: bool = false,
     /// Mip bias for material textures under TAA; negative is sharper.
     texture_mip_bias: f32 = -0.25,
     /// Strength of the post-TAA sharpening filter, 0..1.

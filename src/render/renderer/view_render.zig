@@ -117,7 +117,8 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
     }
     const load: rhi.LoadOp = if (written) .load else .clear;
 
-    var graph = Graph{};
+    var graph: Graph = undefined;
+    graph.clear();
     var scratch_bytes: [16 << 10]u8 align(16) = undefined;
     var scratch = std.heap.FixedBufferAllocator.init(&scratch_bytes);
     var constants: gpu.FrameConstants = undefined;
