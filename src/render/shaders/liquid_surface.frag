@@ -12,7 +12,7 @@ void main() {
     FrameConstants frame = push.frame;
     float here = texelFetch(TEX(push.distance_texture, frame.sampler_nearest_clamp), ivec2(gl_FragCoord.xy), 0).r;
     if (here <= 0.0) discard;
-    float depth = frame.near / here;
+    float depth = depthAt(here, frame.depth_terms);
     gl_FragDepth = depth;
     vec3 position = worldPositionFromDepth(gl_FragCoord.xy * frame.inv_resolution, depth, frame.inv_view_proj);
     vec4 clip = frame.view_proj_unjittered * vec4(position, 1.0);

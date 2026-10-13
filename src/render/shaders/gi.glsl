@@ -20,19 +20,17 @@ ivec3 giUnpackScroll(uint packed) {
 }
 
 GiGrid giGrid(FrameConstants frame, uint index) {
-    if (index == 0u)
-        return GiGrid(frame.gi_origin, frame.gi_spacing, frame.gi_counts, frame.gi_irradiance, frame.gi_visibility, giUnpackScroll(frame.gi_scroll), frame.gi_offsets, frame.sampler_nearest_clamp);
-    if (index == 2u)
-        return GiGrid(frame.gi3_origin, frame.gi3_spacing, frame.gi3_counts, frame.gi3_irradiance, frame.gi3_visibility, giUnpackScroll(frame.gi3_scroll), frame.gi3_offsets, frame.sampler_nearest_clamp);
-    return GiGrid(frame.gi2_origin, frame.gi2_spacing, frame.gi2_counts, frame.gi2_irradiance, frame.gi2_visibility, giUnpackScroll(frame.gi2_scroll), frame.gi2_offsets, frame.sampler_nearest_clamp);
-}
-
-bool giHasMiddle(FrameConstants frame) {
-    return frame.gi3_irradiance != INVALID_ID;
-}
-
-bool giHasCoarse(FrameConstants frame) {
-    return frame.gi2_irradiance != INVALID_ID;
+    GiCascade cascade = frame.gi_cascades[index];
+    GiGrid grid;
+    grid.nearest = frame.sampler_nearest_clamp;
+    grid.origin = cascade.origin;
+    grid.spacing = cascade.spacing;
+    grid.counts = cascade.counts;
+    grid.irradiance = cascade.irradiance;
+    grid.visibility = cascade.visibility;
+    grid.scroll = giUnpackScroll(cascade.scroll);
+    grid.offsets = cascade.offsets;
+    return grid;
 }
 
 ivec3 giProbeCoord(int index, ivec3 counts) {
@@ -75,7 +73,7 @@ vec2 giProbeUv(ivec3 coord, vec3 direction, int texels, ivec3 counts) {
 }
 
 bool giProbeDue(FrameConstants frame, vec3 position, uint probe, uint turn, float far_distance) {
-    if (far_distance <= 0.0 || distance(position, frame.camera_position) < far_distance) return true;
+    if (far_distance <= 0.0 || distance(position, eyePoint(frame, position)) < far_distance) return true;
     return (turn + probe) % 8u == 0u;
 }
 
@@ -93,16 +91,15 @@ float giNestedCoverage(GiGrid grid, vec3 position) {
 }
 
 float giCoverage(FrameConstants frame, vec3 position) {
-    if (!giHasCoarse(frame)) return giGridCoverage(giGrid(frame, 0u), position);
-    float main_coverage = giNestedCoverage(giGrid(frame, 0u), position);
-    if (main_coverage >= 1.0) return main_coverage;
-    float rest = 1.0 - main_coverage;
-    if (giHasMiddle(frame)) {
-        float middle = giNestedCoverage(giGrid(frame, 2u), position);
-        main_coverage += rest * middle;
-        rest *= 1.0 - middle;
+    uint last = max(frame.gi_cascade_count, 1u) - 1u;
+    float covered = 0.0;
+    float rest = 1.0;
+    for (uint i = 0u; i < last && rest > 0.0; i++) {
+        float inside = giNestedCoverage(giGrid(frame, i), position);
+        covered += rest * inside;
+        rest *= 1.0 - inside;
     }
-    return main_coverage + rest * giGridCoverage(giGrid(frame, 1u), position);
+    return covered + rest * giGridCoverage(giGrid(frame, last), position);
 }
 
 vec3 giGridIrradiance(FrameConstants frame, GiGrid grid, vec3 position, vec3 normal, vec3 view) {
@@ -148,19 +145,16 @@ vec3 giGridIrradiance(FrameConstants frame, GiGrid grid, vec3 position, vec3 nor
 }
 
 vec3 giIrradiance(FrameConstants frame, vec3 position, vec3 normal, vec3 view) {
-    GiGrid main_grid = giGrid(frame, 0u);
-    if (!giHasCoarse(frame)) return giGridIrradiance(frame, main_grid, position, normal, view);
-    float main_coverage = giNestedCoverage(main_grid, position);
+    uint last = max(frame.gi_cascade_count, 1u) - 1u;
     vec3 result = vec3(0.0);
-    if (main_coverage > 0.0) result = giGridIrradiance(frame, main_grid, position, normal, view) * main_coverage;
-    float rest = 1.0 - main_coverage;
-    if (rest > 0.0 && giHasMiddle(frame)) {
-        GiGrid middle_grid = giGrid(frame, 2u);
-        float middle = giNestedCoverage(middle_grid, position);
-        if (middle > 0.0) result += giGridIrradiance(frame, middle_grid, position, normal, view) * (rest * middle);
-        rest *= 1.0 - middle;
+    float rest = 1.0;
+    for (uint i = 0u; i < last && rest > 0.0; i++) {
+        GiGrid grid = giGrid(frame, i);
+        float inside = giNestedCoverage(grid, position);
+        if (inside > 0.0) result += giGridIrradiance(frame, grid, position, normal, view) * (rest * inside);
+        rest *= 1.0 - inside;
     }
-    if (rest > 0.0) result += giGridIrradiance(frame, giGrid(frame, 1u), position, normal, view) * rest;
+    if (rest > 0.0) result += giGridIrradiance(frame, giGrid(frame, last), position, normal, view) * rest;
     return result;
 }
 
@@ -183,19 +177,16 @@ vec3 giGridAmbient(FrameConstants frame, GiGrid grid, vec3 position) {
 }
 
 vec3 giAmbient(FrameConstants frame, vec3 position) {
-    GiGrid main_grid = giGrid(frame, 0u);
-    if (!giHasCoarse(frame)) return giGridAmbient(frame, main_grid, position);
-    float main_coverage = giNestedCoverage(main_grid, position);
+    uint last = max(frame.gi_cascade_count, 1u) - 1u;
     vec3 result = vec3(0.0);
-    if (main_coverage > 0.0) result = giGridAmbient(frame, main_grid, position) * main_coverage;
-    float rest = 1.0 - main_coverage;
-    if (rest > 0.0 && giHasMiddle(frame)) {
-        GiGrid middle_grid = giGrid(frame, 2u);
-        float middle = giNestedCoverage(middle_grid, position);
-        if (middle > 0.0) result += giGridAmbient(frame, middle_grid, position) * (rest * middle);
-        rest *= 1.0 - middle;
+    float rest = 1.0;
+    for (uint i = 0u; i < last && rest > 0.0; i++) {
+        GiGrid grid = giGrid(frame, i);
+        float inside = giNestedCoverage(grid, position);
+        if (inside > 0.0) result += giGridAmbient(frame, grid, position) * (rest * inside);
+        rest *= 1.0 - inside;
     }
-    if (rest > 0.0) result += giGridAmbient(frame, giGrid(frame, 1u), position) * rest;
+    if (rest > 0.0) result += giGridAmbient(frame, giGrid(frame, last), position) * rest;
     return result;
 }
 

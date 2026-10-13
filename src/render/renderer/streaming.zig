@@ -1,11 +1,11 @@
 //! Geometry and texture streaming: what each frame keeps resident. Internal to the renderer.
 const std = @import("std");
+const geometry_feature = @import("../features/geometry.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
 const gpu = @import("../gpu.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
-const geometry_passes = @import("../passes/geometry.zig");
 const render = @import("../renderer.zig");
 
 const Renderer = render.Renderer;
@@ -25,7 +25,7 @@ const encodeMaterial = @import("materials.zig").encodeMaterial;
 /// Releases geometry of models far from every camera and restores it for
 /// near ones.
 pub fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
-    const streaming = self.options.geometry_streaming orelse return;
+    const streaming = self.options.geometry.streaming orelse return;
     const near_enough = if (streaming.coarse_distance > 0) @min(streaming.distance, streaming.coarse_distance * 0.9) else streaming.distance;
     const zone = Zone.start(self.options.profiler, "geometry streaming");
     defer zone.stop();
@@ -178,10 +178,10 @@ fn restoreGeometry(self: *Renderer, entry: *ModelEntry) !void {
         };
     }
     try self.meshes.write(device, entry.mesh_base, std.mem.sliceAsBytes(records));
-    if (device.ray_tracing) {
+    if (device.caps.ray_tracing) {
         for (entry.meshes) |*mesh| {
             if (mesh.skin_offset != null) continue;
-            const made = try device.createBlas(geometry_passes.blasDesc(self, mesh.*));
+            const made = try device.createBlas(geometry_feature.blasDesc(self, mesh.*));
             if (device.detached_queue != null) mesh.blas_building = made else mesh.blas = made;
         }
         entry.blas_pending = true;
@@ -272,7 +272,7 @@ const StreamView = struct {
 /// for a copy with the given world-space bounds and scale.
 fn wantPart(model: *ModelEntry, part: StreamPart, center: Vec3, radius: f32, scale: f32, view: StreamView) void {
     if (part.density <= 0) return;
-    const distance = @max(math.length(math.sub(center, view.camera.position)) - radius, view.camera.near);
+    const distance = if (view.camera.orthographic != null) 1 else @max(math.length(math.sub(center, view.camera.position)) - radius, view.camera.near);
     if (view.frustum) |seen| if (!seen.touches(center, radius)) return;
     const level_base = @log2(@max(part.density / @max(scale, 1e-6) * distance / view.pixels_at_one_meter, 1e-12)) + view.bias;
     for (part.streams, part.log_sizes) |index, log_size| {
@@ -317,7 +317,7 @@ fn seenInstances(device: *rhi.Device, scene: *const SceneData, frame: rhi.Frame)
 /// Decides which mip levels the frame's views need, fits them to the
 /// budget, and loads or drops levels to match.
 pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc) !void {
-    const streaming = self.options.texture_streaming orelse return;
+    const streaming = self.options.textures.streaming orelse return;
     const zone = Zone.start(self.options.profiler, "texture streaming");
     defer zone.stop();
     const device = self.device;
@@ -333,10 +333,11 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
         if (!device.textureExists(target)) continue;
         const height = if (view_desc.region) |region| region.height else device.textureInfo(target).height;
         const camera = view_desc.camera;
-        const pixels_at_one_meter = @as(f32, @floatFromInt(height)) * 0.5 / @tan(camera.fov_y * 0.5) *
-            std.math.clamp(view_desc.settings.render_scale, 0.25, 1);
-        const bias = streaming.mip_bias + view_desc.settings.texture_mip_bias;
-        const frustum: ?StreamFrustum = if (streaming.visible_only) blk: {
+        const lens_reach = if (camera.orthographic) |parallel| @max(parallel.height, 1e-6) * 0.5 else @tan(camera.fov_y * 0.5);
+        const pixels_at_one_meter = @as(f32, @floatFromInt(height)) * 0.5 / lens_reach *
+            std.math.clamp(view_desc.settings.resolution.scale, 0.25, 1);
+        const bias = streaming.mip_bias + view_desc.settings.resolution.texture_mip_bias;
+        const frustum: ?StreamFrustum = if (streaming.visible_only and camera.orthographic == null) blk: {
             const info = device.textureInfo(target);
             const width = if (view_desc.region) |region| region.width else info.width;
             const tan_y = @tan(camera.fov_y * 0.5);

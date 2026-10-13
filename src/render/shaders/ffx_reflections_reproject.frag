@@ -26,8 +26,9 @@ FfxSurface surfaceHistory(FrameConstants frame, vec2 uv) {
 }
 
 vec2 hitReprojection(FrameConstants frame, vec2 uv, float surface_depth, float ray_length) {
-    vec3 toward = normalize(worldPositionFromDepth(uv, 0.5, frame.inv_view_proj) - frame.camera_position);
-    vec3 seeming = frame.camera_position + toward * (surface_depth + ray_length);
+    vec3 through = worldPositionFromDepth(uv, 0.5, frame.inv_view_proj);
+    vec3 eye = eyePoint(frame, through);
+    vec3 seeming = eye + normalize(through - eye) * (surface_depth + ray_length);
     vec4 clip = frame.prev_view_proj_unjittered * vec4(seeming, 1.0);
     return clip.xy / clip.w * 0.5 + 0.5;
 }

@@ -223,7 +223,7 @@ pub const Stage = struct {
         renderer_options.surface = if (window) |value| try value.surface(false) else null;
         if (screenshot != null or validation) renderer_options.validation = true;
         if (debug_names) renderer_options.debug_names = true;
-        if (renderer_options.pipeline_cache_path == null) renderer_options.pipeline_cache_path = "zig-out/pipeline.cache";
+        if (renderer_options.cache.pipelines == null) renderer_options.cache.pipelines = "zig-out/pipeline.cache";
         if (timings and renderer_options.profiler == null) {
             zones.io = init.io;
             renderer_options.profiler = .{ .begin = Zones.begin, .end = Zones.end };
@@ -320,6 +320,11 @@ pub const Stage = struct {
             std.debug.print("{d:8.3} ms  {s}{s}\n", .{ entry.total / frames, "        "[0..@min(entry.depth * 2, 8)], entry.name });
         }
         std.debug.print("{d:8.3} ms  GPU\n{d:8.3} ms  CPU\n", .{ gpu / frames, self.timed_cpu / frames });
+        const stats = self.renderer.getStats();
+        std.debug.print("{d:8.1} MiB GPU memory\n{d:8} pipelines\n", .{ @as(f64, @floatFromInt(stats.gpu_memory_bytes)) / (1024 * 1024), stats.pipelines });
+        for (stats.downgraded()) |downgrade| {
+            std.debug.print("{s}: asked for {s}, got {s} ({s})\n", .{ downgrade.feature, downgrade.requested, downgrade.used, @tagName(downgrade.reason) });
+        }
         for (zones.names[0..zones.count], zones.totals[0..zones.count], zones.depths[0..zones.count]) |name, total, depth| {
             std.debug.print("{d:8.3} ms  {s}{s}\n", .{ total / frames, "        "[0 .. depth * 2 + 2], name });
         }

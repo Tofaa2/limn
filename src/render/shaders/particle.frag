@@ -31,7 +31,7 @@ void main() {
         float falloff = clamp(1.0 - dot(centered, centered), 0.0, 1.0);
         color.a *= falloff * falloff;
     }
-    float scene = linearDepth(texelFetch(TEX(push.depth_texture, frame.sampler_nearest_clamp), ivec2(gl_FragCoord.xy), 0).r, frame.near);
+    float scene = linearDepth(texelFetch(TEX(push.depth_texture, frame.sampler_nearest_clamp), ivec2(gl_FragCoord.xy), 0).r, frame.depth_terms);
     float fade = emitter.softness > 0.0 ? clamp((scene - in_view_depth) / emitter.softness, 0.0, 1.0) : float(scene > in_view_depth);
     color.a *= fade;
     if (color.a <= 0.0) discard;

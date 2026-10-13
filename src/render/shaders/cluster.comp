@@ -21,8 +21,10 @@ void main() {
     if (cell.z == CLUSTERS_Z - 1u) z1 = 1e30;
     vec2 ndc0 = vec2(cell.xy) / vec2(CLUSTERS_X, CLUSTERS_Y) * 2.0 - 1.0;
     vec2 ndc1 = vec2(cell.xy + 1u) / vec2(CLUSTERS_X, CLUSTERS_Y) * 2.0 - 1.0;
-    vec2 slope0 = (ndc0 - vec2(frame.proj[2][0], frame.proj[2][1]) * -1.0) / vec2(frame.proj[0][0], frame.proj[1][1]);
-    vec2 slope1 = (ndc1 - vec2(frame.proj[2][0], frame.proj[2][1]) * -1.0) / vec2(frame.proj[0][0], frame.proj[1][1]);
+    bool parallel = frame.parallel != 0.0;
+    vec2 off_axis = parallel ? -vec2(frame.proj[3][0], frame.proj[3][1]) : vec2(frame.proj[2][0], frame.proj[2][1]);
+    vec2 slope0 = (ndc0 + off_axis) / vec2(frame.proj[0][0], frame.proj[1][1]);
+    vec2 slope1 = (ndc1 + off_axis) / vec2(frame.proj[0][0], frame.proj[1][1]);
     vec2 slope_min = min(slope0, slope1);
     vec2 slope_max = max(slope0, slope1);
 
@@ -38,8 +40,9 @@ void main() {
         }
         if (depth + light.range < z0 || depth - light.range > z1) continue;
         float z = clamp(depth, max(z0, 1e-4), max(min(z1, depth + light.range), 1e-4));
-        vec3 closest = vec3(clamp(center.x, slope_min.x * z, slope_max.x * z), clamp(center.y, slope_min.y * z, slope_max.y * z), -z);
-        float slack = light.range * max(max(abs(slope_min.x), abs(slope_max.x)), max(abs(slope_min.y), abs(slope_max.y)));
+        float spread = parallel ? 1.0 : z;
+        vec3 closest = vec3(clamp(center.xy, slope_min * spread, slope_max * spread), -z);
+        float slack = parallel ? 0.0 : light.range * max(max(abs(slope_min.x), abs(slope_max.x)), max(abs(slope_min.y), abs(slope_max.y)));
         vec3 delta = closest - center;
         if (dot(delta, delta) > (light.range + slack) * (light.range + slack)) continue;
         frame.clusters.data[index].lights[count] = i;
@@ -55,8 +58,9 @@ void main() {
         float depth = -center.z;
         if (depth + bounds.w < z0 || depth - bounds.w > z1) continue;
         float z = clamp(depth, max(z0, 1e-4), max(min(z1, depth + bounds.w), 1e-4));
-        vec3 closest = vec3(clamp(center.x, slope_min.x * z, slope_max.x * z), clamp(center.y, slope_min.y * z, slope_max.y * z), -z);
-        float slack = bounds.w * max(max(abs(slope_min.x), abs(slope_max.x)), max(abs(slope_min.y), abs(slope_max.y)));
+        float spread = parallel ? 1.0 : z;
+        vec3 closest = vec3(clamp(center.xy, slope_min * spread, slope_max * spread), -z);
+        float slack = parallel ? 0.0 : bounds.w * max(max(abs(slope_min.x), abs(slope_max.x)), max(abs(slope_min.y), abs(slope_max.y)));
         vec3 delta = closest - center;
         if (dot(delta, delta) > (bounds.w + slack) * (bounds.w + slack)) continue;
         masks[i >> 5u] |= 1u << (i & 31u);

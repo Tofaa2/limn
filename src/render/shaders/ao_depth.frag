@@ -6,7 +6,7 @@ layout(push_constant, scalar) uniform Push {
     uint sampler_index;
     uint first;
     int source_lod;
-    float near;
+    vec4 terms;
 } push;
 
 layout(location = 0) in vec2 in_uv;
@@ -17,7 +17,7 @@ const float sky_depth = 60000.0;
 void main() {
     if (push.first != 0u) {
         float depth = textureLod(TEX(push.source_texture, push.sampler_index), in_uv, 0.0).r;
-        out_depth = min(linearDepth(depth, push.near), sky_depth);
+        out_depth = min(linearDepth(depth, push.terms), sky_depth);
         return;
     }
     ivec2 base = ivec2(gl_FragCoord.xy) * 2;

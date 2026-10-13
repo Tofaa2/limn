@@ -26,8 +26,8 @@ void main() {
     uint linear = frame.sampler_linear_clamp;
     vec2 screen_uv = gl_FragCoord.xy * frame.inv_resolution;
     float scene_depth = texelFetch(TEX(push.depth_texture, nearest), ivec2(gl_FragCoord.xy), 0).r;
-    float surface_distance = (frame.view_proj * vec4(in_position, 1.0)).w;
-    float scene_distance = scene_depth > 0.0 ? linearDepth(scene_depth, frame.near) : 1e9;
+    float surface_distance = clipDepth(frame, frame.view_proj * vec4(in_position, 1.0));
+    float scene_distance = scene_depth > 0.0 ? linearDepth(scene_depth, frame.depth_terms) : 1e9;
     if (scene_distance < surface_distance) discard;
     if (water.data.mask != 0xffffffffu && textureLod(TEX(water.data.mask, nearest), in_uv, 0.0).r < 0.5) discard;
 
@@ -36,15 +36,15 @@ void main() {
     vec3 ahead = waterPoint(water, in_uv + vec2(0.0, texel.y), frame.time) - waterPoint(water, in_uv - vec2(0.0, texel.y), frame.time);
     vec3 normal = normalize(cross(ahead, right));
     {
-        float pixel = surface_distance * 2.0 / (abs(frame.proj[1][1]) * frame.resolution.y);
-        vec3 to_eye = normalize(frame.camera_position - in_position);
+        float pixel = (frame.parallel != 0.0 ? 1.0 : surface_distance) * 2.0 / (abs(frame.proj[1][1]) * frame.resolution.y);
+        vec3 to_eye = normalize(eyePoint(frame, in_position) - in_position);
         float footprint = pixel / max(abs(dot(normal, to_eye)), 0.08);
         vec2 ripple = waterDetailSlope(water.data.detail, in_position.xz, frame.time, footprint);
         vec3 axis_x = normalize(water.data.transform[0].xyz);
         vec3 axis_z = normalize(water.data.transform[2].xyz);
         normal = normalize(normal - axis_x * ripple.x - axis_z * ripple.y);
     }
-    vec3 view = normalize(frame.camera_position - in_position);
+    vec3 view = normalize(eyePoint(frame, in_position) - in_position);
     if (dot(normal, view) < 0.0) normal = -normal;
     float n_dot_v = clamp(dot(normal, view), 0.0, 1.0);
     float fresnel = 0.02 + 0.98 * pow(1.0 - n_dot_v, 5.0);
@@ -53,7 +53,7 @@ void main() {
     vec2 bend = (frame.view * vec4(normal - flat_normal, 0.0)).xy * water.data.refraction / max(surface_distance, 0.5);
     vec2 below_uv = clamp(screen_uv + bend, vec2(0.001), vec2(0.999));
     float below_depth = textureLod(TEX(push.depth_texture, nearest), below_uv, 0.0).r;
-    float below_distance = below_depth > 0.0 ? linearDepth(below_depth, frame.near) : 1e9;
+    float below_distance = below_depth > 0.0 ? linearDepth(below_depth, frame.depth_terms) : 1e9;
     if (below_distance < surface_distance) {
         below_uv = screen_uv;
         below_distance = scene_distance;

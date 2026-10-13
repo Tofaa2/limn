@@ -74,13 +74,14 @@ pub const Library = struct {
     /// Nothing is offered where the SDK is not built in, the GPU is not
     /// NVIDIA's or the driver lacks what DLSS asks for.
     pub fn start(device: *rhi.Device) Library {
-        if (!available or !device.nvidia_ngx) return .{};
+        if (!available or !device.caps.nvidia_ngx) return .{};
+        const native = rhi.native.device(device);
         const offered = c.limnDlssStart(&.{
-            .instance = @intFromEnum(device.instance.handle),
-            .physical_device = @intFromEnum(device.physical),
-            .device = @intFromEnum(device.vkd.handle),
-            .get_instance_proc_addr = rhi.instanceProcAddr(),
-            .get_device_proc_addr = rhi.deviceProcAddr(),
+            .instance = native.instance,
+            .physical_device = native.physical_device,
+            .device = native.device,
+            .get_instance_proc_addr = native.get_instance_proc_addr,
+            .get_device_proc_addr = native.get_device_proc_addr,
             .library_directory = features.dlss_libraries,
             .data_directory = data_directory,
             .logging = @intFromBool(features.dlss_logging),
@@ -93,7 +94,7 @@ pub const Library = struct {
 
     /// Every `Upscaler` must be destroyed first.
     pub fn stop(self: Library, device: *rhi.Device) void {
-        if (available and (self.super_resolution or self.ray_reconstruction)) c.limnDlssStop(@intFromEnum(device.vkd.handle));
+        if (available and (self.super_resolution or self.ray_reconstruction)) c.limnDlssStop(rhi.native.device(device).device);
     }
 
     pub fn offers(self: Library, feature: Feature) bool {
@@ -118,15 +119,15 @@ pub const Upscaler = struct {
     pub fn create(device: *rhi.Device, cmd: *rhi.CommandEncoder, feature: Feature, render_size: [2]u32, output_size: [2]u32) ?Upscaler {
         if (!available) return null;
         const handle = c.limnDlssCreate(&.{
-            .device = @intFromEnum(device.vkd.handle),
-            .command_buffer = @intFromEnum(cmd.command),
+            .device = rhi.native.device(device).device,
+            .command_buffer = rhi.native.commandBuffer(cmd),
             .feature = @intFromEnum(feature),
             .render_width = render_size[0],
             .render_height = render_size[1],
             .output_width = output_size[0],
             .output_height = output_size[1],
         });
-        cmd.bindGlobals();
+        rhi.native.restore(cmd);
         return .{ .handle = handle orelse return null, .feature = feature, .render_size = render_size, .output_size = output_size };
     }
 
@@ -168,7 +169,7 @@ pub const Upscaler = struct {
         const width: f32 = @floatFromInt(self.render_size[0]);
         const height: f32 = @floatFromInt(self.render_size[1]);
         const result = c.limnDlssDispatch(self.handle, &.{
-            .command_buffer = @intFromEnum(cmd.command),
+            .command_buffer = rhi.native.commandBuffer(cmd),
             .color = image(device, inputs.color),
             .depth = image(device, inputs.depth),
             .motion = image(device, inputs.motion),
@@ -183,7 +184,7 @@ pub const Upscaler = struct {
             .frame_milliseconds = @max(inputs.delta_time * 1000, 0.01),
             .reset = @intFromBool(inputs.reset),
         });
-        cmd.bindGlobals();
+        rhi.native.restore(cmd);
         if (result != 0) return error.DlssFailed;
     }
 
@@ -191,13 +192,7 @@ pub const Upscaler = struct {
     const jitter_sign = [2]f32{ 1, 1 };
 
     fn image(device: *rhi.Device, texture: rhi.Texture) Image {
-        const resource = device.textureResource(texture);
-        return .{
-            .image = @intFromEnum(resource.image),
-            .view = @intFromEnum(resource.view),
-            .format = @intFromEnum(resource.vk_format),
-            .width = resource.info.width,
-            .height = resource.info.height,
-        };
+        const native = rhi.native.image(device, texture);
+        return .{ .image = native.image, .view = native.view, .format = native.format, .width = native.width, .height = native.height };
     }
 };

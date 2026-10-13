@@ -26,8 +26,8 @@ layout(location = 1) out vec4 out_motion;
 void main() {
     FrameConstants frame = push.frame;
     float depth = textureLod(TEX(push.depth_texture, frame.sampler_nearest_clamp), in_uv, 0.0).r;
-    vec3 camera = frame.camera_position;
     vec3 end = worldPositionFromDepth(in_uv, max(depth, 1e-6), frame.inv_view_proj);
+    vec3 camera = eyePoint(frame, end);
     float scene_distance = depth > 0.0 ? length(end - camera) : 1e30;
     vec3 direction = normalize(end - camera);
 

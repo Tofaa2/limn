@@ -225,7 +225,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (window) |value| value.deinit();
     const renderer = try gfx.Renderer.init(init.gpa, init.io, .{
         .application_name = "particles",
-        .pipeline_cache_path = "zig-out/pipeline.cache",
+        .cache = .{ .pipelines = "zig-out/pipeline.cache" },
         .validation = offscreen,
         .surface = if (window) |value| try value.surface(false) else null,
     });
@@ -343,9 +343,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.6, -0.5 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = if (target) |texture| .{ .texture = texture } else .backbuffer,
-                .settings = .{ .shadow_distance = 40, .bloom = 0.06, .exposure_compensation = -1.6 },
+                .settings = .{ .shadows = .{ .distance = 40 }, .post = .{ .bloom = 0.06, .exposure_compensation = -1.6 } },
             }},
             .delta_time = dt,
         });

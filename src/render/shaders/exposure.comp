@@ -21,7 +21,7 @@ void main() {
     float seen = 0.0;
     for (int i = 0; i < 5; i++) {
         vec2 offset = vec2(i == 1 ? 0.03 : (i == 2 ? -0.03 : 0.0), i == 3 ? 0.03 : (i == 4 ? -0.03 : 0.0));
-        seen += min(linearDepth(textureLod(TEX(push.depth_texture, frame.sampler_nearest_clamp), vec2(0.5) + offset, 0.0).r, frame.near), 1000.0);
+        seen += min(linearDepth(textureLod(TEX(push.depth_texture, frame.sampler_nearest_clamp), vec2(0.5) + offset, 0.0).r, frame.depth_terms), 1000.0);
     }
     seen /= 5.0;
     float focus = frame.exposure.focus;

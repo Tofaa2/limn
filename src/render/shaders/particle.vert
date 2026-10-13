@@ -53,7 +53,7 @@ void main() {
     vec3 up = frame.inv_view[1].xyz;
     vec2 half_size = vec2(size * 0.5);
     if (emitter.stretch > 0.0) {
-        vec3 toward = normalize(particle.position - frame.camera_position);
+        vec3 toward = normalize(particle.position - eyePoint(frame, particle.position));
         vec3 along = particle.velocity - toward * dot(particle.velocity, toward);
         float speed = length(along);
         if (speed > 1e-4) {

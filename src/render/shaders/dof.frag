@@ -27,7 +27,7 @@ void main() {
     uint linear = frame.sampler_linear_clamp;
     focus_distance = push.focus_distance;
     if (focus_distance < 0.0) focus_distance = max(frame.exposure.focus, frame.near);
-    float center_depth = linearDepth(textureLod(TEX(push.depth_texture, nearest), in_uv, 0.0).r, frame.near);
+    float center_depth = linearDepth(textureLod(TEX(push.depth_texture, nearest), in_uv, 0.0).r, frame.depth_terms);
     float center_radius = blurRadius(center_depth);
     vec3 total = textureLod(TEX(push.color_texture, linear), in_uv, 0.0).rgb;
     float weight_total = 1.0;
@@ -42,7 +42,7 @@ void main() {
             distance_pixels *= cos(0.5 * sector) / cos(within);
         }
         vec2 uv = in_uv + vec2(cos(angle), sin(angle)) * distance_pixels * frame.inv_resolution;
-        float tap_depth = linearDepth(textureLod(TEX(push.depth_texture, nearest), uv, 0.0).r, frame.near);
+        float tap_depth = linearDepth(textureLod(TEX(push.depth_texture, nearest), uv, 0.0).r, frame.depth_terms);
         float tap_radius = blurRadius(tap_depth);
         if (tap_depth > center_depth) tap_radius = min(tap_radius, center_radius);
         float weight = smoothstep(reach - 1.0, reach + 1.0, tap_radius);

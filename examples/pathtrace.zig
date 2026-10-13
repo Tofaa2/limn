@@ -23,14 +23,14 @@ const helpers = @import("window");
 const Stage = helpers.Stage;
 
 pub fn main(init: std.process.Init) !void {
-    var options = gfx.Options{ .path_tracing_fallback = true };
+    var options = gfx.Options{ .ray_tracing = .{ .software_path_tracing = true } };
     var traced = true;
     var orbiting = false;
     {
         var arguments = try init.minimal.args.iterateAllocator(init.gpa);
         defer arguments.deinit();
         while (arguments.next()) |argument| {
-            if (std.mem.eql(u8, argument, "--software")) options.ray_tracing = false;
+            if (std.mem.eql(u8, argument, "--software")) options.ray_tracing.hardware = false;
             if (std.mem.eql(u8, argument, "--raster")) traced = false;
             if (std.mem.eql(u8, argument, "--orbit")) orbiting = true;
         }
@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.35, -0.8, -0.45 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
@@ -114,12 +114,11 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.1, -0.5 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = .{
-                    .shadow_distance = 30,
-                    .path_tracing = traced,
-                    .path_tracing_bounces = bounces,
+                    .shadows = .{ .distance = 30 },
+                    .path_tracing = if (traced) .{ .bounces = bounces } else null,
                 },
             }},
             .delta_time = tick.dt,

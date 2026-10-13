@@ -1,10 +1,10 @@
 //! Water surfaces. Internal to the renderer.
 const std = @import("std");
+const simulation_feature = @import("../features/simulation.zig");
 const handle = @import("../../handle.zig");
 const math = @import("../../math.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
-const simulation_passes = @import("../passes/simulation.zig");
 const render = @import("../renderer.zig");
 
 const Renderer = render.Renderer;
@@ -33,7 +33,7 @@ pub const Waters = struct {
         const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
         if (data.waters.items.len == max_waters) return error.TooManyWaters;
         var state = WaterState{ .scene = scene, .desc = desc };
-        if (desc.splashes > 0) state.splash = try createEmitterLocked(self, scene, simulation_passes.splashDesc(desc));
+        if (desc.splashes > 0) state.splash = try createEmitterLocked(self, scene, simulation_feature.splashDesc(desc));
         errdefer if (state.splash) |emitter| destroyEmitterLocked(self, emitter);
         try createWaterTextures(self, &state);
         errdefer for (state.state) |texture| self.device.destroyTexture(texture);
@@ -51,7 +51,7 @@ pub const Waters = struct {
         defer self.unlock();
         const state = self.waters.table.get(water) orelse return;
         const resized = !std.mem.eql(u32, &desc.resolution, &state.desc.resolution);
-        if (desc.splashes > 0 and state.splash == null) state.splash = try createEmitterLocked(self, state.scene, simulation_passes.splashDesc(desc));
+        if (desc.splashes > 0 and state.splash == null) state.splash = try createEmitterLocked(self, state.scene, simulation_feature.splashDesc(desc));
         if (desc.splashes <= 0) if (state.splash) |emitter| {
             destroyEmitterLocked(self, emitter);
             state.splash = null;

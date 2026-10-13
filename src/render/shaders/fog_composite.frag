@@ -13,7 +13,7 @@ layout(location = 0) out vec4 out_color;
 void main() {
     FrameConstants frame = push.frame;
     uint nearest = frame.sampler_nearest_clamp;
-    float center = linearDepth(texelFetch(TEX(push.depth_texture, nearest), ivec2(gl_FragCoord.xy), 0).r, frame.near);
+    float center = linearDepth(texelFetch(TEX(push.depth_texture, nearest), ivec2(gl_FragCoord.xy), 0).r, frame.depth_terms);
     ivec2 fog_size = textureSize(TEX(push.fog_texture, nearest), 0);
     vec2 position = in_uv * vec2(fog_size) - 0.5;
     ivec2 base = ivec2(floor(position));
@@ -24,7 +24,7 @@ void main() {
         for (int x = 0; x < 2; x++) {
             ivec2 tap = clamp(base + ivec2(x, y), ivec2(0), fog_size - 1);
             vec2 tap_uv = (vec2(tap) + 0.5) / vec2(fog_size);
-            float depth = linearDepth(textureLod(TEX(push.depth_texture, nearest), tap_uv, 0.0).r, frame.near);
+            float depth = linearDepth(textureLod(TEX(push.depth_texture, nearest), tap_uv, 0.0).r, frame.depth_terms);
             float bilinear = (x == 0 ? 1.0 - f.x : f.x) * (y == 0 ? 1.0 - f.y : f.y);
             float weight = bilinear / (1e-3 + abs(depth - center) / max(center, 1e-3) * 20.0);
             total += texelFetch(TEX(push.fog_texture, nearest), tap, 0) * weight;

@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
     const sky = gfx.SkyDesc{ .sun_direction = .{ -0.45, -0.7, -0.4 } };
     renderer.scenes.setSun(scene, gfx.skySun(sky));
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky), .intensity = 1 });
     const right_view = try renderer.views.create();
 
     var positions: [24][3]f32 = undefined;
@@ -113,13 +113,13 @@ pub fn main(init: std.process.Init) !void {
         try list.text(font, try std.fmt.bufPrint(&text, "eyes {d:.0} mm apart · agree at {d:.1} m · {s}", .{ separation * 1000, convergence, if (swapped) "for crossed eyes" else "for relaxed eyes" }), .{ 24, 20 }, .{ .size = 16 });
         try list.text(font, try std.fmt.bufPrint(&text, "{d:.1} ms GPU for both · {d:.0} fps\nUp/Down apart · Left/Right distance · X swap · A/D orbit", .{ stage.gpu_ms, stage.fps }), .{ 24, 44 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
 
-        const settings = gfx.Settings{ .shadow_distance = 40, .global_illumination = false };
+        const settings = gfx.Settings{ .shadows = .{ .distance = 40 }, .global_illumination = null };
         try stage.end(try renderer.render(.{
             .views = &.{
                 .{
                     .scene = scene,
                     .camera = eyes[left],
-                    .draw_lists = &.{&list},
+                    .draw_lists = &.{.{ .list = &list }},
                     .target = stage.target(),
                     .region = .{ .x = 0, .y = 0, .width = half, .height = tick.size[1] },
                     .settings = settings,

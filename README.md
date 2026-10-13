@@ -37,7 +37,7 @@ defer renderer.deinit();
 const scene = try renderer.scenes.create();
 const model = try renderer.models.load("helmet.glb");
 _ = try renderer.entities.spawn(scene, .{ .model = model });
-renderer.scenes.setSun(scene, .{ .direction = .{ -0.4, -1.0, -0.3 } });
+renderer.scenes.setSun(scene, .{ .direction = .{ -0.4, -1.0, -0.3 }, .intensity = 5 });
 
 while (running) {
     _ = try renderer.render(.{
@@ -49,7 +49,7 @@ while (running) {
 
 ## Build
 
-Requires Zig 0.16, a Vulkan 1.3 driver and `glslc`. The Vulkan headers and
+Requires Zig 0.16, a Vulkan 1.3 driver, `glslc` and `slangc`. The Vulkan headers and
 loader are fetched by the build; the examples also need GLFW, which is
 fetched on Windows and linked from the system elsewhere. `flake.nix`
 provides everything. The example assets are stored with Git LFS: run

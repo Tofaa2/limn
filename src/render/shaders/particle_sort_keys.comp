@@ -19,7 +19,7 @@ void main() {
     if (index < push.capacity) {
         Particle particle = push.particles.data[index];
         if (particle.age < particle.lifetime) {
-            vec3 away = particle.position - push.frame.camera_position;
+            vec3 away = particle.position - eyePoint(push.frame, particle.position);
             entry = SortEntry(-dot(away, away), index);
         }
     }

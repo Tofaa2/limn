@@ -1,5 +1,6 @@
 //! A scene's per-frame GPU state: poses, instances, lights and acceleration structures. Internal to the renderer.
 const std = @import("std");
+const geometry_feature = @import("../features/geometry.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
 const gpu = @import("../gpu.zig");
@@ -7,7 +8,6 @@ const animation = @import("../animation.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
 const scene_pass = @import("../scene_pass.zig");
-const geometry_passes = @import("../passes/geometry.zig");
 const render = @import("../renderer.zig");
 
 const Renderer = render.Renderer;
@@ -558,7 +558,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
     const entity_count = layout.len;
     const total = entity_count + scene.static_count;
     const records = &scene.instance_slots[0];
-    const group_rays = device.ray_tracing and scene.static_count != 0 and scene.static_count <= self.options.gi_instance_limit;
+    const group_rays = device.caps.ray_tracing and scene.static_count != 0 and scene.static_count <= self.options.ray_tracing.instance_limit;
     if (records.buffer == null or records.capacity < total) {
         if (records.buffer) |old| device.destroyBuffer(old);
         records.buffer = null;
@@ -578,7 +578,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         scene.records_valid = false;
         scene.static_tlas_uploaded = false;
     }
-    const tree_wanted = scene.trace_wanted and !device.ray_tracing and self.options.path_tracing_fallback;
+    const tree_wanted = scene.trace_wanted and !device.caps.ray_tracing and self.options.ray_tracing.software_path_tracing;
     if (tree_wanted) scene.records_valid = false;
     const whole = !scene.records_valid;
 
@@ -770,7 +770,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
             const padding = model.info.bounds_radius * 0.25 * math.maxScale(now);
             noteMover(self, scene, .{ center[0], center[1], center[2], shared_radius + padding });
             const current = skin_base + parity * mesh.vertex_count;
-            const own_bounds = self.options.skinned_meshlet_bounds and mesh.meshlet_count != 0;
+            const own_bounds = self.options.geometry.skinned_meshlet_bounds and mesh.meshlet_count != 0;
             const previous = skin_base + (1 - parity) * mesh.vertex_count;
             changes.any_moving = true;
             const record = gpu.Instance{
@@ -817,8 +817,8 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
                 .target_count = mesh.morph_targets,
                 .weights_offset = weights_offset,
             });
-            if (self.options.gi_dynamic_geometry and device.ray_tracing and !mesh.blend) {
-                var dynamic_desc = geometry_passes.blasDesc(self, mesh);
+            if (self.options.ray_tracing.dynamic_geometry and device.caps.ray_tracing and !mesh.blend) {
+                var dynamic_desc = geometry_feature.blasDesc(self, mesh);
                 dynamic_desc.vertex_offset = @as(u64, current) * @sizeOf(gpu.Vertex);
                 dynamic_desc.dynamic = true;
                 const slot_blas = &entity.skin_blas[model_instance];
@@ -1083,7 +1083,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
 
 /// Records the GPU side of `prepareScene`: copies and compute passes that
 /// bring the scene's instance buffers up to date.
-pub fn applySceneUpdate(self: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, update: scene_pass.SceneUpdate) void {
+pub fn applySceneUpdate(self: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, update: scene_pass.SceneUpdate) !void {
     const tlas_size = @sizeOf(rhi.AccelerationInstance);
     const copies = update.whole or update.skinned_tlas_count != 0;
     if (copies) cmd.sync(.all_to_transfer);
@@ -1106,14 +1106,14 @@ pub fn applySceneUpdate(self: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scene
         .count = update.move_count,
     };
     if (update.move_count != 0) {
-        cmd.bindPipeline(self.pipelines.instance_moves);
+        cmd.bindPipeline(try self.pipelines.get(.instance_moves));
         cmd.pushConstants(push);
         cmd.dispatch((update.move_count + 63) / 64, 1, 1);
     }
     if (update.rewrite_count != 0) {
         push.updates = update.rewrites;
         push.count = update.rewrite_count;
-        cmd.bindPipeline(self.pipelines.instance_rewrites);
+        cmd.bindPipeline(try self.pipelines.get(.instance_rewrites));
         cmd.pushConstants(push);
         cmd.dispatch((update.rewrite_count + 63) / 64, 1, 1);
     }
@@ -1139,7 +1139,7 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
         .tile_view_proj = undefined,
         .tile_views = undefined,
     };
-    const tiles_per_side = std.math.clamp(self.options.local_shadow_tiles_per_side, 1, local_shadow_tiles_per_side);
+    const tiles_per_side = std.math.clamp(self.options.shadows.local_tiles_per_side, 1, local_shadow_tiles_per_side);
     const tile_scale = 1.0 / @as(f32, @floatFromInt(tiles_per_side));
     const axes = [6]Vec3{ .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 } };
     const granted = try self.gpa.alloc(bool, scene.lights.items.len);
@@ -1287,7 +1287,7 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
                 break :find;
             }
             cmd.sync(.all_to_transfer);
-            cmd.copyBuffer(pool.buffer, pool.buffer, @as(u64, old) * pool.stride, @as(u64, new) * pool.stride, @as(u64, count) * pool.stride);
+            cmd.copyBuffer(pool.get(), pool.get(), @as(u64, old) * pool.stride, @as(u64, new) * pool.stride, @as(u64, count) * pool.stride);
             cmd.sync(.transfer_to_all);
             if (vertices) mesh.vertex_offset = new else mesh.index_offset = new;
             if (!vertices) {
@@ -1336,7 +1336,7 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
                 device.releaseDetached(job);
                 entry.blas_job = null;
             } else for (entry.meshes) |mesh| {
-                if (mesh.blas_building orelse mesh.blas) |blas| try cmd.buildBlas(blas, geometry_passes.blasDesc(self, mesh));
+                if (mesh.blas_building orelse mesh.blas) |blas| try cmd.buildBlas(blas, geometry_feature.blasDesc(self, mesh));
             }
             finished = adoptBlas(self, entry) or finished;
             continue;
@@ -1355,7 +1355,7 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
         for (entry.meshes) |mesh| detached = detached or mesh.blas_building != null;
         if (!detached) {
             entry.blas_pending = false;
-            for (entry.meshes) |mesh| if (mesh.blas) |blas| try cmd.buildBlas(blas, geometry_passes.blasDesc(self, mesh));
+            for (entry.meshes) |mesh| if (mesh.blas) |blas| try cmd.buildBlas(blas, geometry_feature.blasDesc(self, mesh));
             continue;
         }
         still_pending += 1;
@@ -1368,7 +1368,7 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
         // to read. Its contents may be copied a frame after the move is seen.
         if (self.geometry_replaced) |replaced| if (frame_now <= replaced + rhi.frames_in_flight) continue;
         var encoder = (try device.beginDetached()).?;
-        for (entry.meshes) |mesh| if (mesh.blas_building) |blas| try encoder.buildBlas(blas, geometry_passes.blasDesc(self, mesh));
+        for (entry.meshes) |mesh| if (mesh.blas_building) |blas| try encoder.buildBlas(blas, geometry_feature.blasDesc(self, mesh));
         entry.blas_job = try device.submitDetached(encoder);
     };
     self.blas_pending = still_pending;

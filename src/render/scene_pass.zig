@@ -61,6 +61,33 @@ pub const SceneFrame = struct {
     bounds: [2]Vec3,
 };
 
+/// What the features of one view of a scene hand each other while its frame
+/// is put together and drawn.
+pub const Shared = struct {
+    frame: rhi.Frame,
+    arena: *FrameArena,
+    delta_time: f32,
+    sun: *const SunShadows,
+    lighting: *const Lighting,
+    local_shadows: *const LocalShadows,
+    gi: ?*render.GiVolume,
+    shadow_tlas: u64,
+    colored_shadows: bool,
+    cloud_address: u64,
+    fluid_list: *gpu.FluidList,
+    shadows_enabled: bool,
+    first_view: bool,
+    fresh_scene: bool,
+    instance_total: u32,
+    count_readback: rhi.Buffer,
+    culling: *CullState,
+    gathered_gi: ?rhi.Texture = null,
+    reflections: ?render.ReflectionTargets = null,
+    path_traced: bool = false,
+    resolved: *rhi.Texture,
+    bloom_count: usize = 0,
+};
+
 /// State shared by the passes of one view of a scene.
 pub const ScenePass = struct {
     frame: rhi.Frame,
@@ -80,6 +107,10 @@ pub const ScenePass = struct {
     /// Size the scene is rendered at.
     width: u32,
     height: u32,
+    /// Size of the picture once antialiasing has resolved it: the output
+    /// size when that also upscales.
+    resolved_width: u32,
+    resolved_height: u32,
     /// Size of the area of the target the view fills.
     output_width: u32,
     output_height: u32,
@@ -108,6 +139,31 @@ pub const ScenePass = struct {
     lod_band: f32,
     /// Address of the frame constants; 0 until they have been written.
     frame_address: u64 = 0,
+    /// The view is path traced: passes whose result the tracer replaces are
+    /// left out.
+    tracing: bool = false,
+    shared: *Shared = undefined,
+    /// The sun casts shadows in this view.
+    sun_shadows: bool = false,
+    /// What culling leaves for the passes after it; filled when it runs.
+    culling: *const CullState = undefined,
+    /// The antialiased HDR picture, once the resolve stage has run.
+    resolved: *const rhi.Texture = undefined,
+
+    /// A color target the view keeps from frame to frame, made when first
+    /// asked for and dropped a few frames after it no longer is.
+    pub fn keep(p: *const ScenePass, renderer: *render.Renderer, name: [:0]const u8, width: u32, height: u32, format: rhi.Format) !rhi.Texture {
+        return p.keepAs(renderer, .{ .name = name, .width = width, .height = height, .format = format, .usage = .{ .sampled = true, .color_attachment = true } });
+    }
+
+    pub fn keepAs(p: *const ScenePass, renderer: *render.Renderer, desc: rhi.TextureDesc) !rhi.Texture {
+        return p.view_data.kept.single(renderer.gpa, renderer.device, desc, renderer.frame_index);
+    }
+
+    /// `size` at an effect's fraction of the view's resolution.
+    pub fn scaled(resolution: render.EffectResolution, size: u32) u32 {
+        return @max(size >> @intFromEnum(resolution), 1);
+    }
 };
 
 /// The sun's shadow cascades for one view of a frame.

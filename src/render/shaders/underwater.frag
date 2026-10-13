@@ -21,8 +21,8 @@ void main() {
     vec3 scene = texelFetch(TEX(push.scene_texture, nearest), ivec2(gl_FragCoord.xy), 0).rgb;
     float depth = texelFetch(TEX(push.depth_texture, nearest), ivec2(gl_FragCoord.xy), 0).r;
     vec3 world = worldPositionFromDepth(screen_uv, max(depth, 1e-7), frame.inv_view_proj);
-    vec3 direction = normalize(world - frame.camera_position);
-    float reach = depth > 0.0 ? distance(world, frame.camera_position) : 1e5;
+    vec3 direction = normalize(world - eyePoint(frame, world));
+    float reach = depth > 0.0 ? distance(world, eyePoint(frame, world)) : 1e5;
 
     vec3 up = normalize(water.data.transform[1].xyz);
     float below = dot(water.data.transform[3].xyz - frame.camera_position, up);

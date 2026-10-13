@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.3, -0.25, -0.5 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 0.02);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 0.02 });
     renderer.scenes.setSun(scene, .{ .direction = sky_desc.sun_direction, .color = .{ 0.6, 0.7, 1.0 }, .intensity = 0.05 });
 
     var box_positions: [24][3]f32 = undefined;
@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
     helpers.sphereMesh(0.9, &sphere_positions, &sphere_normals, &sphere_indices);
     const chrome = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0.9, 0.9, 0.92, 1 }, .metallic = 1, .roughness = 0.15 } }});
     _ = try renderer.entities.spawn(scene, .{ .model = chrome, .transform = math.translation(.{ 2, 0.9, 2.2 }) });
-    const dot = try renderer.images.create(1, 1, &.{ 255, 255, 255, 255 }, true);
+    const dot = try renderer.images.create(.{ .width = 1, .height = 1, .pixels = &.{ 255, 255, 255, 255 } });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(init.gpa);
@@ -114,9 +114,12 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.5, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 40, .bloom = 0.08, .automatic_exposure = false, .exposure_compensation = 1.5 },
+                .settings = .{
+                    .shadows = .{ .distance = 40 },
+                    .post = .{ .bloom = 0.08, .automatic_exposure = false, .exposure_compensation = 1.5 },
+                },
             }},
             .delta_time = tick.dt,
         }));

@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.3, -0.6 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 0.6);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 0.6 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     const lava = try renderer.materials.createShader(@embedFile("lava.frag.spv"), @embedFile("lava_plain.frag.spv"));
@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
             glow = @max(glow - 1, 0);
             changed = true;
         }
-        if (changed) try renderer.materials.setShader(molten, null, lava, .{ 2.5, glow, 0, 0 });
+        if (changed) try renderer.materials.setShader(molten, .{ .shader = lava, .params = .{ 2.5, glow, 0, 0 } });
 
         list.clear();
         try list.text3d(font, "molten", .{ -(count - 1) * 0.5 * 2.6, 2.4, 0 }, .{ .size = 0.2 });
@@ -88,9 +88,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 30, .bloom = 0.08 },
+                .settings = .{ .shadows = .{ .distance = 30 }, .post = .{ .bloom = 0.08 } },
             }},
             .delta_time = tick.dt,
         }));

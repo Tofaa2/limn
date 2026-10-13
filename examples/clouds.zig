@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
     var sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.6 * @cos(sun_height), -@sin(sun_height), -0.5 } };
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
     const environment = try renderer.environments.createSky(sky_desc);
-    renderer.scenes.setEnvironment(scene, environment, 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 1 });
 
     const cells = 360;
     const extent = 9000.0;
@@ -98,7 +98,13 @@ pub fn main(init: std.process.Init) !void {
     try renderer.waitUntilLoaded();
 
     var clouds = gfx.CloudDesc{ .cirrus = 0.35, .coverage = 0.42, .density = 0.03, .thickness = 2200, .variation = 0.9, .detail = 0.5 };
-    var settings = gfx.Settings{ .shadow_distance = 900, .global_illumination = false, .aerial_perspective = 0.0006 };
+    var cloud_settings = gfx.Clouds{};
+    var clouds_on = true;
+    var settings = gfx.Settings{
+        .shadows = .{ .distance = 900 },
+        .global_illumination = null,
+        .shading = .{ .aerial_perspective = 0.0006 },
+    };
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
     const font = renderer.fonts.default();
@@ -116,7 +122,7 @@ pub fn main(init: std.process.Init) !void {
                 .material = .{ .base_color = .{ 0.9, 0.15, 0.1, 0.6 }, .metallic = 0, .roughness = 0.1, .alpha_mode = .blend, .double_sided = true },
             }});
             _ = try renderer.entities.spawn(scene, .{ .model = pane, .transform = math.translation(.{ 0, 22, -110 }) });
-            settings.colored_shadows = true;
+            settings.shadows = .{ .distance = 900, .colored = true };
         }
         if (std.mem.eql(u8, argument, "--clear")) {
             clouds.coverage = 0;
@@ -153,8 +159,9 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyDown(glfw.GLFW_KEY_S)) altitude = @max((altitude - tick.dt * 20) / (1 + tick.dt * 1.5), 2);
         if (stage.keyDown(glfw.GLFW_KEY_A)) heading -= tick.dt * 0.8;
         if (stage.keyDown(glfw.GLFW_KEY_D)) heading += tick.dt * 0.8;
-        if (stage.keyPressed(glfw.GLFW_KEY_C)) settings.clouds = !settings.clouds;
-        if (stage.keyPressed(glfw.GLFW_KEY_F)) settings.cloud_temporal_filter = !settings.cloud_temporal_filter;
+        if (stage.keyPressed(glfw.GLFW_KEY_C)) clouds_on = !clouds_on;
+        if (stage.keyPressed(glfw.GLFW_KEY_F)) cloud_settings.temporal_filter = !cloud_settings.temporal_filter;
+        settings.clouds = if (clouds_on) cloud_settings else null;
         if (stage.keyDown(glfw.GLFW_KEY_T)) {
             sun_height = @mod(sun_height + tick.dt * 0.25, std.math.pi);
             sky_desc.sun_direction = .{ -0.6 * @cos(sun_height), -@max(@sin(sun_height), -0.05), -0.5 };
@@ -170,9 +177,9 @@ pub fn main(init: std.process.Init) !void {
             stage.fps, stage.gpu_ms, stats.cpu_ms, clouds.coverage, clouds.density, altitude,
         }), .{ 24, 20 }, .{ .size = 16 });
         try list.text(font, "clouds", .{ 24, 66 }, .{ .size = 14 });
-        try list.text(font, if (settings.clouds) "on" else "off", .{ 80, 66 }, .{ .size = 14, .color = if (settings.clouds) gfx.Color.hex(0x3ddc97) else gfx.Color.hex(0x7c8499) });
+        try list.text(font, if (clouds_on) "on" else "off", .{ 80, 66 }, .{ .size = 14, .color = if (clouds_on) gfx.Color.hex(0x3ddc97) else gfx.Color.hex(0x7c8499) });
         try list.text(font, "temporal filter", .{ 130, 66 }, .{ .size = 14 });
-        try list.text(font, if (settings.cloud_temporal_filter) "on" else "off", .{ 240, 66 }, .{ .size = 14, .color = if (settings.cloud_temporal_filter) gfx.Color.hex(0x3ddc97) else gfx.Color.hex(0x7c8499) });
+        try list.text(font, if (cloud_settings.temporal_filter) "on" else "off", .{ 240, 66 }, .{ .size = 14, .color = if (cloud_settings.temporal_filter) gfx.Color.hex(0x3ddc97) else gfx.Color.hex(0x7c8499) });
         try list.text(font, "Up/Down cover · Left/Right density · W/S altitude · A/D turn · T sun · C · F", .{ 24, 88 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
 
         const eye = math.Vec3{ 0, landHeight(0, 60) + altitude, 60 };
@@ -181,7 +188,7 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = .{ .position = eye, .forward = look },
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = settings,
             }},

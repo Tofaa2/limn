@@ -3,6 +3,10 @@
 
 bool projectSphere(vec3 c, float r, float near, float p00, float p11, out vec4 aabb) {
     if (c.z < r + near) return false;
+    if (push.view.far > 0.0) {
+        aabb = (vec4((c.xy - r) * vec2(p00, p11), (c.xy + r) * vec2(p00, p11)) + push.view.lens_shift.xyxy) * 0.5 + 0.5;
+        return true;
+    }
     vec3 cr = c * r;
     float czr2 = c.z * c.z - r * r;
     float vx = sqrt(c.x * c.x + czr2);
@@ -34,7 +38,7 @@ bool occluded(vec3 center, float radius) {
     vec2 uv_min = clamp(min(aabb.xy, aabb.zw), 0.0, 1.0);
     vec2 uv_max = clamp(max(aabb.xy, aabb.zw), 0.0, 1.0);
     float farthest = farthestDepth(uv_min, uv_max);
-    float nearest = push.view.near / (c.z - radius);
+    float nearest = push.view.far > 0.0 ? (push.view.far - c.z + radius) / (push.view.far - push.view.near) : push.view.near / (c.z - radius);
     return nearest < farthest;
 }
 

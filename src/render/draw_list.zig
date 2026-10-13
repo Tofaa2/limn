@@ -402,30 +402,163 @@ const FontSet = struct {
 
 /// Geometry for one space of a draw list (screen or world): an indexed
 /// triangle list in draw order. Owned by its `DrawList`.
+/// How what is drawn is combined with what is already in the picture.
+pub const Blend = enum {
+    /// Over what is there, by its alpha.
+    alpha,
+    /// As `alpha`, for colors already multiplied by their alpha.
+    premultiplied,
+    /// Added to what is there: light, glows, fire.
+    additive,
+    /// What is there, multiplied by the color: shadows, tints.
+    multiply,
+};
+
+/// A fragment shader for draw lists; see `Renderer.canvas.createShader`.
+pub const CanvasShader = struct { slot: u8 };
+
+/// A screen-space parallelogram of one color, as the vertex shader unfolds
+/// it: most of what a draw list holds.
+pub const Quad = extern struct {
+    origin: [2]f32,
+    axis_x: [2]f32,
+    axis_y: [2]f32,
+    /// Texture coordinates at the origin and at the opposite corner.
+    uv: [4]f32,
+    /// `Vertex.offset` of all four corners.
+    extra: [2]f32,
+    color: Color,
+    texture_mode: u32,
+
+    /// `corners` as one record, or null when they are not such a shape.
+    fn from(corners: [4]Vertex) ?Quad {
+        const c = corners;
+        inline for (1..4) |index| {
+            if (@as(u32, @bitCast(c[index].color)) != @as(u32, @bitCast(c[0].color))) return null;
+            if (c[index].offset[0] != c[0].offset[0] or c[index].offset[1] != c[0].offset[1]) return null;
+            if (c[index].position[2] != 0) return null;
+        }
+        if (c[0].position[2] != 0) return null;
+        if (c[1].uv[1] != c[0].uv[1] or c[2].uv[0] != c[1].uv[0] or c[3].uv[0] != c[0].uv[0] or c[3].uv[1] != c[2].uv[1]) return null;
+        inline for (0..2) |axis| {
+            if (@abs(c[1].position[axis] + c[3].position[axis] - c[0].position[axis] - c[2].position[axis]) > 1e-3) return null;
+        }
+        return .{
+            .origin = .{ c[0].position[0], c[0].position[1] },
+            .axis_x = .{ c[1].position[0] - c[0].position[0], c[1].position[1] - c[0].position[1] },
+            .axis_y = .{ c[3].position[0] - c[0].position[0], c[3].position[1] - c[0].position[1] },
+            .uv = .{ c[0].uv[0], c[0].uv[1], c[2].uv[0], c[2].uv[1] },
+            .extra = c[0].offset,
+            .color = c[0].color,
+            .texture_mode = c[0].texture_mode,
+        };
+    }
+};
+
 pub const Batch = struct {
     vertices: std.ArrayList(Vertex) = .empty,
     indices: std.ArrayList(u32) = .empty,
-    /// Clip changes in index order. Empty means the batch is unclipped.
-    clips: std.ArrayList(ClipRange) = .empty,
+    quads: std.ArrayList(Quad) = .empty,
+    /// Changes of clip, blend, layer and shader, in recording order. Before
+    /// the first, nothing is clipped and blending is `Blend.alpha`.
+    states: std.ArrayList(State) = .empty,
+    clip: ?Rect = null,
+    blend: Blend = .alpha,
+    layer: i16 = 0,
+    shader: ?CanvasShader = null,
+    /// Quads that fit one are recorded as `Quad` records.
+    compact: bool = false,
+    /// Quads were recorded since the last state. Within a state triangles
+    /// are drawn first, so triangles recorded now need a state of their own.
+    quads_pending: bool = false,
 
-    /// Indices from `first_index` to the next range are clipped to `rect`, in
-    /// untransformed screen pixels; null is unclipped.
-    pub const ClipRange = struct { first_index: u32, rect: ?Rect };
+    /// What is recorded from `first_index` and `first_quad` up to the next
+    /// state is drawn this way. `clip` is in untransformed screen pixels.
+    pub const State = struct {
+        first_index: u32,
+        first_quad: u32,
+        clip: ?Rect,
+        blend: Blend,
+        layer: i16,
+        shader: ?CanvasShader,
+    };
+
+    fn mark(self: *Batch, gpa: std.mem.Allocator) !void {
+        const state = State{
+            .first_index = @intCast(self.indices.items.len),
+            .first_quad = @intCast(self.quads.items.len),
+            .clip = self.clip,
+            .blend = self.blend,
+            .layer = self.layer,
+            .shader = self.shader,
+        };
+        self.quads_pending = false;
+        if (self.states.items.len != 0) {
+            const last = &self.states.items[self.states.items.len - 1];
+            if (last.first_index == state.first_index and last.first_quad == state.first_quad) {
+                last.* = state;
+                return;
+            }
+        }
+        try self.states.append(gpa, state);
+    }
+
+    /// Call before recording triangles, so they are drawn after the quads
+    /// recorded before them.
+    fn beginTriangles(self: *Batch, gpa: std.mem.Allocator) !void {
+        if (self.quads_pending) try self.mark(gpa);
+    }
 
     fn quad(self: *Batch, gpa: std.mem.Allocator, corners: [4]Vertex) !void {
+        if (self.compact) if (Quad.from(corners)) |record| {
+            try self.quads.append(gpa, record);
+            self.quads_pending = true;
+            return;
+        };
+        try self.beginTriangles(gpa);
         const base: u32 = @intCast(self.vertices.items.len);
         try self.vertices.appendSlice(gpa, &corners);
         try self.indices.appendSlice(gpa, &.{ base, base + 1, base + 2, base, base + 2, base + 3 });
     }
+
+    pub fn isEmpty(self: *const Batch) bool {
+        return self.indices.items.len == 0 and self.quads.items.len == 0;
+    }
+
+    fn deinit(self: *Batch, gpa: std.mem.Allocator) void {
+        self.vertices.deinit(gpa);
+        self.indices.deinit(gpa);
+        self.quads.deinit(gpa);
+        self.states.deinit(gpa);
+    }
+
+    fn clear(self: *Batch) void {
+        self.vertices.clearRetainingCapacity();
+        self.indices.clearRetainingCapacity();
+        self.quads.clearRetainingCapacity();
+        self.states.clearRetainingCapacity();
+        self.clip = null;
+        self.blend = .alpha;
+        self.layer = 0;
+        self.shader = null;
+        self.quads_pending = false;
+    }
 };
+
+var next_list_id = std.atomic.Value(u64).init(1);
 
 /// One frame of 2D and world-space drawing, handed to `Renderer.render`
 /// and drawn in recording order. Not thread safe; use one list per thread.
 /// A failed drawing call leaves what was recorded before valid.
 pub const DrawList = struct {
     gpa: std.mem.Allocator,
+    /// Tells this list from every other, and one filling of it from the
+    /// next, so the renderer can keep the GPU copy of a list that is drawn
+    /// again unchanged.
+    id: u64,
+    generation: u64 = 0,
     /// Screen-space geometry, in pixels from the top-left corner.
-    screen: Batch = .{},
+    screen: Batch = .{ .compact = true },
     /// World-space geometry from the `*3d` calls, depth-tested.
     world: Batch = .{},
     /// Current 2D transform, applied to screen-space calls as recorded.
@@ -443,36 +576,31 @@ pub const DrawList = struct {
     substitutions: SubstitutionCache = .{},
 
     pub fn init(gpa: std.mem.Allocator) DrawList {
-        return .{ .gpa = gpa };
+        return .{ .gpa = gpa, .id = next_list_id.fetchAdd(1, .monotonic) };
     }
 
     /// The list must not be in use by a `Renderer.render` call.
     pub fn deinit(self: *DrawList) void {
-        self.screen.vertices.deinit(self.gpa);
-        self.screen.indices.deinit(self.gpa);
-        self.screen.clips.deinit(self.gpa);
+        self.screen.deinit(self.gpa);
+        self.world.deinit(self.gpa);
         self.glyph_scratch.deinit(self.gpa);
         self.substitutions.deinit(self.gpa);
-        self.world.vertices.deinit(self.gpa);
-        self.world.indices.deinit(self.gpa);
         self.* = undefined;
     }
 
     /// Empties the list, keeping its memory.
     pub fn clear(self: *DrawList) void {
-        self.screen.vertices.clearRetainingCapacity();
-        self.screen.indices.clearRetainingCapacity();
-        self.screen.clips.clearRetainingCapacity();
+        self.screen.clear();
+        self.world.clear();
+        self.generation +%= 1;
         self.clip = null;
         self.clip_depth = 0;
-        self.world.vertices.clearRetainingCapacity();
-        self.world.indices.clearRetainingCapacity();
         self.transform = .identity;
         self.transform_depth = 0;
     }
 
     pub fn isEmpty(self: *const DrawList) bool {
-        return self.screen.indices.items.len == 0 and self.world.indices.items.len == 0;
+        return self.screen.isEmpty() and self.world.isEmpty();
     }
 
     /// Composes `transform` onto the current 2D transform until the matching
@@ -525,11 +653,36 @@ pub const DrawList = struct {
 
     fn setClip(self: *DrawList, clip: ?Rect) !void {
         self.clip = clip;
-        const first: u32 = @intCast(self.screen.indices.items.len);
-        if (self.screen.clips.items.len != 0 and self.screen.clips.items[self.screen.clips.items.len - 1].first_index == first) {
-            self.screen.clips.items[self.screen.clips.items.len - 1].rect = clip;
-        } else {
-            try self.screen.clips.append(self.gpa, .{ .first_index = first, .rect = clip });
+        self.screen.clip = clip;
+        try self.screen.mark(self.gpa);
+    }
+
+    /// How what is drawn from here on is combined with the picture.
+    pub fn setBlend(self: *DrawList, blend: Blend) !void {
+        for ([_]*Batch{ &self.screen, &self.world }) |batch| {
+            if (batch.blend == blend) continue;
+            batch.blend = blend;
+            try batch.mark(self.gpa);
+        }
+    }
+
+    /// What is drawn from here on goes over everything of a lower layer and
+    /// under everything of a higher one, in any list of the same stage of
+    /// the view. Within a layer, recording order holds. Layers start at 0.
+    pub fn setLayer(self: *DrawList, layer: i16) !void {
+        for ([_]*Batch{ &self.screen, &self.world }) |batch| {
+            if (batch.layer == layer) continue;
+            batch.layer = layer;
+            try batch.mark(self.gpa);
+        }
+    }
+
+    /// Draws what follows with `shader`; null is the built-in one.
+    pub fn setShader(self: *DrawList, shader: ?CanvasShader) !void {
+        for ([_]*Batch{ &self.screen, &self.world }) |batch| {
+            if (std.meta.eql(batch.shader, shader)) continue;
+            batch.shader = shader;
+            try batch.mark(self.gpa);
         }
     }
 
@@ -634,6 +787,7 @@ pub const DrawList = struct {
 
     /// Fills a convex polygon given in order around its outline.
     pub fn fillConvex(self: *DrawList, points: []const [2]f32, color: Color) !void {
+        try self.screen.beginTriangles(self.gpa);
         if (points.len < 3) return;
         const base = try self.outlineVertices(points, color);
         for (1..points.len - 1) |index| {
@@ -643,6 +797,7 @@ pub const DrawList = struct {
 
     /// Fills any simple (non-self-intersecting) polygon by ear clipping.
     pub fn fillPolygon(self: *DrawList, points: []const [2]f32, color: Color) !void {
+        try self.screen.beginTriangles(self.gpa);
         if (points.len < 3) return;
         const base = try self.outlineVertices(points, color);
         var remaining: std.ArrayList(u32) = .empty;
@@ -756,6 +911,7 @@ pub const DrawList = struct {
     }
 
     pub fn triangle(self: *DrawList, a: [2]f32, b: [2]f32, c: [2]f32, color: Color) !void {
+        try self.screen.beginTriangles(self.gpa);
         const base = try self.outlineVertices(&.{ a, b, c }, color);
         try self.screen.indices.appendSlice(self.gpa, &.{ base, base + 1, base + 2 });
     }
@@ -1265,13 +1421,35 @@ test "draw list batches quads and honours the transform stack" {
     list.popTransform();
     try list.circle(.{ 0, 0 }, 4, .black);
     try list.line3d(.{ 0, 0, 0 }, .{ 1, 0, 0 }, 2, .white);
-    try std.testing.expectEqual(@as(usize, 8), list.screen.vertices.items.len);
-    try std.testing.expectEqual(@as(usize, 12), list.screen.indices.items.len);
+    try std.testing.expectEqual(@as(usize, 2), list.screen.quads.items.len);
+    try std.testing.expectEqual(@as(usize, 0), list.screen.indices.items.len);
     try std.testing.expectEqual(@as(usize, 6), list.world.indices.items.len);
-    try std.testing.expectApproxEqAbs(@as(f32, 5), list.screen.vertices.items[0].position[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, -4), list.screen.vertices.items[4].position[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), list.screen.quads.items[0].origin[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -4), list.screen.quads.items[1].origin[0], 1e-6);
     list.clear();
     try std.testing.expect(list.isEmpty());
+}
+
+test "a draw list keeps recording order across quads, triangles and state changes" {
+    var list = DrawList.init(std.testing.allocator);
+    defer list.deinit();
+    try list.rect(.{ .x = 0, .y = 0, .width = 10, .height = 10 }, .white);
+    try list.triangle(.{ 0, 0 }, .{ 4, 0 }, .{ 0, 4 }, .white);
+    try list.setBlend(.additive);
+    try list.setLayer(3);
+    try list.rect(.{ .x = 0, .y = 0, .width = 10, .height = 10 }, .white);
+    const states = list.screen.states.items;
+    try std.testing.expectEqual(@as(usize, 2), states.len);
+    try std.testing.expectEqual(@as(u32, 1), states[0].first_quad);
+    try std.testing.expectEqual(@as(u32, 0), states[0].first_index);
+    try std.testing.expectEqual(Blend.alpha, states[0].blend);
+    try std.testing.expectEqual(@as(u32, 1), states[1].first_quad);
+    try std.testing.expect(states[1].first_index > 0);
+    try std.testing.expectEqual(Blend.additive, states[1].blend);
+    try std.testing.expectEqual(@as(i16, 3), states[1].layer);
+    const generation = list.generation;
+    list.clear();
+    try std.testing.expect(list.generation != generation);
 }
 
 /// Unit normal of the edge from `a` to `b`, pointing out of an outline

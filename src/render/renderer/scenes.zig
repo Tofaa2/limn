@@ -119,21 +119,21 @@ pub const Scenes = struct {
         const strongest = @max(sun.intensity, data.sun.intensity);
         const turned = math.dot(math.normalize(sun.direction), math.normalize(data.sun.direction)) < 0.9;
         if ((change > 1 and change > 0.5 * strongest) or (turned and @min(sun.intensity, data.sun.intensity) > 1)) {
-            inline for (.{ "gi", "gi_coarse", "gi_middle" }) |name| {
-                if (@field(data, name)) |*volume| volume.frames = 0;
+            for (&data.gi_cascades) |*slot| {
+                if (slot.*) |*volume| volume.frames = 0;
             }
         }
         data.sun = sun;
     }
 
     /// Sets the HDR environment used for the sky and image-based lighting.
-    pub fn setEnvironment(scenes: *Scenes, scene: Scene, environment: ?Environment, intensity: f32) void {
+    pub fn setEnvironment(scenes: *Scenes, scene: Scene, desc: api.SceneEnvironment) void {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
         if (self.scenes.table.get(scene)) |data| {
-            data.environment = environment;
-            data.environment_intensity = intensity;
+            data.environment = desc.environment;
+            data.environment_intensity = desc.intensity;
         }
     }
 
@@ -194,7 +194,7 @@ pub const Scenes = struct {
             bounds[0] = math.add(bounds[0], offset);
             bounds[1] = math.add(bounds[1], offset);
         }
-        inline for (.{ &data.gi, &data.gi_coarse, &data.gi_middle }) |slot| {
+        for (&data.gi_cascades) |*slot| {
             if (slot.*) |*volume| volume.origin = math.add(volume.origin, offset);
         }
     }
@@ -290,9 +290,9 @@ pub fn freeScene(self: *Renderer, scene: *SceneData) void {
     for (scene.seen_readback) |readback| if (readback) |buffer| self.device.destroyBuffer(buffer);
     if (scene.skin_bounds) |buffer| self.device.destroyBuffer(buffer);
     if (scene.tlas) |tlas| self.device.destroyAcceleration(tlas);
-    if (scene.gi) |volume| volume.deinit(self.device);
-    if (scene.gi_coarse) |volume| volume.deinit(self.device);
-    if (scene.gi_middle) |volume| volume.deinit(self.device);
+    for (scene.gi_cascades) |slot| {
+        if (slot) |volume| volume.deinit(self.device);
+    }
 }
 
 /// Placements of models in scenes.
@@ -426,7 +426,7 @@ pub const Entities = struct {
             data.lightmap = null;
         }
         const wanted = desc orelse return;
-        if (self.pipelines.lightmap_bake == null) return error.RayTracingUnavailable;
+        if (!self.device.caps.ray_tracing) return error.RayTracingUnavailable;
         const size = std.math.clamp(wanted.resolution, 16, 4096);
         var made: [3]?rhi.Texture = @splat(null);
         errdefer for (made) |texture| if (texture) |value| self.device.destroyTexture(value);

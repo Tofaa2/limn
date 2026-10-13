@@ -25,7 +25,7 @@ pub const Images = struct {
     /// to `images.create` on a device without block compression.
     pub fn createCompressed(images: *Images, width: u32, height: u32, pixels: []const u8, srgb: bool) !Image {
         const self = images.renderer();
-        if (!self.device.bc_textures) return self.images.create(width, height, pixels, srgb);
+        if (!self.device.caps.bc_textures) return self.images.create(.{ .width = width, .height = height, .pixels = pixels, .srgb = srgb });
         if (pixels.len != @as(usize, width) * height * 4) return error.InvalidTextureData;
         const chain = try texture_codec.encodeBc7Chain(self.gpa, pixels, width, height, srgb);
         defer self.gpa.free(chain);
@@ -39,16 +39,15 @@ pub const Images = struct {
         });
     }
 
-    /// Creates an image for draw lists from tightly packed RGBA8 pixels.
-    /// `srgb`: true for color, false for data.
-    pub fn create(images: *Images, width: u32, height: u32, pixels: []const u8, srgb: bool) !Image {
-        return images.createLimited(width, height, pixels, srgb, 0);
+    /// Creates an image for draw lists.
+    pub fn create(images: *Images, desc: api.ImageDesc) !Image {
+        return images.createLimited(desc.width, desc.height, desc.pixels, desc.srgb, desc.mip_levels);
     }
 
     /// Like `create`, with at most `levels` mips; 0 means the full chain. An
     /// atlas wants no more than its smallest cell can be halved, or cells
     /// run into each other in the small mips.
-    pub fn createLimited(images: *Images, width: u32, height: u32, pixels: []const u8, srgb: bool, levels: u32) !Image {
+    fn createLimited(images: *Images, width: u32, height: u32, pixels: []const u8, srgb: bool, levels: u32) !Image {
         const self = images.renderer();
         self.lock();
         defer self.unlock();
@@ -90,7 +89,7 @@ pub const Images = struct {
         }
         var decoded = try gltf.loadImage(self.gpa, self.io, path);
         defer decoded.deinit();
-        return self.images.create(decoded.width, decoded.height, decoded.data, true);
+        return self.images.create(.{ .width = decoded.width, .height = decoded.height, .pixels = decoded.data, .srgb = true });
     }
 
     /// Compresses an RGBA8 picture to BC7 with full mips and writes it as a
@@ -130,7 +129,7 @@ pub const Images = struct {
             const level: u8 = @intFromFloat(std.math.clamp(value, 0, 1) * 255 + 0.5);
             pixels[x * 4 ..][0..4].* = .{ level, level, level, 255 };
         }
-        return self.images.create(width, 1, &pixels, false);
+        return self.images.create(.{ .width = width, .height = 1, .pixels = &pixels, .srgb = false });
     }
 
     /// Loads an IES LM-63 light distribution: brightness by angle from the
@@ -187,7 +186,7 @@ fn createImageFromLevels(self: *Renderer, source: ktx2.Texture) !Image {
     defer self.unlock();
     const device = self.device;
     if (source.faces != 1 or source.layers != 1) return error.UnsupportedTextureFormat;
-    if (source.format != .rgba8 and source.format != .rgba16f and !device.bc_textures) return error.UnsupportedTextureFormat;
+    if (source.format != .rgba8 and source.format != .rgba16f and !device.caps.bc_textures) return error.UnsupportedTextureFormat;
     const format: rhi.Format = switch (source.format) {
         .bc7 => if (source.srgb) .bc7_srgb else .bc7_unorm,
         .bc1 => if (source.srgb) .bc1_srgb else .bc1_unorm,

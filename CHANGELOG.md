@@ -12,6 +12,19 @@
 - `Settings.path_tracing_probes`.
 - `entities.setTransforms`.
 - Entity setters work mid-frame.
+- `rhi.Device.caps` and `rhi.native`.
+- `Stats.pipelines`.
+- The `canvas` example takes `--screenshot` and `--timings`.
+- `DrawStage.scene`: draw lists under bloom, exposure and tone mapping, with or without a scene.
+- `Stats.downgraded`.
+- `DrawList.setBlend`, `setLayer` and `setShader`; `Renderer.canvas.createShader`.
+- The `canvas` example takes `--lit` and `--effects`.
+- `Camera.orthographic`, for scenes and draw lists.
+- `Settings.global_illumination.probes.cascades`: up to four probe grids.
+- `Settings.path_tracing.direct`.
+- `Pass` runs on views without a scene; `PassContext` has the camera, its matrices and the resolved settings.
+- The `isometric` example.
+- `rhi.TextureKind.@"3d"`; storage images can be read, used in any shader stage and bound per layer.
 
 ### Changed
 - Breaking: handles are 64 bits.
@@ -21,6 +34,32 @@
 - Breaking: setters and `destroy` ignore destroyed handles.
 - Breaking: `Options.pose_threads` is `worker_threads`.
 - Breaking: `Options.mesh_shaders` is off by default.
+- Breaking: `Device.ray_tracing`, `mesh_shaders` and the like are in `Device.caps`.
+- Breaking: `rhi.instanceProcAddr` and `deviceProcAddr` are in `rhi.native.device`.
+- Breaking: traced reflections, traced light shadows and path tracing work without `global_illumination`.
+- Ray traced reflections, probes, lightmaps and path tracing share one trace and surface shader library.
+- Breaking: `ViewDesc.draw_lists` holds `DrawLayer`s.
+- Breaking: `Settings` is nested by feature (`shadows`, `reflections`, `global_illumination`, `post`, `resolution`, ...); a feature that can be off is an optional, null for off.
+- Breaking: fog, depth of field, motion blur and path tracing are off as null, not as a zero strength.
+- Breaking: `shadows = null` also turns off ray traced light shadows.
+- Breaking: `Settings.resolution.upscaling` is `upscaler`, of type `Upscaler`; `frame_generation` is null or `.fsr3`.
+- Breaking: `Settings.path_tracing.denoise` is `denoiser`; DLSS Ray Reconstruction is asked for with `.ray_reconstruction`.
+- Breaking: `Settings.global_illumination` names its technique: `.{ .probes = .{} }`. `middle_ratio` is `cascade_ratio`.
+- An upscaler, frame generator or denoiser that cannot run is listed in `Stats.downgraded`.
+- Breaking: `Options` is nested: `ray_tracing`, `shadows`, `textures`, `geometry`, `cache`. `ray_tracing` is `ray_tracing.hardware`, `path_tracing_fallback` is `ray_tracing.software_path_tracing`.
+- Breaking: `Renderer.capabilities` replaces `pathTracing`, `dlssSupport` and `hdrActive`.
+- Breaking: `images.create`, `environments.load`, `materials.setShader` and `scenes.setEnvironment` take a struct.
+- Breaking: `PassContext.depth` and `motion` are optional.
+- Breaking: `rhi.Device.storageIndex` takes a layer; `CommandEncoder.copyDepthToColor` is gone.
+- Path tracing runs in a compute shader where storage images are available.
+- The Vulkan code of the RHI is in `src/rhi/vulkan/`.
+- Breaking: the `PathTracing` enum is `PathTracingSupport`.
+- Switching an effect on or off keeps the view's other targets and history.
+- Draw lists send rectangles, sprites and glyphs to the GPU as one record each, and keep the GPU copy of a list drawn again unchanged.
+- Building needs `slangc`: shaders are moving from GLSL to Slang.
+- Pipelines are built on first use.
+- A renderer that draws no scene makes no scene buffers.
+- The frame constants in shaders are generated from `frame_constants.zig`.
 - Fewer FidelityFX shader permutations compiled.
 - Only changed entities are prepared each frame.
 - Animation poses skip unmoved nodes.

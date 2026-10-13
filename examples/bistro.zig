@@ -55,8 +55,8 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var stage = try Stage.create(init, "Limn Bistro", .{
-        .asset_cache_dir = "zig-out/asset-cache",
-        .texture_streaming = .{ .budget_bytes = 2 << 30 },
+        .cache = .{ .assets = "zig-out/asset-cache" },
+        .textures = .{ .streaming = .{ .budget_bytes = 2 << 30 } },
     });
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
@@ -143,7 +143,7 @@ pub fn main(init: std.process.Init) !void {
         if (applied_night != night) {
             applied_night = night;
             const sky = gfx.SkyDesc{ .sun_direction = if (night) .{ 0.3, 0.25, 0.2 } else sun_direction, .intensity = if (night) 0.02 else 1 };
-            renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
+            renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky), .intensity = 1 });
             const sun = gfx.skySun(sky);
             renderer.scenes.setSun(scene, .{ .direction = sun.direction, .color = sun.color, .intensity = 0 });
             lit.clearRetainingCapacity();
@@ -169,12 +169,11 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = camera,
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = .{
-                    .shadow_distance = 80,
-                    .automatic_exposure = false,
-                    .exposure_compensation = if (night) 3 else 1.3,
+                    .shadows = .{ .distance = 80 },
+                    .post = .{ .automatic_exposure = false, .exposure_compensation = if (night) 3 else 1.3 },
                 },
             }},
             .delta_time = tick.dt,

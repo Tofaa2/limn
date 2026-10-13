@@ -28,29 +28,31 @@ const helpers = @import("window");
 const Stage = helpers.Stage;
 
 pub fn main(init: std.process.Init) !void {
-    var options = gfx.Options{ .path_tracing_fallback = true, .asset_cache_dir = "zig-out/asset-cache" };
+    var options = gfx.Options{ .ray_tracing = .{ .software_path_tracing = true }, .cache = .{ .assets = "zig-out/asset-cache" } };
     var path_traced = false;
+    var bounce_light = true;
     var drifting = false;
     var dlss = false;
     {
         var arguments = try init.minimal.args.iterateAllocator(init.gpa);
         defer arguments.deinit();
         while (arguments.next()) |argument| {
-            if (std.mem.eql(u8, argument, "--software")) options.ray_tracing = false;
+            if (std.mem.eql(u8, argument, "--software")) options.ray_tracing.hardware = false;
             if (std.mem.eql(u8, argument, "--path")) path_traced = true;
+            if (std.mem.eql(u8, argument, "--direct")) bounce_light = false;
             if (std.mem.eql(u8, argument, "--drift")) drifting = true;
             if (std.mem.eql(u8, argument, "--dlss")) dlss = true;
         }
     }
     var stage = try Stage.create(init, "Limn ray tracing", options);
     const renderer = stage.renderer;
-    const support = renderer.pathTracing();
+    const capabilities = renderer.capabilities();
+    const support = capabilities.path_tracing;
     const hardware = support == .hardware;
-    const dlss_support = renderer.dlssSupport();
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.25, -1.0, 0.12 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     const sponza = try renderer.models.load("examples/assets/world/Sponza.glb");
@@ -79,7 +81,6 @@ pub fn main(init: std.process.Init) !void {
         .{ .{ 4.6, 1.1, -0.2 }, .{ 2.5, 0.6, 0.4 } },
     };
     var camera: usize = 0;
-    var bounce_light = true;
     var traced_reflections = true;
     var traced_shadows = true;
     var bounces: u32 = 4;
@@ -127,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .key = "2", .label = "reflections", .on = traced_reflections and hardware, .state = if (!hardware) "screen only" else if (traced_reflections) "screen, then traced" else "screen only" },
             .{ .key = "3", .label = "lamp shadows", .on = traced_shadows and hardware, .state = if (!hardware) "shadow map" else if (traced_shadows) "traced, soft" else "shadow map" },
             .{ .key = "P", .label = "path tracing", .on = path_traced, .state = if (!path_traced) "off" else try std.fmt.bufPrint(&count_buffer, "{d} bounces · {d} frames", .{ bounces, stats.path_traced_frames }) },
-            .{ .key = "D", .label = "DLSS", .on = dlss and (if (path_traced) dlss_support.ray_reconstruction else dlss_support.super_resolution), .state = if (!dlss) "off" else if (path_traced) (if (dlss_support.ray_reconstruction) "ray reconstruction" else "needs `zig build dlss-sdk` and an NVIDIA GPU") else if (dlss_support.super_resolution) "antialiasing" else "needs `zig build dlss-sdk` and an NVIDIA GPU" },
+            .{ .key = "D", .label = "DLSS", .on = dlss and (if (path_traced) capabilities.dlss_ray_reconstruction else capabilities.dlss) == .available, .state = if (!dlss) "off" else if (path_traced) (if (capabilities.dlss_ray_reconstruction == .available) "ray reconstruction" else "needs `zig build dlss-sdk` and an NVIDIA GPU") else if (capabilities.dlss == .available) "antialiasing" else "needs `zig build dlss-sdk` and an NVIDIA GPU" },
         };
         for (rows, 0..) |row, index| {
             const y = 70 + 20 * @as(f32, @floatFromInt(index));
@@ -142,16 +143,14 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(math.add(cameras[camera][0], drift), cameras[camera][1]),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = .{
-                    .shadow_distance = 40,
-                    .global_illumination = bounce_light,
-                    .reflection_ray_tracing = traced_reflections,
-                    .ray_traced_light_shadows = traced_shadows,
-                    .path_tracing = path_traced,
-                    .path_tracing_bounces = bounces,
-                    .upscaling = if (dlss) .dlss else .temporal,
+                    .shadows = .{ .distance = 40, .traced_lights = traced_shadows },
+                    .global_illumination = if (bounce_light) .{ .probes = .{} } else null,
+                    .reflections = .{ .ray_tracing = traced_reflections },
+                    .path_tracing = if (path_traced) .{ .bounces = bounces, .denoiser = if (dlss) .ray_reconstruction else .builtin } else null,
+                    .resolution = .{ .upscaler = if (dlss) .dlss else .temporal },
                 },
             }},
             .delta_time = tick.dt,

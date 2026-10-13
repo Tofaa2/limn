@@ -116,7 +116,8 @@ void main() {
         discard;
 #endif
         vec4 world = frame.inv_view_proj * vec4(ndc, 1e-6, 1.0);
-        vec3 direction = normalize(world.xyz / world.w - frame.camera_position);
+        vec3 far_point = world.xyz / world.w;
+        vec3 direction = normalize(far_point - eyePoint(frame, far_point));
         vec4 current = frame.view_proj_unjittered * vec4(direction, 0.0);
         vec4 previous = frame.prev_view_proj_unjittered * vec4(direction, 0.0);
         vec3 sky = vec3(0.0);
@@ -127,7 +128,7 @@ void main() {
         out_reflection = vec4(0.0);
         out_surface = vec4(0.0);
 #endif
-        out_motion = (current.xy / current.w - previous.xy / previous.w) * 0.5;
+        out_motion = frame.parallel != 0.0 ? vec2(0.0) : (current.xy / current.w - previous.xy / previous.w) * 0.5;
         return;
     }
 
@@ -189,7 +190,7 @@ void main() {
     vec4 tangent_object = vertexTangent(v0) * lambda.x + vertexTangent(v1) * lambda.y + vertexTangent(v2) * lambda.z;
     vec3 tangent = mat3(instance.transform) * tangent_object.xyz;
 
-    vec3 view_direction = normalize(frame.camera_position - world_position);
+    vec3 view_direction = normalize(eyePoint(frame, world_position) - world_position);
     if ((material.flags & MATERIAL_DOUBLE_SIDED) != 0u && dot(geometric_normal, view_direction) < 0.0) {
         normal = -normal;
     }
@@ -408,14 +409,14 @@ void main() {
     soft_history_texture = push.shadow_history;
     soft_history_uv = in_uv - out_motion;
     soft_history_depth_texture = push.shadow_depth;
-    soft_history_depth = linearDepth(previous_clip.z / previous_clip.w, frame.near);
+    soft_history_depth = linearDepth(previous_clip.z / previous_clip.w, frame.depth_terms);
     soft_history_slack = 0.05 * soft_history_depth + 2.0 * fwidth(soft_history_depth);
     if (instance.lightmap != INVALID_ID) gathered = vec4(textureLod(TEX(instance.lightmap, frame.sampler_linear_clamp), raw1, 0.0).rgb, 1.0);
     vec3 lit = emissive + shadeSurface(frame, surface, gl_FragCoord.xy, noise, gathered);
     if ((SHADE_FEATURES & FEATURE_AERIAL) != 0u && frame.aerial != 0.0 && (frame.flags & FRAME_ENVIRONMENT) != 0u) {
         vec3 air_through;
         vec3 air;
-        aerialHaze(frame, view_direction, length(world_position - frame.camera_position), air_through, air);
+        aerialHaze(frame, view_direction, length(world_position - eyePoint(frame, world_position)), air_through, air);
         lit = lit * air_through + air * (1.0 - air_through);
     }
     out_color = vec4(lit, soft_shadow_visibility);

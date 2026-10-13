@@ -57,7 +57,7 @@ void main() {
     vec3 behind = ribbonPoint(emitter, slot, particle.position, min(k + 1u, count));
     vec3 direction = ahead - behind;
     if (dot(direction, direction) < 1e-10) direction = particle.velocity;
-    vec3 toward = normalize(center - frame.camera_position);
+    vec3 toward = normalize(center - eyePoint(frame, center));
     vec3 across = cross(direction, toward);
     float across_length = length(across);
     across = across_length > 1e-6 ? across / across_length : frame.inv_view[0].xyz;

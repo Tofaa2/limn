@@ -35,7 +35,7 @@ pub const Views = struct {
         defer self.unlock();
         if (std.meta.eql(view, self.main_view)) return;
         var removed = self.views.table.remove(view) orelse return;
-        removed.deinit(self.device);
+        removed.deinit(self.gpa, self.device);
     }
 
     /// Creates a texture views can draw into (`Target.texture`) and draw

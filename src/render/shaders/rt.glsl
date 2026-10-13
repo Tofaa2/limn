@@ -121,8 +121,13 @@ int rtTraceMasked(FrameConstants frame, uint64_t tlas, vec3 origin, vec3 directi
             radiance += albedo / PI * light.color * tint * (attenuation * facing);
         }
     }
-    if (probe_light && giCoverage(frame, position) > 0.0)
+    if ((frame.flags & FRAME_GI) == 0u) {
+        radiance += albedo * ((frame.flags & FRAME_ENVIRONMENT) != 0u
+            ? textureLod(TEX_CUBE(frame.env_irradiance, frame.sampler_linear_clamp), normal, 0.0).rgb * frame.env_intensity
+            : vec3(0.03));
+    } else if (probe_light && giCoverage(frame, position) > 0.0) {
         radiance += albedo * giIrradiance(frame, position, normal, -direction);
+    }
     return RT_HIT;
 }
 
