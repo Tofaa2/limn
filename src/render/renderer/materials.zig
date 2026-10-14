@@ -52,9 +52,10 @@ pub const Materials = struct {
         return @alignCast(@fieldParentPtr("materials", materials));
     }
 
-    /// Registers a custom material. `spirv` is a fragment shader that defines
-    /// `CUSTOM_MATERIAL`, includes "shade.glsl" and defines
-    /// `customMaterial()`; see `examples/shaders/lava.frag`. `plain_spirv` is the
+    /// Registers a custom material. `spirv` is a Slang fragment shader that
+    /// defines `CUSTOM_MATERIAL`, includes "shade.slang", defines
+    /// `customMaterial()` and is compiled with entry `fragmentMain`; see
+    /// `examples/shaders/lava.slang`. `plain_spirv` is the
     /// same shader compiled with `PLAIN` defined, for views that keep no
     /// reflection targets; null uses `spirv` there too.
     pub fn createShader(materials: *Materials, spirv: []const u8, plain_spirv: ?[]const u8) !MaterialShader {

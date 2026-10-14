@@ -153,7 +153,7 @@ pub const Text3dOptions = struct {
     fallback: []const *const Font = &.{},
 };
 
-/// Layout shared with `shaders/draw.vert`.
+/// Layout shared with `shaders/draw.slang`.
 pub const Vertex = extern struct {
     position: [3]f32,
     /// Camera-facing offset in world units (billboards), else zero.

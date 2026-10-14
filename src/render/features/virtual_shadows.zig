@@ -1,4 +1,4 @@
-//! The sun's virtual shadow map (see vsm.glsl): per-view pages and atlas, page
+//! The sun's virtual shadow map (see vsm.slang): per-view pages and atlas, page
 //! requests, allocation and drawing.
 const geometry_feature = @import("geometry.zig");
 const hair_feature = @import("hair.zig");

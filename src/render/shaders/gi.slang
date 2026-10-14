@@ -159,4 +159,36 @@ float3 giIrradiance(FrameConstants frame, float3 position, float3 normal, float3
     return result;
 }
 
+float3 giGridAmbient(FrameConstants frame, GiGrid grid, float3 position) {
+    int3 counts = grid.counts;
+    uint s = frame.sampler_linear_clamp;
+    float3 cell = (position - grid.origin) / grid.spacing;
+    int3 base = clamp(int3(floor(cell)), int3(0), counts - 2);
+    float3 alpha = clamp(cell - float3(base), 0.0, 1.0);
+    float3 total = float3(0.0);
+    for (int i = 0; i < 8; i++) {
+        int3 offset = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        int3 stored = giStorageCoord(grid, base + offset);
+        float3 trilinear = lerp(1.0 - alpha, alpha, float3(offset));
+        float3 up = sampleTextureLod(grid.irradiance, s, giProbeUv(stored, float3(0.0, 1.0, 0.0), GI_IRRADIANCE_TEXELS, counts), 0.0).rgb;
+        float3 down = sampleTextureLod(grid.irradiance, s, giProbeUv(stored, float3(0.0, -1.0, 0.0), GI_IRRADIANCE_TEXELS, counts), 0.0).rgb;
+        total += 0.5 * (up + down) * (trilinear.x * trilinear.y * trilinear.z);
+    }
+    return total;
+}
+
+float3 giAmbient(FrameConstants frame, float3 position) {
+    uint last = max(frame.gi_cascade_count, 1u) - 1u;
+    float3 result = float3(0.0);
+    float rest = 1.0;
+    for (uint i = 0u; i < last && rest > 0.0; i++) {
+        GiGrid grid = giGrid(frame, i);
+        float inside = giNestedCoverage(grid, position);
+        if (inside > 0.0) result += giGridAmbient(frame, grid, position) * (rest * inside);
+        rest *= 1.0 - inside;
+    }
+    if (rest > 0.0) result += giGridAmbient(frame, giGrid(frame, last), position) * rest;
+    return result;
+}
+
 #endif

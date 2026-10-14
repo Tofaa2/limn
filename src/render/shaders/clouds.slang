@@ -50,4 +50,64 @@ float cloudShadow(FrameConstants frame, float3 position) {
     return lerp(1.0, exp(-optical_depth), clouds.shadow_strength);
 }
 
+float cloudAltitude(CloudData clouds, float3 position, float3 camera) {
+    float2 across = position.xz - camera.xz;
+    return position.y + dot(across, across) / (2.0 * clouds.planet_radius);
+}
+
+float2 cloudCrossings(float height, float rise, float bend, float altitude) {
+    float c = height - altitude;
+    if (bend < 1e-12) {
+        float t = abs(rise) > 1e-6 ? -c / rise : -1.0;
+        return float2(t, t);
+    }
+    float discriminant = rise * rise - 4.0 * bend * c;
+    if (discriminant < 0.0) return float2(-1.0);
+    float q = -0.5 * (rise + (rise >= 0.0 ? 1.0 : -1.0) * sqrt(discriminant));
+    float a = q / bend;
+    float b = abs(q) > 1e-20 ? c / q : a;
+    float low = min(a, b);
+    float high = max(a, b);
+    if (high < 0.0) return float2(-1.0);
+    return float2(low >= 0.0 ? low : high, high);
+}
+
+float2 cloudSegment(CloudData clouds, float height, float rise) {
+    float bend = (1.0 - rise * rise) / (2.0 * clouds.planet_radius);
+    float2 bottom = cloudCrossings(height, rise, bend, clouds.bottom);
+    float2 top = cloudCrossings(height, rise, bend, clouds.top);
+    if (height < clouds.bottom) return float2(bottom.x, top.x);
+    if (height > clouds.top) {
+        if (top.x < 0.0) return float2(0.0, -1.0);
+        return float2(top.x, bottom.x >= 0.0 ? bottom.x : top.y);
+    }
+    float end = top.x >= 0.0 ? top.x : 1e30;
+    if (bottom.x >= 0.0) end = min(end, bottom.x);
+    return float2(0.0, end);
+}
+
+float3 cloudsOverSky(CloudData clouds, float3 direction, float3 sun, float3 sunlight, float3 color) {
+    float2 segment = cloudSegment(clouds, 2.0, direction.y);
+    segment.y = min(segment.y, clouds.max_distance);
+    if (segment.y <= segment.x) return color;
+    const int cloud_steps = 20;
+    float cloud_step = (segment.y - segment.x) / float(cloud_steps);
+    float thickness = clouds.top - clouds.bottom;
+    float3 scattered = float3(0.0);
+    float through = 1.0;
+    for (int i = 0; i < cloud_steps; i++) {
+        float3 point = direction * (segment.x + (float(i) + 0.5) * cloud_step);
+        float altitude = cloudAltitude(clouds, point, float3(0.0));
+        float sigma = cloudDensity(clouds, clouds.depth_texture, point, altitude, false);
+        if (sigma <= 0.0) continue;
+        float above = sigma * (clouds.top - altitude) * 0.5 / max(sun.y, 0.15);
+        float3 light = sunlight * (0.8 / PI) / (1.0 + 0.13 * above) + color * clouds.ambient * (0.3 + 0.7 * (altitude - clouds.bottom) / thickness);
+        float step_through = exp(-sigma * cloud_step);
+        scattered += through * (1.0 - step_through) * light * clouds.albedo;
+        through *= step_through;
+    }
+    float visible = 1.0 - smoothstep(0.6, 1.0, segment.x / clouds.max_distance);
+    return lerp(color, color * through + scattered, visible);
+}
+
 #endif

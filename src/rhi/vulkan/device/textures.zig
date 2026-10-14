@@ -159,9 +159,9 @@ pub fn textureIndex(self: *Device, texture: types.Texture) u32 {
     return self.textureResource(texture).bindless_index orelse @panic("texture was not created with .sampled usage");
 }
 
-/// Index of one mip of one layer in the storage image table (`STORAGE` in
-/// common.glsl), or of a whole 3D texture in the table of volumes
-/// (`STORAGE_3D`). Needs `TextureUsage.storage`; what is indexed must be
+/// Index of one mip of one layer in the storage image table (`storage_2d`
+/// in common.slang), or of a whole 3D texture in the table of volumes
+/// (`storage_3d`). Needs `TextureUsage.storage`; what is indexed must be
 /// in `TextureState.storage` while the shader runs.
 pub fn storageIndex(self: *Device, texture: types.Texture, mip: u32, layer: u32) !u32 {
     const resource = self.textureResource(texture);

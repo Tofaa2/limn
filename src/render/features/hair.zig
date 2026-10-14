@@ -26,7 +26,7 @@ fn drawHairPass(ctx: *ViewContext) !void {
     try drawHair(ctx.renderer, p);
 }
 
-/// Push constants of hair.vert and hair.frag (`HAIR_PUSH` in hair.glsl).
+/// Push constants of the hair strand shaders (`HairPush` in hair.slang).
 const HairPush = extern struct {
     frame: u64,
     points: u64,
@@ -43,7 +43,7 @@ const HairPush = extern struct {
     pad: f32 = 0,
 };
 
-/// Must match `Params` in hair_sim.comp.
+/// Must match `Params` in hair.slang.
 const SimulationParams = extern struct {
     rest: u64,
     current: u64,

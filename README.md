@@ -49,7 +49,7 @@ while (running) {
 
 ## Build
 
-Requires Zig 0.16, a Vulkan 1.3 driver, `glslc` and `slangc`. The Vulkan headers and
+Requires Zig 0.16, a Vulkan 1.3 driver and `slangc` (and `glslc` for the FidelityFX SDK). The Vulkan headers and
 loader are fetched by the build; the examples also need GLFW, which is
 fetched on Windows and linked from the system elsewhere. `flake.nix`
 provides everything. The example assets are stored with Git LFS: run

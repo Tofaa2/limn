@@ -67,7 +67,9 @@
 - Breaking: the `PathTracing` enum is `PathTracingSupport`.
 - Switching an effect on or off keeps the view's other targets and history.
 - Draw lists send rectangles, sprites and glyphs to the GPU as one record each, and keep the GPU copy of a list drawn again unchanged.
-- Building needs `slangc`: shaders are moving from GLSL to Slang.
+- Every shader is Slang; `glslc` is only needed to build the FidelityFX SDK.
+- Breaking: custom material shaders are Slang, include "shade.slang" and are compiled with entry `fragmentMain`; see `examples/shaders/lava.slang`.
+- Slang shaders mark the buffers they only read as read-only, as GLSL did; probe GI and culling run faster.
 - Pipelines are built on first use.
 - A renderer that draws no scene makes no scene buffers.
 - The frame constants in shaders are generated from `frame_constants.zig`.

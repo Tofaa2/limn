@@ -262,7 +262,7 @@ fn tonemap(frame: *Frame) !void {
     cmd.drawFullscreen();
 }
 
-/// Push constants of tonemap.frag.
+/// Push constants of tonemap.slang.
 pub const TonemapPush = extern struct {
     frame: u64,
     color: u32,

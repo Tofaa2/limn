@@ -223,7 +223,7 @@ pub const DrawPush = extern struct {
     list: u64 = 0,
     count: u64 = 0,
     /// A page of the sun's virtual shadow map (`VisibilityPage` in
-    /// visibility_page.glsl).
+    /// visibility_page.slang).
     page: u64 = 0,
 };
 
@@ -254,7 +254,7 @@ pub const CullPush = extern struct {
     lists: u64 = 0,
 };
 
-/// Push constants of cull_instances.comp.
+/// Push constants of the instance pass in cull.slang.
 pub const InstanceCullPush = extern struct {
     frame: u64,
     view: u64,

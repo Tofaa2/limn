@@ -1,5 +1,5 @@
 //! A material written by the application: molten rock, from
-//! `examples/shaders/lava.frag`. The shader only says what the surface
+//! `examples/shaders/lava.slang`. The shader only says what the surface
 //! is (its color, roughness, glow and normal) at each point; lighting,
 //! shadows, reflections and antialiasing stay the renderer's. Each block
 //! passes its own number to the shader, so one cools while the next

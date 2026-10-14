@@ -867,7 +867,7 @@ pub const Settings = struct {
     debug_view: DebugView = .none,
 };
 
-/// See `Settings.debug_view`. Values match the switch in `shaders/shade.glsl`.
+/// See `Settings.debug_view`. Values match the switch in `shaders/shade.slang`.
 pub const DebugView = enum(u32) {
     none,
     /// Material base color, unlit.
@@ -959,7 +959,7 @@ pub const PassContext = struct {
     cmd: *rhi.CommandEncoder,
     device: *rhi.Device,
     stage: PassStage,
-    /// GPU address of this view's `FrameConstants` (see `shaders/common.glsl`);
+    /// GPU address of this view's `FrameConstants` (see `shaders/common.slang`);
     /// 0 on a view without a scene that draws nothing before tone mapping.
     frame: u64,
     color: rhi.Texture,
@@ -1109,7 +1109,7 @@ pub const SkyDesc = struct {
     moon: f32 = 0,
 };
 
-/// Brightness of the sun above the atmosphere; matches env_sky.frag.
+/// Brightness of the sun above the atmosphere; matches environment.slang.
 pub const sky_sun_strength = 8.0;
 
 /// The `Sun` matching a sky: its direction, and its color and intensity after
