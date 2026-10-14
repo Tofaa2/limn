@@ -349,7 +349,7 @@ float3 sampleLight(FrameConstants frame, Surface surface, float3 view, LightSamp
     Glowing chosen = push.glowing[index];
     if (pick.facet >= chosen.triangles) return float3(0.0);
     Instance instance = frame.instances.data[chosen.instance];
-    Mesh mesh = frame.meshes.data[instance.mesh];
+    Mesh mesh = loadAligned<16>(frame.meshes.data + instance.mesh);
     uint base = mesh.index_offset + pick.facet * 3u;
     float3 p0 = mul(instance.transform, float4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base]].position, 1.0));
     float3 p1 = mul(instance.transform, float4(frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 1u]].position, 1.0));

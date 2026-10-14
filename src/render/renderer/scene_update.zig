@@ -339,7 +339,7 @@ const PrepareWhole = struct {
 };
 
 /// This frame's changes to the records of a scene whose other records are
-/// still right: lists for instance_update.comp to apply.
+/// still right: lists for instance_update.slang to apply.
 const Changes = struct {
     renderer: *Renderer,
     scene: *SceneData,

@@ -9,8 +9,22 @@ const Renderer = render.Renderer;
 const hdr_format = renderer_state.hdr_format;
 const bloom_format = renderer_state.bloom_format;
 const PipelineSet = @import("../core/pipeline_set.zig").PipelineSet;
+const spirv_readonly = @import("../core/spirv_readonly.zig");
 const shade_plain_targets = renderer_state.shade_plain_targets;
 const shade_reflective_targets = renderer_state.shade_reflective_targets;
+
+/// `compiled` with what it only reads marked as such, as the build does
+/// after slangc. Takes ownership of `compiled`.
+fn markedSpirv(gpa: std.mem.Allocator, compiled: []u8) ![]u8 {
+    defer gpa.free(compiled);
+    if (compiled.len == 0 or compiled.len % 4 != 0) return gpa.dupe(u8, compiled);
+    const words = try gpa.alloc(u32, compiled.len / 4);
+    defer gpa.free(words);
+    @memcpy(std.mem.sliceAsBytes(words), compiled);
+    const marked = try spirv_readonly.markReadOnly(gpa, words);
+    defer gpa.free(marked);
+    return gpa.dupe(u8, std.mem.sliceAsBytes(marked));
+}
 
 /// The built-in shaders.
 pub const Shaders = struct {
@@ -18,7 +32,7 @@ pub const Shaders = struct {
         return @alignCast(@fieldParentPtr("shaders", shaders));
     }
 
-    /// Recompiles the built-in shaders from source with `glslc` and `slangc` and rebuilds
+    /// Recompiles the built-in shaders from source with `slangc` and rebuilds
     /// every pipeline. On a compile error nothing changes. Returns the number
     /// of shaders compiled. `error.ShaderReloadDisabled` unless built with
     /// `-Dshader_reload`, which Debug builds are.
@@ -38,19 +52,17 @@ pub const Shaders = struct {
         defer gpa.free(include);
         const generated = try std.fmt.allocPrint(gpa, "-I{s}", .{shader_sources.generated_dir});
         defer gpa.free(generated);
-        for (shader_sources.sources, shader_sources.defines, shader_sources.names, shader_sources.entries, shader_sources.stages) |source, defines, name, entry, stage| {
+        for (shader_sources.sources, shader_sources.defines, shader_sources.names, shader_sources.entries, shader_sources.stages, shader_sources.read_only) |source, defines, name, entry, stage, read_only| {
             var argv: [32][]const u8 = undefined;
             var count: usize = 0;
-            const slang = entry.len != 0;
-            const head: []const []const u8 = if (slang) &.{ "slangc", include, generated, "-stage", stage, "-entry", entry } else &.{ "glslc", "--target-env=vulkan1.3", "-O", include, generated };
-            for (head) |arg| {
+            for ([_][]const u8{ "slangc", include, generated, "-stage", stage, "-entry", entry }) |arg| {
                 argv[count] = arg;
                 count += 1;
             }
-            if (slang) for (shader_sources.slang_arguments) |arg| {
+            for (shader_sources.slang_arguments) |arg| {
                 argv[count] = arg;
                 count += 1;
-            };
+            }
             var define_args = std.mem.tokenizeScalar(u8, defines, ' ');
             while (define_args.next()) |arg| {
                 argv[count] = arg;
@@ -58,7 +70,7 @@ pub const Shaders = struct {
             }
             const written = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ shader_sources.generated_dir, name });
             defer gpa.free(written);
-            for ([_][]const u8{ source, "-o", if (slang) written else "-" }) |arg| {
+            for ([_][]const u8{ source, "-o", written }) |arg| {
                 argv[count] = arg;
                 count += 1;
             }
@@ -71,11 +83,11 @@ pub const Shaders = struct {
             };
             const code: []u8 = if (!ok)
                 &.{}
-            else if (slang)
-                std.Io.Dir.cwd().readFileAlloc(self.io, written, gpa, .unlimited) catch &.{}
+            else if (read_only)
+                try markedSpirv(gpa, std.Io.Dir.cwd().readFileAlloc(self.io, written, gpa, .unlimited) catch &.{})
             else
-                try gpa.dupe(u8, result.stdout);
-            if (slang) std.Io.Dir.cwd().deleteFile(self.io, written) catch {};
+                std.Io.Dir.cwd().readFileAlloc(self.io, written, gpa, .unlimited) catch &.{};
+            std.Io.Dir.cwd().deleteFile(self.io, written) catch {};
             if (code.len == 0 or code.len % 4 != 0) {
                 std.log.err("shader {s} did not compile:\n{s}", .{ name, result.stderr });
                 gpa.free(code);

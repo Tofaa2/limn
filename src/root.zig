@@ -286,6 +286,7 @@ test {
     _ = @import("render/renderer/images.zig");
     _ = @import("render/renderer/view_math.zig");
     _ = @import("render/core/graph.zig");
+    _ = @import("render/core/spirv_readonly.zig");
     _ = @import("render/core/features.zig");
     _ = @import("render/core/slot.zig");
     _ = @import("render/core/shader_gen.zig");

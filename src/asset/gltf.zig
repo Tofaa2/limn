@@ -29,7 +29,7 @@ pub const FullVertex = extern struct {
     uv1: [2]f32 = .{ 0, 0 },
 };
 
-/// GPU vertex layout (`Vertex` in common.glsl). Normal and tangent are
+/// GPU vertex layout (`Vertex` in common.slang). Normal and tangent are
 /// octahedron-encoded signed 16-bit pairs.
 pub const Vertex = extern struct {
     position: [3]f32,
@@ -60,7 +60,7 @@ pub const Vertex = extern struct {
     }
 };
 
-/// Octahedron encoding (`packDirection` in common.glsl). A zero vector
+/// Octahedron encoding (`packDirection` in common.slang). A zero vector
 /// becomes +X.
 fn packDirection(direction: [3]f32) [2]i16 {
     const sum = @abs(direction[0]) + @abs(direction[1]) + @abs(direction[2]);
@@ -87,13 +87,13 @@ fn unpackDirection(point: [2]i16) [3]f32 {
     return .{ x / length, y / length, z / length };
 }
 
-/// `SkinVertex` in common.glsl.
+/// `SkinVertex` in common.slang.
 pub const SkinVertex = extern struct {
     joints: [4]u32,
     weights: [4]f32,
 };
 
-/// `Meshlet` in common.glsl.
+/// `Meshlet` in common.slang.
 pub const Meshlet = extern struct {
     /// Bounding sphere in mesh space.
     center: [3]f32,

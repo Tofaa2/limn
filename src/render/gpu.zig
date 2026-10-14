@@ -1,4 +1,4 @@
-//! CPU mirrors of the structures in shaders/common.glsl. GLSL scalar block
+//! CPU mirrors of the structures in shaders/common.slang. Scalar block
 //! layout matches `extern struct` when every field is naturally aligned.
 const std = @import("std");
 const gltf = @import("../asset/gltf.zig");
@@ -12,22 +12,22 @@ pub const frame_flags = frame_constants.flags;
 /// `SHADE_FEATURES` bits.
 pub const shade_features = frame_constants.features;
 
-/// `Vertex` in common.glsl.
+/// `Vertex` in common.slang.
 pub const Vertex = gltf.Vertex;
-/// `SkinVertex` in common.glsl, read by `skin.comp`.
+/// `SkinVertex` in common.slang, read by `skin.slang`.
 pub const SkinVertex = gltf.SkinVertex;
-/// `Meshlet` in common.glsl.
+/// `Meshlet` in common.slang.
 pub const Meshlet = gltf.Meshlet;
 
-/// `INVALID_ID` in common.glsl: no texture, slot or record.
+/// `INVALID_ID` in common.slang: no texture, slot or record.
 pub const invalid_id = frame_constants.invalid_id;
 
-/// `Material.flags` bits (`MATERIAL_*` in common.glsl). Texels with alpha
+/// `Material.flags` bits (`MATERIAL_*` in common.slang). Texels with alpha
 /// under `Material.alpha_cutoff` are discarded.
 pub const material_alpha_test: u32 = 1;
 /// Back faces are not culled.
 pub const material_double_sided: u32 = 2;
-/// `Instance.flags` bits (`INSTANCE_*` in common.glsl). Deformed this
+/// `Instance.flags` bits (`INSTANCE_*` in common.slang). Deformed this
 /// frame: culled by `Instance.bounding_sphere` or its per-meshlet bounds.
 pub const instance_skinned: u32 = 1;
 /// Moved or deformed since last frame: shading reads its previous
@@ -52,7 +52,7 @@ pub fn expand(m: [12]f32) [16]f32 {
     return .{ m[0], m[1], m[2], 0, m[3], m[4], m[5], 0, m[6], m[7], m[8], 0, m[9], m[10], m[11], 1 };
 }
 
-/// The sun's virtual shadow map (vsm.glsl): levels, pages per level side,
+/// The sun's virtual shadow map (vsm.slang): levels, pages per level side,
 /// texels per page side, pages per atlas side, and most pages drawn in a
 /// frame.
 pub const vsm_levels = 4;
@@ -61,11 +61,11 @@ pub const vsm_page_texels = 256;
 pub const vsm_atlas_pages = 16;
 pub const vsm_pages_per_frame = 8;
 
-/// `VsmPage` in vsm.glsl.
+/// `VsmPage` in common.slang.
 pub const VsmPage = extern struct { key: u32, place: u32, used: u32, flags: u32 };
-/// `VsmPageView` in vsm.glsl.
+/// `VsmPageView` in common.slang.
 pub const VsmPageView = extern struct { view_proj: [16]f32, bounds: [4]f32 };
-/// `Vsm` in vsm.glsl.
+/// `VsmData` in common.slang.
 pub const VsmParams = extern struct {
     light_view: [16]f32,
     camera: [3]f32,
@@ -95,7 +95,7 @@ pub const material_sway_weights: u32 = 16;
 /// Cascades of the sun's shadow map. Shaders hard-code 4.
 pub const cascade_count = frame_constants.cascade_count;
 
-/// `Mesh` in common.glsl. 32 bytes.
+/// `Mesh` in common.slang. 32 bytes.
 pub const Mesh = extern struct {
     center: [3]f32,
     radius: f32,
@@ -107,10 +107,10 @@ pub const Mesh = extern struct {
     bvh: u32 = invalid_id,
 };
 
-/// `Material` in common.glsl, one slot of the material buffer. Texture
+/// `Material` in common.slang, one slot of the material buffer. Texture
 /// fields index the bindless texture table, `invalid_id` for none.
 /// 208 bytes. The size must stay a multiple of 16: shaders also read the
-/// buffer as 16-byte entries (`MATERIAL_WORDS` in common.glsl).
+/// buffer as 16-byte entries (`MATERIAL_WORDS` in common.slang).
 pub const Material = extern struct {
     /// Linear RGB and opacity, multiplied with the base color texture.
     base_color: [4]f32,
@@ -170,7 +170,7 @@ pub const Material = extern struct {
     sway: f32 = 0,
 };
 
-/// `Instance` in common.glsl: one drawn copy of a mesh. Rebuilt each
+/// `Instance` in common.slang: one drawn copy of a mesh. Rebuilt each
 /// frame. 116 bytes.
 pub const Instance = extern struct {
     /// Model-to-world matrix as `affine` packs it.
@@ -195,7 +195,7 @@ pub const Instance = extern struct {
     params: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
-/// `StaticCull` in cull_instances.comp: an instance's world-space
+/// `StaticCull` in impostor.slang: an instance's world-space
 /// bounding sphere and where its `MeshletRef`s are.
 pub const StaticCull = extern struct {
     sphere: [4]f32,
@@ -206,7 +206,7 @@ pub const StaticCull = extern struct {
     pad: u32 = 0,
 };
 
-/// `Impostor` in impostor.glsl.
+/// `Impostor` in impostor.slang.
 pub const Impostor = extern struct {
     center: [3]f32,
     radius: f32,
@@ -216,7 +216,7 @@ pub const Impostor = extern struct {
     pad: f32 = 0,
 };
 
-/// `ImpostorDraw` in cull_instances.comp.
+/// `ImpostorDraw` in cull.slang.
 pub const DrawIndirect = extern struct {
     vertex_count: u32,
     instance_count: u32 = 0,
@@ -224,7 +224,7 @@ pub const DrawIndirect = extern struct {
     first_instance: u32 = 0,
 };
 
-/// `MeshDraw` in cull.comp: task shader group counts for one meshlet list.
+/// `MeshDraw` in cull.slang: task shader group counts for one meshlet list.
 pub const MeshDraw = extern struct {
     x: u32 = 0,
     y: u32 = 1,
@@ -232,7 +232,7 @@ pub const MeshDraw = extern struct {
     pad: u32 = 0,
 };
 
-/// `CullDispatch` in cull_view.glsl.
+/// `CullDispatch` in cull_view.slang.
 pub const CullDispatch = extern struct {
     x: u32,
     y: u32 = 1,
@@ -240,14 +240,14 @@ pub const CullDispatch = extern struct {
     count: u32 = 0,
 };
 
-/// `MeshletRef` in common.glsl. An entry's index is its draw's
+/// `MeshletRef` in common.slang. An entry's index is its draw's
 /// `first_instance` and the upper bits of the visibility buffer's ID.
 pub const MeshletRef = extern struct {
     instance: u32,
     meshlet: u32,
 };
 
-/// `Light.flags` bits (`LIGHT_*` in common.glsl); no shape bit is a point
+/// `Light.flags` bits (`LIGHT_*` in common.slang); no shape bit is a point
 /// light. Light is confined to a cone about `Light.direction`.
 pub const light_spot: u32 = 1;
 /// Parallel light along `Light.direction`; no position or falloff.
@@ -258,7 +258,7 @@ pub const light_traced_shadow: u32 = 8;
 /// The glow of a fire: smoke does not shadow it.
 pub const light_fire: u32 = 16;
 
-/// `Light` in common.glsl. 80 bytes.
+/// `Light` in common.slang. 80 bytes.
 pub const Light = extern struct {
     /// World position, and the distance beyond which the light gives nothing.
     position: [3]f32,
@@ -286,7 +286,7 @@ pub const Light = extern struct {
     pad: [2]u32 = .{ 0, 0 },
 };
 
-/// `ShadowTile` in common.glsl: one atlas face of a light. 80 bytes.
+/// `ShadowTile` in common.slang: one atlas face of a light. 80 bytes.
 pub const ShadowTile = extern struct {
     view_proj: [16]f32,
     /// uv = tile_uv * rect[0..2] + rect[2..4].
@@ -294,20 +294,20 @@ pub const ShadowTile = extern struct {
 };
 
 /// Froxel grid for light and decal lookup (`CLUSTERS_X`, `_Y`, `_Z` in
-/// common.glsl). Depth slices are logarithmic; see
+/// common.slang). Depth slices are logarithmic; see
 /// `FrameConstants.cluster_z_scale`.
 pub const clusters_x = 16;
 pub const clusters_y = 9;
 pub const clusters_z = 24;
 /// Records in the buffer at `FrameConstants.clusters`.
 pub const cluster_count = clusters_x * clusters_y * clusters_z;
-/// Most lights one cluster lists (`CLUSTER_CAPACITY` in common.glsl); the
+/// Most lights one cluster lists (`CLUSTER_CAPACITY` in common.slang); the
 /// rest are dropped. Count plus list fill 128 words.
 pub const cluster_capacity = 127;
 /// One bit per decal a cluster can hold, 32 to a word.
 pub const cluster_decal_words = 8;
 
-/// `Cluster` in common.glsl, filled by `cluster.comp`. 544 bytes.
+/// `Cluster` in common.slang, filled by `cluster.slang`. 544 bytes.
 pub const Cluster = extern struct {
     count: u32,
     lights: [cluster_capacity]u32,
@@ -315,7 +315,7 @@ pub const Cluster = extern struct {
     decals: [cluster_decal_words]u32,
 };
 
-/// Written by `cull.comp` per visible meshlet. Layout is Vulkan's
+/// Written by `cull.slang` per visible meshlet. Layout is Vulkan's
 /// `VkDrawIndexedIndirectCommand` (20 bytes) and must not change.
 pub const DrawCommand = extern struct {
     index_count: u32,
@@ -326,7 +326,7 @@ pub const DrawCommand = extern struct {
     first_instance: u32,
 };
 
-/// `CullView` in `cull.comp`: the camera's view or one shadow map's. 432
+/// `CullView` in `cull.slang`: the camera's view or one shadow map's. 432
 /// bytes; shaders assume 16-byte alignment, so the size must stay a
 /// multiple of 16.
 pub const CullView = extern struct {
@@ -376,7 +376,7 @@ pub const CullView = extern struct {
     pad: f32 = 0,
 };
 
-/// The `Exposure` block in common.glsl, updated by `exposure.comp`. 16 bytes.
+/// `ExposureData` in common.slang, updated by `exposure.slang`. 16 bytes.
 pub const Exposure = extern struct {
     /// Multiplies scene radiance before tone mapping.
     exposure: f32,
@@ -397,7 +397,7 @@ comptime {
     std.debug.assert(@sizeOf(CullView) == 432 and @sizeOf(CullView) % 16 == 0);
 }
 
-/// Written by `pick.comp`.
+/// Written by `pick.slang`.
 pub const Pick = extern struct {
     instance: u32,
     triangle: u32,
@@ -407,7 +407,7 @@ pub const Pick = extern struct {
     pad1: u32 = 0,
 };
 
-/// `Emitter.flags` bits (`EMITTER_*` in particles.glsl). Additive blend.
+/// `Emitter.flags` bits (`EMITTER_*` in particles.slang). Additive blend.
 pub const emitter_additive: u32 = 1;
 pub const emitter_lit: u32 = 2;
 /// Carried by the fluid at `Emitter.fluid`.
@@ -416,7 +416,7 @@ pub const emitter_fluid: u32 = 4;
 pub const emitter_collide: u32 = 8;
 pub const emitter_sorted: u32 = 16;
 
-/// `Particle` in particles.glsl.
+/// `Particle` in particles.slang.
 pub const Particle = extern struct {
     position: [3]f32,
     /// Seconds since birth; alive while age < lifetime.
@@ -425,10 +425,10 @@ pub const Particle = extern struct {
     lifetime: f32,
 };
 
-/// Curve length in `Emitter`; `EmitterData` in GLSL declares the same 8.
+/// Curve length in `Emitter`; `EmitterData` in particles.slang declares the same 8.
 pub const emitter_curve_keys = 8;
 
-/// `EmitterData` in particles.glsl. 400 bytes; `fluid` is a GPU address
+/// `EmitterData` in particles.slang. 400 bytes; `fluid` is a GPU address
 /// at an 8-byte boundary. Two-number fields are a range each particle
 /// draws from at birth.
 pub const Emitter = extern struct {
@@ -497,7 +497,7 @@ comptime {
     std.debug.assert(@sizeOf(Emitter) == 400);
 }
 
-/// `Decal` in common.glsl.
+/// `Decal` in common.slang.
 pub const Decal = extern struct {
     world_to_decal: [16]f32,
     color: [4]f32,
@@ -516,7 +516,7 @@ comptime {
     std.debug.assert(@sizeOf(Decal) == 128);
 }
 
-/// `CloudData` in clouds.glsl.
+/// `CloudData` in common.slang.
 pub const Clouds = extern struct {
     offset: [3]f32,
     period: f32,
@@ -545,12 +545,12 @@ pub const Clouds = extern struct {
     flash: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
-/// Length of `Fluid.sources`; `FluidData` in GLSL declares the same 8.
+/// Length of `Fluid.sources`; `FluidData` in common.slang declares the same 8.
 pub const max_fluid_sources = 8;
-/// Length of `Fluid.obstacles`; `FluidData` in GLSL declares the same 8.
+/// Length of `Fluid.obstacles`; `FluidData` in common.slang declares the same 8.
 pub const max_fluid_obstacles = 8;
 
-/// `FluidObstacle` in fluid.glsl, in cells: a sphere (center `a`,
+/// `FluidObstacle` in common.slang, in cells: a sphere (center `a`,
 /// `radius`) or, with a negative radius, a box from corner `a` to `b`.
 pub const FluidObstacle = extern struct {
     a: [3]f32 = .{ 0, 0, 0 },
@@ -559,7 +559,7 @@ pub const FluidObstacle = extern struct {
     pad: f32 = 0,
 };
 
-/// `FluidSource` in fluid.glsl.
+/// `FluidSource` in common.slang.
 pub const FluidSource = extern struct {
     /// Center (0..1 per axis) and radius as a fraction of the box's height.
     position: [3]f32 = .{ 0, 0, 0 },
@@ -574,7 +574,7 @@ pub const FluidSource = extern struct {
     pad1: f32 = 0,
 };
 
-/// `FluidData` in fluid.glsl.
+/// `FluidData` in common.slang.
 pub const Fluid = extern struct {
     world_to_box: [16]f32,
     box_to_world: [16]f32,
@@ -619,17 +619,17 @@ comptime {
     std.debug.assert(@sizeOf(Fluid) == 272 + max_fluid_sources * 48 + max_fluid_obstacles * 32 + 8);
 }
 
-/// `FluidList` in common.glsl.
+/// `FluidList` in common.slang.
 pub const FluidList = extern struct {
     count: u32 = 0,
     pad: u32 = 0,
     fluids: [8]u64 = @splat(0),
 };
 
-/// Length of `Water.ripples`; `WaterData` in GLSL declares the same 16.
+/// Length of `Water.ripples`; `WaterData` in water.slang declares the same 16.
 pub const max_water_ripples = 16;
 
-/// `WaterRipple` in water.glsl: a dent pressed into the surface this step.
+/// `WaterRipple` in water.slang: a dent pressed into the surface this step.
 pub const WaterRipple = extern struct {
     /// Position and width in 0..1 across the surface; depth in the surface's
     /// height units.
@@ -638,7 +638,7 @@ pub const WaterRipple = extern struct {
     depth: f32 = 0,
 };
 
-/// `WaterData` in water.glsl: one water surface and one step of it.
+/// `WaterData` in water.slang: one water surface and one step of it.
 pub const Water = extern struct {
     /// Places the unit square (x and z in -0.5..0.5, y up) in the world.
     transform: [16]f32,
@@ -690,7 +690,7 @@ comptime {
     std.debug.assert(@sizeOf(TextureTransform) == 32);
 }
 
-/// `ReflectionProbeData` in common.glsl.
+/// `ReflectionProbeData` in common.slang.
 pub const ReflectionProbe = extern struct {
     center: [3]f32,
     specular: u32,
@@ -705,7 +705,7 @@ comptime {
     std.debug.assert(@sizeOf(ReflectionProbe) == 48);
 }
 
-/// `LiquidParticle` in liquid.glsl. Positions are in box space: corner at
+/// `LiquidParticle` in liquid.slang. Positions are in box space: corner at
 /// the origin, axes along the box, in world units. 64 bytes.
 pub const LiquidParticle = extern struct {
     position: [3]f32,
@@ -719,7 +719,7 @@ pub const LiquidParticle = extern struct {
     pad2: f32 = 0,
 };
 
-/// `LiquidSource` in liquid.glsl: a round mouth at `position` with
+/// `LiquidSource` in liquid.slang: a round mouth at `position` with
 /// `radius`, in box space, releasing particles at `velocity`. 32 bytes.
 pub const LiquidSource = extern struct {
     position: [3]f32 = .{ 0, 0, 0 },
@@ -729,7 +729,7 @@ pub const LiquidSource = extern struct {
     layer: f32 = 1,
 };
 
-/// `LiquidData` in liquid.glsl. 640 bytes; must be a multiple of 16.
+/// `LiquidData` in liquid.slang. 640 bytes; must be a multiple of 16.
 pub const Liquid = extern struct {
     /// Box space (see `LiquidParticle`) to world space.
     from_box: [16]f32,

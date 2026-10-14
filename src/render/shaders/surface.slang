@@ -71,8 +71,8 @@ struct HitGeometry {
 HitGeometry geometryAt(FrameConstants frame, TraceHit hit, float3 origin, float3 direction) {
     HitGeometry geometry;
     geometry.instance = frame.instances.data[hit.instance];
-    Mesh mesh = frame.meshes.data[geometry.instance.mesh];
-    geometry.material = frame.materials.data[geometry.instance.material];
+    Mesh mesh = loadAligned<16>(frame.meshes.data + geometry.instance.mesh);
+    geometry.material = loadAligned<16>(frame.materials.data + geometry.instance.material);
     uint base = mesh.index_offset + hit.primitive * 3u;
     geometry.v0 = frame.vertices.data[geometry.instance.vertex_offset + frame.indices.data[base]];
     geometry.v1 = frame.vertices.data[geometry.instance.vertex_offset + frame.indices.data[base + 1u]];
@@ -123,7 +123,7 @@ HitSurface surfaceOf(HitGeometry geometry, SurfaceDetail detail) {
     if (material.base_color_texture != INVALID_ID)
         base_color *= sampleTextureLod(material.base_color_texture, material.sampler_index, materialUv(material, (material.uv_sets & 1u) != 0u ? uvb : uv), detail.level(material.base_color_texture, texture_per_world));
     base_color *= unpackUnorm(v0.color) * lambda.x + unpackUnorm(v1.color) * lambda.y + unpackUnorm(v2.color) * lambda.z;
-    base_color.rgb *= unpackUnorm(instance.tint).rgb;
+    base_color = float4(base_color.rgb * unpackUnorm(instance.tint).rgb, base_color.a);
 
     surface.metallic = material.metallic;
     surface.roughness = material.roughness;

@@ -1,7 +1,6 @@
 //! The constants every shader of a view reads, and the flag bits that go with
 //! them. The shader declarations are generated from this file by the build
-//! (`frame_constants.glsl`, `frame_constants.slang`), so it imports nothing
-//! but `std`.
+//! (`frame_constants.slang`), so it imports nothing but `std`.
 const std = @import("std");
 
 pub const invalid_id: u32 = 0xffff_ffff;
@@ -53,7 +52,7 @@ pub const features = struct {
     /// Per-texture coordinate transforms (`Material.texture_transforms`).
     pub const texture_transforms: u32 = 64;
     pub const colored_shadows: u32 = 128;
-    /// Irradiance probes moved off the grid (gi.glsl).
+    /// Irradiance probes moved off the grid (gi.slang).
     pub const gi_relocation: u32 = 256;
     /// Distance haze (`FrameConstants.aerial`).
     pub const aerial: u32 = 512;
@@ -156,7 +155,7 @@ pub const FrameConstants = extern struct {
     /// the nearest such caster's depth (a); or `invalid_id`.
     shadow_color: u32 = invalid_id,
     probe_count: u32 = 0,
-    /// The irradiance probe grids (gi.glsl), finest first: each is blended
+    /// The irradiance probe grids (gi.slang), finest first: each is blended
     /// into the next where it ends.
     gi_cascades: [gi_cascade_max]GiCascade = @splat(.{}),
     gi_pad: u32 = 0,

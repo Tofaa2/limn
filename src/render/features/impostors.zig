@@ -28,10 +28,10 @@ fn impostors(ctx: *ViewContext) !void {
     try drawImpostors(ctx.renderer, p);
 }
 
-/// Tiles per atlas side. Must match `impostor_frames` in impostor.glsl.
+/// Tiles per atlas side. Must match `impostor_frames` in impostor.slang.
 pub const frames = 8;
 
-/// Must match `impostorUnfold` in impostor.glsl.
+/// Must match `impostorUnfold` in impostor.slang.
 fn unfold(place: [2]f32) Vec3 {
     const e = [2]f32{ place[0] * 2 - 1, place[1] * 2 - 1 };
     var direction = Vec3{ e[0], e[1], 1 - @abs(e[0]) - @abs(e[1]) };
@@ -45,7 +45,7 @@ fn unfold(place: [2]f32) Vec3 {
 }
 
 /// Right and up of a tile's capture camera. Must match `impostorBasis` in
-/// impostor.glsl.
+/// impostor.slang.
 fn basis(toward: Vec3) [2]Vec3 {
     const hint: Vec3 = if (@abs(toward[1]) < 0.999) .{ 0, 1, 0 } else .{ 1, 0, 0 };
     const right = math.normalize(math.cross(hint, toward));

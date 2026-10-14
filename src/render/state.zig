@@ -613,7 +613,7 @@ pub const EntityMark = struct {
     pub const restyled: u32 = 8;
 };
 
-/// `Move` in instance_update.comp: a new transform for one instance.
+/// `Move` in instance_update.slang: a new transform for one instance.
 pub const InstanceMove = extern struct {
     instance: u32,
     tlas_slot: u32 = gpu.invalid_id,
@@ -627,7 +627,7 @@ pub const InstanceMove = extern struct {
     pub const keep: u32 = 2;
 };
 
-/// `Rewrite` in instance_update.comp: a whole record for one instance.
+/// `Rewrite` in instance_update.slang: a whole record for one instance.
 pub const InstanceRewrite = extern struct {
     instance: u32,
     tlas_slot: u32 = gpu.invalid_id,
@@ -866,7 +866,7 @@ pub const TransparentDraw = struct {
 };
 
 pub const BlasJob = struct { blas: rhi.AccelerationStructure, vertex_offset: u32, mesh: ModelMesh };
-/// `BoundsJob` in skin_bounds.comp.
+/// `BoundsJob` in skin.slang.
 pub const BoundsJob = extern struct {
     vertex_offset: u32,
     meshlet_offset: u32,
@@ -876,7 +876,7 @@ pub const BoundsJob = extern struct {
     pad: [3]u32 = .{ 0, 0, 0 },
 };
 
-/// `SkinJob` in skin.comp.
+/// `SkinJob` in skin.slang.
 pub const SkinJob = extern struct {
     source_offset: u32,
     destination_offset: u32,
@@ -1014,7 +1014,7 @@ pub const ViewData = struct {
     /// The vendor upscaler this view resolves with.
     upscaler: @import("techniques/upscaling.zig").Slot = .{},
     /// One word per instance of the instance groups: seen last frame
-    /// (`InstanceVisibility` in cull_view.glsl).
+    /// (`InstanceVisibility` in cull_view.slang).
     instance_visibility: ?rhi.Buffer = null,
     instance_visibility_capacity: u32 = 0,
     visibility_scene: ?Scene = null,
@@ -1214,7 +1214,7 @@ pub const water_quads = 160;
 pub const HairState = struct {
     scene: Scene,
     desc: render.HairDesc,
-    /// One `HairPoint` (hair.glsl) per point of every strand.
+    /// One `HairPoint` (hair.slang) per point of every strand.
     points: rhi.Buffer,
     stretches: u32,
     strands: u32,

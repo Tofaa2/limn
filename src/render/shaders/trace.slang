@@ -24,9 +24,9 @@ float3 barycentricWeights(float2 barycentric) {
 /// Whether a hit on alpha tested geometry lands on a drawn part of it.
 bool rayCandidateSolid(FrameConstants frame, uint instance_index, uint primitive, float2 barycentric) {
     Instance instance = frame.instances.data[instance_index];
-    Material material = frame.materials.data[instance.material];
+    Material material = loadAligned<16>(frame.materials.data + instance.material);
     if ((material.flags & MATERIAL_ALPHA_TEST) == 0u) return true;
-    Mesh mesh = frame.meshes.data[instance.mesh];
+    Mesh mesh = loadAligned<16>(frame.meshes.data + instance.mesh);
     uint base = mesh.index_offset + primitive * 3u;
     Vertex v0 = frame.vertices.data[instance.vertex_offset + frame.indices.data[base]];
     Vertex v1 = frame.vertices.data[instance.vertex_offset + frame.indices.data[base + 1u]];
@@ -83,7 +83,7 @@ struct Tracer {
     uint* mesh_items;
 
     bool mesh(Instance instance, uint instance_index, float3 origin, float3 direction, bool any_hit, inout float nearest, inout TraceHit hit) {
-        Mesh mesh = frame.meshes.data[instance.mesh];
+        Mesh mesh = loadAligned<16>(frame.meshes.data + instance.mesh);
         if (mesh.bvh == INVALID_ID) return false;
         float3 inverse = traceInverse(direction);
         uint root = mesh.bvh;

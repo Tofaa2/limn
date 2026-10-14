@@ -41,6 +41,53 @@ int3 fluidCell(FluidRef fluid, int2 pixel) {
     return volumeCell(pixel, fluid.data.size, fluid.data.tiles_x);
 }
 
+int2 fluidPixel(FluidRef fluid, int3 cell) {
+    int tiles_x = fluid.data.tiles_x;
+    return int2(cell.z % tiles_x, cell.z / tiles_x) * fluid.data.size.xy + cell.xy;
+}
+
+bool fluidInside(FluidRef fluid, int3 cell) {
+    return all(cell >= int3(0)) && all(cell < fluid.data.size);
+}
+
+bool fluidWall(FluidRef fluid, int3 cell) {
+    uint walls = fluid.data.walls;
+    if (walls == FLUID_WALLS_CLOSED) return true;
+    return walls == FLUID_WALLS_FLOOR && cell.y < 0;
+}
+
+bool fluidObstacle(FluidRef fluid, int3 cell) {
+    if (fluid.data.solid_mask == 0u) return false;
+    return fetchTexel(fluid.data.solid_texture, fluidPixel(fluid, cell)).r > 0.5;
+}
+
+float4 fluidFetch(FluidRef fluid, uint texture_index, int3 cell) {
+    cell = clamp(cell, int3(0), fluid.data.size - 1);
+    return fetchTexel(texture_index, fluidPixel(fluid, cell));
+}
+
+float4 fluidSample(FluidRef fluid, uint texture_index, float3 position) {
+    int3 size = fluid.data.size;
+    return sampleVolume(texture_index, fluid.data.sampler_linear, position / float3(size), size, fluid.data.tiles_x);
+}
+
+float3 fluidVelocity(FluidRef fluid, uint texture_index, int3 cell, int3 from, float3 center) {
+    float3 mirrored = center * float3(1 - 2 * abs(cell - from));
+    if (!fluidInside(fluid, cell)) return fluidWall(fluid, cell) ? mirrored : center;
+    float4 velocity = fetchTexel(texture_index, fluidPixel(fluid, cell));
+    return velocity.w > 0.5 ? mirrored : velocity.xyz;
+}
+
+float fluidPressure(FluidRef fluid, uint texture_index, int3 cell, float center, out bool solid) {
+    if (!fluidInside(fluid, cell)) {
+        solid = fluidWall(fluid, cell);
+        return solid ? center : 0.0;
+    }
+    float2 pressure = fetchTexel(texture_index, fluidPixel(fluid, cell)).rg;
+    solid = pressure.g > 0.5;
+    return solid ? center : pressure.r;
+}
+
 float3 fireGlow(float temperature) {
     float t = max(temperature, 0.0);
     float3 color = float3(smoothstep(0.02, 0.45, t), smoothstep(0.25, 1.1, t) * 0.75, smoothstep(0.7, 1.9, t) * 0.55);

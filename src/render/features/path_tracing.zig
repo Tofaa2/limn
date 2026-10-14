@@ -107,7 +107,7 @@ pub const View = struct {
     reservoir: ?rhi.Texture = null,
     reservoir_old: ?rhi.Texture = null,
     /// Glossy reflections as traced, and the reflection denoiser's
-    /// (ffx_reflections.glsl) targets and history.
+    /// (ffx_reflections.slang) targets and history.
     gloss_gathered: ?rhi.Texture = null,
     gloss_gathered_old: ?rhi.Texture = null,
     reflection_reprojected: ?rhi.Texture = null,
@@ -197,11 +197,11 @@ fn trace(ctx: *ViewContext) !void {
     p.shared.path_traced = try pathTrace(ctx.renderer, p, try ctx.state(@This()));
 }
 
-/// Step size in pixels of each pathtrace_denoise.frag pass; the short last one
+/// Step size in pixels of each pathtrace_denoise.slang pass; the short last one
 /// removes the grid a wide step leaves.
 const denoise_steps = [_]i32{ 1, 2, 4, 8, 3 };
 
-/// Push constants of pathtrace_denoise.frag.
+/// Push constants of pathtrace_denoise.slang.
 const DenoisePush = extern struct {
     frame: u64,
     color: u32,
@@ -232,7 +232,7 @@ const changed_lamp_history = 4;
 
 const still_history = 8192;
 
-/// `history_clip_weight` in ffx_reflections_resolve.frag; AMD's default.
+/// `history_clip_weight` in ffx_reflections.slang; AMD's default.
 const reflection_stability = 0.7;
 
 /// Recreates a view's path tracing targets at this size and resets
@@ -442,7 +442,7 @@ fn makeGuides(device: *rhi.Device, state: *View) !void {
     }
 }
 
-/// Runs the reflection denoiser (ffx_reflections.glsl) and returns its result,
+/// Runs the reflection denoiser (ffx_reflections.slang) and returns its result,
 /// which is also next frame's history.
 fn denoiseReflections(renderer: *Renderer, p: *const ScenePass, state: *View, gloss: rhi.Texture, reach: rhi.Texture, surface: rhi.Texture) !rhi.Texture {
     const device = renderer.device;
