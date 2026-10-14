@@ -99,6 +99,8 @@ const renderer_shaders: []const Shader = &.{
     .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace.frag.spv", .defines = &.{"SOFTWARE_RAYS"}, .entry = "fragmentMain", .stage = "fragment" },
     .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace_rt.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
     .{ .src = shader_dir ++ "/pathtrace_gather.slang", .name = "pathtrace_gather.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
+    .{ .src = shader_dir ++ "/nrd_pack.slang", .name = "nrd_pack.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
+    .{ .src = shader_dir ++ "/nrd_compose.frag", .name = "nrd_compose.frag.spv" },
     .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace.comp.spv", .defines = &.{ "SOFTWARE_RAYS", "STORAGE_IMAGES" }, .entry = "computeMain", .stage = "compute" },
     .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace_rt.comp.spv", .defines = &.{"STORAGE_IMAGES"}, .entry = "computeMain", .stage = "compute" },
     .{ .src = shader_dir ++ "/liquid_thickness.frag", .name = "liquid_thickness.frag.spv" },
@@ -375,6 +377,25 @@ pub fn build(b: *std.Build) void {
     trim_dlss.step.dependOn(&fetch_dlss.step);
     b.step("dlss-sdk", "Fetch NVIDIA's DLSS SDK into dlss_sdk, under NVIDIA's license; builds after it have DLSS").dependOn(&trim_dlss.step);
     features.addOption(bool, "dlss_logging", b.option(bool, "dlss_logging", "Let DLSS write its log (default: false)") orelse false);
+    const nrd_sdk = b.option([]const u8, "nrd_sdk", "Where NVIDIA's NRD SDK is, built (default: nrd_sdk, which `zig build nrd-sdk` fetches and builds)") orelse b.pathFromRoot(nrd_sdk_default);
+    const nrd_found = if (b.build_root.handle.access(b.graph.io, b.pathResolve(&.{ nrd_sdk, "_Bin", "libNRD.a" }), .{})) |_| true else |_| false;
+    const nrd = b.option(bool, "nrd", "Build NVIDIA's NRD denoiser in, for path tracing (default: true where the SDK is found)") orelse nrd_found;
+    if (nrd and !nrd_found) std.debug.panic("no built NRD SDK at {s}; run `zig build nrd-sdk` or pass -Dnrd_sdk", .{nrd_sdk});
+    features.addOption(bool, "nrd", nrd);
+    const fetch_nrd = b.addSystemCommand(&.{ "git", "clone", "--depth", "1", "--branch", nrd_sdk_version, "--recurse-submodules", "--shallow-submodules", "https://github.com/NVIDIA-RTX/NRD", b.pathFromRoot(nrd_sdk_default) });
+    const configure_nrd = b.addSystemCommand(&.{
+        "cmake",                         "-S",                                         b.pathFromRoot(nrd_sdk_default),
+        "-B",                            b.pathFromRoot(nrd_sdk_default ++ "/_Build"), "-DCMAKE_BUILD_TYPE=Release",
+        "-DNRD_STATIC_LIBRARY=ON",       "-DNRD_EMBEDS_SPIRV_SHADERS=ON",              "-DNRD_EMBEDS_DXIL_SHADERS=OFF",
+        "-DNRD_EMBEDS_DXBC_SHADERS=OFF", "-DNRD_NORMAL_ENCODING=4",                    "-DNRD_ROUGHNESS_ENCODING=1",
+    });
+    if (b.findProgram(&.{"dxc"}, &.{})) |compiler| configure_nrd.addArg(b.fmt("-DNRD_DXC_CUSTOM_PATH={s}", .{compiler})) else |_| {}
+    const patch_nrd = b.addSystemCommand(&.{ "sed", "-i", "s/        --allResourcesBound$/        --allResourcesBound\n        -X -fspv-use-unknown-image-format/", b.pathFromRoot(nrd_sdk_default ++ "/CMakeLists.txt") });
+    patch_nrd.step.dependOn(&fetch_nrd.step);
+    configure_nrd.step.dependOn(&patch_nrd.step);
+    const build_nrd = b.addSystemCommand(&.{ "cmake", "--build", b.pathFromRoot(nrd_sdk_default ++ "/_Build"), "-j", "8" });
+    build_nrd.step.dependOn(&configure_nrd.step);
+    b.step("nrd-sdk", "Fetch NVIDIA's NRD SDK into nrd_sdk, under NVIDIA's license, and build it (needs cmake, a C++ compiler and dxc); builds after it have NRD").dependOn(&build_nrd.step);
     features.addOption(bool, "validate_input", validate_input);
     const features_module = features.createModule();
     const zmesh = b.dependency("zmesh", .{ .target = target, .optimize = asset_optimize });
@@ -467,6 +488,7 @@ pub fn build(b: *std.Build) void {
     renderer.addImport("build_features", features_module);
     if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk);
     if (dlss) addDlss(b, renderer, target, asset_optimize, vulkan_include, dlss_sdk);
+    if (nrd) addNrd(b, renderer, target, asset_optimize, vulkan_include, nrd_sdk);
 
     const library = b.addLibrary(.{ .name = "limn", .root_module = renderer, .linkage = .static, .use_llvm = true });
     b.installArtifact(library);
@@ -854,6 +876,9 @@ fn addFidelityFx(
 }
 
 const dlss_sdk_default = "dlss_sdk";
+const nrd_sdk_default = "nrd_sdk";
+/// The NRD release the shim in src/render/nrd is written against.
+const nrd_sdk_version = "v4.9.4";
 /// Where NixOS keeps the GPU driver's libraries, which are on no default path;
 /// DLSS needs them on the library path of what it runs in.
 const nixos_drivers = "/run/opengl-driver/lib";
@@ -893,6 +918,32 @@ fn addDlss(
         renderer.addObjectFile(.{ .cwd_relative = gnu_cpp });
         renderer.addRPath(.{ .cwd_relative = std.fs.path.dirname(gnu_cpp) orelse "." });
         renderer.linkSystemLibrary("dl", .{});
+    }
+}
+
+/// Builds src/render/nrd/limn_nrd.cpp against the NRD SDK built at `sdk`
+/// and links its library, which is built against the GNU C++ library.
+fn addNrd(
+    b: *std.Build,
+    renderer: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    vulkan_include: std.Build.LazyPath,
+    sdk: []const u8,
+) void {
+    const library = b.addLibrary(.{
+        .name = "renderer_nrd",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libcpp = true }),
+    });
+    library.root_module.addIncludePath(.{ .cwd_relative = b.pathResolve(&.{ sdk, "Include" }) });
+    library.root_module.addIncludePath(vulkan_include);
+    library.root_module.addCSourceFile(.{ .file = b.path("src/render/nrd/limn_nrd.cpp"), .flags = &.{ "-std=c++17", "-w", "-DNRD_STATIC_LIBRARY" } });
+    renderer.linkLibrary(library);
+    renderer.addObjectFile(.{ .cwd_relative = b.pathResolve(&.{ sdk, "_Bin", "libNRD.a" }) });
+    if (target.result.os.tag != .windows) {
+        const gnu_cpp = std.mem.trim(u8, b.run(&.{ "cc", "-print-file-name=libstdc++.so.6" }), " \n");
+        renderer.addObjectFile(.{ .cwd_relative = gnu_cpp });
+        renderer.addRPath(.{ .cwd_relative = std.fs.path.dirname(gnu_cpp) orelse "." });
     }
 }
 

@@ -33,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
     var bounce_light = true;
     var drifting = false;
     var dlss = false;
+    var nrd = false;
     {
         var arguments = try init.minimal.args.iterateAllocator(init.gpa);
         defer arguments.deinit();
@@ -42,6 +43,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, argument, "--direct")) bounce_light = false;
             if (std.mem.eql(u8, argument, "--drift")) drifting = true;
             if (std.mem.eql(u8, argument, "--dlss")) dlss = true;
+            if (std.mem.eql(u8, argument, "--nrd")) nrd = true;
         }
     }
     var stage = try Stage.create(init, "Limn ray tracing", options);
@@ -149,7 +151,7 @@ pub fn main(init: std.process.Init) !void {
                     .shadows = .{ .distance = 40, .traced_lights = traced_shadows },
                     .global_illumination = if (bounce_light) .{ .probes = .{} } else null,
                     .reflections = .{ .ray_tracing = traced_reflections },
-                    .path_tracing = if (path_traced) .{ .bounces = bounces, .denoiser = if (dlss) .ray_reconstruction else .builtin } else null,
+                    .path_tracing = if (path_traced) .{ .bounces = bounces, .denoiser = if (dlss) .ray_reconstruction else if (nrd) .nrd else .builtin } else null,
                     .resolution = .{ .upscaler = if (dlss) .dlss else .temporal },
                 },
             }},

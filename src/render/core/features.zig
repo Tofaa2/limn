@@ -102,6 +102,8 @@ pub const Resolve = struct {
     orthographic: bool = false,
     /// The vendor upscalers that can run.
     upscalers: upscaling.Availability = .{},
+    /// NRD is built in and the device can run it.
+    nrd: bool = false,
     /// The upscaler asked for, before any feature's `resolve`.
     upscaler: api.Upscaler = .temporal,
     /// How the device would path trace.

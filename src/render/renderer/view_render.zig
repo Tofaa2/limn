@@ -93,6 +93,7 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
         .temporal_antialiasing = desc.settings.resolution.temporal_antialiasing,
         .orthographic = desc.camera.orthographic != null,
         .upscalers = upscaling.Availability.of(device, self.dlss),
+        .nrd = @import("../nrd.zig").available and device.caps.storage_images,
         .upscaler = desc.settings.resolution.upscaler,
         .path_tracing = self.pathTracing(),
         .downgrades = &self.downgrades,

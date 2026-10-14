@@ -123,6 +123,7 @@ pub const Reflections = api.Reflections;
 pub const GlobalIllumination = api.GlobalIllumination;
 /// `Settings.path_tracing`.
 pub const PathTracing = api.PathTracing;
+pub const NrdSettings = api.NrdSettings;
 /// `Settings.transparency`.
 pub const Transparency = api.Transparency;
 /// `Settings.fog`.

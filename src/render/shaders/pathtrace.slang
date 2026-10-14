@@ -57,7 +57,8 @@ struct Output {
     /// Color of the surface seen, through mirrors, and how far its
     /// reflections reach.
     float4 guide : SV_Target1;
-    /// Bounced light on that surface, over its color.
+    /// Bounced light on that surface, over its color, with how far the
+    /// bounce went in alpha.
     float4 soft : SV_Target2;
     /// Its normal and distance; the distance is negative through a mirror.
     float4 facing : SV_Target3;
@@ -97,6 +98,7 @@ static float primary_roughness;
 static float primary_distance;
 static bool primary_mirror;
 static float gloss_reach;
+static float soft_reach;
 static bool split_met;
 
 static uint random_state;
@@ -590,6 +592,7 @@ float3 tracePath(FrameConstants frame, float3 origin, float3 direction, bool sca
     gloss = float3(0.0);
     bool glossy_first = false;
     bool awaiting_reach = false;
+    bool awaiting_soft = false;
     float travelled = 0.0;
     bool rough_bounce = false;
     bool split = false;
@@ -614,6 +617,10 @@ float3 tracePath(FrameConstants frame, float3 origin, float3 direction, bool sca
         if (awaiting_reach) {
             gloss_reach = met ? hit.t : 1000.0;
             awaiting_reach = false;
+        }
+        if (awaiting_soft) {
+            soft_reach = met ? hit.t : 1000.0;
+            awaiting_soft = false;
         }
         if (!met) {
             float3 sky = carried * skyLight(frame, direction, unaimed);
@@ -746,7 +753,10 @@ float3 tracePath(FrameConstants frame, float3 origin, float3 direction, bool sca
                 glossy_first = true;
                 awaiting_reach = true;
             }
-            if (!unaimed) rough_bounce = true;
+            if (!unaimed) {
+                awaiting_soft = !rough_bounce;
+                rough_bounce = true;
+            }
         } else {
             float2 xi = randomPair();
             float turn = 2.0 * PI * xi.x;
@@ -755,6 +765,7 @@ float3 tracePath(FrameConstants frame, float3 origin, float3 direction, bool sca
             if (dot(surface.flat_normal, next) <= 0.0) break;
             carried *= scattered * (1.0 - fresnel_view) / (1.0 - mirror_share);
             unaimed = false;
+            awaiting_soft = !rough_bounce;
             rough_bounce = true;
         }
         cone_angle = max(cone_angle, unaimed ? cone_angle : 0.05 + 0.25 * surface.roughness);
@@ -818,6 +829,7 @@ Output tracePixel(float4 position, out Guides guides) {
         primary_distance = 60000.0;
         primary_mirror = false;
         gloss_reach = 0.0;
+        soft_reach = 0.0;
         float3 soft;
         float3 indirect;
         float3 gloss;
@@ -865,7 +877,7 @@ Output tracePixel(float4 position, out Guides guides) {
     Output result;
     result.color = float4(total / float(samples), primary_mirror ? 1.0 : 0.0);
     result.guide = float4(shown, gloss_reach);
-    result.soft = float4(total_soft / float(samples), 0.0);
+    result.soft = float4(total_soft / float(samples), soft_reach);
     result.facing = float4(first_facing, first_mirrored ? -shown_distance : shown_distance);
     result.lamp = float4(min(total_lamp / float(samples), float3(60000.0)), 1.0);
     result.gloss = float4(min(total_gloss / float(samples), float3(60000.0)), 1.0);

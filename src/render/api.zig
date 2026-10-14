@@ -796,6 +796,8 @@ pub const Reflections = @import("features/reflections.zig").Settings;
 pub const GlobalIllumination = @import("features/global_illumination.zig").Settings;
 /// `Settings.path_tracing`.
 pub const PathTracing = @import("features/path_tracing.zig").Settings;
+/// `Settings.path_tracing.nrd`.
+pub const NrdSettings = @import("features/path_tracing.zig").Nrd;
 /// `Settings.transparency.mode`.
 pub const Transparency = @import("features/transparency.zig").Settings;
 /// `Settings.fog`.
@@ -894,7 +896,14 @@ pub const DebugView = enum(u32) {
 pub const Upscaler = enum { spatial, temporal, fsr, fsr2, fsr3, dlss };
 
 /// See `Settings.path_tracing.denoiser`.
-pub const Denoiser = enum { builtin, ray_reconstruction };
+pub const Denoiser = enum {
+    builtin,
+    /// DLSS Ray Reconstruction; needs `Upscaler.dlss`.
+    ray_reconstruction,
+    /// NVIDIA Real-time Denoisers (ReLAX) for bounced light and
+    /// reflections; needs the NRD SDK (`zig build nrd-sdk`).
+    nrd,
+};
 
 /// How a path picks the lamp to light a surface with. `.ris` draws a few
 /// candidates and keeps one by its contribution, reusing last frame's and

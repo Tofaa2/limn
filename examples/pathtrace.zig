@@ -26,6 +26,7 @@ pub fn main(init: std.process.Init) !void {
     var options = gfx.Options{ .ray_tracing = .{ .software_path_tracing = true } };
     var traced = true;
     var orbiting = false;
+    var denoiser: gfx.Denoiser = .builtin;
     {
         var arguments = try init.minimal.args.iterateAllocator(init.gpa);
         defer arguments.deinit();
@@ -33,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, argument, "--software")) options.ray_tracing.hardware = false;
             if (std.mem.eql(u8, argument, "--raster")) traced = false;
             if (std.mem.eql(u8, argument, "--orbit")) orbiting = true;
+            if (std.mem.eql(u8, argument, "--nrd")) denoiser = .nrd;
         }
     }
     var stage = try Stage.create(init, "Limn path tracing", options);
@@ -118,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
                 .target = stage.target(),
                 .settings = .{
                     .shadows = .{ .distance = 30 },
-                    .path_tracing = if (traced) .{ .bounces = bounces } else null,
+                    .path_tracing = if (traced) .{ .bounces = bounces, .denoiser = denoiser } else null,
                 },
             }},
             .delta_time = tick.dt,
