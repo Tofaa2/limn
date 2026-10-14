@@ -76,7 +76,7 @@ pub const Settings = struct {
 pub fn preset(quality: api.Quality) ?Settings {
     return switch (quality) {
         .ultra => .{},
-        .high => .{},
+        .high => .{ .light_rays = 2 },
         .medium => .{ .samples = 8, .light_rays = 2 },
         .low => .{ .cascades = 3, .samples = 4, .light_rays = 1 },
     };

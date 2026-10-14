@@ -24,6 +24,8 @@
 - `Settings.path_tracing.direct`.
 - `Settings.resolution.edge_antialiasing`: antialiasing from the finished picture alone, for views without TAA.
 - `--timings` prints the slowest frame; the `bistro` example takes `--walk`.
+- NVIDIA NRD (ReLAX) as a path tracing denoiser: `Denoiser.nrd`, `zig build nrd-sdk`; the `pathtrace` and `rtx` examples take `--nrd`.
+- `Settings.path_tracing.nrd`: history length and pre-blur radius for NRD.
 - `Settings.global_illumination.probes.idle_interval`: probes are re-traced less often while the scene and its lights are still.
 - `Pass` runs on views without a scene; `PassContext` has the camera, its matrices and the resolved settings.
 - The `isometric` example.
@@ -56,7 +58,7 @@
 - Breaking: `rhi.Device.storageIndex` takes a layer; `CommandEncoder.copyDepthToColor` is gone.
 - Path tracing runs in a compute shader where storage images are available.
 - Acceleration structures of static meshes are compacted after they are built.
-- The high preset traces 64 rays per probe.
+- The high preset traces 64 rays per probe and 2 shadow rays per lamp.
 - Temporal antialiasing keeps less history of what moves, so motion blurs and trails less.
 - A probe grid that follows the camera to a new cell seeds the probes it moves onto from the coarser grid; it no longer re-traces every probe that frame.
 - The `pathtrace` example's walls no longer overlap, which showed as speckles in motion.

@@ -4,6 +4,8 @@ const scene_pass = @import("../scene_pass.zig");
 const resolution_feature = @import("resolution.zig");
 const filled = @import("../api.zig").filled;
 const std = @import("std");
+const nrd = @import("../nrd.zig");
+const math = @import("../../math.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const api = @import("../api.zig");
 const features = @import("../core/features.zig");
@@ -33,8 +35,23 @@ pub const Settings = struct {
     /// averages indirect light over neighbouring pixels of the same surface
     /// while a pixel still varies between frames. `.ray_reconstruction` is
     /// DLSS, which needs `Settings.resolution.upscaler` to be `.dlss`, else
-    /// `.builtin` stands in.
+    /// `.builtin` stands in. `.nrd` is NVIDIA's ReLAX, for bounced light and
+    /// reflections; where the build has no NRD, `.builtin` stands in.
     denoiser: ?api.Denoiser = .builtin,
+    /// How `.nrd` is tuned.
+    nrd: Nrd = .{},
+};
+
+/// See `Settings.path_tracing.nrd`.
+pub const Nrd = struct {
+    /// Most frames of history a pixel keeps, 1..255. More is smoother at
+    /// rest and slower to follow what changes.
+    history_frames: u32 = 30,
+    /// Radius in pixels of a blur over the traced light before it is
+    /// gathered; 0 for none. It hides noise where history is short, as
+    /// behind something that moves, and softens contact shadows and color
+    /// bleeding with it.
+    blur_radius: f32 = 0,
 };
 
 /// What a view keeps for path tracing from frame to frame.
@@ -52,6 +69,19 @@ pub const View = struct {
     raw_scatter: ?rhi.Texture = null,
     raw_reflect: ?rhi.Texture = null,
     raw_normal: ?rhi.Texture = null,
+    /// NRD for this view, the textures it reads and writes, and the camera
+    /// it last saw.
+    nrd: ?nrd.Denoiser = null,
+    nrd_refused: bool = false,
+    nrd_normal: ?rhi.Texture = null,
+    nrd_depth: ?rhi.Texture = null,
+    nrd_diffuse: ?rhi.Texture = null,
+    nrd_specular: ?rhi.Texture = null,
+    nrd_diffuse_out: ?rhi.Texture = null,
+    nrd_specular_out: ?rhi.Texture = null,
+    nrd_view: [16]f32 = math.identity,
+    nrd_projection: [16]f32 = math.identity,
+    nrd_frame: u32 = 0,
     /// The running average and last frame's, for reprojection.
     accum: ?rhi.Texture = null,
     accum_old: ?rhi.Texture = null,
@@ -107,6 +137,7 @@ pub const View = struct {
     }
 
     pub fn deinit(self: *View, device: *rhi.Device) void {
+        dropNrd(self, device);
         inline for (@typeInfo(View).@"struct".fields) |field| {
             if (field.type != ?rhi.Texture) continue;
             if (@field(self, field.name)) |texture| device.destroyTexture(texture);
@@ -147,6 +178,10 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
             r.downgrade("path_tracing.denoiser", "ray_reconstruction", "builtin", why);
             s.denoiser = .builtin;
         }
+    }
+    if (s.denoiser == .nrd and !r.nrd) {
+        r.downgrade("path_tracing.denoiser", "nrd", "builtin", .unavailable);
+        s.denoiser = .builtin;
     }
 }
 
@@ -241,10 +276,12 @@ fn makeTargets(device: *rhi.Device, cmd: *rhi.CommandEncoder, state: *View, widt
         if (target.slot.*) |old| device.destroyTexture(old);
         target.slot.* = null;
     }
-    for ([_]*?rhi.Texture{ &state.raw_scatter, &state.raw_reflect, &state.raw_normal }) |slot| {
+    for ([_]*?rhi.Texture{ &state.raw_scatter, &state.raw_reflect, &state.raw_normal, &state.nrd_normal, &state.nrd_depth, &state.nrd_diffuse, &state.nrd_specular, &state.nrd_diffuse_out, &state.nrd_specular_out }) |slot| {
         if (slot.*) |old| device.destroyTexture(old);
         slot.* = null;
     }
+    dropNrd(state, device);
+    state.nrd_refused = false;
     for (targets) |target| {
         const made = try device.createTexture(.{
             .name = target.name,
@@ -261,6 +298,128 @@ fn makeTargets(device: *rhi.Device, cmd: *rhi.CommandEncoder, state: *View, widt
     state.size = .{ width, height };
     state.gathered = 0;
     state.reusable = false;
+}
+
+fn dropNrd(state: *View, device: *rhi.Device) void {
+    if (state.nrd) |*running| {
+        device.waitIdle() catch {};
+        running.destroy();
+    }
+    state.nrd = null;
+}
+
+/// The built-in denoiser's gathering, then NRD on the bounced light and the
+/// reflections in place of the built-in filters. False where NRD will not
+/// run, which is reported once.
+fn denoiseWithNrd(renderer: *Renderer, p: *const ScenePass, state: *View, signals: Signals, gathered: Gathered, reset: bool) !bool {
+    const device = renderer.device;
+    const cmd = p.cmd;
+    if (state.nrd_refused) return false;
+    if (state.nrd == null) {
+        state.nrd = nrd.Denoiser.create(device, state.size) orelse {
+            state.nrd_refused = true;
+            std.log.warn("NRD would not start; the built-in denoiser stands in", .{});
+            renderer.downgrades.add(.{ .feature = "path_tracing.denoiser", .requested = "nrd", .used = "builtin", .reason = .unavailable });
+            return false;
+        };
+        state.nrd_frame = 0;
+    }
+    const made = [_]struct { slot: *?rhi.Texture, name: [:0]const u8, format: rhi.Format, written: bool }{
+        .{ .slot = &state.nrd_normal, .name = "nrd: normal and roughness", .format = .rgba16_float, .written = false },
+        .{ .slot = &state.nrd_depth, .name = "nrd: view depth", .format = .r32_float, .written = false },
+        .{ .slot = &state.nrd_diffuse, .name = "nrd: bounced light", .format = .rgba16_float, .written = false },
+        .{ .slot = &state.nrd_specular, .name = "nrd: reflections", .format = .rgba16_float, .written = false },
+        .{ .slot = &state.nrd_diffuse_out, .name = "nrd: bounced light, denoised", .format = .rgba16_float, .written = true },
+        .{ .slot = &state.nrd_specular_out, .name = "nrd: reflections, denoised", .format = .rgba16_float, .written = true },
+    };
+    for (made) |target| {
+        if (target.slot.* != null) continue;
+        target.slot.* = try device.createTexture(.{
+            .name = target.name,
+            .width = state.size[0],
+            .height = state.size[1],
+            .format = target.format,
+            .usage = .{ .sampled = true, .color_attachment = !target.written, .storage = target.written },
+        });
+    }
+    const first = state.nrd_frame == 0;
+
+    cmd.beginScope("nrd");
+    defer cmd.endScope();
+    const inputs = [_]rhi.Texture{ state.nrd_normal.?, state.nrd_depth.?, state.nrd_diffuse.?, state.nrd_specular.? };
+    var attachments: [inputs.len]rhi.ColorAttachment = undefined;
+    for (inputs, &attachments) |target, *attachment| attachment.* = .{ .texture = target, .load = .discard };
+    try cmd.beginRendering(.{ .color = &attachments });
+    cmd.bindPipeline(try renderer.pipelines.get(.nrd_pack));
+    cmd.pushConstants(extern struct { frame: u64, surface: u32, diffuse: u32, specular: u32, albedo: u32, depth: u32, pad: u32 = 0 }{
+        .frame = p.frame_address,
+        .surface = device.textureIndex(signals.surface),
+        .diffuse = device.textureIndex(signals.diffuse),
+        .specular = device.textureIndex(signals.specular),
+        .albedo = device.textureIndex(signals.albedo),
+        .depth = device.textureIndex(p.view.depth),
+    });
+    cmd.drawFullscreen();
+    cmd.endRendering();
+    for (inputs) |target| cmd.transition(target, .shader_read);
+    cmd.transition(p.view.motion, .shader_read);
+    cmd.transition(state.nrd_diffuse_out.?, .storage);
+    cmd.transition(state.nrd_specular_out.?, .storage);
+
+    var projection = p.proj_unjittered;
+    projection[5] = -projection[5];
+    projection[9] = -projection[9];
+    projection[13] = -projection[13];
+    const before_view = if (first) p.view_matrix else state.nrd_view;
+    const before_projection = if (first) projection else state.nrd_projection;
+    state.nrd_view = p.view_matrix;
+    state.nrd_projection = projection;
+    state.nrd_frame +%= 1;
+    state.nrd.?.dispatch(device, cmd, .{
+        .motion = p.view.motion,
+        .normal_roughness = state.nrd_normal.?,
+        .view_depth = state.nrd_depth.?,
+        .diffuse = state.nrd_diffuse.?,
+        .specular = state.nrd_specular.?,
+        .diffuse_out = state.nrd_diffuse_out.?,
+        .specular_out = state.nrd_specular_out.?,
+        .view_to_clip = projection,
+        .view_to_clip_previous = before_projection,
+        .world_to_view = p.view_matrix,
+        .world_to_view_previous = before_view,
+        .jitter = .{ 0, 0 },
+        .jitter_previous = .{ 0, 0 },
+        .delta_time = p.delta_time,
+        .frame_index = state.nrd_frame,
+        .reset = reset or first,
+        .history_frames = filled(p.settings.path_tracing).nrd.history_frames,
+        .blur_radius = filled(p.settings.path_tracing).nrd.blur_radius,
+    }) catch {
+        state.nrd_refused = true;
+        std.log.warn("NRD failed; the built-in denoiser stands in", .{});
+        renderer.downgrades.add(.{ .feature = "path_tracing.denoiser", .requested = "nrd", .used = "builtin", .reason = .unavailable });
+        cmd.transition(state.nrd_diffuse_out.?, .shader_read);
+        cmd.transition(state.nrd_specular_out.?, .shader_read);
+        return false;
+    };
+    cmd.transition(state.nrd_diffuse_out.?, .shader_read);
+    cmd.transition(state.nrd_specular_out.?, .shader_read);
+
+    try cmd.beginRendering(.{ .color = &.{.{ .texture = p.view.hdr, .load = .discard }} });
+    cmd.bindPipeline(try renderer.pipelines.get(.nrd_compose));
+    cmd.pushConstants(extern struct { frame: u64, steady: u32, albedo: u32, lamp: u32, diffuse: u32, specular: u32, depth: u32 }{
+        .frame = p.frame_address,
+        .steady = device.textureIndex(gathered.steady),
+        .albedo = device.textureIndex(gathered.albedo),
+        .lamp = device.textureIndex(gathered.lamp),
+        .diffuse = device.textureIndex(state.nrd_diffuse_out.?),
+        .specular = device.textureIndex(state.nrd_specular_out.?),
+        .depth = device.textureIndex(state.nrd_depth.?),
+    });
+    cmd.drawFullscreen();
+    cmd.endRendering();
+    cmd.transition(p.view.hdr, .shader_read);
+    return true;
 }
 
 /// Makes the targets only a denoising upscaler reads, the first time one is
@@ -730,6 +889,7 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass, state: *View) !bool {
         switch (denoiser orelse .builtin) {
             .builtin => try compose(renderer, p, state, gathered, denoiser != null),
             .ray_reconstruction => try handOver(renderer, p, signals),
+            .nrd => if (!try denoiseWithNrd(renderer, p, state, signals, gathered, state.gathered == 0)) try compose(renderer, p, state, gathered, true),
         }
         state.gathered = @min(state.gathered + 1, still_history);
         state.reusable = true;
