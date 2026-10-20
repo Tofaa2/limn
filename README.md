@@ -1,30 +1,32 @@
 # Limn
+
 A high quality, performant, realtime, concurrency-first, physically based renderer written in zig with Vulkan 1.3
 
 Latest docs are published to https://tofaa2.github.io/limn/
 
 # Path tracing
+
 Path tracing is WIP and contains noise, unfortunately RTX is an oversold concept for marketing that requires vendor locked software and tooling to make it look actually good. Its recommended to keep regular ray tracing enabled and path tracing disabled.
 
 ![Sponza, path traced](.github/images/rtx_path.png)
 
-| ![meadow](.github/images/meadow.png) | ![rtx](.github/images/rtx.png) | ![world](.github/images/world.png) |
-|:-:|:-:|:-:|
-| **meadow** | **rtx** | **world** |
-| ![pathtrace](.github/images/pathtrace.png) | ![clouds](.github/images/clouds.png) | ![materials](.github/images/materials.png) |
-| **pathtrace** | **clouds** | **materials** |
-| ![lights](.github/images/lights.png) | ![reflections](.github/images/reflections.png) | ![water](.github/images/water.png) |
-| **lights** | **reflections** | **water** |
-| ![liquid](.github/images/liquid.png) | ![fluid](.github/images/fluid.png) | ![particles](.github/images/particles.png) |
-| **liquid** | **fluid** | **particles** |
-| ![post](.github/images/post.png) | ![decals](.github/images/decals.png) | ![animation](.github/images/animation.png) |
-| **post** | **decals** | **animation** |
-| ![instancing](.github/images/instancing.png) | ![views](.github/images/views.png) | ![shader](.github/images/shader.png) |
-| **instancing** | **views** | **shader** |
-| ![text](.github/images/text.png) | ![canvas](.github/images/canvas.png) | ![triangle](.github/images/triangle.png) |
-| **text** | **canvas** | **triangle** |
-| ![asteroids](.github/images/asteroids.png) | ![voxels](.github/images/voxels.png) | ![bistro](.github/images/bistro.png) |
-| **asteroids** | **voxels** | **bistro** |
+|     ![meadow](.github/images/meadow.png)     |         ![rtx](.github/images/rtx.png)         |     ![world](.github/images/world.png)     |
+| :------------------------------------------: | :--------------------------------------------: | :----------------------------------------: |
+|                  **meadow**                  |                    **rtx**                     |                 **world**                  |
+|  ![pathtrace](.github/images/pathtrace.png)  |      ![clouds](.github/images/clouds.png)      | ![materials](.github/images/materials.png) |
+|                **pathtrace**                 |                   **clouds**                   |               **materials**                |
+|     ![lights](.github/images/lights.png)     | ![reflections](.github/images/reflections.png) |     ![water](.github/images/water.png)     |
+|                  **lights**                  |                **reflections**                 |                 **water**                  |
+|     ![liquid](.github/images/liquid.png)     |       ![fluid](.github/images/fluid.png)       | ![particles](.github/images/particles.png) |
+|                  **liquid**                  |                   **fluid**                    |               **particles**                |
+|       ![post](.github/images/post.png)       |      ![decals](.github/images/decals.png)      | ![animation](.github/images/animation.png) |
+|                   **post**                   |                   **decals**                   |               **animation**                |
+| ![instancing](.github/images/instancing.png) |       ![views](.github/images/views.png)       |    ![shader](.github/images/shader.png)    |
+|                **instancing**                |                   **views**                    |                 **shader**                 |
+|       ![text](.github/images/text.png)       |      ![canvas](.github/images/canvas.png)      |  ![triangle](.github/images/triangle.png)  |
+|                   **text**                   |                   **canvas**                   |                **triangle**                |
+|  ![asteroids](.github/images/asteroids.png)  |      ![voxels](.github/images/voxels.png)      |    ![bistro](.github/images/bistro.png)    |
+|                **asteroids**                 |                   **voxels**                   |                 **bistro**                 |
 
 Every picture is an example in `examples/`: run it with `zig build <name>`.
 
@@ -76,10 +78,10 @@ After that you can use python to serve you the documentation as a webserver with
 ## Platforms
 
 Developed and tested on Linux with an NVIDIA GPU and with Mesa's software
-driver. It cross-compiles for Windows, but has not yet been verified on
-Windows itself, nor on AMD or Intel GPUs.
+driver. It cross-compiles for Windows and has been used on Windows and AMD hardware with modern drivers but not as deeply tested as Linux and NVIDIA.
 
 ## LLM Notice
+
 AI was used for documentation, README prettification, examples, and specific core content. All code PR'ed to this, repo if LLM developed, requires complete verification by the developer. Slop PR's will not be accepted all LLM code must be reviewed.
 
 ## License
