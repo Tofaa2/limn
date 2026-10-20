@@ -170,8 +170,9 @@ const updateTextureStreaming = streaming_module.updateTextureStreaming;
 /// Everything about one kind of object is under its field: `models`, `scenes`,
 /// `entities` and so on. Those, `device` and `options` are the public fields.
 /// The kinds of object kept in a handle table, freed in this order when the
-/// renderer is destroyed. Each namespace has `table` and `free`.
-const stores = .{ "entities", "lights", "decals", "scenes", "models", "environments", "emitters", "probes", "fluids", "waters", "hairs", "liquids", "instances", "views" };
+/// renderer is destroyed. Each namespace has `table` and `free`. A freed
+/// scene forgets its lights and decals, so `scenes` goes before them.
+const stores = .{ "entities", "scenes", "lights", "decals", "models", "environments", "emitters", "probes", "fluids", "waters", "hairs", "liquids", "instances", "views" };
 
 /// Removes `handle` from the table of `kind` and from its scene's list
 /// `list`, then frees what it held. Under the renderer's lock.

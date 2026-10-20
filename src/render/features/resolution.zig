@@ -159,7 +159,7 @@ fn technique(p: *const ScenePass, reconstructing: bool) ?upscaling.Technique {
 
 /// The view's upscaler running `wanted` at this frame's sizes, started if
 /// it is not yet. Null where it is not asked for or will not run, which is
-/// reported once.
+/// logged once and reported every frame.
 pub fn upscalerFor(renderer: *Renderer, p: *const ScenePass, wanted: upscaling.Technique) !?*upscaling.Running {
     const device = renderer.device;
     if (!p.settings.resolution.temporal_antialiasing or p.debugging) return null;
@@ -171,15 +171,19 @@ pub fn upscalerFor(renderer: *Renderer, p: *const ScenePass, wanted: upscaling.T
         .output_size = .{ output_info.width, output_info.height },
     };
     const slot = &(try features.stateOf(p.view_data, device, @This())).upscaler;
-    const was_refused = slot.refused != null;
+    const was_refused = slot.refuses(key);
     const running = try slot.ensure(device, key, upscaling.Running.Context{ .device = device, .cmd = p.cmd }, upscaling.Running.start);
-    if (running == null and !was_refused) refused(renderer, wanted);
+    if (running == null) refused(renderer, wanted, !was_refused);
     return running;
 }
 
-fn refused(renderer: *Renderer, wanted: upscaling.Technique) void {
-    std.log.warn("{s} would not run; temporal antialiasing stands in", .{wanted.label()});
-    renderer.internal.downgrades.add(.{ .feature = "resolution.upscaler", .requested = @tagName(wanted), .used = "temporal", .reason = .unavailable });
+fn refused(renderer: *Renderer, wanted: upscaling.Technique, first: bool) void {
+    const reconstruction = wanted == .dlss_ray_reconstruction;
+    if (first) std.log.warn("{s} would not run; {s} stands in", .{ wanted.label(), if (reconstruction) "the built-in denoiser" else "temporal antialiasing" });
+    renderer.internal.downgrades.add(if (reconstruction)
+        .{ .feature = "path_tracing.denoiser", .requested = "ray_reconstruction", .used = "builtin", .reason = .unavailable }
+    else
+        .{ .feature = "resolution.upscaler", .requested = @tagName(wanted), .used = "temporal", .reason = .unavailable });
 }
 
 /// Resolves into `output` with the vendor upscaler the settings ask for,
@@ -216,7 +220,7 @@ fn resolveWithUpscaler(renderer: *Renderer, p: *const ScenePass, output: rhi.Tex
         .reset = reset,
     }) catch {
         own.upscaler.refuse();
-        refused(renderer, wanted);
+        refused(renderer, wanted, true);
         return false;
     };
     if (generating) if (running.generator()) |generator| {

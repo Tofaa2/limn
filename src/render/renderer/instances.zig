@@ -30,6 +30,7 @@ pub const Instances = struct {
         owner.internal.gpa.free(entry.tints);
         owner.internal.gpa.free(entry.params);
         if (owner.models.table.get(entry.model)) |model| model.references -= 1;
+        if (owner.scenes.table.get(entry.scene)) |scene| scene.layout_dirty = true;
     }
 
     fn renderer(instances: *Instances) *Renderer {
