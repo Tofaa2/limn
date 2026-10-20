@@ -250,6 +250,28 @@ const Checks = struct {
         std.log.info("lifecycle: destroyed groups leave the scene, scenes go before their handles", .{});
     }
 
+    /// Path tracing switched off gives its targets back within a few frames,
+    /// and a cut frame draws.
+    fn switchedOffMemory(self: *Checks) !void {
+        const renderer = self.renderer;
+        if (renderer.capabilities().path_tracing == .unavailable) return std.log.info("switched off: skipped, no path tracing", .{});
+        const Frames = struct {
+            fn draw(checks: *Checks, count: usize, settings: gfx.Settings, cut: bool) !void {
+                for (0..count) |_| _ = try checks.renderer.render(.{ .views = &.{.{ .scene = checks.scene, .camera = checks.camera, .target = .{ .texture = checks.target }, .settings = settings, .cut = cut }} });
+            }
+        };
+        try Frames.draw(self, 20, .{}, false);
+        const before = renderer.getStats().gpu_memory_bytes;
+        try Frames.draw(self, 20, .{ .path_tracing = .{} }, false);
+        try Frames.draw(self, 1, .{ .path_tracing = .{} }, true);
+        const tracing = renderer.getStats().gpu_memory_bytes;
+        if (tracing <= before) return error.PathTracingTookNoMemory;
+        try Frames.draw(self, 20, .{}, false);
+        const after = renderer.getStats().gpu_memory_bytes;
+        if (after > before + (tracing - before) / 4) return error.SwitchedOffFeatureKeptItsMemory;
+        std.log.info("switched off: path tracing took {d} KiB and gave {d} KiB back", .{ (tracing - before) / 1024, (tracing - after) / 1024 });
+    }
+
     fn scenePassReads(self: *Checks) !void {
         var seen = Seen{};
         const passes: []const gfx.Pass = &.{
@@ -592,6 +614,7 @@ pub fn main(init: std.process.Init) !void {
     try checks.scenePassReads();
     try checks.placedLightsAndDecals();
     try checks.lifecycle();
+    try checks.switchedOffMemory();
     try checks.shaderReload();
     try checks.streaming();
     try checks.compaction();
