@@ -581,11 +581,11 @@ float interleavedGradientNoise(float2 pixel, uint frame) {
 }
 
 float3 srgbToLinear(float3 c) {
-    return lerp(c / 12.92, pow((c + 0.055) / 1.055, float3(2.4)), step(float3(0.04045), c));
+    return select(c >= 0.04045, pow((max(c, 0.04045) + 0.055) / 1.055, float3(2.4)), c / 12.92);
 }
 
 float3 linearToSrgb(float3 c) {
-    return lerp(c * 12.92, 1.055 * pow(c, float3(1.0 / 2.4)) - 0.055, step(float3(0.0031308), c));
+    return select(c >= 0.0031308, 1.055 * pow(max(c, 0.0031308), float3(1.0 / 2.4)) - 0.055, c * 12.92);
 }
 
 float3 hdr10Encode(float3 nits) {
