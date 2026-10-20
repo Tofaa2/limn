@@ -223,7 +223,7 @@ pub fn build(b: *std.Build) void {
     }) orelse return;
 
     const asset_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseFast else optimize;
-    const validate_input = b.option(bool, "validate_input", "Check asset files before trusting them and keep safety checks in the asset parsers (default: true)") orelse true;
+    const validate_input = b.option(bool, "validate_input", "Check asset files before trusting them, and in Debug keep safety checks in the texture and font parsers (default: true)") orelse true;
     const parser_optimize: std.builtin.OptimizeMode = if (optimize == .Debug and validate_input) .ReleaseSafe else asset_optimize;
     const fidelityfx = b.option(bool, "fidelityfx", "Build AMD's FidelityFX SDK in, for FSR 2 and FSR 3 upscaling (default: true)") orelse true;
     const features = b.addOptions();

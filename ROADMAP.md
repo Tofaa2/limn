@@ -11,7 +11,6 @@
 - Skinned meshes in the shader fallback.
 
 ### Denoising and upscaling
-- NRD, for GPUs without DLSS.
 - FSR Ray Regeneration.
 - DLSS on Windows.
 - A choice of DLSS model preset.
