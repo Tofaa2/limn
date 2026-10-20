@@ -148,7 +148,7 @@ pub fn main(init: std.process.Init) !void {
 
         const scale = scales[scale_index];
         var shading_ms: f32 = 0;
-        for (renderer.device.passTimings()) |timing| {
+        for (stage.passTimings()) |timing| {
             if (std.mem.eql(u8, timing.name, "shading")) shading_ms = timing.milliseconds;
         }
         list.clear();

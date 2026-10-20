@@ -272,6 +272,57 @@ const Checks = struct {
         std.log.info("switched off: path tracing took {d} KiB and gave {d} KiB back", .{ (tracing - before) / 1024, (tracing - after) / 1024 });
     }
 
+    /// A view drawn at a different size every frame, with the temporal
+    /// features that keep pictures between frames, and its targets replaced
+    /// in between.
+    fn resizing(self: *Checks) !void {
+        const renderer = self.renderer;
+        const sizes = [_][2]u32{ .{ 320, 180 }, .{ 200, 120 }, .{ 640, 360 }, .{ 1, 1 }, .{ 321, 179 } };
+        const view = try renderer.views.create();
+        defer renderer.views.destroy(view);
+        const tracing: @FieldType(gfx.Settings, "path_tracing") = if (renderer.capabilities().path_tracing == .unavailable) null else .{};
+        for (0..3) |round| {
+            for (sizes) |size| {
+                const target = try renderer.views.createTarget(size[0], size[1]);
+                defer renderer.views.destroyTarget(target);
+                const settings: gfx.Settings = .{ .path_tracing = if (round == 1) tracing else null, .shadows = .{ .virtual = round == 2 } };
+                for (0..2) |_| _ = try renderer.render(.{ .views = &.{.{ .view = view, .scene = self.scene, .camera = self.camera, .target = .{ .texture = target }, .settings = settings }} });
+            }
+        }
+        try self.draw(2);
+        std.log.info("resizing: {d} sizes a frame apart, with and without path tracing and virtual shadows", .{sizes.len});
+    }
+
+    /// Shaders reloaded just before a model comes close enough for finer
+    /// texture levels to stream in.
+    fn reloadWhileStreaming(self: *Checks) !void {
+        const renderer = self.renderer;
+        const fox = try renderer.models.load(fox_path);
+        defer renderer.models.destroy(fox) catch {};
+        try renderer.waitUntilLoaded();
+        const scale = math.scaling(.{ 0.02, 0.02, 0.02 });
+        const entity = try renderer.entities.spawn(self.scene, .{ .model = fox, .transform = math.mul(math.translation(.{ 0, 0, -60 }), scale) });
+        defer renderer.entities.despawn(entity);
+        try self.draw(20);
+        const far = renderer.getStats().streamed_texture_bytes;
+        _ = renderer.shaders.reload() catch |err| {
+            if (@as(anyerror, err) != error.ShaderReloadDisabled) return err;
+            return std.log.info("reload while streaming: shader reload left out of this build", .{});
+        };
+        renderer.entities.setTransform(entity, math.mul(math.translation(.{ -1.5, 0, 0 }), scale));
+        var near = far;
+        var still: u32 = 0;
+        for (0..300) |_| {
+            try self.draw(1);
+            const now = renderer.getStats().streamed_texture_bytes;
+            still = if (now == near) still + 1 else 0;
+            near = now;
+            if (still == 16) break;
+        } else return error.StreamingNeverSettled;
+        if (near <= far) return error.NothingStreamedAfterReload;
+        std.log.info("reload while streaming: {d} KiB far, {d} KiB once close", .{ far / 1024, near / 1024 });
+    }
+
     fn scenePassReads(self: *Checks) !void {
         var seen = Seen{};
         const passes: []const gfx.Pass = &.{
@@ -615,10 +666,48 @@ pub fn main(init: std.process.Init) !void {
     try checks.placedLightsAndDecals();
     try checks.lifecycle();
     try checks.switchedOffMemory();
+    try checks.resizing();
+    try checks.reloadWhileStreaming();
     try checks.shaderReload();
     try checks.streaming();
     try checks.compaction();
     try checks.outOfMemory(40);
     try checks.outOfGpuMemory(45);
     try renderer.device.waitIdle();
+    if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
+    try withoutFeatures(init.gpa, init.io);
+}
+
+/// A second renderer with ray tracing, mesh shaders and shading variants
+/// turned off, asked for what needs them: it says so in `capabilities`,
+/// turns the settings down, reports each in `Stats.downgraded` and draws.
+fn withoutFeatures(gpa: std.mem.Allocator, io: std.Io) !void {
+    const renderer = try gfx.Renderer.init(gpa, io, .{
+        .application_name = "limn checks, reduced",
+        .validation = true,
+        .ray_tracing = .{ .hardware = false },
+        .geometry = .{ .mesh_shaders = false },
+        .shader_variants = false,
+    });
+    defer renderer.deinit();
+    const capabilities = renderer.capabilities();
+    if (capabilities.ray_tracing == .available or capabilities.mesh_shaders == .available) return error.TurnedOffFeatureAvailable;
+    const target = try renderer.views.createTarget(width, height);
+    defer renderer.views.destroyTarget(target);
+    const scene = try renderer.scenes.create();
+    renderer.scenes.setSun(scene, .{ .direction = .{ -0.5, -0.7, -0.4 }, .color = .{ 1, 1, 1 }, .intensity = 3 });
+    const triangle = [_][3]f32{ .{ -1, 0, 0 }, .{ 1, 0, 0 }, .{ 0, 1, 0 } };
+    const model = try renderer.models.create(&.{.{ .positions = &triangle, .indices = &.{ 0, 1, 2 } }});
+    _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.identity });
+    const settings: gfx.Settings = .{ .path_tracing = .{}, .shadows = .{ .traced_lights = true } };
+    for (0..4) |_| _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = gfx.Camera.lookAt(.{ 0, 0.5, 3 }, .{ 0, 0.5, 0 }), .target = .{ .texture = target }, .settings = settings }} });
+    const downgraded = renderer.getStats().downgraded();
+    var path_tracing = false;
+    for (downgraded) |item| {
+        if (std.mem.eql(u8, item.feature, "path_tracing")) path_tracing = true;
+    }
+    if (!path_tracing) return error.DowngradeNotReported;
+    try renderer.device.waitIdle();
+    if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
+    std.log.info("without features: {d} settings turned down and reported, and it drew", .{downgraded.len});
 }

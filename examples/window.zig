@@ -139,7 +139,8 @@ pub fn frameLimit(init: std.process.Init) !?u64 {
 /// offscreen target, the renderer, frame timing and key presses.
 ///
 ///   --frames N           exit after N frames
-///   --screenshot f.png   render without a window (with validation on) and
+///   --screenshot f.png   render without a window, with validation and
+///                        `Options.deterministic` on, and
 ///                        write the last frame, to check the picture
 ///   --timings            render without a window and print the average
 ///                        GPU time of each pass and the CPU time of a frame
@@ -226,6 +227,7 @@ pub const Stage = struct {
         renderer_options.application_name = title;
         renderer_options.surface = if (window) |value| try value.surface(false) else null;
         if (screenshot != null or validation) renderer_options.validation = true;
+        if (screenshot != null) renderer_options.deterministic = true;
         if (debug_names) renderer_options.debug_names = true;
         if (renderer_options.cache.pipelines == null) renderer_options.cache.pipelines = "zig-out/pipeline.cache";
         if (timings and renderer_options.profiler == null) {
@@ -279,6 +281,21 @@ pub const Stage = struct {
         return if (self.offscreen) |texture| .{ .texture = texture } else .backbuffer;
     }
 
+    /// The renderer's counters, with CPU time left at 0 in a `--screenshot`
+    /// run, so that its picture comes out the same every time.
+    pub fn stats(self: *const Stage) gfx.Stats {
+        var counted = self.renderer.getStats();
+        if (self.screenshot != null) counted.cpu_ms = 0;
+        return counted;
+    }
+
+    /// GPU times of the passes of a recent frame. None in a `--screenshot`
+    /// run, so that its picture comes out the same every time.
+    pub fn passTimings(self: *const Stage) []const gfx.rhi.PassTiming {
+        if (self.screenshot != null) return &.{};
+        return self.renderer.device.passTimings();
+    }
+
     /// Call with the result of `render`.
     pub fn end(self: *Stage, presented: bool) !void {
         if (!presented) return self.init.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
@@ -292,7 +309,7 @@ pub const Stage = struct {
             self.shown_fps = @as(f32, @floatFromInt(images - self.meter_presented)) / (self.time - self.meter_time);
             self.meter_presented = images;
             self.gpu_ms = 0;
-            for (self.renderer.device.passTimings()) |timing| {
+            for (self.passTimings()) |timing| {
                 if (timing.depth == 0) self.gpu_ms += timing.milliseconds;
             }
             self.meter_time = self.time;
@@ -329,9 +346,9 @@ pub const Stage = struct {
             std.debug.print("{d:8.3} ms  {s}{s}\n", .{ entry.total / frames, "        "[0..@min(entry.depth * 2, 8)], entry.name });
         }
         std.debug.print("{d:8.3} ms  GPU\n{d:8.3} ms  GPU slowest frame\n{d:8.3} ms  CPU\n", .{ gpu / frames, self.timed_worst, self.timed_cpu / frames });
-        const stats = self.renderer.getStats();
-        std.debug.print("{d:8.1} MiB GPU memory\n{d:8} pipelines\n", .{ @as(f64, @floatFromInt(stats.gpu_memory_bytes)) / (1024 * 1024), stats.pipelines });
-        for (stats.downgraded()) |downgrade| {
+        const counted = self.renderer.getStats();
+        std.debug.print("{d:8.1} MiB GPU memory\n{d:8} pipelines\n", .{ @as(f64, @floatFromInt(counted.gpu_memory_bytes)) / (1024 * 1024), counted.pipelines });
+        for (counted.downgraded()) |downgrade| {
             std.debug.print("{s}: asked for {s}, got {s} ({s})\n", .{ downgrade.feature, downgrade.requested, downgrade.used, @tagName(downgrade.reason) });
         }
         for (zones.names[0..zones.count], zones.totals[0..zones.count], zones.depths[0..zones.count]) |name, total, depth| {

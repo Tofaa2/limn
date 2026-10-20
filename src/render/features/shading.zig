@@ -165,6 +165,7 @@ pub fn shadePipeline(renderer: *Renderer, reflective: bool, needed: u32) !rhi.Pi
     const exact = [1]u32{needed};
     const exact_desc = pipelines_module.Desc{ .graphics = shadeVariantDesc(device, reflective, &exact) };
     if (renderer.internal.pipelines.peek(exact_desc)) |ready| return ready;
+    if (renderer.options.deterministic) return renderer.internal.pipelines.get(exact_desc);
     var known = false;
     var stand_in: ?rhi.Pipeline = null;
     for (renderer.internal.shade_variants.items) |variant| {

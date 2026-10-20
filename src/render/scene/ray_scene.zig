@@ -142,7 +142,7 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
             continue;
         };
         if (entry.blas_job) |job| {
-            if (!device.detachedDone(job)) {
+            if (!self.options.deterministic and !device.detachedDone(job)) {
                 still_pending += 1;
                 continue;
             }

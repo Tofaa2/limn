@@ -122,6 +122,14 @@ pub const Options = struct {
     /// Compile a shading-pass variant per set of features a view uses, on a
     /// worker thread. False always uses the full pass.
     shader_variants: bool = true,
+    /// Make runs of the same frames give the same picture, for comparing
+    /// pictures between runs: shading variants, asset loads and ray tracing
+    /// structures are waited for instead of arriving when they are ready,
+    /// and liquids add up neighbours in a fixed order. Surfaces at exactly
+    /// the same depth are still drawn in the order culling finds them, and
+    /// vendor upscalers keep their own order, so a few pixels can differ by
+    /// a level. Slower to start.
+    deterministic: bool = false,
     /// Threads for animation poses and instance records, including the render
     /// thread: 0 picks automatically (at most 8), 1 uses no other thread.
     worker_threads: u32 = 0,

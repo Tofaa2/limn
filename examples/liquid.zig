@@ -88,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
             .delta_time = tick.dt,
         }));
     }
-    for (renderer.device.passTimings()) |timing| {
+    for (stage.passTimings()) |timing| {
         if (std.mem.startsWith(u8, timing.name, "liquid")) std.log.info("gpu: {s} {d:.3} ms", .{ timing.name, timing.milliseconds });
     }
     try stage.finish();

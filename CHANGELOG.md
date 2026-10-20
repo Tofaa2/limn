@@ -37,6 +37,7 @@
 - `Pass` runs on views without a scene; `PassContext` has the camera, its matrices and the resolved settings.
 - The `isometric` example.
 - `ViewDesc.cut`: temporal history starts over after a camera jump.
+- `Options.deterministic`: runs of the same frames give the same picture; `--screenshot` turns it on.
 - `rhi.TextureKind.@"3d"`; storage images can be read, used in any shader stage and bound per layer.
 
 ### Changed

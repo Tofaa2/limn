@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
         try renderer.waters.set(water, desc);
 
         list.clear();
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         try list.rect(.{ .x = 12, .y = 12, .width = 430, .height = 80 }, gfx.Color.rgba(10, 12, 20, 180));
         try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · cpu {d:.2} ms\nrain {s} · swell {d:.2} m · murk {d:.2}", .{
             stage.fps, stage.gpu_ms, stats.cpu_ms, if (desc.rain > 0) "on" else "off", desc.swell, desc.murk,

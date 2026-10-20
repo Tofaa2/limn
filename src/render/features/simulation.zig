@@ -252,6 +252,12 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             cmd.pushConstants(push);
             cmd.dispatch(groups, 1, 1);
             cmd.sync(.compute_to_all);
+            if (renderer.options.deterministic) {
+                push.mode = 6;
+                cmd.pushConstants(push);
+                cmd.dispatch((state.cell_count + 63) / 64, 1, 1);
+                cmd.sync(.compute_to_all);
+            }
             var flip: u32 = 0;
             for (0..std.math.clamp(desc.iterations, 1, 8)) |_| {
                 push.flip = flip;

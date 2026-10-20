@@ -286,7 +286,7 @@ pub fn main(init: std.process.Init) !void {
         const toward = math.normalize(math.sub(target, eye));
         const forward = math.Vec3{ toward[0] * @cos(look) - toward[2] * @sin(look), toward[1], toward[0] * @sin(look) + toward[2] * @cos(look) };
 
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         list.clear();
         try list.rect(.{ .x = 12, .y = 12, .width = 500, .height = 170 }, gfx.Color.rgba(8, 10, 18, 190));
         try list.text(font, try std.fmt.bufPrint(&text, "{d} objects", .{placed + 1}), .{ 24, 20 }, .{ .size = 22 });

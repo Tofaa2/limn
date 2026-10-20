@@ -545,7 +545,7 @@ pub fn main(init: std.process.Init) !void {
             const low = chunk.origin();
             try list.box3d(low, math.add(low, .{ chunk_size, chunk_size, chunk_size }), 1.5, if (chunk.state == .loaded) gfx.Color.rgba(255, 210, 63, 160) else gfx.Color.rgba(255, 90, 90, 220));
         };
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         const voxels = world.buried_voxels + world.counted_voxels;
         try list.rect(.{ .x = 12, .y = 12, .width = 500, .height = 172 }, gfx.Color.rgba(8, 10, 18, 190));
         try list.text(font, if (world.counted_chunks == world.chunks.len)

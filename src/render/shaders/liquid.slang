@@ -116,6 +116,21 @@ float3 contained(float3 position) {
 void simMain(uint3 id : SV_DispatchThreadID) {
     LiquidData* liquid = sim_push.liquid;
     uint index = id.x;
+    if (sim_push.mode == 6u) {
+        if (index >= uint(liquid.cells.x * liquid.cells.y * liquid.cells.z)) return;
+        uint count = min(sim_push.counts[index], liquid.slots);
+        uint base = index * liquid.slots;
+        for (uint i = 1u; i < count; i++) {
+            uint value = sim_push.cells[base + i];
+            uint j = i;
+            while (j > 0u && sim_push.cells[base + j - 1u] > value) {
+                sim_push.cells[base + j] = sim_push.cells[base + j - 1u];
+                j--;
+            }
+            sim_push.cells[base + j] = value;
+        }
+        return;
+    }
     if (index >= liquid.live) return;
 
     if (sim_push.mode == 0u) {
