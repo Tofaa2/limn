@@ -109,7 +109,7 @@ float3 sampleLight(LightSet lights, FrameConstants frame, Surface surface, float
                 attenuation *= cone * cone;
             }
             if ((light.flags & LIGHT_RECTANGLE) != 0u) attenuation *= clamp(dot(-toward, light.direction), 0.0, 1.0);
-            reach -= 0.004;
+            reach = max(reach - 0.004, 0.0);
             if (light.source_radius > 0.0) {
                 float3 to_center = light.position - surface.position;
                 float along = dot(to_center, toward);
@@ -142,7 +142,7 @@ float3 sampleLight(LightSet lights, FrameConstants frame, Surface surface, float
     if (area <= 0.0 || distance_squared <= 1e-8) return float3(0.0);
     reach = sqrt(distance_squared);
     toward = to_spot / reach;
-    reach -= 0.004;
+    reach = max(reach - 0.004, 0.0);
     float facing = abs(dot(across, toward)) / (2.0 * area);
     if (facing <= 1e-4 || dot(surface.flat_normal, toward) <= 0.0) return float3(0.0);
     rarity = area * float(chosen.triangles) * float(lights.glowing_count);

@@ -27,7 +27,7 @@ float3 agxLook(float3 color) {
     const float3 slope = float3(1.0);
     const float3 power = float3(1.2);
     const float saturation = 1.25;
-    color = pow(color * slope, power);
+    color = pow(max(color * slope, float3(0.0)), power);
     float luma = luminance(color);
     return luma + saturation * (color - luma);
 }

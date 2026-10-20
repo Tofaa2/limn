@@ -81,7 +81,7 @@ float3 lightsOnHit(Tracer tracer, float3 position, float3 normal, float3 albedo)
             if (dot(to_lamp, to_lamp) > range * range || dot(normal, to_lamp) <= 0.0) continue;
         }
         if (lampOnHit(frame, lamp, position, normal, toward, reach, arriving)) {
-            if (!rayOccluded(tracer, position + normal * 0.02, toward, reach - 0.04)) radiance += albedo / PI * arriving;
+            if (!rayOccluded(tracer, position + normal * 0.02, toward, max(reach - 0.04, 0.0))) radiance += albedo / PI * arriving;
         }
     }
     return radiance;

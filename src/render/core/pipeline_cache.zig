@@ -15,6 +15,8 @@ pub const PipelineCache = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     made: std.AutoHashMapUnmanaged(u64, rhi.Pipeline) = .empty,
+    /// Pipelines that would not compile; not tried again until `reset`.
+    failed: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Tells this cache, until its next `reset`, from every other: what `of`
     /// remembers is for one stamp.
     stamp: u64,
@@ -52,6 +54,7 @@ pub const PipelineCache = struct {
     pub fn deinit(self: *PipelineCache) void {
         self.reset();
         self.made.deinit(self.gpa);
+        self.failed.deinit(self.gpa);
         self.jobs.deinit(self.gpa);
     }
 
@@ -75,8 +78,8 @@ pub const PipelineCache = struct {
         const Remembered = struct {
             /// Names `describe`, which gives each one its own slot.
             const of_describe = describe;
-            var stamp: u64 = 0;
-            var pipeline: rhi.Pipeline = undefined;
+            threadlocal var stamp: u64 = 0;
+            threadlocal var pipeline: rhi.Pipeline = undefined;
         };
         if (Remembered.stamp == self.stamp) return Remembered.pipeline;
         const pipeline = try self.get(describe(self.device));
@@ -91,10 +94,12 @@ pub const PipelineCache = struct {
     }
 
     /// The pipeline `desc` describes if it is built; otherwise null, and it
-    /// is compiled on a worker thread from the first such call on.
+    /// is compiled on a worker thread from the first such call on. One that
+    /// fails to compile stays null until `reset`.
     pub fn getLater(self: *PipelineCache, desc: Desc) !?rhi.Pipeline {
         const key = hash(desc);
         if (self.made.get(key)) |pipeline| return pipeline;
+        if (self.failed.contains(key)) return null;
         for (self.jobs.items, 0..) |job, index| {
             if (job.key != key) continue;
             if (!job.done.load(.acquire)) return null;
@@ -103,6 +108,7 @@ pub const PipelineCache = struct {
             defer self.gpa.destroy(job);
             const compiled = job.compiled orelse {
                 std.log.warn("pipeline did not compile: {}", .{job.failure.?});
+                try self.failed.put(self.gpa, key, {});
                 return null;
             };
             const pipeline = try self.device.adoptPipeline(compiled, switch (desc) {
@@ -158,6 +164,7 @@ pub const PipelineCache = struct {
         var entries = self.made.valueIterator();
         while (entries.next()) |pipeline| self.device.destroyPipeline(pipeline.*);
         self.made.clearRetainingCapacity();
+        self.failed.clearRetainingCapacity();
     }
 };
 

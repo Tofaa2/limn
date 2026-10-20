@@ -148,9 +148,12 @@ void simMain(uint3 id : SV_DispatchThreadID) {
                 if (depth > 0.0 && behind > 0.0 && behind < 0.5 + length(particle.velocity) * dt * 2.0) {
                     float2 texel = 1.0 / textureSize(depth_texture);
                     float3 here = worldPositionFromDepth(uv, depth, frame.inv_view_proj);
-                    float3 across = worldPositionFromDepth(uv + float2(texel.x, 0.0), sampleTextureLod(depth_texture, nearest, uv + float2(texel.x, 0.0), 0.0).r, frame.inv_view_proj);
-                    float3 down = worldPositionFromDepth(uv + float2(0.0, texel.y), sampleTextureLod(depth_texture, nearest, uv + float2(0.0, texel.y), 0.0).r, frame.inv_view_proj);
-                    float3 normal = normalize(cross(across - here, down - here));
+                    float across_depth = sampleTextureLod(depth_texture, nearest, uv + float2(texel.x, 0.0), 0.0).r;
+                    float down_depth = sampleTextureLod(depth_texture, nearest, uv + float2(0.0, texel.y), 0.0).r;
+                    float3 across = worldPositionFromDepth(uv + float2(texel.x, 0.0), across_depth > 0.0 ? across_depth : depth, frame.inv_view_proj);
+                    float3 down = worldPositionFromDepth(uv + float2(0.0, texel.y), down_depth > 0.0 ? down_depth : depth, frame.inv_view_proj);
+                    float3 facing = cross(across - here, down - here);
+                    float3 normal = dot(facing, facing) > 1e-12 ? normalize(facing) : normalize(eyePoint(frame, here) - here);
                     if (dot(normal, eyePoint(frame, here) - here) < 0.0) normal = -normal;
                     if (dot(particle.velocity, normal) < 0.0)
                         particle.velocity = reflect(particle.velocity, normal) * emitter.bounce;
