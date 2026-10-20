@@ -294,20 +294,18 @@ fn makeTargets(device: *rhi.Device, cmd: *rhi.CommandEncoder, state: *View, widt
 
 /// The built-in denoiser's gathering, then NRD on the bounced light and the
 /// reflections in place of the built-in filters. False where NRD will not
-/// run, which is reported once.
+/// run, which is logged once and reported every frame.
 fn denoiseWithNrd(renderer: *Renderer, p: *const ScenePass, state: *View, signals: Signals, gathered: Gathered, reset: bool) !bool {
     const device = renderer.device;
     const cmd = p.cmd;
-    const was_refused = state.denoiser.refused != null;
-    const running = try state.denoiser.ensure(device, .{ .size = state.size }, device, denoising.Running.startNrd) orelse {
-        if (!was_refused) {
-            std.log.warn("NRD would not start; the built-in denoiser stands in", .{});
-            renderer.internal.downgrades.add(.{ .feature = "path_tracing.denoiser", .requested = "nrd", .used = "builtin", .reason = .unavailable });
-        }
+    const key = denoising.Key{ .size = state.size };
+    const was_refused = state.denoiser.refuses(key);
+    const running = try state.denoiser.ensure(device, key, device, denoising.Running.startNrd) orelse {
+        if (!was_refused) std.log.warn("NRD would not start; the built-in denoiser stands in", .{});
+        renderer.internal.downgrades.add(.{ .feature = "path_tracing.denoiser", .requested = "nrd", .used = "builtin", .reason = .unavailable });
         return false;
     };
-    if (state.denoiser.fresh) state.nrd_frame = 0;
-    _ = state.denoiser.continues(renderer.internal.frame_index);
+    if (!state.denoiser.continues(renderer.internal.frame_index)) state.nrd_frame = 0;
     const made = [_]struct { slot: *?rhi.Texture, name: [:0]const u8, format: rhi.Format, written: bool }{
         .{ .slot = &state.nrd_normal, .name = "nrd: normal and roughness", .format = .rgba16_float, .written = false },
         .{ .slot = &state.nrd_depth, .name = "nrd: view depth", .format = .r32_float, .written = false },
@@ -807,7 +805,7 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass, state: *View) !bool {
             .history_limit = if (changed) changed_history else moving_history,
             .lamp_limit = if (changed) changed_lamp_history else if (moved) moving_history else still_history,
         });
-        const denoiser: ?api.Denoiser = if (reconstructing) .ray_reconstruction else filled(settings.path_tracing).denoiser;
+        const denoiser: ?api.Denoiser = if (reconstructing) .ray_reconstruction else if (filled(settings.path_tracing).denoiser == .ray_reconstruction) .builtin else filled(settings.path_tracing).denoiser;
         switch (denoiser orelse .builtin) {
             .builtin => try compose(renderer, p, state, gathered, denoiser != null),
             .ray_reconstruction => try handOver(renderer, p, signals),

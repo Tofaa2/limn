@@ -68,9 +68,13 @@ fn Placed(comptime Item: type, comptime Tag: type, comptime list: []const u8, co
             const owner = self.renderer();
             owner.lock();
             defer owner.unlock();
-            const entry = self.table.remove(id) orelse return;
-            const data = owner.scenes.table.get(entry.scene) orelse return;
+            const entry = (self.table.get(id) orelse return).*;
+            const data = owner.scenes.table.get(entry.scene) orelse {
+                _ = self.table.remove(id);
+                return;
+            };
             pad(owner, data) catch return;
+            _ = self.table.remove(id);
             const items = &@field(data, list);
             const ids = &@field(data, handles);
             _ = items.swapRemove(entry.index);

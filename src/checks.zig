@@ -218,6 +218,38 @@ const Checks = struct {
         std.log.info("placed lights and decals: created, set and destroyed by handle beside the whole list", .{});
     }
 
+    /// A destroyed instance group stops being drawn, a scene can go before
+    /// the handles into it, and a scene keeping lights and decals by handle
+    /// is left for the renderer to free.
+    fn lifecycle(self: *Checks) !void {
+        const renderer = self.renderer;
+        try self.draw(1);
+        const before = renderer.getStats().instances;
+        const group = try renderer.instances.create(self.scene, self.box_model, &.{ math.translation(.{ 2, 0, 0 }), math.translation(.{ -2, 0, 0 }) });
+        try self.draw(2);
+        if (renderer.getStats().instances != before + 2) return error.GroupNotDrawn;
+        renderer.instances.destroy(group);
+        try self.draw(2);
+        if (renderer.getStats().instances != before) return error.DestroyedGroupStillDrawn;
+
+        const gone = try renderer.scenes.create();
+        const light = try renderer.lights.create(gone, .{ .position = .{ 0, 2, 0 }, .intensity = 1 });
+        const decal = try renderer.decals.create(gone, .{ .transform = math.identity, .color = .{ 1, 0, 0, 1 } });
+        const copies = try renderer.instances.create(gone, self.box_model, &.{math.identity});
+        renderer.scenes.destroy(gone);
+        renderer.lights.set(light, .{ .position = .{ 0, 0, 0 }, .intensity = 2 });
+        renderer.lights.destroy(light);
+        renderer.decals.destroy(decal);
+        renderer.instances.destroy(copies);
+
+        const kept = try renderer.scenes.create();
+        _ = try renderer.lights.create(kept, .{ .position = .{ 0, 2, 0 }, .intensity = 1 });
+        _ = try renderer.decals.create(kept, .{ .transform = math.identity, .color = .{ 0, 1, 0, 1 } });
+        _ = try renderer.instances.create(kept, self.box_model, &.{math.identity});
+        try self.draw(2);
+        std.log.info("lifecycle: destroyed groups leave the scene, scenes go before their handles", .{});
+    }
+
     fn scenePassReads(self: *Checks) !void {
         var seen = Seen{};
         const passes: []const gfx.Pass = &.{
@@ -559,6 +591,7 @@ pub fn main(init: std.process.Init) !void {
     try checks.plainViewPasses();
     try checks.scenePassReads();
     try checks.placedLightsAndDecals();
+    try checks.lifecycle();
     try checks.shaderReload();
     try checks.streaming();
     try checks.compaction();

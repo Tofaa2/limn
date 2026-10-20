@@ -11,8 +11,9 @@ pub fn Slot(comptime Backend: type, comptime Key: type) type {
 
         running: ?Backend = null,
         key: ?Key = null,
-        /// What would not start or failed; left alone until `forgive`.
-        refused: ?Key = null,
+        /// What would not start or failed, the latest last; left alone until
+        /// `forgive`.
+        refused: [4]?Key = @splat(null),
         /// Frame the backend last ran in.
         used: u64 = 0,
         fresh: bool = false,
@@ -20,7 +21,7 @@ pub fn Slot(comptime Backend: type, comptime Key: type) type {
         /// The backend for `key`, started with `start` if none runs for it.
         /// Null when it has refused.
         pub fn ensure(self: *Self, device: *rhi.Device, key: Key, context: anytype, comptime start: fn (@TypeOf(context), Key) ?Backend) !?*Backend {
-            if (self.refused) |no| if (std.meta.eql(no, key)) return null;
+            if (self.refuses(key)) return null;
             if (self.running) |*backend| {
                 if (std.meta.eql(self.key.?, key)) return backend;
                 try device.waitIdle();
@@ -29,12 +30,23 @@ pub fn Slot(comptime Backend: type, comptime Key: type) type {
                 self.key = null;
             }
             self.running = start(context, key) orelse {
-                self.refused = key;
+                self.remember(key);
                 return null;
             };
             self.key = key;
             self.fresh = true;
             return &self.running.?;
+        }
+
+        /// Whether `key` has refused.
+        pub fn refuses(self: *const Self, key: Key) bool {
+            for (self.refused) |maybe| if (maybe) |no| if (std.meta.eql(no, key)) return true;
+            return false;
+        }
+
+        fn remember(self: *Self, key: Key) void {
+            std.mem.copyForwards(?Key, self.refused[0 .. self.refused.len - 1], self.refused[1..]);
+            self.refused[self.refused.len - 1] = key;
         }
 
         /// Marks the backend as run in `frame`. False when it did not run in
@@ -48,11 +60,11 @@ pub fn Slot(comptime Backend: type, comptime Key: type) type {
 
         /// Gives up on what runs now; `ensure` returns null for it from here.
         pub fn refuse(self: *Self) void {
-            self.refused = self.key;
+            if (self.key) |key| if (!self.refuses(key)) self.remember(key);
         }
 
         pub fn forgive(self: *Self) void {
-            self.refused = null;
+            self.refused = @splat(null);
         }
 
         pub fn deinit(self: *Self, device: *rhi.Device) void {
@@ -90,4 +102,8 @@ test "a slot restarts on a new key and leaves a refusal alone" {
     try std.testing.expect(!slot.continues(10));
     slot.refuse();
     try std.testing.expect(try slot.ensure(device, 9, @as(u32, 50), start) == null);
+    var other: Slot(Backend, u32) = .{};
+    try std.testing.expect(try other.ensure(device, 9, @as(u32, 5), start) == null);
+    try std.testing.expect(try other.ensure(device, 30, @as(u32, 20), start) == null);
+    try std.testing.expect(other.refuses(9) and other.refuses(30));
 }
