@@ -260,10 +260,11 @@ pub fn uploadTexture(self: *Device, texture: types.Texture, mip: u32, layer: u32
 /// the rest of the level keeps what it holds.
 pub fn uploadTextureRegion(self: *Device, texture: types.Texture, mip: u32, layer: u32, region: [4]u32, data: []const u8) !void {
     const info = self.textureInfo(texture);
+    if (mip >= info.mip_levels or layer >= info.layers) return error.InvalidTextureData;
     const width = @max(info.width >> @intCast(mip), 1);
     const height = @max(info.height >> @intCast(mip), 1);
     if (info.format.isBlockCompressed()) return error.UnsupportedTextureFormat;
-    if (region[2] == 0 or region[3] == 0 or region[0] + region[2] > width or region[1] + region[3] > height) return error.InvalidTextureData;
+    if (region[2] == 0 or region[3] == 0 or region[0] >= width or region[1] >= height or region[2] > width - region[0] or region[3] > height - region[1]) return error.InvalidTextureData;
     if (data.len != info.format.dataSize(region[2], region[3])) return error.InvalidTextureData;
     const staging = try createStaging(self, data);
     errdefer self.destroyBuffer(staging);

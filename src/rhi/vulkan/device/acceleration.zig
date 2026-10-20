@@ -17,6 +17,7 @@ pub const compaction_capacity = 512;
 fn blasGeometries(self: *Device, desc: types.BlasDesc, geometries: *[types.max_blas_geometries]vk.AccelerationStructureGeometryKHR, triangles: *[types.max_blas_geometries]u32) !u32 {
     if (desc.geometries.len == 0 or desc.geometries.len > types.max_blas_geometries) return error.InvalidBlasDesc;
     for (desc.geometries, 0..) |geometry, index| {
+        if (geometry.vertex_count == 0) return error.InvalidBlasDesc;
         geometries[index] = .{
             .geometry_type = .triangles_khr,
             .flags = .{ .opaque_bit_khr = geometry.solid },
@@ -76,7 +77,7 @@ pub fn createBlas(self: *Device, desc: types.BlasDesc) !types.AccelerationStruct
         .scratch_data = .{ .device_address = 0 },
     }, &triangles, &sizes);
     var total: u32 = 0;
-    for (triangles[0..count]) |value| total += value;
+    for (triangles[0..count]) |value| total = std.math.add(u32, total, value) catch return error.InvalidBlasDesc;
     const blas = try createAcceleration(self, false, sizes.acceleration_structure_size, @max(sizes.build_scratch_size, sizes.update_scratch_size), total);
     self.accelerationResource(blas).dynamic = desc.dynamic;
     self.accelerationResource(blas).compactable = !desc.dynamic;
@@ -173,9 +174,9 @@ pub fn buildBlasesCommand(self: *Device, command: vk.CommandBuffer, builds: []co
                 .p_geometries = &geometries[index],
                 .scratch_data = .{ .device_address = scratch_address },
             };
-            resource.built = true;
         }
         self.vkd.cmdBuildAccelerationStructuresKHR(command, infos[0..batch.len], range_pointers[0..batch.len]);
+        for (batch) |build| self.accelerationResource(build.blas).built = true;
     }
 }
 

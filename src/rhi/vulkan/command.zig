@@ -155,6 +155,8 @@ pub const CommandEncoder = struct {
             .draw_indirect_bit = true,
             .vertex_input_bit = true,
             .acceleration_structure_build_bit_khr = self.device.caps.ray_tracing,
+            .task_shader_bit_ext = self.device.caps.mesh_shaders,
+            .mesh_shader_bit_ext = self.device.caps.mesh_shaders,
         };
         const shader_access = vk.AccessFlags2{
             .shader_read_bit = true,
@@ -465,6 +467,13 @@ pub const CommandEncoder = struct {
         if (device.uploads.items.len == 0) return;
         var uploads = device.takeUploads();
         defer uploads.deinit(device.gpa);
+        for (uploads.items) |upload| switch (upload) {
+            .buffer, .copy => {
+                self.sync(.all_to_transfer);
+                break;
+            },
+            else => {},
+        };
         var copied_buffers = false;
         for (uploads.items) |upload| switch (upload) {
             .buffer => |copy| {
@@ -553,6 +562,7 @@ pub const CommandEncoder = struct {
     /// side by side.
     pub fn buildBlases(self: *CommandEncoder, builds: []const types.BlasBuild) !void {
         std.debug.assert(!self.rendering);
+        self.rayQueryBarrier();
         try acceleration.buildBlasesCommand(self.device, self.command, builds);
     }
 
@@ -577,6 +587,7 @@ pub const CommandEncoder = struct {
     /// `instances_address`.
     pub fn buildTlas(self: *CommandEncoder, tlas: types.AccelerationStructure, instances_address: u64, instance_count: u32) void {
         std.debug.assert(!self.rendering);
+        self.rayQueryBarrier();
         self.accelerationBarrier();
         acceleration.buildTlasCommand(self.device, self.command, tlas, instances_address, instance_count, false);
         self.accelerationBarrier();
@@ -587,9 +598,23 @@ pub const CommandEncoder = struct {
     /// instances that only moved.
     pub fn updateTlas(self: *CommandEncoder, tlas: types.AccelerationStructure, instances_address: u64, instance_count: u32) void {
         std.debug.assert(!self.rendering);
+        self.rayQueryBarrier();
         self.accelerationBarrier();
         acceleration.buildTlasCommand(self.device, self.command, tlas, instances_address, instance_count, true);
         self.accelerationBarrier();
+    }
+
+    /// Lets a build overwrite a structure only once earlier ray queries,
+    /// of this frame or one still in flight, are done with it.
+    fn rayQueryBarrier(self: *CommandEncoder) void {
+        const barrier = vk.MemoryBarrier2{
+            .src_stage_mask = .{ .compute_shader_bit = true, .fragment_shader_bit = true },
+            .dst_stage_mask = .{ .acceleration_structure_build_bit_khr = true },
+        };
+        self.device.vkd.cmdPipelineBarrier2(self.command, &.{
+            .memory_barrier_count = 1,
+            .p_memory_barriers = @ptrCast(&barrier),
+        });
     }
 
     /// Makes builds visible to later builds and to ray queries.
