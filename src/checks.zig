@@ -250,8 +250,9 @@ const Checks = struct {
         std.log.info("lifecycle: destroyed groups leave the scene, scenes go before their handles", .{});
     }
 
-    /// Path tracing switched off gives its targets back within a few frames,
-    /// and a cut frame draws.
+    /// Path tracing gathers over frames, starts over after a cut or a frame
+    /// it did not trace, and gives its targets back within a few frames of
+    /// being switched off.
     fn switchedOffMemory(self: *Checks) !void {
         const renderer = self.renderer;
         if (renderer.capabilities().path_tracing == .unavailable) return std.log.info("switched off: skipped, no path tracing", .{});
@@ -263,7 +264,12 @@ const Checks = struct {
         try Frames.draw(self, 20, .{}, false);
         const before = renderer.getStats().gpu_memory_bytes;
         try Frames.draw(self, 20, .{ .path_tracing = .{} }, false);
+        if (renderer.getStats().path_traced_frames < 10) return error.PathTracingDidNotGather;
         try Frames.draw(self, 1, .{ .path_tracing = .{} }, true);
+        if (renderer.getStats().path_traced_frames != 1) return error.CutKeptHistory;
+        try Frames.draw(self, 1, .{}, false);
+        try Frames.draw(self, 1, .{ .path_tracing = .{} }, false);
+        if (renderer.getStats().path_traced_frames != 1) return error.GapKeptHistory;
         const tracing = renderer.getStats().gpu_memory_bytes;
         if (tracing <= before) return error.PathTracingTookNoMemory;
         try Frames.draw(self, 20, .{}, false);
