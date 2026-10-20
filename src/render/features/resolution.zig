@@ -1,4 +1,6 @@
 //! The size a view is rendered at and how it is antialiased and brought to the size of its target.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const taa_push = @import("../shaders/push/taa.zig");
 const render = @import("../renderer.zig");
 const scene_pass = @import("../scene_pass.zig");
 const path_tracing_feature = @import("path_tracing.zig");
@@ -14,6 +16,45 @@ const Renderer = render.Renderer;
 const ViewContext = features.ViewContext;
 
 pub const name = "resolution";
+
+/// What a view keeps for antialiasing: this frame's resolved picture and the
+/// last one, which swap every frame, and the vendor upscaler it runs.
+pub const View = struct {
+    history: [2]?rhi.Texture = .{ null, null },
+    width: u32 = 0,
+    height: u32 = 0,
+    upscaler: upscaling.Slot = .{},
+
+    pub fn init(_: *rhi.Device) !View {
+        return .{};
+    }
+
+    pub fn deinit(self: *View, device: *rhi.Device) void {
+        for (self.history) |texture| if (texture) |made| device.destroyTexture(made);
+        self.upscaler.deinit(device);
+    }
+
+    /// Makes the pictures `width` by `height`.
+    pub fn fit(self: *View, device: *rhi.Device, width: u32, height: u32) !void {
+        if (self.history[0] != null and self.width == width and self.height == height) return;
+        for (&self.history) |*texture| {
+            if (texture.*) |made| device.destroyTexture(made);
+            texture.* = null;
+        }
+        for (&self.history) |*texture| {
+            texture.* = try device.createTexture(.{ .name = "taa history", .width = width, .height = height, .format = render.hdr_format, .usage = .{ .sampled = true, .color_attachment = true, .storage = device.caps.storage_images, .copy_dst = true } });
+        }
+        self.width = width;
+        self.height = height;
+    }
+};
+
+/// The view's resolved pictures, indexed by frame parity: `[frames & 1]` is
+/// this frame's, the other the last.
+pub fn history(renderer: *Renderer, view_data: *render.ViewData) ![2]rhi.Texture {
+    const own = try features.stateOf(view_data, renderer.device, @This());
+    return .{ own.history[0].?, own.history[1].? };
+}
 
 pub const Settings = struct {
     /// Scene resolution as a fraction of the output size; above 1 supersamples.
@@ -93,7 +134,7 @@ pub fn resolve(setting: *Settings, r: *features.Resolve) void {
 pub fn declare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
     if (p.settings.resolution.temporal_antialiasing and !p.debugging) {
-        ctx.constants.flags |= gpu.frame_flags.temporal;
+        ctx.constants.temporal = 1;
         ctx.constants.texture_gradient_scale = std.math.pow(f32, 2, std.math.clamp(p.settings.resolution.texture_mip_bias, -2, 2));
     }
     const g = ctx.graph;
@@ -122,14 +163,14 @@ fn technique(p: *const ScenePass, reconstructing: bool) ?upscaling.Technique {
 pub fn upscalerFor(renderer: *Renderer, p: *const ScenePass, wanted: upscaling.Technique) !?*upscaling.Running {
     const device = renderer.device;
     if (!p.settings.resolution.temporal_antialiasing or p.debugging) return null;
-    if (!upscaling.Availability.of(device, renderer.dlss).has(wanted)) return null;
-    const output_info = device.textureInfo(p.view.history[0]);
+    if (!upscaling.Availability.of(device, renderer.internal.dlss).has(wanted)) return null;
+    const output_info = device.textureInfo((try history(renderer, p.view_data))[0]);
     const key = upscaling.Key{
         .technique = wanted,
         .render_size = .{ p.width, p.height },
         .output_size = .{ output_info.width, output_info.height },
     };
-    const slot = &p.view_data.upscaler;
+    const slot = &(try features.stateOf(p.view_data, device, @This())).upscaler;
     const was_refused = slot.refused != null;
     const running = try slot.ensure(device, key, upscaling.Running.Context{ .device = device, .cmd = p.cmd }, upscaling.Running.start);
     if (running == null and !was_refused) refused(renderer, wanted);
@@ -138,7 +179,7 @@ pub fn upscalerFor(renderer: *Renderer, p: *const ScenePass, wanted: upscaling.T
 
 fn refused(renderer: *Renderer, wanted: upscaling.Technique) void {
     std.log.warn("{s} would not run; temporal antialiasing stands in", .{wanted.label()});
-    renderer.downgrades.add(.{ .feature = "resolution.upscaler", .requested = @tagName(wanted), .used = "temporal", .reason = .unavailable });
+    renderer.internal.downgrades.add(.{ .feature = "resolution.upscaler", .requested = @tagName(wanted), .used = "temporal", .reason = .unavailable });
 }
 
 /// Resolves into `output` with the vendor upscaler the settings ask for,
@@ -148,6 +189,7 @@ fn resolveWithUpscaler(renderer: *Renderer, p: *const ScenePass, output: rhi.Tex
     const cmd = p.cmd;
     const view_data = p.view_data;
     const view = p.view;
+    const own = try features.stateOf(view_data, device, @This());
     const path_state = features.viewState(view_data, path_tracing_feature);
     const reconstructing = path_traced and path_state != null and path_state.?.reconstructing;
     const wanted = technique(p, reconstructing) orelse return false;
@@ -156,12 +198,9 @@ fn resolveWithUpscaler(renderer: *Renderer, p: *const ScenePass, output: rhi.Tex
     const enlarges = output_info.width > p.width or output_info.height > p.height;
     if ((wanted == .fsr2 or wanted == .fsr3) and !generating and !enlarges) return false;
     const running = try upscalerFor(renderer, p, wanted) orelse return false;
-    const reset = !view_data.upscaler.continues(renderer.frame_index) or !view.history_valid;
+    const reset = !own.upscaler.continues(renderer.internal.frame_index) or !view.history_valid;
     cmd.beginScope(wanted.label());
     defer cmd.endScope();
-    cmd.transition(view.hdr, .shader_read);
-    cmd.transition(view.depth, .shader_read);
-    cmd.transition(view.motion, .shader_read);
     cmd.transition(output, .shader_read);
     running.dispatch(device, cmd, .{
         .color = view.hdr,
@@ -176,13 +215,13 @@ fn resolveWithUpscaler(renderer: *Renderer, p: *const ScenePass, output: rhi.Tex
         .delta_time = p.delta_time,
         .reset = reset,
     }) catch {
-        view_data.upscaler.refuse();
+        own.upscaler.refuse();
         refused(renderer, wanted);
         return false;
     };
     if (generating) if (running.generator()) |generator| {
-        renderer.generating = generator;
-        renderer.generating_reset = reset;
+        renderer.internal.generating = generator;
+        renderer.internal.generating_reset = reset;
     };
     return true;
 }
@@ -201,29 +240,28 @@ pub fn resolveTemporal(renderer: *Renderer, p: *const ScenePass, path_traced: bo
     const still: f32 = @floatFromInt(path_still -| path_tracing_feature.frames_to_settle);
     const settled: f32 = if (path_traced) @min(still / path_tracing_feature.frames_to_hand_over, 1) else 0;
     if (settings.resolution.temporal_antialiasing and !debugging) {
-        const current = view.history[@intCast(view_data.frames & 1)];
-        const previous = view.history[@intCast((view_data.frames + 1) & 1)];
+        const pictures = try history(renderer, view_data);
+        const current = pictures[@intCast(view_data.frames & 1)];
+        const previous = pictures[@intCast((view_data.frames + 1) & 1)];
         if (try resolveWithUpscaler(renderer, p, current, path_traced)) {
             view.history_valid = true;
             return current;
         }
         cmd.beginScope("temporal antialiasing");
-        if (view.history_valid) cmd.transition(view.previous_motion, .shader_read);
         try cmd.beginRendering(.{ .color = &.{.{ .texture = current, .load = .discard }} });
-        cmd.bindPipeline(try renderer.pipelines.get(.taa));
-        cmd.pushConstants(extern struct { frame: u64, color: u32, history: u32, motion: u32, depth: u32, history_valid: u32, settled: f32, previous_motion: u32 }{
+        cmd.bindPipeline(try renderer.internal.pipelines.of(taaPipeline));
+        cmd.pushConstants(taa_push.Push{
             .frame = frame_address,
-            .color = device.textureIndex(view.hdr),
-            .history = device.textureIndex(previous),
-            .motion = device.textureIndex(view.motion),
-            .depth = device.textureIndex(view.depth),
+            .color_texture = device.textureIndex(view.hdr),
+            .history_texture = device.textureIndex(previous),
+            .motion_texture = device.textureIndex(view.motion),
+            .depth_texture = device.textureIndex(view.depth),
             .history_valid = @intFromBool(view.history_valid),
             .settled = settled,
-            .previous_motion = if (view.history_valid) device.textureIndex(view.previous_motion) else gpu.invalid_id,
+            .previous_motion_texture = if (view.history_valid) device.textureIndex(view.previous_motion) else gpu.invalid_id,
         });
         cmd.drawFullscreen();
         cmd.endRendering();
-        cmd.transition(current, .shader_read);
         cmd.endScope();
         resolved = current;
         view.history_valid = true;
@@ -231,4 +269,8 @@ pub fn resolveTemporal(renderer: *Renderer, p: *const ScenePass, path_traced: bo
         view.history_valid = false;
     }
     return resolved;
+}
+
+fn taaPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("taa", pipelines_module.shaderCode("taa.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
 }

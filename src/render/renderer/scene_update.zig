@@ -1,4 +1,6 @@
 //! A scene's per-frame GPU state: poses, instances, lights and acceleration structures. Internal to the renderer.
+const pipelines_module = @import("pipelines.zig");
+const instance_update_push = @import("../shaders/push/instance_update.zig");
 const std = @import("std");
 const geometry_feature = @import("../features/geometry.zig");
 const rhi = @import("../../rhi/rhi.zig");
@@ -48,7 +50,7 @@ fn noteMover(self: *Renderer, scene: *SceneData, sphere: [4]f32) void {
         scene.movers_overflow = true;
         return;
     }
-    scene.movers.append(self.gpa, sphere) catch {
+    scene.movers.append(self.internal.gpa, sphere) catch {
         scene.movers_overflow = true;
     };
 }
@@ -63,17 +65,17 @@ fn evaluatePoses(self: *Renderer, scene: *SceneData) !void {
     const count = posed.len;
     if (count == 0) return;
     const threads = std.math.clamp(count / pose_batch, 1, workerThreads(self));
-    for (self.pose_scratch[0..threads]) |*scratch| try scratch.resize(self.gpa, most_nodes * 3);
-    if (threads == 1) return poseEntities(self, posed, self.pose_scratch[0].items);
+    for (self.internal.pose_scratch[0..threads]) |*scratch| try scratch.resize(self.internal.gpa, most_nodes * 3);
+    if (threads == 1) return poseEntities(self, posed, self.internal.pose_scratch[0].items);
     var group: std.Io.Group = .init;
     const share = (count + threads - 1) / threads;
     for (1..threads) |index| {
         const batch = posed[@min(index * share, count)..@min((index + 1) * share, count)];
-        group.concurrent(self.io, poseEntities, .{ self, batch, self.pose_scratch[index].items }) catch
-            poseEntities(self, batch, self.pose_scratch[index].items);
+        group.concurrent(self.internal.io, poseEntities, .{ self, batch, self.internal.pose_scratch[index].items }) catch
+            poseEntities(self, batch, self.internal.pose_scratch[index].items);
     }
-    poseEntities(self, posed[0..@min(share, count)], self.pose_scratch[0].items);
-    group.await(self.io) catch {};
+    poseEntities(self, posed[0..@min(share, count)], self.internal.pose_scratch[0].items);
+    group.await(self.internal.io) catch {};
 }
 
 /// Runs on any thread. Writes only each entity's own node matrices; no
@@ -91,7 +93,7 @@ fn poseEntities(self: *Renderer, entities: []const Entity, scratch: []animation.
 fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     const zone = Zone.start(self.options.profiler, "rebuild layout");
     defer zone.stop();
-    const gpa = self.gpa;
+    const gpa = self.internal.gpa;
     scene.layout.clearRetainingCapacity();
     scene.posed.clearRetainingCapacity();
     scene.posed_nodes = 0;
@@ -104,13 +106,13 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     scene.rigid_tlas = 0;
     scene.skinned_entries = 0;
     scene.records_valid = false;
-    self.scratch_refs.clearRetainingCapacity();
+    self.internal.scratch_refs.clearRetainingCapacity();
     scene.joint_count = 0;
     scene.triangle_count = 0;
     scene.masked_ref_count = 0;
     for (scene.entities.items) |entity_handle| {
         const entity = self.entities.table.get(entity_handle) orelse continue;
-        const mark = &self.entity_marks.items[entity_handle.index];
+        const mark = &self.internal.entity_marks.items[entity_handle.index];
         mark.layout_first = @intCast(scene.layout.items.len);
         mark.layout_count = 0;
         if (!entity.visible) continue;
@@ -166,8 +168,8 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
             if (entity.skin_offsets[index] != no_skin) scene.joint_count += @intCast(source.skins[instance.skin.?].joints.len);
             if (entity.rays_only) continue;
             if (mesh.masked) scene.masked_ref_count += mesh.meshlet_count;
-            try self.scratch_refs.ensureUnusedCapacity(gpa, mesh.meshlet_count);
-            for (0..mesh.meshlet_count) |meshlet| self.scratch_refs.appendAssumeCapacity(.{
+            try self.internal.scratch_refs.ensureUnusedCapacity(gpa, mesh.meshlet_count);
+            for (0..mesh.meshlet_count) |meshlet| self.internal.scratch_refs.appendAssumeCapacity(.{
                 .instance = instance_index,
                 .meshlet = mesh.meshlet_offset + @as(u32, @intCast(meshlet)),
             });
@@ -178,7 +180,7 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     try scene.chunk_bounds.resize(gpa, chunk_count);
     try scene.chunk_stale.resize(gpa, chunk_count);
     scene.static_count = 0;
-    scene.entity_ref_count = @intCast(self.scratch_refs.items.len);
+    scene.entity_ref_count = @intCast(self.internal.scratch_refs.items.len);
     scene.static_ranges.clearRetainingCapacity();
     for (scene.groups.items) |group_handle| {
         const group = self.instances.table.get(group_handle) orelse continue;
@@ -195,10 +197,10 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
                 const instance_index = group.base + @as(u32, @intCast(copy)) * group.per_copy + slot;
                 slot += 1;
                 scene.triangle_count += mesh.lod0_index_count / 3;
-                try scene.static_ranges.append(gpa, .{ @intCast(self.scratch_refs.items.len), mesh.meshlet_count });
+                try scene.static_ranges.append(gpa, .{ @intCast(self.internal.scratch_refs.items.len), mesh.meshlet_count });
                 if (mesh.masked) scene.masked_ref_count += mesh.meshlet_count;
-                try self.scratch_refs.ensureUnusedCapacity(gpa, mesh.meshlet_count);
-                for (0..mesh.meshlet_count) |meshlet| self.scratch_refs.appendAssumeCapacity(.{
+                try self.internal.scratch_refs.ensureUnusedCapacity(gpa, mesh.meshlet_count);
+                for (0..mesh.meshlet_count) |meshlet| self.internal.scratch_refs.appendAssumeCapacity(.{
                     .instance = instance_index,
                     .meshlet = mesh.meshlet_offset + @as(u32, @intCast(meshlet)),
                 });
@@ -207,7 +209,7 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
         scene.static_count += @as(u32, @intCast(group.transforms.len)) * group.per_copy;
     }
     scene.static_version += 1;
-    const count: u32 = @intCast(self.scratch_refs.items.len);
+    const count: u32 = @intCast(self.internal.scratch_refs.items.len);
     if (count > scene.refs_capacity) {
         if (scene.refs) |buffer| self.device.destroyBuffer(buffer);
         scene.refs_capacity = @max(count + count / 2, 4096);
@@ -217,11 +219,11 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
             .usage = .{ .storage = true },
         });
     }
-    if (count != 0) try self.device.uploadBuffer(scene.refs.?, 0, std.mem.sliceAsBytes(self.scratch_refs.items));
+    if (count != 0) try self.device.uploadBuffer(scene.refs.?, 0, std.mem.sliceAsBytes(self.internal.scratch_refs.items));
     scene.ref_count = count;
     scene.layout_dirty = false;
     scene.layout_version += 1;
-    scene.layout_generation = self.asset_generation;
+    scene.layout_generation = self.internal.asset_generation;
 }
 
 fn rigidRecord(self: *Renderer, entity: *const EntityData, model: *const ModelEntry, mesh_index: u32, transform: Mat4, still: bool, aimed: bool) gpu.Instance {
@@ -285,10 +287,10 @@ const PrepareWhole = struct {
         for (1..threads) |index| {
             const first = @min(index * share, count);
             const last = @min((index + 1) * share, count);
-            group.concurrent(self.io, Run.run, .{ prepare, first, last }) catch Run.run(prepare, first, last);
+            group.concurrent(self.internal.io, Run.run, .{ prepare, first, last }) catch Run.run(prepare, first, last);
         }
         Run.run(prepare, 0, @min(share, count));
-        group.await(self.io) catch {};
+        group.await(self.internal.io) catch {};
     }
 
     /// Ends the frame for each entity: what it is now is what it was.
@@ -299,9 +301,9 @@ const PrepareWhole = struct {
         for (layout[start..@min(start + prepare_batch, layout.len)]) |entry| {
             if (!entry.first_of_entity) continue;
             const slot = entry.entity.index;
-            const now = self.entity_transforms.items[slot];
-            const before = &self.entity_previous.items[slot];
-            self.entity_marks.items[slot].travelled = math.length(math.sub(now[12..15].*, before[12..15].*));
+            const now = self.internal.entity_transforms.items[slot];
+            const before = &self.internal.entity_previous.items[slot];
+            self.internal.entity_marks.items[slot].travelled = math.length(math.sub(now[12..15].*, before[12..15].*));
             before.* = now;
         }
     }
@@ -320,8 +322,8 @@ const PrepareWhole = struct {
             const instance = model.source.?.instances[entry.model_instance];
             const node_world = if (entity.node_world.len != 0) entity.node_world else model.node_world;
             const previous_node_world = if (entity.node_world.len != 0) entity.previous_node_world else model.node_world;
-            const transform = math.mul(self.entity_transforms.items[entry.entity.index], node_world[instance.node]);
-            const previous_transform = math.mul(self.entity_previous.items[entry.entity.index], previous_node_world[instance.node]);
+            const transform = math.mul(self.internal.entity_transforms.items[entry.entity.index], node_world[instance.node]);
+            const previous_transform = math.mul(self.internal.entity_previous.items[entry.entity.index], previous_node_world[instance.node]);
             const still = std.mem.eql(f32, &transform, &previous_transform);
             if (!still) {
                 info.bits |= EntryInfo.moved;
@@ -419,7 +421,7 @@ const MoveShare = struct {
             share.tlas_changed = tlas_changed;
         }
         for (edited[share.first..share.last]) |slot| {
-            const mark = &self.entity_marks.items[slot];
+            const mark = &self.internal.entity_marks.items[slot];
             const bits = @atomicLoad(u32, &mark.bits, .monotonic);
             if (mark.handle == 0 or bits & EntityMark.listed == 0 or self.scenes.table.get(mark.scene) != scene) continue;
             const count = mark.layout_count;
@@ -436,8 +438,8 @@ const MoveShare = struct {
                 continue;
             }
             if (@atomicRmw(u32, &mark.bits, .And, ~EntityMark.listed, .monotonic) & EntityMark.listed == 0) continue;
-            const now = self.entity_transforms.items[slot];
-            const before = &self.entity_previous.items[slot];
+            const now = self.internal.entity_transforms.items[slot];
+            const before = &self.internal.entity_previous.items[slot];
             const changed = !std.mem.eql(f32, &now, before);
             for (entries[mark.layout_first..][0..count], mark.layout_first..) |*info, index| {
                 const transform = math.mul(now, info.rest.?.*);
@@ -485,7 +487,7 @@ fn moveAcrossThreads(self: *Renderer, scene: *SceneData, changes: *Changes, room
     const threads = std.math.clamp(edited.len / move_batch, 1, workerThreads(self));
     if (threads == 1) return;
     const base = changes.move_count;
-    try self.scratch_moved.resize(self.gpa, room);
+    try self.internal.scratch_moved.resize(self.internal.gpa, room);
     var cursor: std.atomic.Value(u32) = .init(base);
     var shares: [max_worker_threads]MoveShare = undefined;
     const share_size = (edited.len + threads - 1) / threads;
@@ -493,15 +495,15 @@ fn moveAcrossThreads(self: *Renderer, scene: *SceneData, changes: *Changes, room
         .changes = changes,
         .cursor = &cursor,
         .limit = base + room,
-        .settling = self.scratch_moved.items,
+        .settling = self.internal.scratch_moved.items,
         .base = base,
         .first = @min(index * share_size, edited.len),
         .last = @min((index + 1) * share_size, edited.len),
     };
     var group: std.Io.Group = .init;
-    for (shares[1..threads]) |*share| group.concurrent(self.io, MoveShare.run, .{share}) catch share.run();
+    for (shares[1..threads]) |*share| group.concurrent(self.internal.io, MoveShare.run, .{share}) catch share.run();
     shares[0].run();
-    group.await(self.io) catch {};
+    group.await(self.internal.io) catch {};
 
     const end = @min(cursor.load(.monotonic), base + room - (room % MoveShare.block));
     changes.move_count = end;
@@ -518,8 +520,8 @@ fn moveAcrossThreads(self: *Renderer, scene: *SceneData, changes: *Changes, room
     changes.any_moving = true;
     const listed = scene.movers.items.len + moved <= max_movers;
     if (!listed) scene.movers_overflow = true;
-    try scene.settling.ensureUnusedCapacity(self.gpa, moved);
-    for (self.scratch_moved.items[0 .. end - base]) |pair| {
+    try scene.settling.ensureUnusedCapacity(self.internal.gpa, moved);
+    for (self.internal.scratch_moved.items[0 .. end - base]) |pair| {
         if (pair[0] == gpu.invalid_id) continue;
         scene.settling.appendAssumeCapacity(pair);
         if (listed) noteMover(self, scene, scene.spheres.items[pair[0]]);
@@ -552,7 +554,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
     const zone = Zone.start(self.options.profiler, "prepare scene");
     defer zone.stop();
     const device = self.device;
-    if (scene.layout_dirty or scene.layout_generation != self.asset_generation) try rebuildLayout(self, scene);
+    if (scene.layout_dirty or scene.layout_generation != self.internal.asset_generation) try rebuildLayout(self, scene);
     const layout = scene.layout.items;
     const entries = scene.entries.items;
     const entity_count = layout.len;
@@ -583,10 +585,10 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
     const whole = !scene.records_valid;
 
     const joints = try arena.alloc(device, Mat4, scene.joint_count);
-    self.skin_jobs.clearRetainingCapacity();
-    self.skin_weights.clearRetainingCapacity();
-    self.bounds_jobs.clearRetainingCapacity();
-    self.blas_jobs.clearRetainingCapacity();
+    self.internal.skin_jobs.clearRetainingCapacity();
+    self.internal.skin_weights.clearRetainingCapacity();
+    self.internal.bounds_jobs.clearRetainingCapacity();
+    self.internal.rays.blas_jobs.clearRetainingCapacity();
     try evaluatePoses(self, scene);
     scene.movers.clearRetainingCapacity();
     scene.movers_overflow = false;
@@ -611,14 +613,14 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         update.records = .{ .buffer = staged.buffer, .offset = staged.offset };
         update.previous = .{ .buffer = staged_before.buffer, .offset = staged_before.offset };
         update.tlas = .{ .buffer = staged_tlas.buffer, .offset = staged_tlas.offset };
-        try self.prepare_chunks.resize(self.gpa, scene.chunk_stale.items.len);
+        try self.internal.prepare_chunks.resize(self.internal.gpa, scene.chunk_stale.items.len);
         whole_prepare = PrepareWhole{
             .renderer = self,
             .scene = scene,
             .records = staged_records,
             .previous = staged_previous,
             .tlas = staged_tlas.items,
-            .chunks = self.prepare_chunks.items,
+            .chunks = self.internal.prepare_chunks.items,
         };
         const prepare = whole_prepare.?;
         prepare.spread(PrepareWhole.batch);
@@ -627,7 +629,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         for (entries, 0..) |info, index| {
             if (info.bits & EntryInfo.moved == 0) continue;
             noteMover(self, scene, scene.spheres.items[index]);
-            if (info.bits & EntryInfo.posed == 0) scene.settling.append(self.gpa, .{ @intCast(index), layout[index].entity.index }) catch {
+            if (info.bits & EntryInfo.posed == 0) scene.settling.append(self.internal.gpa, .{ @intCast(index), layout[index].entity.index }) catch {
                 scene.layout_dirty = true;
             };
         }
@@ -641,24 +643,24 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         changes.rewrites = rewrites.items;
         update.moves = moves.address;
         update.rewrites = rewrites.address;
-        std.mem.swap(std.ArrayList([2]u32), &scene.settling, &self.scratch_settling);
+        std.mem.swap(std.ArrayList([2]u32), &scene.settling, &self.internal.scratch_settling);
         scene.settling.clearRetainingCapacity();
-        for (self.scratch_settling.items) |pair| {
-            const mark = &self.entity_marks.items[pair[1]];
+        for (self.internal.scratch_settling.items) |pair| {
+            const mark = &self.internal.entity_marks.items[pair[1]];
             const info = &entries[pair[0]];
             if (mark.bits & EntityMark.listed != 0 or info.bits & EntryInfo.moved == 0) continue;
-            changes.move(pair[0], info, math.mul(self.entity_transforms.items[pair[1]], info.rest.?.*), InstanceMove.keep);
+            changes.move(pair[0], info, math.mul(self.internal.entity_transforms.items[pair[1]], info.rest.?.*), InstanceMove.keep);
             mark.travelled = 0;
         }
 
         try moveAcrossThreads(self, scene, &changes, threaded_room);
         var deferred: usize = 0;
         for (scene.edited.items) |slot| {
-            const mark = &self.entity_marks.items[slot];
+            const mark = &self.internal.entity_marks.items[slot];
             if (mark.handle == 0 or mark.bits & EntityMark.listed == 0 or self.scenes.table.get(mark.scene) != scene) continue;
             mark.bits &= ~EntityMark.listed;
-            const now = self.entity_transforms.items[slot];
-            const before = &self.entity_previous.items[slot];
+            const now = self.internal.entity_transforms.items[slot];
+            const before = &self.internal.entity_previous.items[slot];
             const changed = !std.mem.eql(f32, &now, before);
             const jumped = mark.bits & EntityMark.teleported != 0;
             const whole_records = mark.bits & EntityMark.restyled != 0 or (jumped and changed);
@@ -681,7 +683,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
                     const record = rigidRecord(self, entity, model, model.source.?.instances[entry.model_instance].mesh, transform, !changed, info.bits & EntryInfo.glows != 0);
                     changes.rewrite(@intCast(index), info, record, math.mul(before.*, rest.*), transform, changed or jumped);
                 } else changes.move(@intCast(index), info, transform, flags);
-                if (info.bits & EntryInfo.moved != 0) scene.settling.append(self.gpa, .{ @intCast(index), slot }) catch {
+                if (info.bits & EntryInfo.moved != 0) scene.settling.append(self.internal.gpa, .{ @intCast(index), slot }) catch {
                     scene.layout_dirty = true;
                 };
             }
@@ -697,7 +699,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         scene.edited.shrinkRetainingCapacity(deferred);
     }
 
-    const parity: u32 = @intCast(self.frame_index & 1);
+    const parity: u32 = @intCast(self.internal.frame_index & 1);
     const skinned_tlas = try arena.alloc(device, rhi.AccelerationInstance, scene.skinned_entries);
     var skinned_tlas_count: u32 = 0;
     var joint_cursor: u32 = 0;
@@ -705,12 +707,12 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
     var skinned_vertices: u32 = 0;
     for (scene.posed.items) |handle_value| {
         const slot = handle_value.index;
-        const mark = &self.entity_marks.items[slot];
+        const mark = &self.internal.entity_marks.items[slot];
         const entity = self.entities.table.get(handle_value).?;
         const model = self.models.table.get(entity.model).?;
         const source = &model.source.?;
-        const now = self.entity_transforms.items[slot];
-        const before = self.entity_previous.items[slot];
+        const now = self.internal.entity_transforms.items[slot];
+        const before = self.internal.entity_previous.items[slot];
         const entity_changed = !std.mem.eql(f32, &now, &before);
         const jumped = mark.bits & EntityMark.teleported != 0;
         const restyled = mark.bits & EntityMark.restyled != 0;
@@ -802,12 +804,12 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
             entity.bounds_offsets[model_instance] = gpu.invalid_id;
             if (own_bounds) {
                 entity.bounds_offsets[model_instance] = bounds_cursor;
-                try self.bounds_jobs.append(self.gpa, .{ .vertex_offset = current, .meshlet_offset = mesh.meshlet_offset, .meshlet_count = mesh.meshlet_count, .bounds_offset = bounds_cursor });
+                try self.internal.bounds_jobs.append(self.internal.gpa, .{ .vertex_offset = current, .meshlet_offset = mesh.meshlet_offset, .meshlet_count = mesh.meshlet_count, .bounds_offset = bounds_cursor });
                 bounds_cursor += mesh.meshlet_count;
             }
-            const weights_offset: u32 = @intCast(self.skin_weights.items.len);
-            try self.skin_weights.appendSlice(self.gpa, morph_weights[0..mesh.morph_targets]);
-            try self.skin_jobs.append(self.gpa, .{
+            const weights_offset: u32 = @intCast(self.internal.skin_weights.items.len);
+            try self.internal.skin_weights.appendSlice(self.internal.gpa, morph_weights[0..mesh.morph_targets]);
+            try self.internal.skin_jobs.append(self.internal.gpa, .{
                 .source_offset = mesh.vertex_offset,
                 .destination_offset = current,
                 .skin_offset = mesh.skin_offset.?,
@@ -818,12 +820,11 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
                 .weights_offset = weights_offset,
             });
             if (self.options.ray_tracing.dynamic_geometry and device.caps.ray_tracing and !mesh.blend) {
-                var dynamic_desc = geometry_feature.blasDesc(self, mesh);
-                dynamic_desc.vertex_offset = @as(u64, current) * @sizeOf(gpu.Vertex);
-                dynamic_desc.dynamic = true;
+                var dynamic_geometry = geometry_feature.blasGeometry(self, mesh);
+                dynamic_geometry.vertex_offset = @as(u64, current) * @sizeOf(gpu.Vertex);
                 const slot_blas = &entity.skin_blas[model_instance];
-                if (slot_blas.* == null) slot_blas.* = try device.createBlas(dynamic_desc);
-                try self.blas_jobs.append(self.gpa, .{ .blas = slot_blas.*.?, .vertex_offset = current, .mesh = mesh });
+                if (slot_blas.* == null) slot_blas.* = try device.createBlas(.{ .geometries = &.{dynamic_geometry}, .dynamic = true });
+                try self.internal.rays.blas_jobs.append(self.internal.gpa, .{ .blas = slot_blas.*.?, .vertex_offset = current, .mesh = mesh });
                 skinned_tlas.items[skinned_tlas_count] = tlasInstance(device, slot_blas.*.?, instance_index, false, now);
                 skinned_tlas_count += 1;
                 changes.tlas_changed = true;
@@ -835,12 +836,12 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
     }
     if (whole_prepare) |prepare| prepare.spread(PrepareWhole.finish);
     for (scene.edited.items) |slot| {
-        const mark = &self.entity_marks.items[slot];
+        const mark = &self.internal.entity_marks.items[slot];
         if (whole) {
             if (mark.handle == 0 or self.scenes.table.get(mark.scene) != scene) continue;
         } else {
-            const now = self.entity_transforms.items[slot];
-            const before = &self.entity_previous.items[slot];
+            const now = self.internal.entity_transforms.items[slot];
+            const before = &self.internal.entity_previous.items[slot];
             mark.travelled = if (mark.bits & EntityMark.teleported != 0) 0 else math.length(math.sub(now[12..15].*, before[12..15].*));
             before.* = now;
         }
@@ -872,7 +873,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         }
     }
 
-    try scene.transparent.resize(self.gpa, scene.blended.items.len);
+    try scene.transparent.resize(self.internal.gpa, scene.blended.items.len);
     for (scene.transparent.items, scene.blended.items) |*draw, blended| {
         draw.* = blended;
         draw.center = scene.spheres.items[blended.instance][0..3].*;
@@ -898,13 +899,13 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         if (group.driver != null) driven = true;
     }
     if (driven or records.static_version != scene.static_version or records.entity_count != entity_count) {
-        self.scratch_instances.clearRetainingCapacity();
-        self.scratch_static_cull.clearRetainingCapacity();
-        try self.scratch_static_cull.ensureTotalCapacity(self.gpa, scene.static_count);
-        self.scratch_impostors.clearRetainingCapacity();
+        self.internal.scratch_instances.clearRetainingCapacity();
+        self.internal.scratch_static_cull.clearRetainingCapacity();
+        try self.internal.scratch_static_cull.ensureTotalCapacity(self.internal.gpa, scene.static_count);
+        self.internal.scratch_impostors.clearRetainingCapacity();
         scene.static_transparent.clearRetainingCapacity();
         scene.static_transmissive = false;
-        try self.scratch_instances.ensureTotalCapacity(self.gpa, scene.static_count);
+        try self.internal.scratch_instances.ensureTotalCapacity(self.internal.gpa, scene.static_count);
         for (scene.groups.items) |group_handle| {
             const group = self.instances.table.get(group_handle) orelse continue;
             if (group.per_copy == 0) continue;
@@ -914,14 +915,14 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
             var impostor_index: u32 = 0;
             if (group.impostor) |impostor| if (impostor.baked and group.per_copy == 1 and driver == null) {
                 const whole_mesh = source.meshes[source.instances[0].mesh];
-                try self.scratch_impostors.append(self.gpa, .{
+                try self.internal.scratch_impostors.append(self.internal.gpa, .{
                     .center = whole_mesh.bounds_center,
                     .radius = whole_mesh.bounds_radius,
                     .color_texture = device.textureIndex(impostor.color),
                     .normal_texture = device.textureIndex(impostor.normal),
                     .pixels = impostor.pixels,
                 });
-                impostor_index = @intCast(self.scratch_impostors.items.len);
+                impostor_index = @intCast(self.internal.scratch_impostors.items.len);
             };
             for (group.transforms, 0..) |placement, copy_index| {
                 const tint: u32 = if (group.tints.len == group.transforms.len) group.tints[copy_index] else 0xffffffff;
@@ -960,8 +961,8 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
                         if (!noted) noteMover(self, scene, record.bounding_sphere);
                         noted = true;
                     }
-                    const range = scene.static_ranges.items[self.scratch_instances.items.len];
-                    self.scratch_static_cull.appendAssumeCapacity(.{
+                    const range = scene.static_ranges.items[self.internal.scratch_instances.items.len];
+                    self.internal.scratch_static_cull.appendAssumeCapacity(.{
                         .sphere = if (skin_base != no_skin) record.bounding_sphere else .{ center[0], center[1], center[2], source.meshes[instance.mesh].bounds_radius * math.maxScale(world) },
                         .first_ref = range[0],
                         .ref_count = range[1],
@@ -969,27 +970,27 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
                     });
                     if (mesh.blend) {
                         if (source.materials[source.meshes[instance.mesh].material].transmission > 0) scene.static_transmissive = true;
-                        try scene.static_transparent.append(self.gpa, .{
-                            .instance = @intCast(entity_count + self.scratch_instances.items.len),
+                        try scene.static_transparent.append(self.internal.gpa, .{
+                            .instance = @intCast(entity_count + self.internal.scratch_instances.items.len),
                             .first_index = mesh.index_offset,
                             .index_count = mesh.lod0_index_count,
                             .center = center,
                             .transmissive = source.materials[source.meshes[instance.mesh].material].transmission > 0,
                         });
                     }
-                    self.scratch_instances.appendAssumeCapacity(record);
+                    self.internal.scratch_instances.appendAssumeCapacity(record);
                 }
             }
         }
-        if (self.scratch_instances.items.len != 0) try device.uploadBuffer(
+        if (self.internal.scratch_instances.items.len != 0) try device.uploadBuffer(
             records.buffer.?,
             @as(u64, entity_count) * @sizeOf(gpu.Instance),
-            std.mem.sliceAsBytes(self.scratch_instances.items),
+            std.mem.sliceAsBytes(self.internal.scratch_instances.items),
         );
-        if (self.scratch_static_cull.items.len > scene.static_cull_capacity) {
+        if (self.internal.scratch_static_cull.items.len > scene.static_cull_capacity) {
             if (scene.static_cull) |old| device.destroyBuffer(old);
             scene.static_cull = null;
-            const capacity: u32 = @intCast(self.scratch_static_cull.items.len + @min(self.scratch_static_cull.items.len / 2, 1 << 16));
+            const capacity: u32 = @intCast(self.internal.scratch_static_cull.items.len + @min(self.internal.scratch_static_cull.items.len / 2, 1 << 16));
             scene.static_cull = try device.createBuffer(.{
                 .name = "instance bounds",
                 .size = @as(u64, capacity) * @sizeOf(gpu.StaticCull),
@@ -997,8 +998,8 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
             });
             scene.static_cull_capacity = capacity;
         }
-        if (self.scratch_static_cull.items.len != 0) try device.uploadBuffer(scene.static_cull.?, 0, std.mem.sliceAsBytes(self.scratch_static_cull.items));
-        scene.impostor_count = @intCast(self.scratch_impostors.items.len);
+        if (self.internal.scratch_static_cull.items.len != 0) try device.uploadBuffer(scene.static_cull.?, 0, std.mem.sliceAsBytes(self.internal.scratch_static_cull.items));
+        scene.impostor_count = @intCast(self.internal.scratch_impostors.items.len);
         if (scene.impostor_count > scene.impostor_table_capacity) {
             if (scene.impostor_table) |old| device.destroyBuffer(old);
             scene.impostor_table = null;
@@ -1009,12 +1010,12 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
             });
             scene.impostor_table_capacity = scene.impostor_count;
         }
-        if (scene.impostor_count != 0) try device.uploadBuffer(scene.impostor_table.?, 0, std.mem.sliceAsBytes(self.scratch_impostors.items));
+        if (scene.impostor_count != 0) try device.uploadBuffer(scene.impostor_table.?, 0, std.mem.sliceAsBytes(self.internal.scratch_impostors.items));
         records.static_version = scene.static_version;
         records.entity_count = entity_count;
     }
     if (scene.static_transmissive) scene.transmissive = true;
-    try scene.transparent.appendSlice(self.gpa, scene.static_transparent.items);
+    try scene.transparent.appendSlice(self.internal.gpa, scene.static_transparent.items);
     var tlas_count = scene.rigid_tlas;
     if (group_rays) {
         if (driven or scene.static_tlas_version != scene.static_version or scene.static_tlas_base != entity_count) {
@@ -1034,7 +1035,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
                         const posed: ?rhi.AccelerationStructure = if (driver) |entity| (if (entity.skin_offsets[model_instance] != no_skin and model_instance < entity.skin_blas.len) entity.skin_blas[model_instance] else null) else null;
                         const blas = posed orelse mesh.blas orelse continue;
                         const t = if (posed != null) placement else math.mul(placement, model.node_world[instance.node]);
-                        try scene.static_tlas.append(self.gpa, tlasInstance(device, blas, record, false, t));
+                        try scene.static_tlas.append(self.internal.gpa, tlasInstance(device, blas, record, false, t));
                     }
                 }
             }
@@ -1097,7 +1098,7 @@ pub fn applySceneUpdate(self: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scene
         cmd.copyBuffer(update.skinned_tlas.buffer, scene.tlas_instances.?, update.skinned_tlas.offset, @as(u64, update.skinned_tlas_first) * tlas_size, @as(u64, update.skinned_tlas_count) * tlas_size);
     if (copies) cmd.sync(.transfer_to_all);
     if (update.move_count == 0 and update.rewrite_count == 0) return;
-    const Push = extern struct { records: u64, previous: u64, tlas: u64, updates: u64, count: u32, pad: u32 = 0 };
+    const Push = instance_update_push.Push;
     var push = Push{
         .records = self.device.bufferAddress(scene.instance_slots[0].buffer.?),
         .previous = self.device.bufferAddress(scene.previous.?),
@@ -1106,14 +1107,14 @@ pub fn applySceneUpdate(self: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scene
         .count = update.move_count,
     };
     if (update.move_count != 0) {
-        cmd.bindPipeline(try self.pipelines.get(.instance_moves));
+        cmd.bindPipeline(try self.internal.pipelines.of(instanceMovesPipeline));
         cmd.pushConstants(push);
         cmd.dispatch((update.move_count + 63) / 64, 1, 1);
     }
     if (update.rewrite_count != 0) {
         push.updates = update.rewrites;
         push.count = update.rewrite_count;
-        cmd.bindPipeline(try self.pipelines.get(.instance_rewrites));
+        cmd.bindPipeline(try self.internal.pipelines.of(instanceRewritesPipeline));
         cmd.pushConstants(push);
         cmd.dispatch((update.rewrite_count + 63) / 64, 1, 1);
     }
@@ -1142,17 +1143,17 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
     const tiles_per_side = std.math.clamp(self.options.shadows.local_tiles_per_side, 1, local_shadow_tiles_per_side);
     const tile_scale = 1.0 / @as(f32, @floatFromInt(tiles_per_side));
     const axes = [6]Vec3{ .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 } };
-    const granted = try self.gpa.alloc(bool, scene.lights.items.len);
-    defer self.gpa.free(granted);
+    const granted = try self.internal.gpa.alloc(bool, scene.lights.items.len);
+    defer self.internal.gpa.free(granted);
     @memset(granted, false);
-    const shared = shadows and scene.shadow_grants_frame == self.frame_index and
+    const shared = shadows and scene.shadow_grants_frame == self.internal.frame_index and
         scene.shadow_grants_traced == traced_shadows and scene.shadow_grants.items.len == granted.len;
     if (shared) {
         @memcpy(granted, scene.shadow_grants.items);
     } else if (shadows) {
         const Candidate = struct { index: u32, score: f32 };
-        const candidates = try self.gpa.alloc(Candidate, scene.lights.items.len);
-        defer self.gpa.free(candidates);
+        const candidates = try self.internal.gpa.alloc(Candidate, scene.lights.items.len);
+        defer self.internal.gpa.free(candidates);
         var candidate_count: usize = 0;
         for (scene.lights.items, 0..) |light, index| {
             if (!light.cast_shadows or light.kind == .directional or light.kind == .rectangle) continue;
@@ -1173,9 +1174,9 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
             tiles_left -= needed;
             granted[candidate.index] = true;
         }
-        try scene.shadow_grants.resize(self.gpa, granted.len);
+        try scene.shadow_grants.resize(self.internal.gpa, granted.len);
         @memcpy(scene.shadow_grants.items, granted);
-        scene.shadow_grants_frame = self.frame_index;
+        scene.shadow_grants_frame = self.internal.frame_index;
         scene.shadow_grants_traced = traced_shadows;
     }
     result.tiles_key = std.hash.Wyhash.hash(tiles_per_side, std.mem.sliceAsBytes(granted));
@@ -1256,7 +1257,7 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
 pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
     var moved = false;
     inline for (.{ "vertices", "indices" }) |name| {
-        const pool: *Pool = &@field(self, name);
+        const pool: *Pool = &@field(self.internal, name);
         const vertices = comptime std.mem.eql(u8, name, "vertices");
         var free_inside: u64 = 0;
         for (pool.ranges.free_ranges.items) |range| free_inside += range.count;
@@ -1283,7 +1284,7 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
             if (count == 0 or @as(u64, count) * pool.stride > 16 << 20) break :find;
             const new = pool.ranges.alloc(count) orelse break :find;
             if (new + count > old) {
-                pool.ranges.free(self.gpa, new, count);
+                pool.ranges.free(self.internal.gpa, new, count);
                 break :find;
             }
             cmd.sync(.all_to_transfer);
@@ -1300,13 +1301,13 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
                     .meshlet_count = mesh.meshlet_count,
                     .bvh = mesh.bvh_nodes orelse gpu.invalid_id,
                 };
-                try self.meshes.write(self.device, entry.mesh_base + @as(u32, @intCast(last_mesh)), std.mem.asBytes(&record));
+                try self.internal.meshes.write(self.device, entry.mesh_base + @as(u32, @intCast(last_mesh)), std.mem.asBytes(&record));
             }
             for (self.scenes.table.slots.items) |*slot| if (slot.value) |*scene| {
                 scene.static_version += 1;
                 scene.layout_dirty = true;
             };
-            self.stats.geometry_bytes_compacted += @as(u64, count) * pool.stride;
+            self.internal.stats.geometry_bytes_compacted += @as(u64, count) * pool.stride;
             pool.free(self, old, count);
             moved = true;
         }
@@ -1314,133 +1315,10 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
     return moved;
 }
 
-/// Builds acceleration structures of newly loaded models. With
-/// `frame_index` and a second GPU queue they build asynchronously and are
-/// adopted when done; otherwise `cmd` builds them at once. Must run after
-/// their geometry uploads have been recorded, and waits for a geometry pool
-/// that moved to a new buffer to be filled.
-pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: ?u64) !void {
-    if (frame_index) |frame_now| if (self.vertices.replaced or self.indices.replaced) {
-        self.vertices.replaced = false;
-        self.indices.replaced = false;
-        self.geometry_replaced = frame_now;
-    };
-    if (self.blas_compacting != 0) try compactBuiltBlas(self, cmd);
-    if (self.blas_pending == 0) return;
-    const device = self.device;
-    var still_pending: u32 = 0;
-    var finished = false;
-    for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
-        if (!entry.blas_pending) continue;
-        const frame_now = frame_index orelse {
-            if (entry.blas_job) |job| {
-                device.releaseDetached(job);
-                entry.blas_job = null;
-            } else {
-                for (entry.meshes) |mesh| {
-                    if (mesh.blas_building orelse mesh.blas) |blas| try cmd.buildBlas(blas, geometry_feature.blasDesc(self, mesh));
-                }
-                for (entry.meshes) |mesh| {
-                    if (mesh.blas_building orelse mesh.blas) |blas| try cmd.measureBlas(blas);
-                }
-            }
-            finished = adoptBlas(self, entry) or finished;
-            continue;
-        };
-        if (entry.blas_job) |job| {
-            if (!device.detachedDone(job)) {
-                still_pending += 1;
-                continue;
-            }
-            device.releaseDetached(job);
-            entry.blas_job = null;
-            finished = adoptBlas(self, entry) or finished;
-            continue;
-        }
-        var detached = false;
-        for (entry.meshes) |mesh| detached = detached or mesh.blas_building != null;
-        if (!detached) {
-            entry.blas_pending = false;
-            for (entry.meshes) |mesh| if (mesh.blas) |blas| try cmd.buildBlas(blas, geometry_feature.blasDesc(self, mesh));
-            for (entry.meshes) |mesh| if (mesh.blas) |blas| try cmd.measureBlas(blas);
-            markCompacting(self, entry);
-            continue;
-        }
-        still_pending += 1;
-        const carried = entry.blas_frame orelse {
-            entry.blas_frame = frame_now;
-            continue;
-        };
-        if (frame_now < carried + rhi.frames_in_flight) continue;
-        // A pool that has just moved holds nothing yet for the second queue
-        // to read. Its contents may be copied a frame after the move is seen.
-        if (self.geometry_replaced) |replaced| if (frame_now <= replaced + rhi.frames_in_flight) continue;
-        var encoder = (try device.beginDetached()).?;
-        for (entry.meshes) |mesh| if (mesh.blas_building) |blas| try encoder.buildBlas(blas, geometry_feature.blasDesc(self, mesh));
-        for (entry.meshes) |mesh| if (mesh.blas_building) |blas| try encoder.measureBlas(blas);
-        entry.blas_job = try device.submitDetached(encoder);
-    };
-    self.blas_pending = still_pending;
-    if (finished) self.asset_generation += 1;
+fn instanceMovesPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "instance moves", .shader = pipelines_module.shaderCode("instance_moves.comp.spv") } };
 }
 
-/// Has `compactBuiltBlas` look at the model's structures.
-fn markCompacting(self: *Renderer, entry: *ModelEntry) void {
-    if (entry.blas_compacting) return;
-    entry.blas_compacting = true;
-    self.blas_compacting += 1;
-}
-
-/// Most structures replaced by smaller copies in one frame.
-const compactions_per_frame = 64;
-
-/// Replaces the built structures whose compacted size has come back from
-/// the GPU with copies of that size. The copy is made by `cmd`, ahead of
-/// anything that traces rays this frame.
-fn compactBuiltBlas(self: *Renderer, cmd: *rhi.CommandEncoder) !void {
-    const device = self.device;
-    var budget: u32 = compactions_per_frame;
-    var replaced = false;
-    for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
-        if (!entry.blas_compacting or entry.blas_pending) continue;
-        var waiting = false;
-        for (entry.meshes) |*mesh| {
-            const built = mesh.blas orelse continue;
-            if (!device.blasMeasured(built)) continue;
-            if (budget == 0) {
-                waiting = true;
-                continue;
-            }
-            const size = device.compactedBlasSize(built) orelse {
-                waiting = waiting or device.blasMeasured(built);
-                continue;
-            };
-            const compact = device.createCompactBlas(built, size) catch continue;
-            cmd.compactBlas(built, compact);
-            device.destroyAcceleration(built);
-            mesh.blas = compact;
-            replaced = true;
-            budget -= 1;
-        }
-        if (!waiting) {
-            entry.blas_compacting = false;
-            self.blas_compacting -= 1;
-        }
-    };
-    if (replaced) self.asset_generation += 1;
-}
-
-/// Makes a model's finished acceleration structures the live ones.
-/// Returns whether there were any.
-fn adoptBlas(self: *Renderer, entry: *ModelEntry) bool {
-    var any = false;
-    for (entry.meshes) |*mesh| if (mesh.blas_building) |built| {
-        mesh.blas = built;
-        mesh.blas_building = null;
-        any = true;
-    };
-    entry.blas_pending = false;
-    entry.blas_frame = null;
-    markCompacting(self, entry);
-    return any;
+fn instanceRewritesPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "instance rewrites", .shader = pipelines_module.shaderCode("instance_rewrites.comp.spv") } };
 }

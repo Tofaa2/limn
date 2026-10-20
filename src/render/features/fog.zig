@@ -1,4 +1,7 @@
 //! Height fog lit by the sun and local lights.
+const rhi = @import("../../rhi/rhi.zig");
+const pipelines_module = @import("../renderer/pipelines.zig");
+const fog_push = @import("../shaders/push/fog.zig");
 const scene_pass = @import("../scene_pass.zig");
 const render = @import("../renderer.zig");
 const filled = @import("../api.zig").filled;
@@ -57,10 +60,10 @@ pub fn drawFog(renderer: *Renderer, p: *const ScenePass) !void {
     cmd.beginScope("volumetric fog");
     const fog = try p.keep(renderer, "fog", ScenePass.scaled(filled(settings.fog).resolution, p.width), ScenePass.scaled(filled(settings.fog).resolution, p.height), render.hdr_format);
     try cmd.beginRendering(.{ .color = &.{.{ .texture = fog, .load = .discard }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.fog));
-    cmd.pushConstants(extern struct { frame: u64, depth: u32, density: f32, anisotropy: f32, height_falloff: f32, max_distance: f32, ambient: f32, step_count: i32, pad: u32 = 0 }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(fogPipeline));
+    cmd.pushConstants(fog_push.FogPush{
         .frame = frame_address,
-        .depth = device.textureIndex(view.depth),
+        .depth_texture = device.textureIndex(view.depth),
         .density = (if (settings.fog) |on| on.density else 0),
         .anisotropy = std.math.clamp(filled(settings.fog).anisotropy, 0, 0.95),
         .height_falloff = filled(settings.fog).height_falloff,
@@ -70,16 +73,18 @@ pub fn drawFog(renderer: *Renderer, p: *const ScenePass) !void {
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(fog, .shader_read);
     try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.fog_composite));
-    cmd.pushConstants(extern struct { frame: u64, fog: u32, depth: u32 }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(pipelines_module.fogCompositePipeline));
+    cmd.pushConstants(fog_push.CompositePush{
         .frame = frame_address,
-        .fog = device.textureIndex(fog),
-        .depth = device.textureIndex(view.depth),
+        .fog_texture = device.textureIndex(fog),
+        .depth_texture = device.textureIndex(view.depth),
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(view.hdr, .shader_read);
     cmd.endScope();
+}
+
+fn fogPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fog", pipelines_module.shaderCode("fog.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
 }

@@ -1,9 +1,6 @@
 #include "common.slang"
 
-struct UpscalePush {
-    FrameConstants frame;
-    uint source_texture;
-};
+#include "resolution.UpscalePush.slang"
 
 [[vk::push_constant]] UpscalePush upscale_push;
 
@@ -32,24 +29,11 @@ float4 upscaleMain([[vk::location(0)]] float2 in_uv) : SV_Target {
     return float4(max(result.rgb / result.a, float3(0.0)), 1.0);
 }
 
-struct EasuPush {
-    FrameConstants frame;
-    uint source_texture;
-    uint pad;
-    uint4 con0;
-    uint4 con1;
-    uint4 con2;
-    uint4 con3;
-};
+#include "resolution.EasuPush.slang"
 
 [[vk::push_constant]] EasuPush easu_push;
 
-struct RcasPush {
-    FrameConstants frame;
-    uint source_texture;
-    uint pad;
-    uint4 con;
-};
+#include "resolution.RcasPush.slang"
 
 [[vk::push_constant]] RcasPush rcas_push;
 

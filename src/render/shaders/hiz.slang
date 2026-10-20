@@ -1,12 +1,6 @@
 #include "common.slang"
 
-struct RasterPush {
-    uint source_texture;
-    uint sampler_index;
-    uint first;
-    int source_lod;
-    float2 texel;
-};
+#include "hiz.RasterPush.slang"
 
 [[vk::push_constant]] RasterPush raster_push;
 
@@ -30,15 +24,7 @@ float rasterMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position
 }
 
 #ifdef STORAGE_IMAGES
-struct ComputePush {
-    uint source_texture;
-    uint sampler_index;
-    uint first;
-    int source_lod;
-    uint target;
-    uint pad;
-    int2 size;
-};
+#include "hiz.ComputePush.slang"
 
 [[vk::push_constant]] ComputePush compute_push;
 

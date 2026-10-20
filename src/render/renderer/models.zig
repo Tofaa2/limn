@@ -40,6 +40,11 @@ fn lodOptions(self: *const Renderer) gltf.LodOptions {
 pub const Models = struct {
     table: handle.HandleTable(renderer_state.ModelEntry, api.ModelTag),
 
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.ModelEntry) void {
+        freeModel(owner, entry);
+    }
+
     fn renderer(models: *Models) *Renderer {
         return @alignCast(@fieldParentPtr("models", models));
     }
@@ -50,12 +55,12 @@ pub const Models = struct {
         const self = models.renderer();
         self.lock();
         defer self.unlock();
-        const job = try self.gpa.create(ModelJob);
-        errdefer self.gpa.destroy(job);
+        const job = try self.internal.gpa.create(ModelJob);
+        errdefer self.internal.gpa.destroy(job);
         job.* = .{
             .gpa = self.options.job_allocator orelse std.heap.smp_allocator,
-            .io = self.io,
-            .path = try self.gpa.dupe(u8, path),
+            .io = self.internal.io,
+            .path = try self.internal.gpa.dupe(u8, path),
             .options = .{
                 .compress_textures = self.options.textures.compression == .bc7 and self.device.caps.bc_textures,
                 .normal_maps_bc5 = self.options.textures.normal_maps_bc5,
@@ -64,10 +69,10 @@ pub const Models = struct {
                 .cache_dir = self.options.cache.assets,
             },
         };
-        errdefer self.gpa.free(job.path);
+        errdefer self.internal.gpa.free(job.path);
         const model = try self.models.table.insert(.{ .job = job });
-        job.group.concurrent(self.io, runModelJob, .{job}) catch job.group.async(self.io, runModelJob, .{job});
-        self.loading_count += 1;
+        job.group.concurrent(self.internal.io, runModelJob, .{job}) catch job.group.async(self.internal.io, runModelJob, .{job});
+        self.internal.loading_count += 1;
         return model;
     }
 
@@ -80,7 +85,7 @@ pub const Models = struct {
         self.lock();
         defer self.unlock();
         const model = try self.models.table.insert(.{ .source = source });
-        self.loading_count += 1;
+        self.internal.loading_count += 1;
         return model;
     }
 
@@ -155,8 +160,8 @@ pub const Models = struct {
         if (entry.state != .ready) return error.ModelNotReady;
         const source = &entry.source.?;
         if (node >= source.nodes.len) return error.InvalidNode;
-        try self.scratch_locals.resize(self.gpa, source.nodes.len * 3);
-        const moved = animation.rootMotion(source, self.scratch_locals.items, animation_index, node, from, to, true);
+        try self.internal.scratch_locals.resize(self.internal.gpa, source.nodes.len * 3);
+        const moved = animation.rootMotion(source, self.internal.scratch_locals.items, animation_index, node, from, to, true);
         return if (source.nodes[node].parent) |parent| math.transformDirection(entry.node_world[parent], moved) else moved;
     }
 
@@ -182,15 +187,15 @@ pub const Models = struct {
         const entry = self.models.table.get(model) orelse return;
         if (entry.references != 0) return error.ModelInUse;
         var removed = self.models.table.remove(model).?;
-        if (removed.state == .loading) self.loading_count -= 1;
+        if (removed.state == .loading) self.internal.loading_count -= 1;
         freeModel(self, &removed);
-        self.asset_generation += 1;
+        self.internal.asset_generation += 1;
     }
 };
 
 pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
     const device = self.device;
-    const gpa = self.gpa;
+    const gpa = self.internal.gpa;
     if (entry.job) |job| {
         job.group.await(job.io) catch {};
         const failure = job.failure;
@@ -220,13 +225,13 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
                 stream.total = stream.data.len;
                 if (streaming.from_cache and floor > 0 and image.block == .bc7 and image.cache_key != 0) if (self.options.cache.assets) |directory| {
                     const extension: []const u8 = if (image.two_channel) "bc5" else if (image.one_channel) "bc4" else "bc7";
-                    const path = try std.fmt.allocPrint(self.gpa, "{s}/{x:0>16}.{s}", .{ directory, image.cache_key, extension });
-                    errdefer self.gpa.free(path);
+                    const path = try std.fmt.allocPrint(self.internal.gpa, "{s}/{x:0>16}.{s}", .{ directory, image.cache_key, extension });
+                    errdefer self.internal.gpa.free(path);
                     const tail_offset = stream.levelOffset(floor);
                     const in_cache = blk: {
-                        const file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch break :blk false;
-                        defer file.close(self.io);
-                        const stat = file.stat(self.io) catch break :blk false;
+                        const file = std.Io.Dir.cwd().openFile(self.internal.io, path, .{}) catch break :blk false;
+                        defer file.close(self.internal.io);
+                        const stat = file.stat(self.internal.io) catch break :blk false;
                         break :blk stat.size == 12 + stream.total;
                     };
                     if (in_cache) {
@@ -235,7 +240,7 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
                         stream.data = tail;
                         stream.tail_offset = tail_offset;
                         stream.path = path;
-                    } else self.gpa.free(path);
+                    } else self.internal.gpa.free(path);
                 };
                 entry.streamed += 1;
                 entry.textures[entry.next_image] = try createStreamTexture(self, stream, floor);
@@ -282,7 +287,7 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
     if (transform_count != 0) {
         entry.transform_base = try self.materials.pool.alloc(self, transform_count * gpu.texture_transform_slots);
         entry.transform_count = transform_count;
-        self.texture_transform_users += 1;
+        self.internal.texture_transform_users += 1;
         var slot = entry.transform_base;
         for (source.materials) |material| {
             if (!material.hasOwnTransforms()) continue;
@@ -303,7 +308,7 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
     }
     try self.materials.pool.write(device, entry.material_base, std.mem.sliceAsBytes(materials));
 
-    entry.mesh_base = try self.meshes.alloc(self, @intCast(source.meshes.len));
+    entry.mesh_base = try self.internal.meshes.alloc(self, @intCast(source.meshes.len));
     entry.meshes = try gpa.alloc(ModelMesh, source.meshes.len);
     @memset(entry.meshes, std.mem.zeroes(ModelMesh));
     const mesh_records = try gpa.alloc(gpu.Mesh, source.meshes.len);
@@ -312,13 +317,13 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
     var meshlet_count: u32 = 0;
     for (source.meshes, entry.meshes, mesh_records) |mesh, *out, *record| {
         out.* = .{
-            .vertex_offset = try self.vertices.alloc(self, @intCast(mesh.vertices.len)),
+            .vertex_offset = try self.internal.vertices.alloc(self, @intCast(mesh.vertices.len)),
             .vertex_count = @intCast(mesh.vertices.len),
             .skin_offset = null,
-            .index_offset = try self.indices.alloc(self, @intCast(mesh.indices.len)),
+            .index_offset = try self.internal.indices.alloc(self, @intCast(mesh.indices.len)),
             .index_count = @intCast(mesh.indices.len),
             .lod0_index_count = mesh.lod0_index_count,
-            .meshlet_offset = try self.meshlets.alloc(self, @intCast(mesh.meshlets.len)),
+            .meshlet_offset = try self.internal.meshlets.alloc(self, @intCast(mesh.meshlets.len)),
             .meshlet_count = @intCast(mesh.meshlets.len),
             .material = entry.material_base + mesh.material,
             .blend = source.materials[mesh.material].alpha_mode == .blend or source.materials[mesh.material].transmission > 0,
@@ -328,17 +333,17 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
             .coarse_vertex_count = mesh.coarse_vertex_count,
             .coarse_error = mesh.coarse_error,
         };
-        try self.vertices.write(device, out.vertex_offset, std.mem.sliceAsBytes(mesh.vertices));
-        try self.indices.write(device, out.index_offset, std.mem.sliceAsBytes(mesh.indices));
-        try self.meshlets.write(device, out.meshlet_offset, std.mem.sliceAsBytes(mesh.meshlets));
+        try self.internal.vertices.write(device, out.vertex_offset, std.mem.sliceAsBytes(mesh.vertices));
+        try self.internal.indices.write(device, out.index_offset, std.mem.sliceAsBytes(mesh.indices));
+        try self.internal.meshlets.write(device, out.meshlet_offset, std.mem.sliceAsBytes(mesh.meshlets));
         if (self.options.ray_tracing.software_path_tracing and !device.caps.ray_tracing and mesh.skin == null) try buildMeshTree(self, mesh, out, entry.mesh_base + @as(u32, @intCast((@intFromPtr(out) - @intFromPtr(entry.meshes.ptr)) / @sizeOf(ModelMesh))));
         if (mesh.skin) |skin| {
-            out.skin_offset = try self.skin_vertices.alloc(self, @intCast(skin.len));
-            try self.skin_vertices.write(device, out.skin_offset.?, std.mem.sliceAsBytes(skin));
+            out.skin_offset = try self.internal.skin_vertices.alloc(self, @intCast(skin.len));
+            try self.internal.skin_vertices.write(device, out.skin_offset.?, std.mem.sliceAsBytes(skin));
             if (mesh.morph_targets != 0) {
-                out.morph_offset = try self.morph_deltas.alloc(self, @intCast(mesh.morph_deltas.len));
+                out.morph_offset = try self.internal.morph_deltas.alloc(self, @intCast(mesh.morph_deltas.len));
                 out.morph_targets = mesh.morph_targets;
-                try self.morph_deltas.write(device, out.morph_offset.?, std.mem.sliceAsBytes(mesh.morph_deltas));
+                try self.internal.morph_deltas.write(device, out.morph_offset.?, std.mem.sliceAsBytes(mesh.morph_deltas));
             }
         }
         record.* = .{
@@ -352,12 +357,12 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
         triangle_count += out.lod0_index_count / 3;
         meshlet_count += out.meshlet_count;
     }
-    try self.meshes.write(device, entry.mesh_base, std.mem.sliceAsBytes(mesh_records));
+    try self.internal.meshes.write(device, entry.mesh_base, std.mem.sliceAsBytes(mesh_records));
 
     entry.order = try animation.topologicalOrder(gpa, source.nodes);
     entry.node_world = try gpa.alloc(Mat4, source.nodes.len);
-    try self.scratch_locals.resize(gpa, source.nodes.len * 3);
-    animation.evaluate(source, entry.order, null, self.scratch_locals.items, entry.node_world);
+    try self.internal.scratch_locals.resize(gpa, source.nodes.len * 3);
+    animation.evaluate(source, entry.order, null, self.internal.scratch_locals.items, entry.node_world);
     {
         const needed = try gpa.alloc(bool, source.nodes.len);
         defer gpa.free(needed);
@@ -436,12 +441,12 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
     if (device.caps.ray_tracing) {
         for (entry.meshes) |*mesh| {
             if (mesh.skin_offset != null) continue;
-            const made = try device.createBlas(geometry_feature.blasDesc(self, mesh.*));
+            const made = try device.createBlas(.{ .geometries = &.{geometry_feature.blasGeometry(self, mesh.*)} });
             if (device.detached_queue != null) mesh.blas_building = made else mesh.blas = made;
         }
         entry.blas_pending = true;
         entry.blas_frame = null;
-        self.blas_pending += 1;
+        self.internal.rays.blas_pending += 1;
     }
     entry.state = .ready;
     return true;
@@ -459,14 +464,14 @@ const TraceInstance = extern struct {
 /// its contents changed. `entities` are this frame's entity records;
 /// instance groups follow them, as in the instance buffer.
 pub fn buildSceneTree(self: *Renderer, scene: *SceneData, entities: []const gpu.Instance) !void {
-    const gpa = self.gpa;
+    const gpa = self.internal.gpa;
     const device = self.device;
     const Placed = extern struct { transform: Mat4, mesh: u32, instance: u32 };
     var placed: std.ArrayList(Placed) = .empty;
     defer placed.deinit(gpa);
     for (entities, 0..) |record, index| {
         if (record.flags & (gpu.instance_skinned | gpu.instance_proxy) != 0) continue;
-        if (record.mesh >= self.mesh_boxes.items.len or self.mesh_boxes.items[record.mesh] == null) continue;
+        if (record.mesh >= self.internal.rays.mesh_boxes.items.len or self.internal.rays.mesh_boxes.items[record.mesh] == null) continue;
         try placed.append(gpa, .{ .transform = gpu.expand(record.transform), .mesh = record.mesh, .instance = @intCast(index) });
     }
     var record: u32 = @intCast(entities.len);
@@ -480,7 +485,7 @@ pub fn buildSceneTree(self: *Renderer, scene: *SceneData, entities: []const gpu.
                 defer record += 1;
                 const mesh = model.mesh_base + instance.mesh;
                 if (model.meshes[instance.mesh].skin_offset != null) continue;
-                if (mesh >= self.mesh_boxes.items.len or self.mesh_boxes.items[mesh] == null) continue;
+                if (mesh >= self.internal.rays.mesh_boxes.items.len or self.internal.rays.mesh_boxes.items[mesh] == null) continue;
                 try placed.append(gpa, .{ .transform = math.mul(placement, model.node_world[instance.node]), .mesh = mesh, .instance = record });
             }
         }
@@ -493,7 +498,7 @@ pub fn buildSceneTree(self: *Renderer, scene: *SceneData, entities: []const gpu.
     const hi = try gpa.alloc([3]f32, placed.items.len);
     defer gpa.free(hi);
     for (placed.items, lo, hi) |item, *low, *high| {
-        const box = self.mesh_boxes.items[item.mesh].?;
+        const box = self.internal.rays.mesh_boxes.items[item.mesh].?;
         low.* = @splat(std.math.inf(f32));
         high.* = @splat(-std.math.inf(f32));
         for (0..8) |corner| {
@@ -541,7 +546,7 @@ pub fn buildSceneTree(self: *Renderer, scene: *SceneData, entities: []const gpu.
 /// Builds a mesh's full-detail triangle BVH into the BVH pools; see
 /// `Options.ray_tracing.software_path_tracing`.
 fn buildMeshTree(self: *Renderer, mesh: gltf.Mesh, out: *ModelMesh, record: u32) !void {
-    const gpa = self.gpa;
+    const gpa = self.internal.gpa;
     const triangles = mesh.lod0_index_count / 3;
     if (triangles == 0) return;
     const lo = try gpa.alloc([3]f32, triangles);
@@ -561,32 +566,32 @@ fn buildMeshTree(self: *Renderer, mesh: gltf.Mesh, out: *ModelMesh, record: u32)
     }
     var tree = try bvh.build(gpa, lo, hi, 4);
     defer tree.deinit(gpa);
-    const items = try self.bvh_items.alloc(self, triangles);
-    errdefer self.bvh_items.free(self, items, triangles);
-    const nodes = try self.bvh_nodes.alloc(self, @intCast(tree.nodes.len));
-    errdefer self.bvh_nodes.free(self, nodes, @intCast(tree.nodes.len));
+    const items = try self.internal.rays.bvh_items.alloc(self, triangles);
+    errdefer self.internal.rays.bvh_items.free(self, items, triangles);
+    const nodes = try self.internal.rays.bvh_nodes.alloc(self, @intCast(tree.nodes.len));
+    errdefer self.internal.rays.bvh_nodes.free(self, nodes, @intCast(tree.nodes.len));
     for (tree.nodes) |*node| {
         if (node.count != 0) node.first += items;
     }
-    try self.bvh_items.write(self.device, items, std.mem.sliceAsBytes(tree.order));
-    try self.bvh_nodes.write(self.device, nodes, std.mem.sliceAsBytes(tree.nodes));
+    try self.internal.rays.bvh_items.write(self.device, items, std.mem.sliceAsBytes(tree.order));
+    try self.internal.rays.bvh_nodes.write(self.device, nodes, std.mem.sliceAsBytes(tree.nodes));
     out.bvh_nodes = nodes;
     out.bvh_node_count = @intCast(tree.nodes.len);
     out.bvh_items = items;
     out.bvh_item_count = triangles;
     out.bvh_min = tree.nodes[0].min;
     out.bvh_max = tree.nodes[0].max;
-    while (self.mesh_boxes.items.len <= record) try self.mesh_boxes.append(gpa, null);
-    self.mesh_boxes.items[record] = .{ tree.nodes[0].min, tree.nodes[0].max };
+    while (self.internal.rays.mesh_boxes.items.len <= record) try self.internal.rays.mesh_boxes.append(gpa, null);
+    self.internal.rays.mesh_boxes.items[record] = .{ tree.nodes[0].min, tree.nodes[0].max };
 }
 
 pub fn freeModel(self: *Renderer, entry: *ModelEntry) void {
-    const gpa = self.gpa;
+    const gpa = self.internal.gpa;
     if (entry.blas_job) |job| self.device.releaseDetached(job);
     entry.blas_job = null;
     if (entry.blas_compacting) {
         entry.blas_compacting = false;
-        self.blas_compacting -= 1;
+        self.internal.rays.blas_compacting -= 1;
     }
     if (entry.job) |job| {
         job.group.cancel(job.io);
@@ -611,26 +616,26 @@ pub fn freeModel(self: *Renderer, entry: *ModelEntry) void {
     entry.textures = &.{};
     for (entry.meshes) |*mesh| {
         if (entry.geometry_resident) freeMeshGeometry(self, mesh);
-        self.meshlets.free(self, mesh.meshlet_offset, mesh.meshlet_count);
+        self.internal.meshlets.free(self, mesh.meshlet_offset, mesh.meshlet_count);
         if (mesh.bvh_nodes) |offset| {
-            self.bvh_nodes.free(self, offset, mesh.bvh_node_count);
-            self.bvh_items.free(self, mesh.bvh_items, mesh.bvh_item_count);
+            self.internal.rays.bvh_nodes.free(self, offset, mesh.bvh_node_count);
+            self.internal.rays.bvh_items.free(self, mesh.bvh_items, mesh.bvh_item_count);
         }
-        if (mesh.skin_offset) |offset| self.skin_vertices.free(self, offset, mesh.vertex_count);
-        if (mesh.morph_offset) |offset| self.morph_deltas.free(self, offset, mesh.vertex_count * mesh.morph_targets);
+        if (mesh.skin_offset) |offset| self.internal.skin_vertices.free(self, offset, mesh.vertex_count);
+        if (mesh.morph_offset) |offset| self.internal.morph_deltas.free(self, offset, mesh.vertex_count * mesh.morph_targets);
         if (mesh.blas) |blas| self.device.destroyAcceleration(blas);
         if (mesh.blas_building) |blas| self.device.destroyAcceleration(blas);
     }
     for (0..entry.meshes.len) |index| {
-        if (entry.mesh_base + index < self.mesh_boxes.items.len) self.mesh_boxes.items[entry.mesh_base + index] = null;
+        if (entry.mesh_base + index < self.internal.rays.mesh_boxes.items.len) self.internal.rays.mesh_boxes.items[entry.mesh_base + index] = null;
     }
     if (entry.source) |*source| {
         if (entry.transform_count != 0) {
             self.materials.pool.free(self, entry.transform_base, entry.transform_count * gpu.texture_transform_slots);
-            self.texture_transform_users -= 1;
+            self.internal.texture_transform_users -= 1;
             entry.transform_count = 0;
         }
-        if (entry.meshes.len != 0) self.meshes.free(self, entry.mesh_base, @intCast(source.meshes.len));
+        if (entry.meshes.len != 0) self.internal.meshes.free(self, entry.mesh_base, @intCast(source.meshes.len));
         if (entry.state == .ready) {
             for (source.materials) |material| self.materials.shader_users[if (material.shader < self.materials.shaders.len) material.shader else 0] -= 1;
             self.materials.pool.free(self, entry.material_base, @intCast(source.materials.len));

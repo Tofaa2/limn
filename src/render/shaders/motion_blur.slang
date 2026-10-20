@@ -1,14 +1,6 @@
 #include "common.slang"
 
-struct Push {
-    FrameConstants frame;
-    uint color_texture;
-    uint motion_texture;
-    float shutter;
-    float max_length;
-    int tap_count;
-    uint spread;
-};
+#include "motion_blur.Push.slang"
 
 [[vk::push_constant]] Push push;
 

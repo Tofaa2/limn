@@ -27,8 +27,8 @@ pub const Images = struct {
         const self = images.renderer();
         if (!self.device.caps.bc_textures) return self.images.create(.{ .width = width, .height = height, .pixels = pixels, .srgb = srgb });
         if (pixels.len != @as(usize, width) * height * 4) return error.InvalidTextureData;
-        const chain = try texture_codec.encodeBc7Chain(self.gpa, pixels, width, height, srgb);
-        defer self.gpa.free(chain);
+        const chain = try texture_codec.encodeBc7Chain(self.internal.gpa, pixels, width, height, srgb);
+        defer self.internal.gpa.free(chain);
         return createImageFromLevels(self, .{
             .width = width,
             .height = height,
@@ -70,7 +70,7 @@ pub const Images = struct {
     /// Decodes an image file to RGBA8. The pixels belong to `gpa`.
     pub fn readFile(images: *Images, gpa: std.mem.Allocator, path: []const u8) !png.Image {
         const self = images.renderer();
-        var decoded = try gltf.loadImage(self.gpa, self.io, path);
+        var decoded = try gltf.loadImage(self.internal.gpa, self.internal.io, path);
         defer decoded.deinit();
         return .{ .width = decoded.width, .height = decoded.height, .pixels = try gpa.dupe(u8, decoded.data) };
     }
@@ -80,14 +80,14 @@ pub const Images = struct {
     /// `error.UnsupportedTextureFormat` for a KTX2 cube, array or missing BC.
     pub fn load(images: *Images, path: []const u8) !Image {
         const self = images.renderer();
-        const bytes = try gltf.readFile(self.gpa, self.io, path);
-        defer self.gpa.free(bytes);
+        const bytes = try gltf.readFile(self.internal.gpa, self.internal.io, path);
+        defer self.internal.gpa.free(bytes);
         if (ktx2.isKtx2(bytes)) {
-            const texture = try ktx2.read(self.gpa, bytes);
-            defer self.gpa.free(texture.data);
+            const texture = try ktx2.read(self.internal.gpa, bytes);
+            defer self.internal.gpa.free(texture.data);
             return createImageFromLevels(self, texture);
         }
-        var decoded = try gltf.loadImage(self.gpa, self.io, path);
+        var decoded = try gltf.loadImage(self.internal.gpa, self.internal.io, path);
         defer decoded.deinit();
         return self.images.create(.{ .width = decoded.width, .height = decoded.height, .pixels = decoded.data, .srgb = true });
     }
@@ -96,9 +96,9 @@ pub const Images = struct {
     /// KTX2 file.
     pub fn writeKtx2(images: *Images, path: []const u8, width: u32, height: u32, pixels: []const u8, srgb: bool) !void {
         const self = images.renderer();
-        const chain = try texture_codec.encodeBc7Chain(self.gpa, pixels, width, height, srgb);
-        defer self.gpa.free(chain);
-        const file = try ktx2.write(self.gpa, .{
+        const chain = try texture_codec.encodeBc7Chain(self.internal.gpa, pixels, width, height, srgb);
+        defer self.internal.gpa.free(chain);
+        const file = try ktx2.write(self.internal.gpa, .{
             .width = width,
             .height = height,
             .format = .bc7,
@@ -106,8 +106,8 @@ pub const Images = struct {
             .levels = texture_codec.mipCount(width, height),
             .data = chain,
         });
-        defer self.gpa.free(file);
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = file });
+        defer self.internal.gpa.free(file);
+        try std.Io.Dir.cwd().writeFile(self.internal.io, .{ .sub_path = path, .data = file });
     }
 
     /// Makes a light profile from relative brightness values spread evenly
@@ -136,10 +136,10 @@ pub const Images = struct {
     /// fixture's axis, averaged around it.
     pub fn loadLightProfile(images: *Images, path: []const u8) !Image {
         const self = images.renderer();
-        const bytes = try gltf.readFile(self.gpa, self.io, path);
-        defer self.gpa.free(bytes);
-        const values = try parseIes(self.gpa, bytes);
-        defer self.gpa.free(values);
+        const bytes = try gltf.readFile(self.internal.gpa, self.internal.io, path);
+        defer self.internal.gpa.free(bytes);
+        const values = try parseIes(self.internal.gpa, bytes);
+        defer self.internal.gpa.free(values);
         return self.images.createLightProfile(values);
     }
 
@@ -174,7 +174,7 @@ pub const Images = struct {
 /// Lists `texture` as an image of the renderer's own.
 fn own(self: *Renderer, texture: rhi.Texture, index: u32, width: u32, height: u32) !Image {
     const id = self.images.next_id;
-    try self.images.list.append(self.gpa, .{ .texture = texture, .index = index, .id = id });
+    try self.images.list.append(self.internal.gpa, .{ .texture = texture, .index = index, .id = id });
     self.images.next_id +%= 1;
     if (self.images.next_id == 0) self.images.next_id = 1;
     return .{ .index = index, .width = width, .height = height, .id = id };

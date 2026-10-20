@@ -1,154 +1,14 @@
 const std = @import("std");
 const shader_gen = @import("src/render/core/shader_gen.zig");
 
-const Shader = struct {
-    src: []const u8,
-    name: []const u8,
-    defines: []const []const u8 = &.{},
-    /// The entry point to compile and its stage.
-    entry: []const u8,
-    stage: []const u8,
-    /// Skips `spirv_readonly` for a shader whose buffer reads timed faster
-    /// on the writable path.
-    writable_reads: bool = false,
-};
+const manifest = @import("src/render/shaders/manifest.zig");
+const Shader = manifest.Shader;
 
 /// Arguments every Slang shader is compiled with; `shaders.reload` uses the
 /// same ones.
 const slang_arguments = [_][]const u8{ "-profile", "spirv_1_5", "-target", "spirv", "-fvk-use-scalar-layout", "-matrix-layout-column-major", "-O2", "-warnings-disable", "39001,41012,41035" };
 
 const shader_dir = "src/render/shaders";
-
-const renderer_shaders: []const Shader = &.{
-    .{ .src = shader_dir ++ "/fullscreen.slang", .name = "fullscreen.vert.spv", .entry = "fullscreenMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/skin.slang", .name = "skin.comp.spv", .entry = "skinMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/skin.slang", .name = "skin_bounds.comp.spv", .entry = "boundsMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/instance_update.slang", .name = "instance_moves.comp.spv", .entry = "computeMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/instance_update.slang", .name = "instance_rewrites.comp.spv", .defines = &.{"REWRITE"}, .entry = "computeMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/cull.slang", .name = "cull.comp.spv", .entry = "meshletMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/cull.slang", .name = "cull_instances.comp.spv", .entry = "instanceMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/visibility.slang", .name = "visibility.task.spv", .entry = "geometryTaskMain", .stage = "amplification" },
-    .{ .src = shader_dir ++ "/visibility.slang", .name = "visibility.mesh.spv", .entry = "geometryMeshMain", .stage = "mesh" },
-    .{ .src = shader_dir ++ "/hiz.slang", .name = "hiz.comp.spv", .defines = &.{"STORAGE_IMAGES"}, .entry = "computeMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/cluster.slang", .name = "cluster.comp.spv", .entry = "computeMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/forward.slang", .name = "forward.vert.spv", .entry = "vertexMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/forward.slang", .name = "forward.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/forward.slang", .name = "forward_weighted.frag.spv", .defines = &.{"WEIGHTED"}, .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/forward.slang", .name = "forward_peel.frag.spv", .defines = &.{"PEEL"}, .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/hiz.slang", .name = "hiz.frag.spv", .entry = "rasterMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/gi_passes.slang", .name = "gi_trace.comp.spv", .entry = "traceMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/gi_passes.slang", .name = "gi_relocate.frag.spv", .entry = "relocateMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/gi_passes.slang", .name = "gi_gather.frag.spv", .entry = "gatherMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/gi_passes.slang", .name = "gi_clamp.frag.spv", .entry = "clampMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/gi_passes.slang", .name = "gi_irradiance.frag.spv", .entry = "updateMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/gi_passes.slang", .name = "gi_visibility.frag.spv", .defines = &.{"VISIBILITY"}, .entry = "updateMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/visibility.slang", .name = "visibility.vert.spv", .entry = "geometryVertexMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/visibility.slang", .name = "visibility.frag.spv", .entry = "visibilityMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/visibility.slang", .name = "visibility_masked.frag.spv", .defines = &.{"ALPHA_TEST"}, .entry = "visibilityMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/shadow.slang", .name = "shadow_masked.frag.spv", .entry = "maskedMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/shadow.slang", .name = "shadow_color.frag.spv", .entry = "colorMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/shade.slang", .name = "shade.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/shade.slang", .name = "shade_rt.frag.spv", .defines = &.{"RAY_TRACED"}, .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/shade.slang", .name = "shade_plain.frag.spv", .defines = &.{"PLAIN"}, .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/shade.slang", .name = "shade_rt_plain.frag.spv", .defines = &.{ "RAY_TRACED", "PLAIN" }, .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/ambient_occlusion.slang", .name = "ao_depth.frag.spv", .entry = "depthMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/ambient_occlusion.slang", .name = "gtao.frag.spv", .entry = "gtaoMain", .stage = "fragment", .writable_reads = true },
-    .{ .src = shader_dir ++ "/ambient_occlusion.slang", .name = "gtao_denoise.frag.spv", .entry = "denoiseMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/ambient_occlusion.slang", .name = "gtao_bounce_denoise.frag.spv", .defines = &.{"BOUNCE"}, .entry = "denoiseMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fog.slang", .name = "fog.frag.spv", .entry = "fogMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fog.slang", .name = "fog_composite.frag.spv", .entry = "compositeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/taa.slang", .name = "taa.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/bloom.slang", .name = "bloom_down.frag.spv", .entry = "downMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/bloom.slang", .name = "bloom_up.frag.spv", .entry = "upMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/exposure.slang", .name = "exposure.comp.spv", .entry = "computeMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/dof.slang", .name = "dof.frag.spv", .entry = "blurMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/dof.slang", .name = "dof_composite.frag.spv", .entry = "compositeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/motion_blur.slang", .name = "motion_blur.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/oit_composite.slang", .name = "oit_composite.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fullscreen.slang", .name = "copy.frag.spv", .entry = "copyMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/resolution.slang", .name = "upscale.frag.spv", .entry = "upscaleMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/shading_rate.slang", .name = "shading_rate.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/resolution.slang", .name = "fsr_easu.frag.spv", .entry = "easuMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/resolution.slang", .name = "fsr_rcas.frag.spv", .entry = "rcasMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/ssr.slang", .name = "ssr.frag.spv", .entry = "traceMain", .stage = "fragment", .writable_reads = true },
-    .{ .src = shader_dir ++ "/ssr.slang", .name = "ssr_rt.frag.spv", .defines = &.{"RAY_TRACED"}, .entry = "traceMain", .stage = "fragment", .writable_reads = true },
-    .{ .src = shader_dir ++ "/ssr.slang", .name = "ssr_composite.frag.spv", .entry = "compositeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/cloud_passes.slang", .name = "cloud_noise.frag.spv", .entry = "noiseMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/cloud_passes.slang", .name = "cloud.frag.spv", .entry = "marchMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/cloud_passes.slang", .name = "cloud_composite.frag.spv", .entry = "compositeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_advect.frag.spv", .entry = "advectMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_curl.frag.spv", .entry = "curlMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_force.frag.spv", .entry = "forceMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_divergence.frag.spv", .entry = "divergenceMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_pressure.frag.spv", .entry = "pressureMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_project.frag.spv", .entry = "projectMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_present.frag.spv", .entry = "presentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/water_passes.slang", .name = "water_sim.frag.spv", .entry = "simMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/water_passes.slang", .name = "water.vert.spv", .entry = "surfaceMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/water_passes.slang", .name = "water.frag.spv", .entry = "shadeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/water_passes.slang", .name = "underwater.frag.spv", .entry = "underwaterMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/water_passes.slang", .name = "water_rt.frag.spv", .defines = &.{"RAY_TRACED"}, .entry = "shadeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/liquid.slang", .name = "liquid_sim.comp.spv", .entry = "simMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/liquid.slang", .name = "liquid.vert.spv", .entry = "sphereVertexMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/liquid.slang", .name = "liquid_depth.frag.spv", .entry = "sphereDepthMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/liquid.slang", .name = "liquid_shadow.vert.spv", .entry = "shadowVertexMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/liquid.slang", .name = "liquid_shadow.frag.spv", .entry = "shadowFragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/liquid.slang", .name = "liquid_surface.frag.spv", .entry = "surfaceMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/pathtrace_denoise.slang", .name = "pathtrace_denoise.frag.spv", .entry = "denoiseMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/ffx_reflections.slang", .name = "ffx_reflections_reproject.frag.spv", .entry = "reprojectMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/ffx_reflections.slang", .name = "ffx_reflections_average.frag.spv", .entry = "averageMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/ffx_reflections.slang", .name = "ffx_reflections_prefilter.frag.spv", .entry = "prefilterMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/ffx_reflections.slang", .name = "ffx_reflections_resolve.frag.spv", .entry = "resolveMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace.frag.spv", .defines = &.{"SOFTWARE_RAYS"}, .entry = "fragmentMain", .stage = "fragment", .writable_reads = true },
-    .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace_rt.frag.spv", .entry = "fragmentMain", .stage = "fragment", .writable_reads = true },
-    .{ .src = shader_dir ++ "/pathtrace_denoise.slang", .name = "pathtrace_gather.frag.spv", .entry = "gatherMain", .stage = "fragment", .writable_reads = true },
-    .{ .src = shader_dir ++ "/pathtrace_denoise.slang", .name = "nrd_pack.frag.spv", .entry = "nrdPackMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/pathtrace_denoise.slang", .name = "nrd_compose.frag.spv", .entry = "nrdComposeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace.comp.spv", .defines = &.{ "SOFTWARE_RAYS", "STORAGE_IMAGES" }, .entry = "computeMain", .stage = "compute", .writable_reads = true },
-    .{ .src = shader_dir ++ "/pathtrace.slang", .name = "pathtrace_rt.comp.spv", .defines = &.{"STORAGE_IMAGES"}, .entry = "computeMain", .stage = "compute", .writable_reads = true },
-    .{ .src = shader_dir ++ "/liquid.slang", .name = "liquid_thickness.frag.spv", .entry = "sphereThicknessMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/liquid.slang", .name = "liquid_blur.frag.spv", .entry = "blurMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/liquid.slang", .name = "liquid.frag.spv", .entry = "shadeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_solid.frag.spv", .entry = "solidMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_solid_rt.frag.spv", .defines = &.{"RAY_TRACED"}, .entry = "solidMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_carry.frag.spv", .entry = "carryMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid.frag.spv", .entry = "volumeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_motion.frag.spv", .entry = "motionMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/pick.slang", .name = "pick.comp.spv", .entry = "computeMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/fluid_passes.slang", .name = "fluid_light.comp.spv", .entry = "lightMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/particles.slang", .name = "particle_sim.comp.spv", .entry = "simMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/particles.slang", .name = "particle_sort_keys.comp.spv", .entry = "sortKeysMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/particles.slang", .name = "particle_sort.comp.spv", .entry = "sortMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/particles.slang", .name = "particle.vert.spv", .entry = "spriteVertexMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/particles.slang", .name = "particle_trail.vert.spv", .entry = "trailVertexMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/impostor_passes.slang", .name = "impostor.vert.spv", .entry = "drawMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/impostor_passes.slang", .name = "impostor.frag.spv", .entry = "shadeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/impostor_passes.slang", .name = "impostor_bake.vert.spv", .entry = "bakeVertexMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/impostor_passes.slang", .name = "impostor_bake.frag.spv", .entry = "bakeFragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/lightmap.slang", .name = "lightmap_bake.vert.spv", .entry = "bakeVertexMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/lightmap.slang", .name = "lightmap_bake.frag.spv", .entry = "bakeFragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/lightmap.slang", .name = "lightmap_dilate.frag.spv", .entry = "dilateMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/vsm_passes.slang", .name = "vsm_mark.comp.spv", .entry = "markMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/vsm_passes.slang", .name = "vsm_allocate.comp.spv", .entry = "allocateMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/vsm_passes.slang", .name = "vsm_clear.vert.spv", .entry = "clearMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/hair.slang", .name = "hair_sim.comp.spv", .entry = "simMain", .stage = "compute" },
-    .{ .src = shader_dir ++ "/hair.slang", .name = "hair_shadow.vert.spv", .entry = "shadowMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/hair.slang", .name = "hair.vert.spv", .entry = "strandMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/hair.slang", .name = "hair.frag.spv", .entry = "shadeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/particles.slang", .name = "particle_mesh.vert.spv", .entry = "meshVertexMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/particles.slang", .name = "particle_mesh.frag.spv", .entry = "meshFragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/particles.slang", .name = "particle.frag.spv", .entry = "spriteFragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/tonemap.slang", .name = "tonemap.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/edge_antialiasing.slang", .name = "edge_antialiasing.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/draw.slang", .name = "draw.vert.spv", .entry = "vertexMain", .stage = "vertex" },
-    .{ .src = shader_dir ++ "/draw.slang", .name = "draw.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/environment.slang", .name = "env_cube.frag.spv", .entry = "cubeMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/environment.slang", .name = "probe_face.frag.spv", .entry = "probeFaceMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/environment.slang", .name = "env_sky.frag.spv", .entry = "skyMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/environment.slang", .name = "env_irradiance.frag.spv", .entry = "irradianceMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/environment.slang", .name = "env_prefilter.frag.spv", .entry = "prefilterMain", .stage = "fragment" },
-    .{ .src = shader_dir ++ "/environment.slang", .name = "brdf_lut.frag.spv", .entry = "brdfLutMain", .stage = "fragment" },
-};
 
 const Example = struct {
     name: []const u8,
@@ -460,6 +320,7 @@ pub fn build(b: *std.Build) void {
     renderer.addImport("font_baker", font_baker);
     const generated_shaders = b.addWriteFiles();
     _ = generated_shaders.add("frame_constants.slang", shader_gen.frame_slang);
+    for (shader_gen.push_files) |file| _ = generated_shaders.add(file.name, file.text);
     const generated_dir = generated_shaders.getDirectory();
     const spirv_readonly = b.addExecutable(.{
         .name = "spirv_readonly",
@@ -469,16 +330,16 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    addShaders(b, renderer, renderer_shaders, shaders_step, generated_dir, spirv_readonly);
+    addShaders(b, renderer, manifest.renderer, shaders_step, generated_dir, spirv_readonly);
     const shader_reload = b.option(bool, "shader_reload", "Keep the shader source paths in the library for `shaders.reload` (default: Debug only)") orelse (optimize == .Debug);
     const shader_options = b.addOptions();
-    var shader_names: [renderer_shaders.len][]const u8 = undefined;
-    var shader_sources: [renderer_shaders.len][]const u8 = undefined;
-    var shader_defines: [renderer_shaders.len][]const u8 = undefined;
-    var shader_entries: [renderer_shaders.len][]const u8 = undefined;
-    var shader_stages: [renderer_shaders.len][]const u8 = undefined;
-    var shader_read_only: [renderer_shaders.len]bool = undefined;
-    for (renderer_shaders, 0..) |shader, index| {
+    var shader_names: [manifest.renderer.len][]const u8 = undefined;
+    var shader_sources: [manifest.renderer.len][]const u8 = undefined;
+    var shader_defines: [manifest.renderer.len][]const u8 = undefined;
+    var shader_entries: [manifest.renderer.len][]const u8 = undefined;
+    var shader_stages: [manifest.renderer.len][]const u8 = undefined;
+    var shader_read_only: [manifest.renderer.len]bool = undefined;
+    for (manifest.renderer, 0..) |shader, index| {
         shader_names[index] = shader.name;
         shader_sources[index] = if (shader_reload) b.pathFromRoot(shader.src) else "";
         shader_defines[index] = "";

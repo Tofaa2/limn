@@ -20,6 +20,18 @@ const packTint = renderer_state.packTint;
 pub const Instances = struct {
     table: handle.HandleTable(renderer_state.InstanceGroupData, api.InstanceGroupTag),
 
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.InstanceGroupData) void {
+        if (entry.impostor) |impostor| {
+            owner.device.destroyTexture(impostor.color);
+            owner.device.destroyTexture(impostor.normal);
+        }
+        owner.internal.gpa.free(entry.transforms);
+        owner.internal.gpa.free(entry.tints);
+        owner.internal.gpa.free(entry.params);
+        if (owner.models.table.get(entry.model)) |model| model.references -= 1;
+    }
+
     fn renderer(instances: *Instances) *Renderer {
         return @alignCast(@fieldParentPtr("instances", instances));
     }
@@ -33,11 +45,11 @@ pub const Instances = struct {
         defer self.unlock();
         const scene_data = self.scenes.table.get(scene) orelse return error.InvalidScene;
         const entry = self.models.table.get(model) orelse return error.InvalidModel;
-        const copy = try self.gpa.dupe(Mat4, transforms);
-        errdefer self.gpa.free(copy);
+        const copy = try self.internal.gpa.dupe(Mat4, transforms);
+        errdefer self.internal.gpa.free(copy);
         const group = try self.instances.table.insert(.{ .scene = scene, .model = model, .transforms = copy });
         errdefer _ = self.instances.table.remove(group);
-        try scene_data.groups.append(self.gpa, group);
+        try scene_data.groups.append(self.internal.gpa, group);
         entry.references += 1;
         scene_data.layout_dirty = true;
         return group;
@@ -55,8 +67,8 @@ pub const Instances = struct {
             scene.static_version += 1;
             return;
         }
-        const copy = try self.gpa.dupe(Mat4, transforms);
-        self.gpa.free(data.transforms);
+        const copy = try self.internal.gpa.dupe(Mat4, transforms);
+        self.internal.gpa.free(data.transforms);
         data.transforms = copy;
         scene.layout_dirty = true;
     }
@@ -70,9 +82,9 @@ pub const Instances = struct {
         const data = self.instances.table.get(group) orelse return;
         const scene = self.scenes.table.get(data.scene) orelse return;
         if (colors.len != 0 and colors.len != data.transforms.len) return error.ColorCountMismatch;
-        const tints = try self.gpa.alloc(u32, colors.len);
+        const tints = try self.internal.gpa.alloc(u32, colors.len);
         for (tints, colors) |*tint, color| tint.* = packTint(color);
-        self.gpa.free(data.tints);
+        self.internal.gpa.free(data.tints);
         data.tints = tints;
         scene.static_version += 1;
     }
@@ -86,8 +98,8 @@ pub const Instances = struct {
         const data = self.instances.table.get(group) orelse return;
         const scene = self.scenes.table.get(data.scene) orelse return;
         if (params.len != 0 and params.len != data.transforms.len) return error.ParamCountMismatch;
-        const copy = try self.gpa.dupe([4]f32, params);
-        self.gpa.free(data.params);
+        const copy = try self.internal.gpa.dupe([4]f32, params);
+        self.internal.gpa.free(data.params);
         data.params = copy;
         scene.static_version += 1;
     }
@@ -134,20 +146,6 @@ pub const Instances = struct {
         const self = instances.renderer();
         self.lock();
         defer self.unlock();
-        const removed = self.instances.table.remove(group) orelse return;
-        if (removed.impostor) |impostor| {
-            self.device.destroyTexture(impostor.color);
-            self.device.destroyTexture(impostor.normal);
-        }
-        self.gpa.free(removed.transforms);
-        self.gpa.free(removed.tints);
-        self.gpa.free(removed.params);
-        if (self.models.table.get(removed.model)) |model| model.references -= 1;
-        const scene = self.scenes.table.get(removed.scene) orelse return;
-        for (scene.groups.items, 0..) |item, index| if (std.meta.eql(item, group)) {
-            _ = scene.groups.orderedRemove(index);
-            break;
-        };
-        scene.layout_dirty = true;
+        render.destroyObject(self, "instances", "groups", group);
     }
 };

@@ -337,6 +337,8 @@ pub const ComputePipelineDesc = struct {
     name: [:0]const u8 = "compute pipeline",
     /// SPIR-V bytes, entry point `main`.
     shader: []const u8,
+    /// Specialization constants, by constant id from 0.
+    constants: []const u32 = &.{},
 };
 
 /// What a texture is about to be used for; the encoder derives layout
@@ -467,6 +469,27 @@ pub const Capabilities = struct {
     nvidia_ngx: bool = false,
     /// Largest width or height of a 2D texture.
     max_texture_size: u32 = 0,
+    /// Largest width, height or depth of a 3D texture.
+    max_volume_size: u32 = 0,
+    max_texture_layers: u32 = 0,
+    /// Invocations in one compute workgroup.
+    max_workgroup_size: u32 = 0,
+    /// Workgroups in one dispatch, each way.
+    max_workgroups: [3]u32 = .{ 0, 0, 0 },
+    /// What each format can be used for, in optimal tiling.
+    formats: std.EnumArray(Format, FormatSupport) = .initFill(.{}),
+};
+
+/// The uses of one texture format a device supports.
+pub const FormatSupport = struct {
+    sampled: bool = false,
+    /// Sampled with linear filtering.
+    filtered: bool = false,
+    color_attachment: bool = false,
+    /// A color attachment that blends.
+    blended: bool = false,
+    depth_attachment: bool = false,
+    storage: bool = false,
 };
 
 /// From `Device.adapterInfo`.
@@ -489,7 +512,9 @@ pub const MemoryStats = struct {
 };
 
 /// Positions are three floats at the start of each vertex.
-pub const BlasDesc = struct {
+/// Triangles of a bottom-level structure. Shaders see the place of a
+/// geometry in `BlasDesc.geometries` as the geometry index of a hit.
+pub const BlasGeometry = struct {
     /// Needs `acceleration_input` usage.
     vertices: Buffer,
     vertex_offset: u64 = 0,
@@ -501,11 +526,32 @@ pub const BlasDesc = struct {
     index_offset: u64 = 0,
     /// Three per triangle.
     index_count: u32,
-    /// Rebuilt every frame: built for speed, scratch memory kept.
-    dynamic: bool = false,
     /// False sends every ray that meets the geometry through the shader's
     /// candidate test, as alpha tested surfaces need.
     solid: bool = true,
+};
+
+pub const BlasDesc = struct {
+    /// At most `max_blas_geometries`; a structure is always built from the
+    /// same number, each with the triangle count it was created for.
+    geometries: []const BlasGeometry,
+    /// Rebuilt every frame: built for speed, scratch memory kept.
+    dynamic: bool = false,
+};
+
+pub const max_blas_geometries = 16;
+
+/// One structure of a `CommandEncoder.buildBlases` batch.
+pub const BlasBuild = struct {
+    blas: AccelerationStructure,
+    desc: BlasDesc,
+};
+
+pub const TlasDesc = struct {
+    max_instances: u32,
+    /// Built so that `CommandEncoder.updateTlas` can move instances
+    /// without a full rebuild, at some cost to tracing.
+    updatable: bool = false,
 };
 
 /// Layout of `VkAccelerationStructureInstanceKHR`.

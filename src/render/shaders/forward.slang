@@ -1,12 +1,9 @@
 #include "common.slang"
 #include "shading.slang"
 
-struct VertexPush {
-    FrameConstants frame;
-    uint instance_index;
-};
+#include "forward.ForwardPush.slang"
 
-[[vk::push_constant]] VertexPush vertex_push;
+[[vk::push_constant]] ForwardPush vertex_push;
 
 struct Varyings {
     [[vk::location(0)]] float3 position;
@@ -47,16 +44,8 @@ Varyings vertexMain(uint vertex_index : SV_VulkanVertexID) {
     return result;
 }
 
-struct FragmentPush {
-    FrameConstants frame;
-    uint instance_index;
-    uint mode;
-    uint scene_texture;
-    uint opaque_depth;
-    uint peel_depth;
-};
 
-[[vk::push_constant]] FragmentPush fragment_push;
+[[vk::push_constant]] ForwardPush fragment_push;
 
 struct Output {
     float4 color : SV_Target0;
@@ -144,7 +133,7 @@ Output fragmentMain(
     }
 
     DECAL_LOOP_BEGIN(in_position, fragment.xy)
-        Decal decal = frame.decals.data[i];
+        Decal decal = frame.shading.decals.data[i];
         float3 local = (mul(decal.world_to_decal, float4(in_position, 1.0))).xyz;
         if (any((abs(local) > float3(0.5)))) continue;
         float3 axis = normalize(float3(decal.world_to_decal[2][0], decal.world_to_decal[2][1], decal.world_to_decal[2][2]));
@@ -213,7 +202,7 @@ Output fragmentMain(
         color += behind * base_color.rgb * through;
         coverage += through;
     }
-    if (frame.aerial != 0.0 && (frame.flags & FRAME_ENVIRONMENT) != 0u) {
+    if (frame.shading.aerial != 0.0 && frame.environment != 0u) {
         float3 air_through;
         float3 air;
         aerialHaze(frame, surface.view, length(in_position - eyePoint(frame, in_position)), air_through, air);

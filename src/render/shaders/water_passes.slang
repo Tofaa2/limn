@@ -2,9 +2,7 @@
 #include "common.slang"
 #include "shading.slang"
 
-struct SimPush {
-    WaterRef water;
-};
+#include "water_passes.SimPush.slang"
 
 [[vk::push_constant]] SimPush sim_push;
 
@@ -36,13 +34,7 @@ float4 simMain(float4 fragment : SV_Position) : SV_Target {
     return float4(height, velocity, 0.0, 0.0);
 }
 
-struct SurfacePush {
-    FrameConstants frame;
-    WaterRef water;
-    uint depth_texture;
-    uint scene_texture;
-    uint quads;
-};
+#include "water_passes.SurfacePush.slang"
 
 [[vk::push_constant]] SurfacePush surface_push;
 
@@ -67,13 +59,7 @@ Varyings surfaceMain(uint vertex : SV_VulkanVertexID) {
     return result;
 }
 
-struct ShadePush {
-    FrameConstants frame;
-    WaterRef water;
-    uint depth_texture;
-    uint scene_texture;
-    uint quads;
-};
+#include "water_passes.ShadePush.slang"
 
 [[vk::push_constant]] ShadePush shade_push;
 
@@ -135,7 +121,7 @@ ShadeOutput shadeMain(
     float3 tint = water.color / max(max(water.color.r, water.color.g), max(water.color.b, 1.0e-4));
     float3 clear = exp(-looked_through * water.murk * (float3(1.25) - tint));
     float3 ambient = float3(0.0);
-    if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
+    if (frame.environment != 0u)
         ambient = sampleCubeLod(frame.env_irradiance, linear, float3(0.0, 1.0, 0.0), 0.0).rgb * frame.env_intensity;
     float sun_shadow = sunShadow(frame, in_position, normal, 1.0, surface_distance, 0.5);
     float3 body = water.color * (ambient + frame.sun_radiance * max(frame.sun_direction.y, 0.0) * sun_shadow * 0.3);
@@ -146,8 +132,8 @@ ShadeOutput shadeMain(
     float3 reflected = float3(0.0);
     bool found = false;
 #ifdef RAY_TRACED
-    if ((frame.tlas_low | frame.tlas_high) != 0u) {
-        uint64_t tlas = uint64_t(frame.tlas_low) | (uint64_t(frame.tlas_high) << 32);
+    if ((frame.shadows.tlas_low | frame.shadows.tlas_high) != 0u) {
+        uint64_t tlas = uint64_t(frame.shadows.tlas_low) | (uint64_t(frame.shadows.tlas_high) << 32);
         Tracer tracer;
         tracer.frame = frame;
         tracer.scene = tlas;
@@ -156,7 +142,7 @@ ShadeOutput shadeMain(
         if (found) reflected = throughFluids(frame, in_position, mirror, seen.distance, seen.radiance);
     }
 #endif
-    if (!found && (frame.flags & FRAME_ENVIRONMENT) != 0u)
+    if (!found && frame.environment != 0u)
         reflected = sampleCubeLod(frame.env_specular, linear, mirror, water.roughness * (frame.env_specular_mips - 1.0)).rgb * frame.env_intensity;
 
     if (dot(flat_normal, view) < 0.0) {
@@ -197,12 +183,7 @@ ShadeOutput shadeMain(
     return result;
 }
 
-struct UnderwaterPush {
-    FrameConstants frame;
-    WaterRef water;
-    uint depth_texture;
-    uint scene_texture;
-};
+#include "water_passes.UnderwaterPush.slang"
 
 [[vk::push_constant]] UnderwaterPush underwater_push;
 
@@ -234,7 +215,7 @@ UnderwaterOutput underwaterMain(
 
     if (in_water) scene *= lerp(1.0, waterCaustic(water, world, frame.sun_direction, frame.time), sunShadow(frame, world, up, 1.0, reach, 0.5));
     float3 ambient = float3(0.0);
-    if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
+    if (frame.environment != 0u)
         ambient = sampleCubeLod(frame.env_irradiance, frame.sampler_linear_clamp, float3(0.0, 1.0, 0.0), 0.0).rgb * frame.env_intensity;
     float3 body = water.color * (ambient + frame.sun_radiance * max(frame.sun_direction.y, 0.0) * 0.3);
     result.color = float4(lerp(body, scene, exp(-through * water.murk)), 1.0);

@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
 
-    const studio = try renderer.environments.load("examples/assets/studio_small_03_1k.hdr", .{ .max_radiance = 64 });
+    const studio = try renderer.environments.load(.{ .path = "examples/assets/studio_small_03_1k.hdr", .max_radiance = 64 });
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.6, -0.45 } };
     const sky = try renderer.environments.createSky(sky_desc);
     var outdoors = false;

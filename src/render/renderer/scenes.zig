@@ -39,6 +39,11 @@ const freeProbe = @import("probes.zig").freeProbe;
 pub const Scenes = struct {
     table: handle.HandleTable(renderer_state.SceneData, api.SceneTag),
 
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.SceneData) void {
+        freeScene(owner, entry);
+    }
+
     fn renderer(scenes: *Scenes) *Renderer {
         return @alignCast(@fieldParentPtr("scenes", scenes));
     }
@@ -79,8 +84,9 @@ pub const Scenes = struct {
         defer self.unlock();
         const data = self.scenes.table.get(scene) orelse return;
         if (decals.len > max_decals) return error.TooManyDecals;
+        self.decals.forget(data);
         data.decals.clearRetainingCapacity();
-        try data.decals.appendSlice(self.gpa, decals);
+        try data.decals.appendSlice(self.internal.gpa, decals);
     }
 
     /// Creates an empty scene: no entities or lights, sun off, no
@@ -100,7 +106,7 @@ pub const Scenes = struct {
         var removed = self.scenes.table.remove(scene) orelse return;
         for (removed.entities.items) |entity| {
             const data = self.entities.table.remove(entity) orelse continue;
-            self.entity_marks.items[entity.index] = .{};
+            self.internal.entity_marks.items[entity.index] = .{};
             if (self.models.table.get(data.model)) |model| model.references -= 1;
             freeEntityStorage(self, data);
         }
@@ -143,8 +149,9 @@ pub const Scenes = struct {
         self.lock();
         defer self.unlock();
         const data = self.scenes.table.get(scene) orelse return;
+        self.lights.forget(data);
         data.lights.clearRetainingCapacity();
-        try data.lights.appendSlice(self.gpa, lights);
+        try data.lights.appendSlice(self.internal.gpa, lights);
         data.lights_version += 1;
     }
 
@@ -160,8 +167,8 @@ pub const Scenes = struct {
         for (data.entities.items) |item| {
             if (self.markOf(item) == null) continue;
             inline for (0..3) |axis| {
-                self.entity_transforms.items[item.index][12 + axis] += offset[axis];
-                self.entity_previous.items[item.index][12 + axis] += offset[axis];
+                self.internal.entity_transforms.items[item.index][12 + axis] += offset[axis];
+                self.internal.entity_previous.items[item.index][12 + axis] += offset[axis];
             }
         }
         data.records_valid = false;
@@ -219,69 +226,73 @@ pub const Scenes = struct {
 };
 
 pub fn freeScene(self: *Renderer, scene: *SceneData) void {
-    scene.entities.deinit(self.gpa);
-    scene.lights.deinit(self.gpa);
-    scene.shadow_grants.deinit(self.gpa);
+    scene.entities.deinit(self.internal.gpa);
+    self.lights.forget(scene);
+    scene.lights.deinit(self.internal.gpa);
+    scene.light_handles.deinit(self.internal.gpa);
+    scene.shadow_grants.deinit(self.internal.gpa);
     for (scene.emitters.items) |emitter| if (self.emitters.table.remove(emitter)) |removed| {
         self.device.destroyBuffer(removed.buffer);
         if (removed.order) |order| self.device.destroyBuffer(order);
         if (removed.trail) |trail| self.device.destroyBuffer(trail);
     };
-    scene.emitters.deinit(self.gpa);
+    scene.emitters.deinit(self.internal.gpa);
     for (scene.probes.items) |probe| if (self.probes.table.remove(probe)) |removed_probe| {
         var removed = removed_probe;
         freeProbe(self, &removed);
     };
-    scene.probes.deinit(self.gpa);
+    scene.probes.deinit(self.internal.gpa);
     for (scene.fluids.items) |fluid| if (self.fluids.table.remove(fluid)) |removed| {
         var state = removed;
         destroyFluidTextures(self, &state);
     };
-    scene.fluids.deinit(self.gpa);
+    scene.fluids.deinit(self.internal.gpa);
     for (scene.waters.items) |water| if (self.waters.table.remove(water)) |removed| {
         for (removed.state) |texture| self.device.destroyTexture(texture);
     };
-    scene.waters.deinit(self.gpa);
+    scene.waters.deinit(self.internal.gpa);
     for (scene.hairs.items) |hair| if (self.hairs.table.remove(hair)) |removed| freeHair(self, removed);
-    scene.hairs.deinit(self.gpa);
+    scene.hairs.deinit(self.internal.gpa);
     for (scene.liquids.items) |liquid| if (self.liquids.table.remove(liquid)) |removed_liquid| {
         var removed = removed_liquid;
         removed.deinit(self.device);
     };
-    scene.liquids.deinit(self.gpa);
+    scene.liquids.deinit(self.internal.gpa);
     if (scene.trace_nodes) |buffer| self.device.destroyBuffer(buffer);
     if (scene.trace_instances) |buffer| self.device.destroyBuffer(buffer);
-    scene.decals.deinit(self.gpa);
-    scene.movers.deinit(self.gpa);
+    self.decals.forget(scene);
+    scene.decals.deinit(self.internal.gpa);
+    scene.decal_handles.deinit(self.internal.gpa);
+    scene.movers.deinit(self.internal.gpa);
     for (scene.groups.items) |group| if (self.instances.table.remove(group)) |removed| {
         if (removed.impostor) |impostor| {
             self.device.destroyTexture(impostor.color);
             self.device.destroyTexture(impostor.normal);
         }
-        self.gpa.free(removed.transforms);
-        self.gpa.free(removed.tints);
-        self.gpa.free(removed.params);
+        self.internal.gpa.free(removed.transforms);
+        self.internal.gpa.free(removed.tints);
+        self.internal.gpa.free(removed.params);
         if (self.models.table.get(removed.model)) |model| model.references -= 1;
     };
-    scene.groups.deinit(self.gpa);
-    scene.static_tlas.deinit(self.gpa);
+    scene.groups.deinit(self.internal.gpa);
+    scene.static_tlas.deinit(self.internal.gpa);
     for (scene.instance_slots) |slot| if (slot.buffer) |buffer| self.device.destroyBuffer(buffer);
-    scene.transparent.deinit(self.gpa);
-    scene.static_transparent.deinit(self.gpa);
-    scene.layout.deinit(self.gpa);
-    scene.posed.deinit(self.gpa);
-    scene.entries.deinit(self.gpa);
-    scene.spheres.deinit(self.gpa);
-    scene.blended.deinit(self.gpa);
-    scene.glowing.deinit(self.gpa);
-    scene.chunk_bounds.deinit(self.gpa);
-    scene.chunk_stale.deinit(self.gpa);
-    scene.edited.deinit(self.gpa);
-    scene.settling.deinit(self.gpa);
+    scene.transparent.deinit(self.internal.gpa);
+    scene.static_transparent.deinit(self.internal.gpa);
+    scene.layout.deinit(self.internal.gpa);
+    scene.posed.deinit(self.internal.gpa);
+    scene.entries.deinit(self.internal.gpa);
+    scene.spheres.deinit(self.internal.gpa);
+    scene.blended.deinit(self.internal.gpa);
+    scene.glowing.deinit(self.internal.gpa);
+    scene.chunk_bounds.deinit(self.internal.gpa);
+    scene.chunk_stale.deinit(self.internal.gpa);
+    scene.edited.deinit(self.internal.gpa);
+    scene.settling.deinit(self.internal.gpa);
     if (scene.previous) |buffer| self.device.destroyBuffer(buffer);
     if (scene.tlas_instances) |buffer| self.device.destroyBuffer(buffer);
     if (scene.refs) |buffer| self.device.destroyBuffer(buffer);
-    scene.static_ranges.deinit(self.gpa);
+    scene.static_ranges.deinit(self.internal.gpa);
     if (scene.static_cull) |buffer| self.device.destroyBuffer(buffer);
     if (scene.impostor_table) |buffer| self.device.destroyBuffer(buffer);
     if (scene.impostor_list) |buffer| self.device.destroyBuffer(buffer);
@@ -298,6 +309,11 @@ pub fn freeScene(self: *Renderer, scene: *SceneData) void {
 /// Placements of models in scenes.
 pub const Entities = struct {
     table: handle.HandleTable(renderer_state.EntityData, api.EntityTag),
+
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.EntityData) void {
+        freeEntityStorage(owner, entry.*);
+    }
 
     fn renderer(entities: *Entities) *Renderer {
         return @alignCast(@fieldParentPtr("entities", entities));
@@ -322,8 +338,8 @@ pub const Entities = struct {
         });
         errdefer _ = self.entities.table.remove(entity);
         try self.markEntity(entity, scene, desc.transform);
-        errdefer self.entity_marks.items[entity.index] = .{};
-        try scene_data.entities.append(self.gpa, entity);
+        errdefer self.internal.entity_marks.items[entity.index] = .{};
+        try scene_data.entities.append(self.internal.gpa, entity);
         model.references += 1;
         scene_data.layout_dirty = true;
         return entity;
@@ -336,7 +352,7 @@ pub const Entities = struct {
         self.lock();
         defer self.unlock();
         const data = self.entities.table.remove(entity) orelse return;
-        self.entity_marks.items[entity.index] = .{};
+        self.internal.entity_marks.items[entity.index] = .{};
         if (self.scenes.table.get(data.scene)) |scene| {
             for (scene.entities.items, 0..) |candidate, index| if (std.meta.eql(candidate, entity)) {
                 _ = scene.entities.orderedRemove(index);
@@ -495,22 +511,22 @@ pub fn freeEntityStorage(self: *Renderer, entity: EntityData) void {
     if (self.models.table.get(entity.model)) |model| {
         if (model.source) |source| for (entity.skin_offsets, 0..) |offset, index| {
             if (offset == no_skin) continue;
-            self.vertices.free(self, offset, model.meshes[source.instances[index].mesh].vertex_count * 2);
+            self.internal.vertices.free(self, offset, model.meshes[source.instances[index].mesh].vertex_count * 2);
         };
     }
-    self.gpa.free(entity.skin_offsets);
+    self.internal.gpa.free(entity.skin_offsets);
     for (entity.skin_blas) |blas| if (blas) |value| self.device.destroyAcceleration(value);
-    self.gpa.free(entity.skin_blas);
-    self.gpa.free(entity.bounds_offsets);
-    self.gpa.free(entity.node_world);
-    self.gpa.free(entity.previous_node_world);
+    self.internal.gpa.free(entity.skin_blas);
+    self.internal.gpa.free(entity.bounds_offsets);
+    self.internal.gpa.free(entity.node_world);
+    self.internal.gpa.free(entity.previous_node_world);
 }
 
 /// Allocates per-entity animation state once its model is ready.
 pub fn resolveEntity(self: *Renderer, entity: *EntityData, model: *ModelEntry) !void {
     if (entity.resolved) return;
     const source = &model.source.?;
-    const gpa = self.gpa;
+    const gpa = self.internal.gpa;
     if (source.skins.len != 0 or source.animations.len != 0) {
         entity.node_world = try gpa.dupe(Mat4, model.node_world);
         entity.previous_node_world = try gpa.dupe(Mat4, model.node_world);
@@ -524,7 +540,7 @@ pub fn resolveEntity(self: *Renderer, entity: *EntityData, model: *ModelEntry) !
     for (source.instances, entity.skin_offsets) |instance, *offset| {
         const mesh = model.meshes[instance.mesh];
         if (instance.skin == null or mesh.skin_offset == null) continue;
-        offset.* = try self.vertices.alloc(self, mesh.vertex_count * 2);
+        offset.* = try self.internal.vertices.alloc(self, mesh.vertex_count * 2);
     }
     entity.history_frames = 0;
     entity.resolved = true;

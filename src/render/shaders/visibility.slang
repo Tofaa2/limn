@@ -1,9 +1,7 @@
 #include "common.slang"
 #include "visibility_page.slang"
 
-struct VisibilityPush {
-    FrameConstants frame;
-};
+#include "visibility.VisibilityPush.slang"
 
 [[vk::push_constant]] VisibilityPush visibility_push;
 
@@ -17,7 +15,7 @@ uint visibilityMain(
     uint primitive : SV_PrimitiveID) : SV_Target {
 #ifdef ALPHA_TEST
     if (in_fade.x < 1.0 || in_fade.y > 0.0) {
-        float noise = interleavedGradientNoise(fragment.xy, (visibility_push.frame.flags & FRAME_TEMPORAL) != 0u ? visibility_push.frame.frame_index : 0u);
+        float noise = interleavedGradientNoise(fragment.xy, visibility_push.frame.temporal != 0u ? visibility_push.frame.frame_index : 0u);
         if (noise >= in_fade.x || noise < in_fade.y) discard;
     }
     Material material = visibility_push.frame.materials.data[in_material];
@@ -42,23 +40,7 @@ struct MeshletTasks {
     uint entries[meshlets_per_task * 2u];
 };
 
-struct GeometryPush {
-    FrameConstants frame;
-    /// 1 in a shadow pass whose translucent casters go into the tint pass.
-    uint tinted;
-    /// Nonzero when `page` supplies the view.
-    uint paged;
-    float4x4 view_proj;
-    /// LOD cross-fade, main camera pass only: LOD camera (xyz), error-to-pixels
-    /// scale (w), band width (1 for none) and near plane.
-    float4 lod;
-    float lod_band;
-    float lod_near;
-    /// Meshlet references written by cull.slang, and their count.
-    uint* list;
-    uint* count;
-    VisibilityPage page;
-};
+#include "visibility.GeometryPush.slang"
 
 [[vk::push_constant]] GeometryPush geometry_push;
 

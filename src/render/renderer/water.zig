@@ -21,6 +21,12 @@ const destroyEmitterLocked = @import("emitters.zig").destroyEmitterLocked;
 pub const Waters = struct {
     table: handle.HandleTable(renderer_state.WaterState, api.WaterTag),
 
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.WaterState) void {
+        if (entry.splash) |emitter| destroyEmitterLocked(owner, emitter);
+        for (entry.state) |texture| owner.device.destroyTexture(texture);
+    }
+
     fn renderer(waters: *Waters) *Renderer {
         return @alignCast(@fieldParentPtr("waters", waters));
     }
@@ -39,7 +45,7 @@ pub const Waters = struct {
         errdefer for (state.state) |texture| self.device.destroyTexture(texture);
         const water = try self.waters.table.insert(state);
         errdefer _ = self.waters.table.remove(water);
-        try data.waters.append(self.gpa, water);
+        try data.waters.append(self.internal.gpa, water);
         return water;
     }
 
@@ -94,14 +100,7 @@ pub const Waters = struct {
         const self = waters.renderer();
         self.lock();
         defer self.unlock();
-        const removed = self.waters.table.remove(water) orelse return;
-        if (removed.splash) |emitter| destroyEmitterLocked(self, emitter);
-        for (removed.state) |texture| self.device.destroyTexture(texture);
-        const scene = self.scenes.table.get(removed.scene) orelse return;
-        for (scene.waters.items, 0..) |item, index| if (std.meta.eql(item, water)) {
-            _ = scene.waters.orderedRemove(index);
-            break;
-        };
+        render.destroyObject(self, "waters", "waters", water);
     }
 };
 

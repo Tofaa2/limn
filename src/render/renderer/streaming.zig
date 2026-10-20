@@ -108,9 +108,9 @@ pub fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
             released_bytes += bytes;
         }
     };
-    self.stats.geometry_models_released = released;
-    self.stats.geometry_bytes_released = released_bytes;
-    self.stats.geometry_models_coarse = coarse_models;
+    self.internal.stats.geometry_models_released = released;
+    self.internal.stats.geometry_bytes_released = released_bytes;
+    self.internal.stats.geometry_models_coarse = coarse_models;
     if (changed) for (self.scenes.table.slots.items) |*slot| if (slot.value) |*scene| {
         scene.layout_dirty = true;
     };
@@ -119,12 +119,12 @@ pub fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
 /// Frees a mesh's vertex and index pool ranges, whole or coarse.
 pub fn freeMeshGeometry(self: *Renderer, mesh: *ModelMesh) void {
     if (mesh.coarse) {
-        self.vertices.free(self, mesh.vertex_offset, mesh.coarse_vertex_count);
-        self.indices.free(self, mesh.index_offset + mesh.lod0_index_count, mesh.index_count - mesh.lod0_index_count);
+        self.internal.vertices.free(self, mesh.vertex_offset, mesh.coarse_vertex_count);
+        self.internal.indices.free(self, mesh.index_offset + mesh.lod0_index_count, mesh.index_count - mesh.lod0_index_count);
         mesh.coarse = false;
     } else {
-        self.vertices.free(self, mesh.vertex_offset, mesh.vertex_count);
-        self.indices.free(self, mesh.index_offset, mesh.index_count);
+        self.internal.vertices.free(self, mesh.vertex_offset, mesh.vertex_count);
+        self.internal.indices.free(self, mesh.index_offset, mesh.index_count);
     }
 }
 
@@ -134,8 +134,8 @@ fn keepCoarse(self: *Renderer, entry: *ModelEntry) bool {
     var any = false;
     for (entry.meshes) |*mesh| {
         if (mesh.coarse or mesh.coarse_vertex_count == 0 or mesh.bvh_nodes != null or mesh.skin_offset != null) continue;
-        self.vertices.free(self, mesh.vertex_offset + mesh.coarse_vertex_count, mesh.vertex_count - mesh.coarse_vertex_count);
-        self.indices.free(self, mesh.index_offset, mesh.lod0_index_count);
+        self.internal.vertices.free(self, mesh.vertex_offset + mesh.coarse_vertex_count, mesh.vertex_count - mesh.coarse_vertex_count);
+        self.internal.indices.free(self, mesh.index_offset, mesh.lod0_index_count);
         if (mesh.blas) |blas| self.device.destroyAcceleration(blas);
         mesh.blas = null;
         mesh.coarse = true;
@@ -149,25 +149,25 @@ fn keepCoarse(self: *Renderer, entry: *ModelEntry) bool {
 fn restoreGeometry(self: *Renderer, entry: *ModelEntry) !void {
     const device = self.device;
     const source = &entry.source.?;
-    const records = try self.gpa.alloc(gpu.Mesh, entry.meshes.len);
-    defer self.gpa.free(records);
+    const records = try self.internal.gpa.alloc(gpu.Mesh, entry.meshes.len);
+    defer self.internal.gpa.free(records);
     var reserved: usize = 0;
     errdefer for (entry.meshes[0..reserved]) |mesh| {
-        self.vertices.free(self, mesh.vertex_offset, mesh.vertex_count);
-        self.indices.free(self, mesh.index_offset, mesh.index_count);
+        self.internal.vertices.free(self, mesh.vertex_offset, mesh.vertex_count);
+        self.internal.indices.free(self, mesh.index_offset, mesh.index_count);
     };
     for (entry.meshes) |*mesh| {
-        const vertex_offset = try self.vertices.alloc(self, mesh.vertex_count);
-        mesh.index_offset = self.indices.alloc(self, mesh.index_count) catch |err| {
-            self.vertices.free(self, vertex_offset, mesh.vertex_count);
+        const vertex_offset = try self.internal.vertices.alloc(self, mesh.vertex_count);
+        mesh.index_offset = self.internal.indices.alloc(self, mesh.index_count) catch |err| {
+            self.internal.vertices.free(self, vertex_offset, mesh.vertex_count);
             return err;
         };
         mesh.vertex_offset = vertex_offset;
         reserved += 1;
     }
     for (source.meshes, entry.meshes, records) |mesh, placed, *record| {
-        try self.vertices.write(device, placed.vertex_offset, std.mem.sliceAsBytes(mesh.vertices));
-        try self.indices.write(device, placed.index_offset, std.mem.sliceAsBytes(mesh.indices));
+        try self.internal.vertices.write(device, placed.vertex_offset, std.mem.sliceAsBytes(mesh.vertices));
+        try self.internal.indices.write(device, placed.index_offset, std.mem.sliceAsBytes(mesh.indices));
         record.* = .{
             .center = mesh.bounds_center,
             .radius = mesh.bounds_radius,
@@ -177,16 +177,16 @@ fn restoreGeometry(self: *Renderer, entry: *ModelEntry) !void {
             .bvh = placed.bvh_nodes orelse gpu.invalid_id,
         };
     }
-    try self.meshes.write(device, entry.mesh_base, std.mem.sliceAsBytes(records));
+    try self.internal.meshes.write(device, entry.mesh_base, std.mem.sliceAsBytes(records));
     if (device.caps.ray_tracing) {
         for (entry.meshes) |*mesh| {
             if (mesh.skin_offset != null) continue;
-            const made = try device.createBlas(geometry_feature.blasDesc(self, mesh.*));
+            const made = try device.createBlas(.{ .geometries = &.{geometry_feature.blasGeometry(self, mesh.*)} });
             if (device.detached_queue != null) mesh.blas_building = made else mesh.blas = made;
         }
         entry.blas_pending = true;
         entry.blas_frame = null;
-        self.blas_pending += 1;
+        self.internal.rays.blas_pending += 1;
     }
     entry.geometry_resident = true;
 }
@@ -195,7 +195,7 @@ pub fn createStreamTexture(self: *Renderer, stream: *const TextureStream, wanted
     const device = self.device;
     var first = wanted_first;
     var from_file: []u8 = &.{};
-    defer self.gpa.free(from_file);
+    defer self.internal.gpa.free(from_file);
     const file_start = stream.levelOffset(first);
     if (file_start < stream.tail_offset) {
         if (readStreamLevels(self, stream, file_start, stream.tail_offset - file_start)) |bytes| {
@@ -227,11 +227,11 @@ pub fn createStreamTexture(self: *Renderer, stream: *const TextureStream, wanted
 /// Reads part of a texture's mip chain from its asset cache file (12-byte
 /// header, then the chain). Caller frees.
 fn readStreamLevels(self: *Renderer, stream: *const TextureStream, offset: usize, size: usize) ![]u8 {
-    const file = try std.Io.Dir.cwd().openFile(self.io, stream.path, .{});
-    defer file.close(self.io);
-    const bytes = try self.gpa.alloc(u8, size);
-    errdefer self.gpa.free(bytes);
-    if (try file.readPositionalAll(self.io, bytes, 12 + offset) != size) return error.EndOfStream;
+    const file = try std.Io.Dir.cwd().openFile(self.internal.io, stream.path, .{});
+    defer file.close(self.internal.io);
+    const bytes = try self.internal.gpa.alloc(u8, size);
+    errdefer self.internal.gpa.free(bytes);
+    if (try file.readPositionalAll(self.internal.io, bytes, 12 + offset) != size) return error.EndOfStream;
     return bytes;
 }
 
@@ -239,7 +239,7 @@ fn readStreamLevels(self: *Renderer, stream: *const TextureStream, offset: usize
 fn streamParts(self: *Renderer, model: *ModelEntry) ![]const StreamPart {
     const source = &model.source.?;
     if (model.stream_parts.len == source.instances.len) return model.stream_parts;
-    const parts = try self.gpa.alloc(StreamPart, source.instances.len);
+    const parts = try self.internal.gpa.alloc(StreamPart, source.instances.len);
     for (parts, source.instances) |*part, instance| {
         const mesh = &source.meshes[instance.mesh];
         const material = &source.materials[mesh.material];
@@ -349,12 +349,12 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
         } else null;
         const seen: ?[]const u32 = if (streaming.skip_occluded) seenInstances(device, scene, frame) else null;
         const view = StreamView{ .camera = camera, .pixels_at_one_meter = pixels_at_one_meter, .bias = bias, .frustum = frustum };
-        const laid_out = scene.records_valid and !scene.layout_dirty and scene.layout_generation == self.asset_generation;
-        self.seen_round += 1;
+        const laid_out = scene.records_valid and !scene.layout_dirty and scene.layout_generation == self.internal.asset_generation;
+        self.internal.seen_round += 1;
         if (seen != null) for (scene.layout.items, 0..) |placed, index| {
             if (!placed.first_of_entity) continue;
             const entity = self.entities.table.get(placed.entity) orelse continue;
-            entity.seen_round = self.seen_round;
+            entity.seen_round = self.internal.seen_round;
             entity.seen_first = @intCast(index);
         };
         for (scene.entities.items) |item| {
@@ -363,7 +363,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
             const model = self.models.table.get(entity.model) orelse continue;
             if (model.state != .ready or model.streamed == 0) continue;
             const parts: ?[]const u32 = if (seen) |drawn| blk: {
-                if (entity.seen_round != self.seen_round) continue;
+                if (entity.seen_round != self.internal.seen_round) continue;
                 const count = model.source.?.instances.len;
                 if (entity.seen_first + count > drawn.len) continue;
                 break :blk drawn[entity.seen_first..][0..count];
@@ -475,7 +475,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
             try self.materials.pool.write(device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded));
         }
     };
-    self.stats.streamed_textures = count;
-    self.stats.streamed_texture_bytes = resident_bytes;
-    self.stats.streamed_textures_pending = pending;
+    self.internal.stats.streamed_textures = count;
+    self.internal.stats.streamed_texture_bytes = resident_bytes;
+    self.internal.stats.streamed_textures_pending = pending;
 }

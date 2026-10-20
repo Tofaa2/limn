@@ -10,6 +10,7 @@
 #ifdef STORAGE_IMAGES
 [[vk::binding(2, 0)]] [[vk::image_format("unknown")]] RWTexture2D<float4> storage_2d[];
 [[vk::binding(3, 0)]] [[vk::image_format("unknown")]] RWTexture3D<float4> storage_3d[];
+[[vk::binding(3, 0)]] [[vk::image_format("unknown")]] RWTexture2DArray<float4> storage_2d_array[];
 #endif
 [[vk::binding(1, 0)]] SamplerComparisonState samplers_shadow[];
 

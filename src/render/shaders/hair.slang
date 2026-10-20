@@ -14,22 +14,7 @@ HairPoint hairPoint(float3 position, float along) {
     return point;
 }
 
-/// Push constants of the hair strand passes.
-struct HairPush {
-    FrameConstants frame;
-    HairPoint* points;
-    HairPoint* previous_points;
-    float4x4 transform;
-    float4x4 previous_transform;
-    float3 root_color;
-    float root_width;
-    float3 tip_color;
-    float tip_width;
-    uint points_per_strand;
-    float roughness;
-    float spread;
-    float pad1;
-};
+#include "hair.HairPush.slang"
 
 float3 hairCopyOffset(uint strand, uint copy) {
     if (copy == 0u) return float3(0.0);
@@ -80,10 +65,7 @@ struct Params {
     float4 colliders[6];
 };
 
-struct SimPush {
-    FrameConstants frame;
-    Params* params;
-};
+#include "hair.SimPush.slang"
 
 [[vk::push_constant]] SimPush sim_push;
 
@@ -268,21 +250,7 @@ StrandVaryings strandMain(uint vertex : SV_VulkanVertexID, uint instance : SV_Vu
     return result;
 }
 
-struct ShadowPush {
-    FrameConstants frame;
-    HairPoint* points;
-    VisibilityPage page;
-    float4x4 view_proj;
-    float4x4 transform;
-    float3 light;
-    float root_width;
-    float tip_width;
-    float least_width;
-    uint points_per_strand;
-    uint paged;
-    float spread;
-    float pad;
-};
+#include "hair.ShadowPush.slang"
 
 [[vk::push_constant]] ShadowPush shadow_push;
 

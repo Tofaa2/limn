@@ -1,15 +1,6 @@
 #include "common.slang"
 
-struct BlurPush {
-    FrameConstants frame;
-    uint color_texture;
-    uint depth_texture;
-    float focus_distance;
-    float strength;
-    float max_radius;
-    int tap_count;
-    uint blades;
-};
+#include "dof.BlurPush.slang"
 
 [[vk::push_constant]] BlurPush blur_push;
 
@@ -49,15 +40,7 @@ float4 blurMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position)
     return float4(total / weight_total, clamp(center_radius / max(blur_push.max_radius, 1e-3), 0.0, 1.0));
 }
 
-struct CompositePush {
-    FrameConstants frame;
-    uint color_texture;
-    uint blurred_texture;
-    uint depth_texture;
-    float focus_distance;
-    float strength;
-    float max_radius;
-};
+#include "dof.CompositePush.slang"
 
 [[vk::push_constant]] CompositePush composite_push;
 

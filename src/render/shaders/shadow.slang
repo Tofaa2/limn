@@ -1,9 +1,6 @@
 #include "common.slang"
 
-struct MaskedPush {
-    FrameConstants frame;
-    uint tinted;
-};
+#include "shadow.MaskedPush.slang"
 
 [[vk::push_constant]] MaskedPush masked_push;
 
@@ -23,9 +20,7 @@ void maskedMain([[vk::location(1)]] nointerpolation uint in_material, [[vk::loca
     }
 }
 
-struct ColorPush {
-    FrameConstants frame;
-};
+#include "shadow.ColorPush.slang"
 
 [[vk::push_constant]] ColorPush color_push;
 

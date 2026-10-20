@@ -15,6 +15,8 @@ const renderer_state = @import("../state.zig");
 const scene_pass = @import("../scene_pass.zig");
 const graph_module = @import("../core/graph.zig");
 const features = @import("../core/features.zig");
+const path_tracing_feature = @import("../features/path_tracing.zig");
+const resolution_feature = @import("../features/resolution.zig");
 const canvas = @import("../features/canvas.zig");
 const post = @import("../features/post.zig");
 const ray_scene = @import("../scene/ray_scene.zig");
@@ -45,7 +47,7 @@ const SceneData = renderer_state.SceneData;
 const ViewState = renderer_state.ViewState;
 const ViewData = renderer_state.ViewData;
 const ReflectionTargets = renderer_state.ReflectionTargets;
-const buildPendingBlas = @import("scene_update.zig").buildPendingBlas;
+const buildPendingBlas = @import("../scene/ray_scene.zig").buildPendingBlas;
 const view_math = @import("view_math.zig");
 const halton = @import("view_math.zig").halton;
 const prepareLights = @import("scene_update.zig").prepareLights;
@@ -67,8 +69,8 @@ const Composite = struct {
         cmd.bindPipeline(try post_feature.tonemapPipeline(ctx.renderer, self.format));
         cmd.pushConstants(post_feature.TonemapPush{
             .frame = ctx.frame_address,
-            .color = ctx.device.textureIndex(self.picture),
-            .bloom = gpu.invalid_id,
+            .color_texture = ctx.device.textureIndex(self.picture),
+            .bloom_texture = gpu.invalid_id,
             .bloom_strength = 0,
             .encode_srgb = 0,
             .sharpen = 0,
@@ -92,11 +94,11 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
         .debugging = desc.settings.debug_view != .none,
         .temporal_antialiasing = desc.settings.resolution.temporal_antialiasing,
         .orthographic = desc.camera.orthographic != null,
-        .upscalers = upscaling.Availability.of(device, self.dlss),
+        .upscalers = upscaling.Availability.of(device, self.internal.dlss),
         .nrd = @import("../nrd.zig").available and device.caps.storage_images,
         .upscaler = desc.settings.resolution.upscaler,
-        .path_tracing = self.pathTracing(),
-        .downgrades = &self.downgrades,
+        .path_tracing = pathTracingSupport(self),
+        .downgrades = &self.internal.downgrades,
     };
     features.resolve(&desc.settings, &resolving);
     const target = switch (desc.target) {
@@ -112,9 +114,9 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
     const whole = region.width == info.width and region.height == info.height;
     const written = targetWritten(self, target);
     if (!written) {
-        if (self.frame_target_count == self.frame_targets.len) return error.TooManyTargets;
-        self.frame_targets[self.frame_target_count] = target;
-        self.frame_target_count += 1;
+        if (self.internal.frame_target_count == self.internal.frame_targets.len) return error.TooManyTargets;
+        self.internal.frame_targets[self.internal.frame_target_count] = target;
+        self.internal.frame_target_count += 1;
     }
     const load: rhi.LoadOp = if (written) .load else .clear;
 
@@ -136,13 +138,14 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
         .output = .{ .texture = target, .format = info.format, .region = region, .load = load, .clear = desc.clear_color },
         .constants = &constants,
         .frame_address = 0,
+        .rays = resolving.rays,
     };
 
     if (desc.scene) |scene_handle| {
         try self.ensureSceneResources(cmd);
         const scene = self.scenes.table.get(scene_handle) orelse return error.InvalidScene;
-        const view = self.views.table.get(desc.view orelse self.main_view) orelse return error.InvalidView;
-        if (view.last_frame == self.frame_index) return error.ViewUsedTwice;
+        const view = self.views.table.get(desc.view orelse self.internal.main_view) orelse return error.InvalidView;
+        if (view.last_frame == self.internal.frame_index) return error.ViewUsedTwice;
         var color = target;
         if (!whole) {
             if (view.output) |texture| {
@@ -187,16 +190,16 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
         const internal_width: u32 = @max(@as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(region.width)) * render_scale))), 1);
         const internal_height: u32 = @max(@as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(region.height)) * render_scale))), 1);
         try renderScene(self, &ctx, frame, scene_handle, scene, view, color, internal_width, internal_height, region.width, region.height, delta_time);
-        view.kept.collect(device, self.frame_index);
+        view.kept.collect(device, self.internal.frame_index);
     } else {
         const picture = try graph.import(target);
         graph.publish(.picture, picture);
         graph.want(picture);
         if (canvas.lit(&desc)) {
-            const view = self.views.table.get(desc.view orelse self.main_view) orelse return error.InvalidView;
-            if (view.last_frame == self.frame_index) return error.ViewUsedTwice;
-            if (view.last_frame +% 1 != self.frame_index) view.exposure_reset = true;
-            view.last_frame = self.frame_index;
+            const view = self.views.table.get(desc.view orelse self.internal.main_view) orelse return error.InvalidView;
+            if (view.last_frame == self.internal.frame_index) return error.ViewUsedTwice;
+            if (view.last_frame +% 1 != self.internal.frame_index) view.exposure_reset = true;
+            view.last_frame = self.internal.frame_index;
             ctx.view = view;
             const frame_constants = try arena.alloc(device, gpu.FrameConstants, 1);
             constants = std.mem.zeroes(gpu.FrameConstants);
@@ -204,12 +207,12 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
             constants.inv_resolution = .{ 1.0 / @as(f32, @floatFromInt(region.width)), 1.0 / @as(f32, @floatFromInt(region.height)) };
             constants.near = desc.camera.near;
             constants.depth_terms = view_math.depthTerms(desc.camera);
-            constants.frame_index = @truncate(self.frame_index);
-            constants.time = self.time;
+            constants.frame_index = @truncate(self.internal.frame_index);
+            constants.time = self.internal.time;
             constants.delta_time = delta_time;
-            constants.sampler_linear_clamp = device.samplerIndex(self.sampler_linear_clamp);
-            constants.sampler_nearest_clamp = device.samplerIndex(self.sampler_nearest_clamp);
-            constants.sampler_linear_repeat = device.samplerIndex(self.sampler_linear_repeat);
+            constants.sampler_linear_clamp = device.samplerIndex(self.internal.sampler_linear_clamp);
+            constants.sampler_nearest_clamp = device.samplerIndex(self.internal.sampler_nearest_clamp);
+            constants.sampler_linear_repeat = device.samplerIndex(self.internal.sampler_linear_repeat);
             constants.exposure = device.bufferAddress(view.exposure);
             ctx.frame_address = frame_constants.address;
             const hdr = try graph.transient(.{ .name = "hdr", .width = region.width, .height = region.height, .format = hdr_format, .usage = .{ .sampled = true, .color_attachment = true } });
@@ -217,15 +220,15 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
             try post.declareFlat(&ctx, hdr);
             try features.declare(&ctx);
             frame_constants.items[0] = constants;
-            try graph.execute(self.gpa, device, cmd, &self.target_pool, self.frame_index);
-            view.kept.collect(device, self.frame_index);
+            try graph.execute(self.internal.gpa, device, cmd, &self.internal.target_pool, self.internal.frame_index);
+            view.kept.collect(device, self.internal.frame_index);
         } else {
             if (desc.passes.len != 0 and ctx.output.load == .clear) {
                 try graph.add(.{ .name = "clear", .stage = .prepare, .color = &.{.{ .target = picture, .load = .clear, .clear = ctx.output.clear }}, .always = true, .scope = false }, &ctx, cleared);
                 ctx.output.load = .load;
             }
             try features.declare(&ctx);
-            try graph.execute(self.gpa, device, cmd, &self.target_pool, self.frame_index);
+            try graph.execute(self.internal.gpa, device, cmd, &self.internal.target_pool, self.internal.frame_index);
         }
     }
     if (desc.target == .texture) cmd.transition(target, .shader_read);
@@ -255,14 +258,14 @@ fn renderScene(
     const desc = ctx.desc.*;
     const arena = ctx.arena;
     const settings = desc.settings;
-    const first_view = self.frame_scene_views == 0;
-    self.frame_scene_views += 1;
+    const first_view = self.internal.frame_scene_views == 0;
+    self.internal.frame_scene_views += 1;
 
     cmd.beginScope("scene update");
-    const fresh_scene = scene.prepared_frame != self.frame_index;
+    const fresh_scene = scene.prepared_frame != self.internal.frame_index;
     if (fresh_scene) {
         scene.prepared = try prepareScene(self, scene, arena);
-        scene.prepared_frame = self.frame_index;
+        scene.prepared_frame = self.internal.frame_index;
         try applySceneUpdate(self, cmd, scene, scene.prepared.update);
     }
     const scene_frame = scene.prepared;
@@ -273,20 +276,22 @@ fn renderScene(
     const temporal_upscale = (settings.resolution.upscaler == .temporal or settings.resolution.upscaler == .fsr2 or settings.resolution.upscaler == .fsr3 or settings.resolution.upscaler == .dlss) and settings.resolution.temporal_antialiasing and settings.debug_view == .none and (output_width > width or output_height > height);
     const resolved_width = if (temporal_upscale) output_width else width;
     const resolved_height = if (temporal_upscale) output_height else height;
+    const antialiasing = try features.stateOf(view_data, device, resolution_feature);
     if (view_data.state == null or view_data.state.?.width != width or view_data.state.?.height != height or
         view_data.state.?.resolved_width != resolved_width or view_data.state.?.resolved_height != resolved_height)
     {
         if (view_data.state) |*old| old.deinit(device);
         view_data.state = null;
         view_data.state = try ViewState.init(device, width, height, resolved_width, resolved_height);
-        view_data.upscaler.forgive();
+        antialiasing.upscaler.forgive();
         view_data.exposure_reset = true;
         view_data.camera_known = false;
     }
+    try antialiasing.fit(device, resolved_width, resolved_height);
     const view = &view_data.state.?;
     std.mem.swap(rhi.Texture, &view.depth, &view.previous_depth);
     std.mem.swap(rhi.Texture, &view.motion, &view.previous_motion);
-    if (view_data.last_frame +% 1 != self.frame_index) {
+    if (view_data.last_frame +% 1 != self.internal.frame_index) {
         view_data.camera_known = false;
         view.history_valid = false;
     }
@@ -370,68 +375,13 @@ fn renderScene(
         .culling = &culling,
         .resolved = &resolved,
     };
-    const colored_shadows = shadows_enabled and filled(settings.shadows).colored and filled(settings.shadows).transparent;
-    if (colored_shadows and view_data.shadow_color == null) {
-        view_data.shadow_color = try device.createTexture(.{
-            .name = "shadow tint",
-            .width = @max(self.options.shadows.resolution / 2, 1),
-            .height = @max(self.options.shadows.resolution / 2, 1),
-            .format = .rgba8_unorm,
-            .usage = .{ .sampled = true, .color_attachment = true },
-            .layers = gpu.cascade_count,
-            .kind = .@"2d_array",
-        });
-    }
-    if (view_data.shadows_colored != colored_shadows) {
-        view_data.shadows_colored = colored_shadows;
-        view_data.cascade_cache.valid = false;
-    }
-    const cascade_plan = shadows_feature.updateCascades(self, &pass, shadows_enabled);
-    const cascades = view_data.cascade_cache.cascades;
-    if (shadows_enabled and view_data.shadow_map == null) {
-        view_data.shadow_map = try device.createTexture(.{
-            .name = "shadow cascades",
-            .width = self.options.shadows.resolution,
-            .height = self.options.shadows.resolution,
-            .format = .depth32_float,
-            .usage = .{ .sampled = true, .depth_attachment = true },
-            .layers = gpu.cascade_count,
-            .kind = .@"2d_array",
-        });
-    }
-    const shadow_map = if (shadows_enabled) view_data.shadow_map.? else self.shadow_map;
-    const sun_shadows = SunShadows{
-        .enabled = shadows_enabled,
-        .colored = colored_shadows,
-        .map = shadow_map,
-        .cascades = cascades,
-        .count = cascade_plan.count,
-        .update = cascade_plan.update,
-    };
-
     const environment: ?*EnvironmentEntry = blk: {
         const entry = self.environments.table.get(scene.environment orelse break :blk null) orelse break :blk null;
         break :blk if (entry.state == .ready) entry else null;
     };
 
-    try ray_scene.prepare(self, scene, scene_frame, ray_scene.wanted(self, scene, settings), fresh_scene);
-    const gi = try global_illumination_feature.prepareGi(self, scene, scene_frame, settings, desc.camera.position);
-    const traced_shadows = (if (settings.shadows) |shadows| shadows.traced_lights else false) and ray_scene.ready(scene, scene_frame);
-    const lighting = try prepareLights(self, scene, arena, (settings.shadows != null), desc.camera.position, traced_shadows);
-    const local_shadows = shadows_feature.planLocalShadows(self, &pass, &lighting);
-    const cloud_address = try clouds_feature.prepareClouds(self, &pass);
-    var flags: u32 = 0;
-    if (shadows_enabled) flags |= gpu.frame_flags.shadows;
-    if (environment != null) flags |= gpu.frame_flags.environment;
-    const probes = try shading_feature.reflectionProbeList(self, &pass);
-    const fluid_list = try arena.alloc(device, gpu.FluidList, 1);
-    fluid_list.items[0] = .{};
-    if (colored_shadows) flags |= gpu.frame_flags.colored_shadows;
-    if (cloud_address != 0 and scene.clouds.?.shadow > 0) flags |= gpu.frame_flags.cloud_shadows;
-
-    const decals_address = try shading_feature.writeDecals(self, &pass);
+    try ray_scene.prepare(self, scene, scene_frame, ray_scene.wanted(self, scene, ctx.rays), fresh_scene);
     const constants = try arena.alloc(device, gpu.FrameConstants, 1);
-    const shadow_tlas: u64 = if (traced_shadows) device.accelerationAddress(scene.tlas.?) else 0;
     ctx.constants.* = .{
         .view = view_matrix,
         .proj = proj,
@@ -441,9 +391,6 @@ fn renderScene(
         .prev_view_proj_unjittered = view_data.previous_view_proj,
         .inv_view = math.inverse(view_matrix),
         .inv_proj = math.inverse(proj),
-        .cascade_view_proj = cascades.view_proj,
-        .cascade_splits = cascades.splits,
-        .cascade_texel_size = cascades.texel_size,
         .camera_position = desc.camera.position,
         .near = desc.camera.near,
         .depth_terms = view_math.depthTerms(desc.camera),
@@ -456,47 +403,26 @@ fn renderScene(
         .inv_resolution = .{ 1.0 / @as(f32, @floatFromInt(width)), 1.0 / @as(f32, @floatFromInt(height)) },
         .jitter = jitter,
         .prev_jitter = view_data.previous_jitter,
-        .frame_index = @truncate(self.frame_index),
-        .time = self.time,
+        .frame_index = @truncate(self.internal.frame_index),
+        .time = self.internal.time,
         .delta_time = delta_time,
-        .flags = flags,
-        .shadow_map = device.textureIndex(shadow_map),
-        .shadow_sampler = device.samplerIndex(self.sampler_shadow),
+        .environment = @intFromBool(environment != null),
         .env_specular = if (environment) |entry| device.textureIndex(entry.specular.?) else gpu.invalid_id,
         .env_irradiance = if (environment) |entry| device.textureIndex(entry.irradiance.?) else gpu.invalid_id,
         .env_sky = if (environment) |entry| device.textureIndex(entry.sky.?) else gpu.invalid_id,
-        .brdf_lut = device.textureIndex(self.brdf_lut),
-        .sampler_linear_clamp = device.samplerIndex(self.sampler_linear_clamp),
-        .sampler_nearest_clamp = device.samplerIndex(self.sampler_nearest_clamp),
+        .brdf_lut = device.textureIndex(self.internal.brdf_lut),
+        .sampler_linear_clamp = device.samplerIndex(self.internal.sampler_linear_clamp),
+        .sampler_nearest_clamp = device.samplerIndex(self.internal.sampler_nearest_clamp),
         .env_specular_mips = env_specular_mips,
-        .light_count = lighting.light_count,
-        .sampler_linear_repeat = device.samplerIndex(self.sampler_linear_repeat),
-        .local_shadow_map = device.textureIndex(self.local_shadow_map),
-        .local_shadow_sampler = device.samplerIndex(self.sampler_local_shadow),
-        .cluster_z_scale = cluster_z_scale,
-        .cluster_z_bias = -@log2(cluster_near) * cluster_z_scale,
-        .contact_depth = if (!debugging) device.textureIndex(view.depth) else gpu.invalid_id,
-        .tlas_low = @truncate(shadow_tlas),
-        .tlas_high = @truncate(shadow_tlas >> 32),
-        .shadow_color = if (colored_shadows) device.textureIndex(view_data.shadow_color.?) else gpu.invalid_id,
-        .vertices = device.bufferAddress(self.vertices.get()),
-        .indices = device.bufferAddress(self.indices.get()),
-        .meshlets = device.bufferAddress(self.meshlets.get()),
-        .meshes = device.bufferAddress(self.meshes.get()),
+        .sampler_linear_repeat = device.samplerIndex(self.internal.sampler_linear_repeat),
+        .vertices = device.bufferAddress(self.internal.vertices.get()),
+        .indices = device.bufferAddress(self.internal.indices.get()),
+        .meshlets = device.bufferAddress(self.internal.meshlets.get()),
+        .meshes = device.bufferAddress(self.internal.meshes.get()),
         .materials = device.bufferAddress(self.materials.pool.get()),
         .instances = scene_frame.instances,
         .previous_transforms = scene_frame.previous_transforms,
-        .vsm = 0,
         .meshlet_refs = if (scene.refs) |buffer| device.bufferAddress(buffer) else 0,
-        .lights = lighting.lights,
-        .clusters = device.bufferAddress(self.clusters),
-        .shadow_tiles = lighting.tiles,
-        .decal_count = @intCast(scene.decals.items.len),
-        .decals = decals_address,
-        .clouds = cloud_address,
-        .fluids = fluid_list.address,
-        .probes = probes.address,
-        .probe_count = probes.count,
         .exposure = device.bufferAddress(view_data.exposure),
     };
     pass.frame_address = constants.address;
@@ -508,27 +434,27 @@ fn renderScene(
     g.publish(.visibility, try g.import(view.visibility));
     g.publish(.motion, try g.import(view.motion));
     g.publish(.hdr, try g.import(view.hdr));
-    const count_readback = self.count_readback[@intCast(frame.index % rhi.frames_in_flight)];
+    const count_readback = self.internal.count_readback[@intCast(frame.index % rhi.frames_in_flight)];
     if (first_view) {
         const counted = device.mappedSlice(u32, count_readback);
-        self.stats.meshlets_drawn = counted[0] + counted[1] + counted[main_late_view * 2] + counted[main_late_view * 2 + 1];
-        self.stats.shadow_meshlets_drawn = 0;
-        for (1..1 + gpu.cascade_count) |index| self.stats.shadow_meshlets_drawn += counted[index * 2] + counted[index * 2 + 1];
-        self.stats.instances_drawn = counted[view_count * 2];
+        self.internal.stats.meshlets_drawn = counted[0] + counted[1] + counted[main_late_view * 2] + counted[main_late_view * 2 + 1];
+        self.internal.stats.shadow_meshlets_drawn = 0;
+        for (1..1 + gpu.cascade_count) |index| self.internal.stats.shadow_meshlets_drawn += counted[index * 2] + counted[index * 2 + 1];
+        self.internal.stats.instances_drawn = counted[view_count * 2];
     }
 
     var shared = scene_pass.Shared{
         .frame = frame,
         .arena = arena,
         .delta_time = delta_time,
-        .sun = &sun_shadows,
-        .lighting = &lighting,
-        .local_shadows = &local_shadows,
-        .gi = gi,
-        .shadow_tlas = shadow_tlas,
-        .colored_shadows = colored_shadows,
-        .cloud_address = cloud_address,
-        .fluid_list = &fluid_list.items[0],
+        .sun = undefined,
+        .lighting = undefined,
+        .local_shadows = undefined,
+        .gi = null,
+        .shadow_tlas = 0,
+        .colored_shadows = false,
+        .cloud_address = 0,
+        .fluid_list = undefined,
         .shadows_enabled = shadows_enabled,
         .first_view = first_view,
         .fresh_scene = fresh_scene,
@@ -538,21 +464,29 @@ fn renderScene(
         .resolved = &resolved,
     };
     pass.shared = &shared;
-    pass.tracing = settings.path_tracing != null and !debugging and view_data.path_traced;
+    const tracer = try features.stateOf(view_data, device, path_tracing_feature);
+    pass.tracing = settings.path_tracing != null and !debugging and tracer.traced;
+    try features.prepare(ctx);
     try features.declare(ctx);
     constants.items[0] = ctx.constants.*;
-    try g.execute(self.gpa, device, cmd, &self.target_pool, self.frame_index);
-    view_data.path_traced = shared.path_traced;
+    try g.execute(self.internal.gpa, device, cmd, &self.internal.target_pool, self.internal.frame_index);
+    tracer.traced = shared.path_traced;
 
     view_data.previous_view_proj = view_proj_unjittered;
     view_data.previous_jitter = jitter;
     view_data.frames += 1;
-    view_data.last_frame = self.frame_index;
+    view_data.last_frame = self.internal.frame_index;
     view_data.camera_known = true;
     if (first_view) {
-        self.stats.instances = instance_total;
-        self.stats.meshlets = scene.ref_count;
-        self.stats.triangles = scene.triangle_count;
-        self.stats.skinned_vertices = scene_frame.skinned_vertices;
+        self.internal.stats.instances = instance_total;
+        self.internal.stats.meshlets = scene.ref_count;
+        self.internal.stats.triangles = scene.triangle_count;
+        self.internal.stats.skinned_vertices = scene_frame.skinned_vertices;
     }
+}
+
+/// How this renderer path traces, if it can.
+pub fn pathTracingSupport(renderer: *const Renderer) api.PathTracingSupport {
+    if (renderer.device.caps.ray_tracing) return .hardware;
+    return if (renderer.options.ray_tracing.software_path_tracing) .shader else .unavailable;
 }

@@ -130,7 +130,7 @@ pub fn destroyTexture(self: *Device, texture: types.Texture) void {
     var resource = self.textures.remove(texture) orelse return;
     for (resource.sub_views.items) |sub| retire(self, .{ .view = sub.view });
     resource.sub_views.deinit(self.gpa);
-    for (resource.storage_slots.items) |storage| retire(self, if (resource.info.kind == .@"3d") .{ .storage_volume_slot = storage.slot } else .{ .storage_slot = storage.slot });
+    for (resource.storage_slots.items) |storage| retire(self, if (resource.info.kind == .@"3d" or storage.layer == device_module.all_layers) .{ .storage_volume_slot = storage.slot } else .{ .storage_slot = storage.slot });
     resource.storage_slots.deinit(self.gpa);
     retire(self, .{ .view = resource.view });
     if (resource.bindless_index) |slot| retire(self, .{ .texture_slot = slot });
@@ -160,22 +160,23 @@ pub fn textureIndex(self: *Device, texture: types.Texture) u32 {
 }
 
 /// Index of one mip of one layer in the storage image table (`storage_2d`
-/// in common.slang), or of a whole 3D texture in the table of volumes
+/// in common.slang), or of a whole 3D texture in the table of whole textures
 /// (`storage_3d`). Needs `TextureUsage.storage`; what is indexed must be
 /// in `TextureState.storage` while the shader runs.
 pub fn storageIndex(self: *Device, texture: types.Texture, mip: u32, layer: u32) !u32 {
     const resource = self.textureResource(texture);
     for (resource.storage_slots.items) |storage| if (storage.mip == mip and storage.layer == layer) return storage.slot;
     const volume = resource.info.kind == .@"3d";
-    const view = if (volume) resource.view else try self.subView(texture, mip, layer);
-    const slots = if (volume) &self.storage_volume_slots else &self.storage_slots;
+    const view = if (volume) resource.view else if (layer == device_module.all_layers) try layersView(self, texture, mip) else try subView(self, texture, mip, layer);
+    const whole = volume or layer == device_module.all_layers;
+    const slots = if (whole) &self.storage_volume_slots else &self.storage_slots;
     const slot = try slots.allocate();
     errdefer slots.release(slot);
     try resource.storage_slots.append(self.gpa, .{ .mip = mip, .layer = layer, .slot = slot });
     const image_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = view, .image_layout = .general };
     self.vkd.updateDescriptorSets(&.{.{
         .dst_set = self.descriptor_set,
-        .dst_binding = if (volume) 3 else 2,
+        .dst_binding = if (whole) 3 else 2,
         .dst_array_element = slot,
         .descriptor_count = 1,
         .descriptor_type = .storage_image,
@@ -184,6 +185,35 @@ pub fn storageIndex(self: *Device, texture: types.Texture, mip: u32, layer: u32)
         .p_texel_buffer_view = undefined,
     }}, &.{});
     return slot;
+}
+
+/// Index of one mip of every layer of an array or cube texture in the table
+/// of whole textures (`storage_2d_array` in common.slang). As
+/// `storageIndex` otherwise.
+pub fn storageArrayIndex(self: *Device, texture: types.Texture, mip: u32) !u32 {
+    return storageIndex(self, texture, mip, device_module.all_layers);
+}
+
+/// View of one mip of every layer, as a 2D array.
+fn layersView(self: *Device, texture: types.Texture, mip: u32) !vk.ImageView {
+    const resource = self.textureResource(texture);
+    for (resource.sub_views.items) |sub| if (sub.mip == mip and sub.layer == device_module.all_layers) return sub.view;
+    const view = try self.vkd.createImageView(&.{
+        .image = resource.image,
+        .view_type = .@"2d_array",
+        .format = resource.vk_format,
+        .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
+        .subresource_range = .{
+            .aspect_mask = resource.aspect,
+            .base_mip_level = mip,
+            .level_count = 1,
+            .base_array_layer = 0,
+            .layer_count = resource.info.layers,
+        },
+    }, null);
+    errdefer self.vkd.destroyImageView(view, null);
+    try resource.sub_views.append(self.gpa, .{ .mip = mip, .layer = device_module.all_layers, .view = view });
+    return view;
 }
 
 /// View of a single mip/layer, used as a render attachment.
@@ -303,7 +333,7 @@ pub fn readTexture(self: *Device, gpa: std.mem.Allocator, texture: types.Texture
         .image_extent = .{ .width = info.width, .height = info.height, .depth = 1 },
     }});
     if (previous != .undefined) encoder.transition(texture, previous);
-    try self.endImmediate();
+    try self.endImmediate(&encoder);
     return gpa.dupe(u8, self.mapped(staging)[0..@intCast(size)]);
 }
 

@@ -58,14 +58,7 @@ struct LiquidData {
 /// Corners of the two triangles drawn for each particle.
 static const float2 liquid_corners[6] = { float2(-1.0, -1.0), float2(1.0, -1.0), float2(1.0, 1.0), float2(-1.0, -1.0), float2(1.0, 1.0), float2(-1.0, 1.0) };
 
-struct SimPush {
-    LiquidData* liquid;
-    LiquidParticle* particles;
-    uint* counts;
-    uint* cells;
-    uint mode;
-    uint flip;
-};
+#include "liquid.SimPush.slang"
 
 [[vk::push_constant]] SimPush sim_push;
 
@@ -264,13 +257,7 @@ void simMain(uint3 id : SV_DispatchThreadID) {
     }
 }
 
-struct SpherePush {
-    FrameConstants frame;
-    LiquidData* liquid;
-    LiquidParticle* particles;
-    uint depth_texture;
-    float swell;
-};
+#include "liquid.SpherePush.slang"
 
 [[vk::push_constant]] SpherePush sphere_push;
 
@@ -326,14 +313,7 @@ float sphereThicknessMain(SphereVaryings input) : SV_Target {
     return 2.0 * input.sphere.w * sqrt(1.0 - off_center) * 0.24;
 }
 
-struct ShadowPush {
-    FrameConstants frame;
-    LiquidData* liquid;
-    LiquidParticle* particles;
-    float4x4 view_proj;
-    float swell;
-    float strength;
-};
+#include "liquid.ShadowPush.slang"
 
 [[vk::push_constant]] ShadowPush shadow_push;
 
@@ -371,10 +351,7 @@ void shadowFragmentMain(ShadowVaryings input) {
     if ((screen[texel.y * 4 + texel.x] + 0.5) / 16.0 > shadow_push.strength) discard;
 }
 
-struct SurfacePush {
-    FrameConstants frame;
-    uint distance_texture;
-};
+#include "liquid.SurfacePush.slang"
 
 [[vk::push_constant]] SurfacePush surface_push;
 
@@ -397,14 +374,7 @@ SurfaceOutput surfaceMain(float4 fragment : SV_Position) {
     return result;
 }
 
-struct BlurPush {
-    FrameConstants frame;
-    uint source_texture;
-    uint raw;
-    float2 direction;
-    float width;
-    float edge;
-};
+#include "liquid.BlurPush.slang"
 
 [[vk::push_constant]] BlurPush blur_push;
 
@@ -439,14 +409,7 @@ float blurMain(float4 fragment : SV_Position) : SV_Target {
     return sum / weight;
 }
 
-struct ShadePush {
-    FrameConstants frame;
-    LiquidData* liquid;
-    uint distance_texture;
-    uint thickness_texture;
-    uint scene_texture;
-    uint depth_texture;
-};
+#include "liquid.ShadePush.slang"
 
 [[vk::push_constant]] ShadePush shade_push;
 
@@ -501,7 +464,7 @@ ShadeOutput shadeMain(
 
     float3 clear = exp(-liquid.murk * thickness * (float3(1.0) - liquid.color));
     float3 ambient = float3(0.0);
-    if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
+    if (frame.environment != 0u)
         ambient = sampleCubeLod(frame.env_irradiance, linear, normal, 0.0).rgb * frame.env_intensity;
     float sun_shadow = sunShadow(frame, position, normal, 1.0, here, 0.5);
     float sun_facing = clamp(dot(normal, frame.sun_direction), 0.0, 1.0);
@@ -510,7 +473,7 @@ ShadeOutput shadeMain(
 
     float3 mirror = reflect(-view, normal);
     float3 reflected = float3(0.0);
-    if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
+    if (frame.environment != 0u)
         reflected = sampleCubeLod(frame.env_specular, linear, mirror, 0.04 * (frame.env_specular_mips - 1.0)).rgb * frame.env_intensity;
     float3 halfway = normalize(view + frame.sun_direction);
     float glint = pow(clamp(dot(normal, halfway), 0.0, 1.0), 220.0) * sun_shadow;

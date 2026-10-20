@@ -1,4 +1,6 @@
 //! Reflections traced on screen and, where the GPU traces rays, through the scene.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const ssr_push = @import("../shaders/push/ssr.zig");
 const scene_pass = @import("../scene_pass.zig");
 const gpu = @import("../gpu.zig");
 const std = @import("std");
@@ -56,17 +58,36 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
         s.ray_tracing = false;
         r.downgrade("reflections.ray_tracing", "on", "off", .no_ray_tracing);
     }
+    if (s.ray_tracing) r.rays = true;
+}
+
+/// Makes this frame's reflection targets and publishes the ones shading
+/// writes.
+pub fn prepare(ctx: *ViewContext) !void {
+    const p = ctx.scene orelse return;
+    if (p.settings.reflections == null or p.debugging) return;
+    const targets = try reflectionTargets(ctx.renderer, p);
+    p.shared.reflections = targets;
+    const g = ctx.graph;
+    g.publish(.reflection_weight, try g.import(targets.weight));
+    g.publish(.reflection_surface, try g.import(targets.surface));
 }
 
 /// Adds the feature's passes to a view of a scene. A path traced view leaves
 /// out those whose result the tracer replaces.
 pub fn declare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
-    if (p.settings.reflections != null and !p.debugging) ctx.constants.flags |= gpu.frame_flags.ssr;
-    if (filled(p.settings.reflections).transparent) ctx.constants.flags |= gpu.frame_flags.reflect_transparent;
+    if (p.settings.reflections != null and !p.debugging) ctx.constants.reflections.enabled = 1;
+    if (filled(p.settings.reflections).transparent) ctx.constants.reflections.transparent = 1;
     if (p.tracing) return;
     const g = ctx.graph;
-    try g.add(.{ .name = "reflections", .stage = .reflections, .always = true, .scope = false }, ctx, reflect);
+    const reads = try ctx.make([2]features.Target);
+    var count: usize = 0;
+    for ([_]features.graph.Slot{ .reflection_weight, .reflection_surface }) |slot| if (g.slot(slot)) |target| {
+        reads[count] = target;
+        count += 1;
+    };
+    try g.add(.{ .name = "reflections", .stage = .reflections, .reads = reads[0..count], .always = true, .scope = false }, ctx, reflect);
 }
 
 fn reflect(ctx: *ViewContext) !void {
@@ -80,13 +101,13 @@ fn reflect(ctx: *ViewContext) !void {
 pub fn reflectionTargets(renderer: *Renderer, p: *const ScenePass) !ReflectionTargets {
     const device = renderer.device;
     const kept = &p.view_data.kept;
-    const frame = renderer.frame_index;
+    const frame = renderer.internal.frame_index;
     const color = rhi.TextureUsage{ .sampled = true, .color_attachment = true };
     const scale = filled(p.settings.reflections).resolution;
-    const traced = try kept.history(renderer.gpa, device, .{ .name = "reflections", .width = @import("../state.zig").scaledExtent(scale, p.width), .height = @import("../state.zig").scaledExtent(scale, p.height), .format = render.hdr_format, .usage = color }, frame);
+    const traced = try kept.history(renderer.internal.gpa, device, .{ .name = "reflections", .width = @import("../state.zig").scaledExtent(scale, p.width), .height = @import("../state.zig").scaledExtent(scale, p.height), .format = render.hdr_format, .usage = color }, frame);
     return .{
-        .weight = try kept.single(renderer.gpa, device, .{ .name = "reflection weight", .width = p.width, .height = p.height, .format = render.hdr_format, .usage = color }, frame),
-        .surface = try kept.single(renderer.gpa, device, .{ .name = "reflection surface", .width = p.width, .height = p.height, .format = render.hdr_format, .usage = color }, frame),
+        .weight = try kept.single(renderer.internal.gpa, device, .{ .name = "reflection weight", .width = p.width, .height = p.height, .format = render.hdr_format, .usage = color }, frame),
+        .surface = try kept.single(renderer.internal.gpa, device, .{ .name = "reflection surface", .width = p.width, .height = p.height, .format = render.hdr_format, .usage = color }, frame),
         .traced = traced.current,
         .history = traced.previous orelse traced.current,
         .history_valid = traced.previous != null,
@@ -110,38 +131,48 @@ pub fn drawReflections(renderer: *Renderer, p: *const ScenePass, targets: Reflec
         (if (scene.tlas) |tlas| device.accelerationAddress(tlas) else 0)
     else
         0;
-    cmd.bindPipeline(if (traced_tlas != 0) try renderer.pipelines.get(.ssr_traced) else try renderer.pipelines.get(.ssr));
-    cmd.pushConstants(extern struct { frame: u64, depth: u32, color: u32, reflection: u32, surface: u32, max_roughness: f32, thickness: f32, max_distance: f32, step_count: i32, history: u32, history_blend: f32, tlas: u64 }{
+    cmd.bindPipeline(if (traced_tlas != 0) try renderer.internal.pipelines.of(ssrTracedPipeline) else try renderer.internal.pipelines.of(ssrPipeline));
+    cmd.pushConstants(ssr_push.TracePush{
         .frame = frame_address,
-        .depth = device.textureIndex(view.depth),
-        .color = device.textureIndex(view.hdr),
-        .reflection = device.textureIndex(targets.weight),
-        .surface = device.textureIndex(targets.surface),
+        .depth_texture = device.textureIndex(view.depth),
+        .color_texture = device.textureIndex(view.hdr),
+        .reflection_texture = device.textureIndex(targets.weight),
+        .surface_texture = device.textureIndex(targets.surface),
         .max_roughness = std.math.clamp(filled(settings.reflections).max_roughness, 0.05, 1),
         .thickness = @max(filled(settings.reflections).thickness, 0.01),
         .max_distance = @max(filled(settings.reflections).distance, 0.1),
         .step_count = @intCast(std.math.clamp(filled(settings.reflections).steps, 4, 256)),
-        .history = if (targets.history_valid and filled(settings.reflections).temporal_filter) device.textureIndex(targets.history) else gpu.invalid_id,
+        .history_texture = if (targets.history_valid and filled(settings.reflections).temporal_filter) device.textureIndex(targets.history) else gpu.invalid_id,
         .history_blend = 0.12,
         .tlas = traced_tlas,
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(targets.traced, .shader_read);
     try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.ssr_composite));
-    cmd.pushConstants(extern struct { frame: u64, depth: u32, reflection: u32, surface: u32, traced: u32, max_roughness: f32, blur_taps: i32, reduced: u32, pad: u32 = 0 }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(ssrCompositePipeline));
+    cmd.pushConstants(ssr_push.CompositePush{
         .frame = frame_address,
-        .depth = device.textureIndex(view.depth),
-        .reflection = device.textureIndex(targets.weight),
-        .surface = device.textureIndex(targets.surface),
-        .traced = device.textureIndex(targets.traced),
+        .depth_texture = device.textureIndex(view.depth),
+        .reflection_texture = device.textureIndex(targets.weight),
+        .surface_texture = device.textureIndex(targets.surface),
+        .traced_texture = device.textureIndex(targets.traced),
         .max_roughness = std.math.clamp(filled(settings.reflections).max_roughness, 0.05, 1),
         .blur_taps = @intCast(@min(filled(settings.reflections).blur_samples, 32)),
         .reduced = @intFromBool(filled(settings.reflections).resolution != .full),
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(view.hdr, .shader_read);
     cmd.endScope();
+}
+
+fn ssrPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("reflections", pipelines_module.shaderCode("ssr.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn ssrTracedPipeline(device: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("reflections (ray traced)", if (device.caps.ray_tracing) pipelines_module.shaderCode("ssr_rt.frag.spv") else pipelines_module.shaderCode("ssr.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn ssrCompositePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("reflection composite", pipelines_module.shaderCode("ssr_composite.frag.spv"), &.{.{ .format = pipelines_module.hdr_format, .blend = .additive }});
 }

@@ -1,10 +1,14 @@
 //! Command recording for one frame. The encoder tracks texture state per
-//! mip and derives layout transitions; `beginRendering` transitions its
-//! attachments itself.
+//! mip and derives layout transitions. Sampled textures rest in
+//! `shader_read`: `beginRendering` and the copies move theirs out, and
+//! they return before the next work that could sample them.
 const std = @import("std");
 const vk = @import("vulkan");
 const types = @import("../types.zig");
 const device_module = @import("device.zig");
+const acceleration = @import("device/acceleration.zig");
+const pipelines = @import("device/pipelines.zig");
+const textures = @import("device/textures.zig");
 const Device = device_module.Device;
 
 /// Records into one command buffer: a frame's (`Frame.cmd`) or one from
@@ -22,6 +26,81 @@ pub const CommandEncoder = struct {
     rendering: bool = false,
     /// Number of `drawIndexedIndirectCount` draws recorded.
     indirect_draws: u32 = 0,
+    /// Mips of sampled textures left in an attachment or copy state, owed a
+    /// return to `shader_read`.
+    owed: [max_owed]Mip = undefined,
+    owed_count: u8 = 0,
+    /// The attachments of the open rendering.
+    attached: [9]Mip = undefined,
+    attached_count: u8 = 0,
+
+    const max_owed = 64;
+
+    const Mip = struct {
+        texture: types.Texture,
+        mip: u32,
+        /// Layers drawn into since the last barrier on the mip; a bit per
+        /// layer, the last standing for every layer from 63 on.
+        drawn: u64 = 0,
+
+        fn in(self: Mip, list: []const Mip) bool {
+            for (list) |other| {
+                if (other.texture == self.texture and other.mip == self.mip) return true;
+            }
+            return false;
+        }
+    };
+
+    fn owe(self: *CommandEncoder, entry: Mip) void {
+        const resource = self.device.textures.get(entry.texture) orelse return;
+        if (resource.bindless_index == null) return;
+        for (self.owed[0..self.owed_count]) |*other| {
+            if (other.texture == entry.texture and other.mip == entry.mip) {
+                other.drawn |= entry.drawn;
+                return;
+            }
+        }
+        if (self.owed_count == max_owed) self.settleExcept(&.{});
+        self.owed[self.owed_count] = entry;
+        self.owed_count += 1;
+    }
+
+    /// Returns every owed texture to `shader_read`, for work that samples
+    /// textures without the encoder seeing it: an external SDK recording
+    /// into the command buffer. Draws, dispatches and submits do it
+    /// themselves.
+    pub fn settle(self: *CommandEncoder) void {
+        self.settleExcept(&.{});
+    }
+
+    /// As `settle`, leaving the mips in `keep` as they are and owed.
+    fn settleExcept(self: *CommandEncoder, keep: []const Mip) void {
+        var barriers: [max_owed]vk.ImageMemoryBarrier2 = undefined;
+        var count: u32 = 0;
+        var kept: u8 = 0;
+        for (self.owed[0..self.owed_count]) |entry| {
+            if (entry.in(keep)) {
+                self.owed[kept] = entry;
+                kept += 1;
+                continue;
+            }
+            const resource = self.device.textures.get(entry.texture) orelse continue;
+            const from = resource.states[entry.mip];
+            switch (from) {
+                .color_attachment, .depth_attachment, .copy_src, .copy_dst => {},
+                else => continue,
+            }
+            barriers[count] = imageBarrier(resource, entry.mip, 1, from, .shader_read);
+            count += 1;
+            resource.states[entry.mip] = .shader_read;
+        }
+        self.owed_count = kept;
+        if (count == 0) return;
+        self.device.vkd.cmdPipelineBarrier2(self.command, &.{
+            .image_memory_barrier_count = count,
+            .p_image_memory_barriers = &barriers,
+        });
+    }
 
     /// Binds the global descriptor table for both bind points.
     pub fn bindGlobals(self: *CommandEncoder) void {
@@ -111,9 +190,16 @@ pub const CommandEncoder = struct {
     }
 
     /// Begins a render pass, transitioning the attachments and setting a
-    /// full-size viewport and scissor.
+    /// full-size viewport and scissor. Owed textures other than the
+    /// attachments return to `shader_read` first.
     pub fn beginRendering(self: *CommandEncoder, desc: types.RenderingDesc) !void {
         std.debug.assert(!self.rendering);
+        self.attached_count = 0;
+        for (desc.color) |attachment| self.attach(.{ .texture = attachment.texture, .mip = attachment.mip, .drawn = layerBit(attachment.layer) });
+        if (desc.depth) |attachment| self.attach(.{ .texture = attachment.texture, .mip = attachment.mip, .drawn = layerBit(attachment.layer) });
+        self.settleExcept(self.attached[0..self.attached_count]);
+        for (desc.color) |attachment| self.redraw(attachment.texture, attachment.mip, attachment.layer, .color_attachment);
+        if (desc.depth) |attachment| self.redraw(attachment.texture, attachment.mip, attachment.layer, .depth_attachment);
         var colors: [8]vk.RenderingAttachmentInfo = undefined;
         var extent: vk.Extent2D = .{ .width = 0, .height = 0 };
         for (desc.color, 0..) |attachment, index| {
@@ -121,7 +207,7 @@ pub const CommandEncoder = struct {
             self.transitionMip(attachment.texture, attachment.mip, .color_attachment);
             extent = mipExtent(resource.info, attachment.mip);
             colors[index] = .{
-                .image_view = try self.device.subView(attachment.texture, attachment.mip, attachment.layer),
+                .image_view = try textures.subView(self.device, attachment.texture, attachment.mip, attachment.layer),
                 .image_layout = .attachment_optimal,
                 .resolve_mode = .{},
                 .resolve_image_layout = .undefined,
@@ -139,7 +225,7 @@ pub const CommandEncoder = struct {
             self.transitionMip(attachment.texture, attachment.mip, .depth_attachment);
             extent = mipExtent(resource.info, attachment.mip);
             depth = .{
-                .image_view = try self.device.subView(attachment.texture, attachment.mip, attachment.layer),
+                .image_view = try textures.subView(self.device, attachment.texture, attachment.mip, attachment.layer),
                 .image_layout = .attachment_optimal,
                 .resolve_mode = .{},
                 .resolve_image_layout = .undefined,
@@ -171,12 +257,46 @@ pub const CommandEncoder = struct {
         self.setViewport(0, 0, extent.width, extent.height);
     }
 
-    /// Attachments stay in their attachment state; `transition` them before
-    /// sampling or copying.
+    /// Sampled attachments are owed a return to `shader_read`.
     pub fn endRendering(self: *CommandEncoder) void {
         std.debug.assert(self.rendering);
         self.device.vkd.cmdEndRendering(self.command);
         self.rendering = false;
+        for (self.attached[0..self.attached_count]) |entry| self.owe(entry);
+        self.attached_count = 0;
+    }
+
+    fn layerBit(layer: u32) u64 {
+        return @as(u64, 1) << @intCast(@min(layer, 63));
+    }
+
+    fn attach(self: *CommandEncoder, entry: Mip) void {
+        for (self.attached[0..self.attached_count]) |*other| {
+            if (other.texture == entry.texture and other.mip == entry.mip) {
+                other.drawn |= entry.drawn;
+                return;
+            }
+        }
+        self.attached[self.attached_count] = entry;
+        self.attached_count += 1;
+    }
+
+    /// Orders drawing into a layer that is still an attachment after the
+    /// drawing that left it there. Other layers of the mip need no order.
+    fn redraw(self: *CommandEncoder, texture: types.Texture, mip: u32, layer: u32, state: types.TextureState) void {
+        const resource = self.device.textureResource(texture);
+        if (resource.states[mip] != state) return;
+        for (self.owed[0..self.owed_count]) |*entry| {
+            if (entry.texture != texture or entry.mip != mip) continue;
+            if (entry.drawn & layerBit(layer) == 0) return;
+            entry.drawn = 0;
+            break;
+        }
+        const barrier = imageBarrier(resource, mip, 1, state, state);
+        self.device.vkd.cmdPipelineBarrier2(self.command, &.{
+            .image_memory_barrier_count = 1,
+            .p_image_memory_barriers = @ptrCast(&barrier),
+        });
     }
 
     /// Sets viewport and scissor to the same rectangle, in pixels from the
@@ -216,7 +336,7 @@ pub const CommandEncoder = struct {
         const T = @TypeOf(value);
         comptime std.debug.assert(@sizeOf(T) <= device_module.push_constant_size);
         comptime std.debug.assert(@sizeOf(T) % 4 == 0);
-        self.device.vkd.cmdPushConstants(self.command, self.device.pipeline_layout, self.device.shaderStages(), 0, @sizeOf(T), @ptrCast(&value));
+        self.device.vkd.cmdPushConstants(self.command, self.device.pipeline_layout, pipelines.shaderStages(self.device), 0, @sizeOf(T), @ptrCast(&value));
     }
 
     /// Binds `buffer` from byte `offset` for pipelines with a `VertexLayout`.
@@ -308,12 +428,14 @@ pub const CommandEncoder = struct {
     /// Runs the bound compute pipeline; outside a render pass. Buffer writes
     /// are not visible to later passes until `sync(.compute_to_all)`.
     pub fn dispatch(self: *CommandEncoder, x: u32, y: u32, z: u32) void {
+        self.settle();
         self.device.vkd.cmdDispatch(self.command, x, y, z);
     }
 
     /// `dispatch` with its three 32-bit workgroup counts read from `buffer` at
     /// `offset`. Needs `BufferUsage.indirect`.
     pub fn dispatchIndirect(self: *CommandEncoder, buffer: types.Buffer, offset: u64) void {
+        self.settle();
         self.device.vkd.cmdDispatchIndirect(self.command, self.device.bufferResource(buffer).handle, offset);
     }
 
@@ -381,8 +503,13 @@ pub const CommandEncoder = struct {
     }
 
     /// Copies mip 0 of `source` to `destination` texel for texel: same size,
-    /// formats of the same texel size. Leaves them in `copy_src`/`copy_dst`.
+    /// formats of the same texel size. Sampled ones return to `shader_read`
+    /// before the next work that could sample them.
     pub fn copyTexture(self: *CommandEncoder, source: types.Texture, destination: types.Texture) void {
+        self.settleExcept(&.{ .{ .texture = source, .mip = 0 }, .{ .texture = destination, .mip = 0 } });
+        defer for ([_]types.Texture{ source, destination }) |texture| {
+            for (0..self.device.textureResource(texture).info.mip_levels) |mip| self.owe(.{ .texture = texture, .mip = @intCast(mip) });
+        };
         self.transition(source, .copy_src);
         self.transition(destination, .copy_dst);
         const from = self.device.textureResource(source);
@@ -419,8 +546,14 @@ pub const CommandEncoder = struct {
 
     /// Builds a bottom-level structure from geometry already on the GPU.
     pub fn buildBlas(self: *CommandEncoder, blas: types.AccelerationStructure, desc: types.BlasDesc) !void {
+        try self.buildBlases(&.{.{ .blas = blas, .desc = desc }});
+    }
+
+    /// As `buildBlas` for each, recorded together so the GPU may build them
+    /// side by side.
+    pub fn buildBlases(self: *CommandEncoder, builds: []const types.BlasBuild) !void {
         std.debug.assert(!self.rendering);
-        try self.device.buildBlasCommand(self.command, blas, desc);
+        try acceleration.buildBlasesCommand(self.device, self.command, builds);
     }
 
     /// Asks for the size a structure built earlier in these commands compacts
@@ -428,7 +561,7 @@ pub const CommandEncoder = struct {
     pub fn measureBlas(self: *CommandEncoder, blas: types.AccelerationStructure) !void {
         std.debug.assert(!self.rendering);
         self.accelerationBarrier();
-        try self.device.measureBlasCommand(self.command, blas);
+        try acceleration.measureBlasCommand(self.device, self.command, blas);
     }
 
     /// Copies `source` into `destination`, made by
@@ -436,7 +569,7 @@ pub const CommandEncoder = struct {
     pub fn compactBlas(self: *CommandEncoder, source: types.AccelerationStructure, destination: types.AccelerationStructure) void {
         std.debug.assert(!self.rendering);
         self.accelerationBarrier();
-        self.device.compactBlasCommand(self.command, source, destination);
+        acceleration.compactBlasCommand(self.device, self.command, source, destination);
         self.accelerationBarrier();
     }
 
@@ -445,7 +578,17 @@ pub const CommandEncoder = struct {
     pub fn buildTlas(self: *CommandEncoder, tlas: types.AccelerationStructure, instances_address: u64, instance_count: u32) void {
         std.debug.assert(!self.rendering);
         self.accelerationBarrier();
-        self.device.buildTlasCommand(self.command, tlas, instances_address, instance_count);
+        acceleration.buildTlasCommand(self.device, self.command, tlas, instances_address, instance_count, false);
+        self.accelerationBarrier();
+    }
+
+    /// As `buildTlas`, updating the last build in place when the structure
+    /// is `TlasDesc.updatable` and the instance count has not changed: for
+    /// instances that only moved.
+    pub fn updateTlas(self: *CommandEncoder, tlas: types.AccelerationStructure, instances_address: u64, instance_count: u32) void {
+        std.debug.assert(!self.rendering);
+        self.accelerationBarrier();
+        acceleration.buildTlasCommand(self.device, self.command, tlas, instances_address, instance_count, true);
         self.accelerationBarrier();
     }
 

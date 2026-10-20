@@ -1,31 +1,7 @@
 #include "path_history.slang"
 #include "common.slang"
 
-struct GatherPush {
-    FrameConstants frame;
-    uint color;
-    uint guide;
-    uint soft;
-    uint facing;
-    uint lamp;
-    uint gloss;
-    uint surface;
-    uint history_color;
-    uint history_guide;
-    uint history_soft;
-    uint history_facing;
-    uint history_lamp;
-    uint history_gloss;
-    uint history_surface;
-    uint motion;
-    uint depth;
-    uint moved;
-    uint reset;
-    float history_limit;
-    float lamp_limit;
-    float3 previous_camera;
-    float pad;
-};
+#include "pathtrace_denoise.GatherPush.slang"
 
 [[vk::push_constant]] GatherPush gather_push;
 
@@ -139,19 +115,7 @@ GatherOutput gatherMain(float4 position : SV_Position) {
     return result;
 }
 
-struct DenoisePush {
-    FrameConstants frame;
-    uint color_texture;
-    uint guide_texture;
-    int step_size;
-    uint gathered;
-    uint mode;
-    uint steady_texture;
-    uint facing_texture;
-    uint gloss_texture;
-    uint gloss_gathered_texture;
-    uint lamp_texture;
-};
+#include "pathtrace_denoise.DenoisePush.slang"
 
 [[vk::push_constant]] DenoisePush denoise_push;
 
@@ -305,15 +269,7 @@ float4 denoiseMain(float4 fragment : SV_Position) : SV_Target {
     return denoise_push.mode == mode_last ? float4(steady_texel.rgb + (smoothed + lamp) * divisor(guide) + gloss, 1.0) : float4(smoothed, doubt);
 }
 
-struct NrdPackPush {
-    FrameConstants frame;
-    uint surface;
-    uint diffuse;
-    uint specular;
-    uint albedo;
-    uint depth;
-    uint pad;
-};
+#include "pathtrace_denoise.NrdPackPush.slang"
 
 [[vk::push_constant]] NrdPackPush nrd_pack_push;
 
@@ -356,15 +312,7 @@ NrdPackOutput nrdPackMain(float4 position : SV_Position) {
     return result;
 }
 
-struct NrdComposePush {
-    FrameConstants frame;
-    uint steady_texture;
-    uint albedo_texture;
-    uint lamp_texture;
-    uint diffuse_texture;
-    uint specular_texture;
-    uint depth_texture;
-};
+#include "pathtrace_denoise.NrdComposePush.slang"
 
 [[vk::push_constant]] NrdComposePush nrd_compose_push;
 

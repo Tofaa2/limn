@@ -1,28 +1,6 @@
 #include "common.slang"
 
-struct Push {
-    FrameConstants frame;
-    uint color_texture;
-    uint bloom_texture;
-    float bloom_strength;
-    uint encode_srgb;
-    float sharpen;
-    float bloom_scale;
-    uint passthrough;
-    int2 origin;
-    float vignette;
-    float grain;
-    float saturation;
-    float contrast;
-    float3 color_filter;
-    float aberration;
-    float hdr_paper_white;
-    float hdr_peak;
-    uint lut_texture;
-    float lut_strength;
-    float flare;
-    uint flare_pad;
-};
+#include "tonemap.Push.slang"
 
 [[vk::push_constant]] Push push;
 

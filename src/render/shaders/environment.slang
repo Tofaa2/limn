@@ -20,16 +20,7 @@ float2 equirectUv(float3 direction) {
     return float2(atan2(direction.z, direction.x) / (2.0 * PI) + 0.5, acos(clamp(direction.y, -1.0, 1.0)) / PI);
 }
 
-struct CubePush {
-    uint source_texture;
-    uint sampler_index;
-    uint face;
-    float max_radiance;
-    uint from_cube;
-    float3 to_sun;
-    float3 sunlight;
-    CloudData clouds;
-};
+#include "environment.CubePush.slang"
 
 [[vk::push_constant]] CubePush cube_push;
 
@@ -45,12 +36,7 @@ float4 cubeMain([[vk::location(0)]] float2 in_uv) : SV_Target {
     return float4(color, 1.0);
 }
 
-struct IrradiancePush {
-    uint source_texture;
-    uint sampler_index;
-    uint face;
-    float source_size;
-};
+#include "environment.IrradiancePush.slang"
 
 [[vk::push_constant]] IrradiancePush irradiance_push;
 
@@ -75,13 +61,7 @@ float4 irradianceMain([[vk::location(0)]] float2 in_uv) : SV_Target {
     return float4(total / float(sample_count), 1.0);
 }
 
-struct PrefilterPush {
-    uint source_texture;
-    uint sampler_index;
-    uint face;
-    float source_size;
-    float roughness;
-};
+#include "environment.PrefilterPush.slang"
 
 [[vk::push_constant]] PrefilterPush prefilter_push;
 
@@ -110,20 +90,7 @@ float4 prefilterMain([[vk::location(0)]] float2 in_uv) : SV_Target {
     return float4(total / max(weight_total, 1e-4), 1.0);
 }
 
-struct SkyPush {
-    float3 to_sun;
-    uint face;
-    float3 ground_color;
-    float turbidity;
-    float intensity;
-    float max_radiance;
-    float sun_disc;
-    float stars;
-    float3 to_moon;
-    float moon;
-    float ozone;
-    CloudData clouds;
-};
+#include "environment.SkyPush.slang"
 
 [[vk::push_constant]] SkyPush sky_push;
 
@@ -279,15 +246,7 @@ float4 skyMain([[vk::location(0)]] float2 in_uv) : SV_Target {
     return float4(min(color * sky_push.intensity, float3(sky_push.max_radiance)), 1.0);
 }
 
-struct ProbeFacePush {
-    uint source_texture;
-    uint sampler_index;
-    uint face;
-    float max_radiance;
-    float3 right;
-    float3 up;
-    float3 forward;
-};
+#include "environment.ProbeFacePush.slang"
 
 [[vk::push_constant]] ProbeFacePush probe_face_push;
 

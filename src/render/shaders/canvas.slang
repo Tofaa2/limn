@@ -21,25 +21,7 @@ struct DrawQuad {
     uint texture_mode;
 };
 
-struct Push {
-    DrawVertex* vertices;
-    uint* indices;
-    float4x4 transform;
-    float3 camera_right;
-    uint encode_srgb;
-    float3 camera_up;
-    float sdf_spread;
-    float2 viewport;
-    uint sampler_linear;
-    uint sampler_nearest;
-    uint depth_texture;
-    float hdr_paper_white;
-    float2 origin;
-    uint sharp_text;
-    float time;
-    DrawQuad* quads;
-    uint unfold;
-};
+#include "canvas.Push.slang"
 
 [[vk::push_constant]] Push push;
 
@@ -117,7 +99,7 @@ float4 canvasColor(Varyings input) {
     if (push.depth_texture != INVALID_ID) {
         float2 uv = (input.position.xy - push.origin) / push.viewport;
         float scene = textures_2d[NonUniformResourceIndex(push.depth_texture)].SampleLevel(samplers[NonUniformResourceIndex(push.sampler_nearest)], uv, 0.0).r;
-        if (input.position.z < scene) discard;
+        if (push.under != 0u ? scene > 0.0 : input.position.z < scene) discard;
     }
     uint mode = input.texture_mode >> 24;
     uint texture_index = input.texture_mode & 0x00ffffffu;

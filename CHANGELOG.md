@@ -13,9 +13,16 @@
 - `entities.setTransforms`.
 - Entity setters work mid-frame.
 - `rhi.Device.caps` and `rhi.native`.
+- `rhi.Capabilities` limits and per-format support.
+- Compute pipelines take specialization constants; `rhi.Device.compileComputePipeline`.
+- `rhi.Device.storageArrayIndex`: storage views of every layer.
+- `rhi.CommandEncoder.buildBlases` and `updateTlas`.
 - `Stats.pipelines`.
 - The `canvas` example takes `--screenshot` and `--timings`.
 - `DrawStage.scene`: draw lists under bloom, exposure and tone mapping, with or without a scene.
+- `DrawStage.under`: draw lists behind the scene, where no surface is.
+- `Renderer.lights` and `Renderer.decals`: single lights and decals by handle, beside `scenes.setLights` and `setDecals`.
+- `Pass.reads`, `PassStage.after_resolve`, and `PassContext.visibility` and `ambient_occlusion`.
 - `Stats.downgraded`.
 - `DrawList.setBlend`, `setLayer` and `setShader`; `Renderer.canvas.createShader`.
 - The `canvas` example takes `--lit` and `--effects`.
@@ -70,9 +77,17 @@
 - Every shader is Slang; `glslc` is only needed to build the FidelityFX SDK.
 - Breaking: custom material shaders are Slang, include "shade.slang" and are compiled with entry `fragmentMain`; see `examples/shaders/lava.slang`.
 - Slang shaders mark the buffers they only read as read-only, as GLSL did; probe GI and culling run faster.
-- Pipelines are built on first use.
+- `rhi.CommandEncoder` returns drawn and copied textures to `shader_read` itself, before the next work that could sample them.
+- Breaking: `rhi.Device.endImmediate` takes the encoder.
+- Breaking: shaders read a feature's frame constants from its block (`frame.shadows`, `frame.lights`, `frame.gi`, `frame.shading` and so on), and the `FRAME_*` flags are fields of those blocks.
+- Breaking: `Renderer` fields other than the namespaces, `options` and `device` are in `Renderer.internal`.
+- Breaking: `Renderer.pathTracing` is `Renderer.capabilities().path_tracing`.
+- Breaking: `environments.load` takes an `EnvironmentDesc`.
+- Breaking: `rhi.BlasDesc` holds a list of `rhi.BlasGeometry`; `createTlas` takes a `rhi.TlasDesc`.
+- Pipelines are built on first use, kept by their description; any can compile on a worker thread.
 - A renderer that draws no scene makes no scene buffers.
 - The frame constants in shaders are generated from `frame_constants.zig`.
+- The shaders' push constants are generated from `src/render/shaders/push`.
 - Fewer FidelityFX shader permutations compiled.
 - Only changed entities are prepared each frame.
 - Animation poses skip unmoved nodes.
@@ -83,6 +98,8 @@
 
 
 ### Fixed
+- Impostor textures and reflection probes are freed with the renderer.
+- Particle trails are freed with the renderer.
 - Tint, params and flags on skinned entities.
 - GI restarting with reflection probes or several views.
 - Local light and virtual shadows with several views.

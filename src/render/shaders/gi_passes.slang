@@ -2,22 +2,7 @@
 #include "gi.slang"
 #include "common.slang"
 
-struct TracePush {
-    FrameConstants frame;
-    float4* rays;
-    uint64_t tlas;
-    float4* directions;
-    uint rays_per_probe;
-    uint probe_count;
-    uint multibounce;
-    float max_distance;
-    uint probe_stride;
-    uint probe_phase;
-    uint grid;
-    uint skip_buried;
-    float far_distance;
-    uint turn;
-};
+#include "gi_passes.TracePush.slang"
 
 [[vk::push_constant]] TracePush trace_push;
 
@@ -47,7 +32,7 @@ void traceMain(uint3 id : SV_DispatchThreadID) {
     LitRay seen = traceLit(tracer, origin, direction, trace_push.max_distance, 3.0, trace_push.multibounce != 0u, RAY_SOLID);
     if (seen.met == RAY_MISS) {
         float3 sky = float3(0.0);
-        if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
+        if (frame.environment != 0u)
             sky = sampleCubeLod(frame.env_specular, frame.sampler_linear_clamp, direction, 2.0).rgb * frame.env_intensity;
         storeAligned<16>(trace_push.rays + slot, float4(throughFluids(frame, origin, direction, trace_push.max_distance, sky), trace_push.max_distance));
     } else if (seen.met == RAY_BACK) {
@@ -57,32 +42,16 @@ void traceMain(uint3 id : SV_DispatchThreadID) {
     }
 }
 
-struct RelocatePush {
-    FrameConstants frame;
-    float4* rays;
-    float4* directions;
-    uint rays_per_probe;
-    float hysteresis;
-    float max_distance;
-    uint probe_stride;
-    uint probe_phase;
-    float fast_hysteresis;
-    int3 shift;
-    uint grid_index;
-    float far_distance;
-    uint turn;
-    float3 axis;
-    float axis_pad;
-    uint previous_offsets;
-};
+#include "gi_passes.UpdatePush.slang"
+#include "gi_passes.RelocatePush.slang"
 
 [[vk::push_constant]] RelocatePush relocate_push;
 
 [shader("fragment")]
 float4 relocateMain(float4 fragment : SV_Position) : SV_Target {
-    FrameConstants frame = relocate_push.frame;
+    FrameConstants frame = relocate_push.update.frame;
     int2 pixel = int2(fragment.xy);
-    GiGrid grid = giGrid(frame, relocate_push.grid_index);
+    GiGrid grid = giGrid(frame, relocate_push.update.grid_index);
     int3 counts = grid.counts;
     int3 storage = int3(pixel.x % counts.x, pixel.y, pixel.x / counts.x);
     int probe = storage.x + storage.y * counts.x + storage.z * counts.x * counts.y;
@@ -92,9 +61,9 @@ float4 relocateMain(float4 fragment : SV_Position) : SV_Target {
     float4 before = fetchTexel(relocate_push.previous_offsets, pixel);
     float apart = abs(before.w - mark);
     float3 offset = min(apart, 1.0 - apart) < 0.004 ? before.xyz : float3(0.0);
-    if (uint(probe) % relocate_push.probe_stride != relocate_push.probe_phase) return float4(offset, mark);
+    if (uint(probe) % relocate_push.update.probe_stride != relocate_push.update.probe_phase) return float4(offset, mark);
 
-    float count = float(relocate_push.rays_per_probe);
+    float count = float(relocate_push.update.rays_per_probe);
     float backs = 0.0;
     float nearest_back = 1e30;
     float3 nearest_back_way = float3(0.0);
@@ -102,9 +71,9 @@ float4 relocateMain(float4 fragment : SV_Position) : SV_Target {
     float3 nearest_front_way = float3(0.0);
     float farthest_front = 0.0;
     float3 farthest_front_way = float3(0.0);
-    for (uint ray = 0u; ray < relocate_push.rays_per_probe; ray++) {
-        float met = loadAligned<16>(relocate_push.rays + uint(probe) * relocate_push.rays_per_probe + ray).w;
-        float3 way = loadAligned<16>(relocate_push.directions + ray).xyz;
+    for (uint ray = 0u; ray < relocate_push.update.rays_per_probe; ray++) {
+        float met = loadAligned<16>(relocate_push.update.rays + uint(probe) * relocate_push.update.rays_per_probe + ray).w;
+        float3 way = loadAligned<16>(relocate_push.update.directions + ray).xyz;
         if (met < 0.0) {
             backs += 1.0;
             float distance_met = -met * 5.0;
@@ -139,10 +108,7 @@ float4 relocateMain(float4 fragment : SV_Position) : SV_Target {
     return float4(offset, mark);
 }
 
-struct GatherPush {
-    FrameConstants frame;
-    uint depth_texture;
-};
+#include "gi_passes.GatherPush.slang"
 
 [[vk::push_constant]] GatherPush gather_push;
 
@@ -169,15 +135,10 @@ float4 gatherMain([[vk::location(0)]] float2 in_uv) : SV_Target {
     float3 normal = normalize(cross(dx, dy));
     if (dot(normal, view) < 0.0) normal = -normal;
 
-    return float4(giIrradiance(frame, position, normal, view) * frame.gi_intensity, linearDepth(depth, frame.depth_terms));
+    return float4(giIrradiance(frame, position, normal, view) * frame.gi.gi_intensity, linearDepth(depth, frame.depth_terms));
 }
 
-struct ClampPush {
-    FrameConstants frame;
-    uint fast_texture;
-    float scale;
-    float offset;
-};
+#include "gi_passes.ClampPush.slang"
 
 [[vk::push_constant]] ClampPush clamp_push;
 
@@ -187,23 +148,6 @@ float4 clampMain(float4 fragment : SV_Position) : SV_Target {
     return float4(max(fast * clamp_push.scale + clamp_push.offset, float3(0.0)), 1.0);
 }
 
-struct UpdatePush {
-    FrameConstants frame;
-    float4* rays;
-    float4* directions;
-    uint rays_per_probe;
-    float hysteresis;
-    float max_distance;
-    uint probe_stride;
-    uint probe_phase;
-    float fast_hysteresis;
-    int3 shift;
-    uint grid_index;
-    float far_distance;
-    uint turn;
-    float3 axis;
-    float axis_pad;
-};
 
 [[vk::push_constant]] UpdatePush update_push;
 
@@ -256,7 +200,7 @@ Output updateMain(float4 fragment : SV_Position) {
         if (moved > 0 && grid[axis] >= counts[axis] - moved) fresh = true;
         if (moved < 0 && grid[axis] < -moved) fresh = true;
     }
-    bool seeded = fresh && update_push.grid_index + 1u < frame.gi_cascade_count;
+    bool seeded = fresh && update_push.grid_index + 1u < frame.gi.gi_cascade_count;
     bool due = uint(probe) % update_push.probe_stride == update_push.probe_phase &&
         giProbeDue(frame, giProbePosition(probe_grid, grid), uint(probe), update_push.turn, update_push.far_distance);
     if (!seeded && !due) discard;

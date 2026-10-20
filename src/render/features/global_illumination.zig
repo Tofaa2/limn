@@ -1,4 +1,6 @@
 //! Bounce light from grids of probes that trace the scene.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const gi_passes_push = @import("../shaders/push/gi_passes.zig");
 const scene_pass = @import("../scene_pass.zig");
 const ray_scene = @import("../scene/ray_scene.zig");
 const math = @import("../../math.zig");
@@ -113,31 +115,43 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
         setting.* = null;
         r.downgrade("global_illumination", "probes", "off", .no_ray_tracing);
     }
+    if (setting.* != null) r.rays = true;
 }
 
 /// Adds the feature's passes to a view of a scene. A path traced view leaves
 /// out those whose result the tracer replaces.
+/// Places and fills the probe grids for this frame.
+pub fn prepare(ctx: *ViewContext) !void {
+    const p = ctx.scene orelse return;
+    p.shared.gi = try prepareGi(ctx.renderer, p.scene, p.scene_frame, p.settings, p.desc.camera.position);
+}
+
 pub fn declare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
     describe(ctx, p);
     const g = ctx.graph;
     try g.add(.{ .name = "probes", .stage = .lighting, .always = true, .scope = false }, ctx, updateProbes);
-    try g.add(.{ .name = "probe gather", .stage = .lighting, .always = true, .scope = false }, ctx, gatherProbes);
+    if (p.shared.gi == null) return;
+    const reduced = probes(p.settings.global_illumination).resolution;
+    if (reduced == .full) return;
+    const gathered = try ctx.kept(.{ .name = "gi gather", .width = ScenePass.scaled(reduced, p.width), .height = ScenePass.scaled(reduced, p.height), .format = hdr_format, .usage = .{ .sampled = true, .color_attachment = true } });
+    g.publish(.diffuse_gi, gathered);
+    try g.add(.{ .name = "gi gather", .stage = .lighting, .color = &.{.{ .target = gathered }}, .always = true }, ctx, gatherProbes);
 }
 
 /// Fills in the frame constants that are this feature's.
 fn describe(ctx: *ViewContext, p: *const ScenePass) void {
     const own = probes(p.settings.global_illumination);
     const constants = ctx.constants;
-    constants.gi_intensity = own.intensity;
-    if (own.local_lights) constants.flags |= gpu.frame_flags.gi_local_lights;
-    constants.flags |= std.math.clamp(own.bounce_lights, 1, 1023) << 20;
+    constants.gi.gi_intensity = own.intensity;
+    constants.gi.local_lights = @intFromBool(own.local_lights);
+    constants.gi.bounce_lights = std.math.clamp(own.bounce_lights, 1, 1023);
     if (p.shared.gi == null) return;
-    constants.flags |= gpu.frame_flags.gi;
-    constants.gi_cascade_count = p.scene.gi_cascade_count;
+    constants.gi.enabled = 1;
+    constants.gi.gi_cascade_count = p.scene.gi_cascade_count;
     for (p.scene.gi_cascades[0..p.scene.gi_cascade_count], 0..) |*slot, index| {
         const volume = &slot.*.?;
-        constants.gi_cascades[index] = .{
+        constants.gi.gi_cascades[index] = .{
             .origin = volume.origin,
             .spacing = volume.spacing,
             .counts = .{ @intCast(volume.counts[0]), @intCast(volume.counts[1]), @intCast(volume.counts[2]) },
@@ -155,42 +169,32 @@ fn updateProbes(ctx: *ViewContext) !void {
     const self = ctx.renderer;
     const scene = p.scene;
     if (c.gi == null) return;
-    if (scene.gi_updated_frame == self.frame_index) return;
+    if (scene.gi_updated_frame == self.internal.frame_index) return;
     const count = scene.gi_cascade_count;
     const last = count - 1;
     noteChanges(scene, p.scene_frame.tlas_hash);
     try updateGi(self, p.cmd, scene, &scene.gi_cascades[0].?, p.arena, p.frame_address, p.settings, 0);
     if (last != 0) {
         const coarse = &scene.gi_cascades[last].?;
-        if (coarse.frames < 64 or self.frame_index % @max(probes(p.settings.global_illumination).coarse_interval, 1) == 0)
+        if (coarse.frames < 64 or self.internal.frame_index % @max(probes(p.settings.global_illumination).coarse_interval, 1) == 0)
             try updateGi(self, p.cmd, scene, coarse, p.arena, p.frame_address, p.settings, last);
     }
     for (1..@max(last, 1)) |index| try updateGi(self, p.cmd, scene, &scene.gi_cascades[index].?, p.arena, p.frame_address, p.settings, @intCast(index));
-    scene.gi_updated_frame = self.frame_index;
+    scene.gi_updated_frame = self.internal.frame_index;
 }
 
-/// Optional reduced-resolution probe gather, upsampled by shading.
+/// The reduced-resolution probe gather, which the graph has begun rendering
+/// into; shading upsamples it.
 fn gatherProbes(ctx: *ViewContext) !void {
     const p = ctx.scene.?;
-    const c = p.shared;
     const self = ctx.renderer;
     const cmd = p.cmd;
-    if (c.gi == null) return;
-    const reduced = probes(p.settings.global_illumination).resolution;
-    if (reduced == .full) return;
-    const texture = try p.keep(self, "gi gather", ScenePass.scaled(reduced, p.width), ScenePass.scaled(reduced, p.height), hdr_format);
-    cmd.beginScope("gi gather");
-    try cmd.beginRendering(.{ .color = &.{.{ .texture = texture, .load = .discard }} });
-    cmd.bindPipeline(try self.pipelines.get(.gi_gather));
-    cmd.pushConstants(extern struct { frame: u64, depth: u32, pad: u32 = 0 }{
+    cmd.bindPipeline(try self.internal.pipelines.of(giGatherPipeline));
+    cmd.pushConstants(gi_passes_push.GatherPush{
         .frame = p.frame_address,
-        .depth = self.device.textureIndex(p.view.depth),
+        .depth_texture = self.device.textureIndex(p.view.depth),
     });
     cmd.drawFullscreen();
-    cmd.endRendering();
-    cmd.transition(texture, .shader_read);
-    cmd.endScope();
-    c.gathered_gi = texture;
 }
 
 /// Most probes across X times Z: the atlases lay them side by side, 16 texels
@@ -290,10 +294,10 @@ pub fn prepareGi(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame
     }
     if (!(settings.global_illumination != null) or !ray_scene.ready(scene, scene_frame)) return null;
 
-    if (scene.gi_frame == renderer.frame_index) {
+    if (scene.gi_frame == renderer.internal.frame_index) {
         if (scene.gi_cascades[0]) |*volume| return volume;
     }
-    scene.gi_frame = renderer.frame_index;
+    scene.gi_frame = renderer.internal.frame_index;
 
     const own = probes(settings.global_illumination);
     const bounds = scene.gi_bounds orelse scene_frame.bounds;
@@ -401,7 +405,7 @@ pub fn updateGi(
     defer cmd.endScope();
     const tlas = scene.tlas.?;
 
-    const turn: f64 = @floatFromInt(renderer.frame_index + 1);
+    const turn: f64 = @floatFromInt(renderer.internal.frame_index + 1);
     const first: f32 = @floatCast(@mod(turn * 0.8191725133961645, 1.0));
     const second: f32 = @floatCast(@mod(turn * 0.6710436067037893, 1.0));
     const third: f32 = @floatCast(@mod(turn * 0.5497004779019703, 1.0));
@@ -424,30 +428,15 @@ pub fn updateGi(
     const idle = !fresh and own.idle_interval != 0 and scene.gi_lighting_still >= frames_to_idle;
     const usual = std.math.clamp(own.update_interval, 1, 16);
     const stride: u32 = if (fresh) 1 else if (idle) @max(usual, @min(own.idle_interval, 64)) else usual;
-    const distances_due = fresh or scene.gi_geometry_still < frames_to_idle or (renderer.frame_index / stride) % idle_visibility_rounds == 0;
-    const phase: u32 = @intCast(renderer.frame_index % stride);
+    const distances_due = fresh or scene.gi_geometry_still < frames_to_idle or (renderer.internal.frame_index / stride) % idle_visibility_rounds == 0;
+    const phase: u32 = @intCast(renderer.internal.frame_index % stride);
 
     const far_distance: f32 = if (fresh) 0 else @max(probes(settings.global_illumination).far_distance, 0);
-    const update_turn: u32 = @truncate(renderer.frame_index / stride);
+    const update_turn: u32 = @truncate(renderer.internal.frame_index / stride);
 
     cmd.beginScope("gi trace");
-    cmd.bindPipeline(try renderer.pipelines.get(.gi_trace));
-    cmd.pushConstants(extern struct {
-        frame: u64,
-        rays: u64,
-        tlas: u64,
-        directions: u64,
-        rays_per_probe: u32,
-        probe_count: u32,
-        multibounce: u32,
-        max_distance: f32,
-        probe_stride: u32,
-        probe_phase: u32,
-        grid: u32,
-        skip_buried: u32,
-        far_distance: f32,
-        turn: u32,
-    }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(giTracePipeline));
+    cmd.pushConstants(gi_passes_push.TracePush{
         .frame = frame_address,
         .rays = device.bufferAddress(volume.rays),
         .tlas = device.accelerationAddress(tlas),
@@ -472,27 +461,8 @@ pub fn updateGi(
     const hysteresis: f32 = if (volume.frames == 0) 0 else @min(settled, @max(0.8, 1 - 2 / (gathered + 2)));
     const fast_hysteresis = 0.97;
     const raise_reluctance = 2.5;
-    const UpdatePush = extern struct {
-        frame: u64,
-        rays: u64,
-        directions: u64,
-        rays_per_probe: u32,
-        hysteresis: f32,
-        max_distance: f32,
-        probe_stride: u32,
-        probe_phase: u32,
-        fast_hysteresis: f32,
-        /// Grid cells the volume moved by; probes that wrapped start over.
-        shift: [3]i32,
-        grid: u32,
-        far_distance: f32,
-        turn: u32,
-        /// The direction the first ray points nearest and the last furthest
-        /// from, between which the others are ordered.
-        axis: [3]f32,
-        pad: f32 = 0,
-    };
-    const RelocatePush = extern struct { update: UpdatePush, previous_offsets: u32, pad: [3]u32 = .{ 0, 0, 0 } };
+    const UpdatePush = gi_passes_push.UpdatePush;
+    const RelocatePush = gi_passes_push.RelocatePush;
     const update_push = UpdatePush{
         .frame = frame_address,
         .rays = device.bufferAddress(volume.rays),
@@ -504,7 +474,7 @@ pub fn updateGi(
         .probe_phase = phase,
         .fast_hysteresis = if (volume.frames == 0) 0 else fast_hysteresis,
         .shift = volume.shift,
-        .grid = grid_index,
+        .grid_index = grid_index,
         .far_distance = far_distance,
         .turn = update_turn,
         .axis = math.transformDirection(rotation, .{ 0, 0, 1 }),
@@ -515,20 +485,19 @@ pub fn updateGi(
         .{ .texture = volume.irradiance, .load = load },
         .{ .texture = volume.irradiance_fast, .load = load },
     } });
-    cmd.bindPipeline(try renderer.pipelines.get(.gi_irradiance));
+    cmd.bindPipeline(try renderer.internal.pipelines.of(giIrradiancePipeline));
     cmd.pushConstants(update_push);
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(volume.irradiance_fast, .shader_read);
     const tolerance = std.math.clamp(probes(settings.global_illumination).change_tolerance, 0, 4);
     if (tolerance > 0 and volume.frames != 0) {
-        const ClampPush = extern struct { frame: u64, fast: u32, scale: f32, offset: f32, pad: u32 = 0 };
-        for ([_]rhi.Pipeline{ try renderer.pipelines.get(.gi_clamp_upper), try renderer.pipelines.get(.gi_clamp_lower) }, [_]f32{ 1, -1 }) |pipeline, sign| {
+        const ClampPush = gi_passes_push.ClampPush;
+        for ([_]rhi.Pipeline{ try renderer.internal.pipelines.of(giClampUpperPipeline), try renderer.internal.pipelines.of(giClampLowerPipeline) }, [_]f32{ 1, -1 }) |pipeline, sign| {
             try cmd.beginRendering(.{ .color = &.{.{ .texture = volume.irradiance, .load = .load }} });
             cmd.bindPipeline(pipeline);
             cmd.pushConstants(ClampPush{
                 .frame = frame_address,
-                .fast = device.textureIndex(volume.irradiance_fast),
+                .fast_texture = device.textureIndex(volume.irradiance_fast),
                 .scale = if (sign > 0) 1 + tolerance else @max(1 - tolerance * raise_reluctance, 0),
                 .offset = sign * 0.002,
             });
@@ -536,12 +505,11 @@ pub fn updateGi(
             cmd.endRendering();
         }
     }
-    cmd.transition(volume.irradiance, .shader_read);
     cmd.endScope();
     if (distances_due) {
         cmd.beginScope("gi visibility");
         try cmd.beginRendering(.{ .color = &.{.{ .texture = volume.visibility, .load = load }} });
-        cmd.bindPipeline(try renderer.pipelines.get(.gi_visibility));
+        cmd.bindPipeline(try renderer.internal.pipelines.of(giVisibilityPipeline));
         cmd.pushConstants(update_push);
         cmd.drawFullscreen();
         cmd.endRendering();
@@ -556,19 +524,75 @@ pub fn updateGi(
         if (!volume.offsets_valid) {
             try cmd.beginRendering(.{ .color = &.{.{ .texture = read, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
             cmd.endRendering();
-            cmd.transition(read, .shader_read);
         }
         try cmd.beginRendering(.{ .color = &.{.{ .texture = write, .load = .discard }} });
-        cmd.bindPipeline(try renderer.pipelines.get(.gi_relocate));
+        cmd.bindPipeline(try renderer.internal.pipelines.of(giRelocatePipeline));
         var relocate_push = RelocatePush{ .update = update_push, .previous_offsets = device.textureIndex(read) };
-        relocate_push.update.grid = grid_index;
+        relocate_push.update.grid_index = grid_index;
         cmd.pushConstants(relocate_push);
         cmd.drawFullscreen();
         cmd.endRendering();
-        cmd.transition(write, .shader_read);
         volume.offset_turn = 1 - volume.offset_turn;
         volume.offsets_valid = true;
     } else volume.offsets_valid = false;
     volume.frames +|= 1;
-    renderer.stats.gi_probes = probe_count;
+    renderer.internal.stats.gi_probes = probe_count;
+}
+
+fn giGatherPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("gi gather", pipelines_module.shaderCode("gi_gather.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn giTracePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "gi trace", .shader = pipelines_module.shaderCode("gi_trace.comp.spv") } };
+}
+
+fn giIrradiancePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "gi irradiance",
+        .vertex = pipelines_module.shaderCode("fullscreen.vert.spv"),
+        .fragment = pipelines_module.shaderCode("gi_irradiance.frag.spv"),
+        .color_targets = &.{ .{ .format = pipelines_module.hdr_format, .blend = .alpha }, .{ .format = pipelines_module.hdr_format, .blend = .alpha } },
+        .cull = .none,
+    } };
+}
+
+fn giClampUpperPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "gi clamp upper",
+        .vertex = pipelines_module.shaderCode("fullscreen.vert.spv"),
+        .fragment = pipelines_module.shaderCode("gi_clamp.frag.spv"),
+        .color_targets = &.{.{ .format = pipelines_module.hdr_format, .blend = .minimum }},
+        .cull = .none,
+    } };
+}
+
+fn giRelocatePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "gi relocate",
+        .vertex = pipelines_module.shaderCode("fullscreen.vert.spv"),
+        .fragment = pipelines_module.shaderCode("gi_relocate.frag.spv"),
+        .color_targets = &.{.{ .format = .rgba16_float }},
+        .cull = .none,
+    } };
+}
+
+fn giClampLowerPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "gi clamp lower",
+        .vertex = pipelines_module.shaderCode("fullscreen.vert.spv"),
+        .fragment = pipelines_module.shaderCode("gi_clamp.frag.spv"),
+        .color_targets = &.{.{ .format = pipelines_module.hdr_format, .blend = .maximum }},
+        .cull = .none,
+    } };
+}
+
+fn giVisibilityPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "gi visibility",
+        .vertex = pipelines_module.shaderCode("fullscreen.vert.spv"),
+        .fragment = pipelines_module.shaderCode("gi_visibility.frag.spv"),
+        .color_targets = &.{.{ .format = .rg16_float, .blend = .alpha }},
+        .cull = .none,
+    } };
 }

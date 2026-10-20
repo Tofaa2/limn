@@ -1,4 +1,7 @@
 //! How lit surfaces are shaded.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const shade_pass_push = @import("../shaders/push/shade.zig");
+const shading_rate_push = @import("../shaders/push/shading_rate.zig");
 const scene_pass = @import("../scene_pass.zig");
 const filled = @import("../api.zig").filled;
 const reflections_feature = @import("reflections.zig");
@@ -10,12 +13,11 @@ const std = @import("std");
 const global_illumination_feature = @import("global_illumination.zig");
 const api = @import("../api.zig");
 const features = @import("../core/features.zig");
+const resolution_feature = @import("resolution.zig");
 
 const Lighting = scene_pass.Lighting;
 const ReflectionTargets = render.ReflectionTargets;
-const runShadeVariantJob = render.runShadeVariantJob;
 const shadeVariantDesc = render.shadeVariantDesc;
-const ShadeVariantJob = render.ShadeVariantJob;
 const ProbeList = scene_pass.ProbeList;
 const ScenePass = scene_pass.ScenePass;
 const Renderer = render.Renderer;
@@ -57,26 +59,50 @@ pub fn resolve(setting: *Settings, r: *features.Resolve) void {
 }
 
 /// Adds the pass that lights every visible surface.
+/// Lists the reflection probes and decals shading reads.
+pub fn prepare(ctx: *ViewContext) !void {
+    const p = ctx.scene orelse return;
+    const probes = try reflectionProbeList(ctx.renderer, p);
+    ctx.constants.shading.probes = probes.address;
+    ctx.constants.shading.probe_count = probes.count;
+    ctx.constants.shading.decals = try writeDecals(ctx.renderer, p);
+    ctx.constants.shading.decal_count = @intCast(p.scene.decals.items.len);
+}
+
 pub fn declare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
     const own = p.settings.shading;
-    if (own.specular_antialiasing) ctx.constants.flags |= gpu.frame_flags.specular_aa;
-    ctx.constants.aerial = if (own.aerial_model == .sky) -@max(own.aerial_perspective, 0) else @max(own.aerial_perspective, 0);
+    ctx.constants.shading.specular_aa = @intFromBool(own.specular_antialiasing);
+    ctx.constants.shading.aerial = if (own.aerial_model == .sky) -@max(own.aerial_perspective, 0) else @max(own.aerial_perspective, 0);
     const g = ctx.graph;
-    var reads: [2]features.Target = undefined;
-    var count: usize = 0;
-    for ([_]features.graph.Slot{ .ambient_occlusion, .occluder_light }) |slot| if (g.slot(slot)) |target| {
-        reads[count] = target;
-        count += 1;
+    const read_slots = [_]features.graph.Slot{ .ambient_occlusion, .occluder_light, .diffuse_gi };
+    const reads = try ctx.make([read_slots.len]features.Target);
+    var read_count: usize = 0;
+    for (read_slots) |slot| if (g.slot(slot)) |target| {
+        reads[read_count] = target;
+        read_count += 1;
     };
-    try g.add(.{ .name = "shading", .stage = .surfaces, .reads = reads[0..count], .always = true, .scope = false }, ctx, shade);
+    const writes = try ctx.make([2]features.Target);
+    var write_count: usize = 0;
+    for ([_]features.graph.Slot{ .reflection_weight, .reflection_surface }) |slot| if (g.slot(slot)) |target| {
+        writes[write_count] = target;
+        write_count += 1;
+    };
+    try g.add(.{ .name = "shading", .stage = .surfaces, .reads = reads[0..read_count], .writes = writes[0..write_count], .always = true, .scope = false }, ctx, shade);
 }
 
 fn shade(ctx: *ViewContext) !void {
     const p = ctx.scene.?;
     const c = p.shared;
     const g = ctx.graph;
-    c.reflections = try shadeScene(ctx.renderer, p, c.lighting, ctx.constants.flags, c.shadow_tlas, c.colored_shadows, c.gathered_gi, .{
+    const texture = struct {
+        fn of(graph: *features.Graph, slot: features.graph.Slot) ?rhi.Texture {
+            return graph.texture(graph.slot(slot) orelse return null);
+        }
+    }.of;
+    const weight = texture(g, .reflection_weight);
+    const surface = texture(g, .reflection_surface);
+    try shadeScene(ctx.renderer, p, c.lighting, ctx.constants, c.shadow_tlas, c.colored_shadows, texture(g, .diffuse_gi), if (weight != null and surface != null) .{ .weight = weight.?, .surface = surface.? } else null, .{
         .occlusion = if (g.slot(.ambient_occlusion)) |target| g.texture(target) else null,
         .light = if (g.slot(.occluder_light)) |target| g.texture(target) else null,
     });
@@ -133,43 +159,25 @@ pub fn writeDecals(renderer: *Renderer, p: *const ScenePass) !u64 {
 /// The shading pipeline for a view: the exact feature set if built, else a
 /// ready superset while the exact one compiles on a worker thread.
 pub fn shadePipeline(renderer: *Renderer, reflective: bool, needed: u32) !rhi.Pipeline {
-    const full_id: render.PipelineId = if (reflective) .shade_reflective else .shade;
-    const full = renderer.pipelines.peek(full_id);
-    if (!renderer.options.shader_variants) return renderer.pipelines.get(full_id);
-    var requested = false;
+    const device = renderer.device;
+    const full_desc = if (reflective) fullShadeReflectivePipeline(device) else fullShadePipeline(device);
+    if (!renderer.options.shader_variants) return renderer.internal.pipelines.get(full_desc);
+    const exact = [1]u32{needed};
+    const exact_desc = pipelines_module.Desc{ .graphics = shadeVariantDesc(device, reflective, &exact) };
+    if (renderer.internal.pipelines.peek(exact_desc)) |ready| return ready;
+    var known = false;
     var stand_in: ?rhi.Pipeline = null;
-    for (renderer.shade_variants.items) |*variant| {
+    for (renderer.internal.shade_variants.items) |variant| {
         if (variant.reflective != reflective) continue;
-        if (variant.job) |job| if (job.done.load(.acquire)) {
-            job.group.cancel(job.io);
-            if (job.compiled) |compiled| {
-                variant.pipeline = renderer.device.adoptPipeline(compiled, "shading (variant)") catch null;
-            } else if (job.failure) |err| std.log.warn("shading variant did not compile: {}", .{err});
-            renderer.gpa.destroy(job);
-            variant.job = null;
-        };
-        if (variant.features == needed) {
-            requested = true;
-            if (variant.pipeline) |ready| return ready;
-        } else if (variant.features & needed == needed) {
-            if (variant.pipeline) |ready| stand_in = stand_in orelse ready;
-        }
+        if (variant.features == needed) known = true;
+        if (variant.features & needed != needed or stand_in != null) continue;
+        const constants = [1]u32{variant.features};
+        stand_in = renderer.internal.pipelines.peek(.{ .graphics = shadeVariantDesc(device, reflective, &constants) });
     }
-    if (!requested) {
-        if (full == null and stand_in == null) {
-            const constants = [1]u32{needed};
-            const made = try renderer.device.createGraphicsPipeline(shadeVariantDesc(renderer.device, reflective, &constants));
-            errdefer renderer.device.destroyPipeline(made);
-            try renderer.shade_variants.append(renderer.gpa, .{ .reflective = reflective, .features = needed, .pipeline = made });
-            return made;
-        }
-        const job = try renderer.gpa.create(ShadeVariantJob);
-        errdefer renderer.gpa.destroy(job);
-        job.* = .{ .device = renderer.device, .io = renderer.io, .reflective = reflective, .constants = .{needed} };
-        try renderer.shade_variants.append(renderer.gpa, .{ .reflective = reflective, .features = needed, .job = job });
-        job.group.concurrent(renderer.io, runShadeVariantJob, .{job}) catch job.group.async(renderer.io, runShadeVariantJob, .{job});
-    }
-    return stand_in orelse renderer.pipelines.get(full_id);
+    if (!known) try renderer.internal.shade_variants.append(renderer.internal.gpa, .{ .reflective = reflective, .features = needed });
+    if (stand_in == null and renderer.internal.pipelines.peek(full_desc) == null) return renderer.internal.pipelines.get(exact_desc);
+    if (try renderer.internal.pipelines.getLater(exact_desc)) |ready| return ready;
+    return stand_in orelse renderer.internal.pipelines.get(full_desc);
 }
 
 /// The view's shading rate tiles; null where the GPU has no such thing.
@@ -189,8 +197,11 @@ fn shadingRates(renderer: *Renderer, p: *const ScenePass) !?rhi.Texture {
 pub const Occluded = struct { occlusion: ?rhi.Texture, light: ?rhi.Texture };
 
 /// Material evaluation and lighting in one pass from the visibility buffer.
-/// Returns the targets it filled for the reflection pass, if any.
-pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lighting, flags: u32, shadow_tlas: u64, colored_shadows: bool, gathered_gi: ?rhi.Texture, occluded: Occluded) !?ReflectionTargets {
+/// What shading writes for the reflection technique.
+pub const ReflectionOutputs = struct { weight: rhi.Texture, surface: rhi.Texture };
+
+/// Writes `reflections` too, when the view has reflections.
+pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lighting, constants: *const gpu.FrameConstants, shadow_tlas: u64, colored_shadows: bool, gathered_gi: ?rhi.Texture, reflections: ?ReflectionOutputs, occluded: Occluded) !void {
     const device = renderer.device;
     const cmd = p.cmd;
     const settings = p.settings;
@@ -203,11 +214,11 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
     if (settings.shading.variable_rate and settings.resolution.temporal_antialiasing and view.history_valid and !debugging) if (try shadingRates(renderer, p)) |rates| {
         cmd.beginScope("shading rate");
         try cmd.beginRendering(.{ .color = &.{.{ .texture = rates, .load = .discard }} });
-        cmd.bindPipeline(try renderer.pipelines.get(.shading_rate));
-        cmd.pushConstants(extern struct { frame: u64, history: u32, depth: u32, tile: u32, contrast: f32 }{
+        cmd.bindPipeline(try renderer.internal.pipelines.of(shadingRatePipeline));
+        cmd.pushConstants(shading_rate_push.Push{
             .frame = frame_address,
-            .history = device.textureIndex(view.history[@intCast((view_data.frames + 1) & 1)]),
-            .depth = device.textureIndex(view.depth),
+            .history_texture = device.textureIndex((try resolution_feature.history(renderer, view_data))[@intCast((view_data.frames + 1) & 1)]),
+            .depth_texture = device.textureIndex(view.depth),
             .tile = device.caps.shading_rate_tile,
             .contrast = @max(settings.shading.variable_rate_contrast, 0),
         });
@@ -217,9 +228,6 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
         shading_rate = rates;
     };
     cmd.beginScope("shading");
-    if (view.history_valid) cmd.transition(view.previous_depth, .shader_read);
-    const reflections_on = (settings.reflections != null) and !debugging;
-    const reflections: ?ReflectionTargets = if (reflections_on) try reflections_feature.reflectionTargets(renderer, p) else null;
     if (reflections) |targets| {
         try cmd.beginRendering(.{ .color = &.{
             .{ .texture = view.hdr, .load = .discard },
@@ -233,18 +241,18 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
             .{ .texture = view.motion, .load = .discard },
         }, .shading_rate = shading_rate });
     }
-    const ShadePush = extern struct { frame: u64, visibility: u32, ao: u32, debug_view: u32, gi: u32, material_shader: u32, shadow_history: u32, bounce: u32, bounce_strength: f32, shadow_depth: u32 = gpu.invalid_id };
+    const ShadePush = shade_pass_push.Push;
     var shade_push = ShadePush{
         .frame = frame_address,
-        .visibility = device.textureIndex(view.visibility),
-        .ao = if (occluded.occlusion) |texture| device.textureIndex(texture) else gpu.invalid_id,
-        .bounce = if (occluded.light) |texture| device.textureIndex(texture) else gpu.invalid_id,
+        .visibility_texture = device.textureIndex(view.visibility),
+        .ao_texture = if (occluded.occlusion) |texture| device.textureIndex(texture) else gpu.invalid_id,
+        .bounce_texture = if (occluded.light) |texture| device.textureIndex(texture) else gpu.invalid_id,
         .bounce_strength = if (settings.ambient_occlusion) |occlusion| occlusion.bounce else 0,
         .debug_view = @intFromEnum(settings.debug_view),
-        .gi = if (gathered_gi) |texture| device.textureIndex(texture) else gpu.invalid_id,
+        .gi_texture = if (gathered_gi) |texture| device.textureIndex(texture) else gpu.invalid_id,
         .material_shader = 0,
         .shadow_history = if (filled(settings.shadows).light_filter and settings.resolution.temporal_antialiasing and view.history_valid and !debugging)
-            device.textureIndex(view.history[@intCast((view_data.frames + 1) & 1)])
+            device.textureIndex((try resolution_feature.history(renderer, view_data))[@intCast((view_data.frames + 1) & 1)])
         else
             gpu.invalid_id,
     };
@@ -262,10 +270,10 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
             break;
         };
     }
-    if (flags & gpu.frame_flags.fluid_shadows != 0) shade_features |= gpu.shade_features.fluid_shadows;
-    if (flags & gpu.frame_flags.cloud_shadows != 0) shade_features |= gpu.shade_features.cloud_shadows;
+    if (constants.fluids.shadows != 0) shade_features |= gpu.shade_features.fluid_shadows;
+    if (constants.clouds.shadows != 0) shade_features |= gpu.shade_features.cloud_shadows;
     if (scene.decals.items.len != 0) shade_features |= gpu.shade_features.decals;
-    if (renderer.texture_transform_users != 0) shade_features |= gpu.shade_features.texture_transforms;
+    if (renderer.internal.texture_transform_users != 0) shade_features |= gpu.shade_features.texture_transforms;
     if (colored_shadows) shade_features |= gpu.shade_features.colored_shadows;
     if (global_illumination_feature.probes(settings.global_illumination).probe_relocation) shade_features |= gpu.shade_features.gi_relocation;
     if (settings.shading.aerial_perspective > 0) shade_features |= gpu.shade_features.aerial;
@@ -280,8 +288,17 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
         cmd.drawFullscreen();
     }
     cmd.endRendering();
-    cmd.transition(view.hdr, .shader_read);
-    cmd.transition(view.motion, .shader_read);
     cmd.endScope();
-    return reflections;
+}
+
+fn shadingRatePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("shading rate", pipelines_module.shaderCode("shading_rate.frag.spv"), &.{.{ .format = .r8_uint }});
+}
+
+fn fullShadePipeline(device: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("shading", if (device.caps.ray_tracing) pipelines_module.shaderCode("shade_rt_plain.frag.spv") else pipelines_module.shaderCode("shade_plain.frag.spv"), &pipelines_module.shade_plain_targets);
+}
+
+fn fullShadeReflectivePipeline(device: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("shading (reflective)", if (device.caps.ray_tracing) pipelines_module.shaderCode("shade_rt.frag.spv") else pipelines_module.shaderCode("shade.frag.spv"), &pipelines_module.shade_reflective_targets);
 }

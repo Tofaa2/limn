@@ -2,10 +2,7 @@
 #include "fluid.slang"
 #include "clouds.slang"
 
-struct MarchPush {
-    FrameConstants frame;
-    CloudRef clouds;
-};
+#include "cloud_passes.MarchPush.slang"
 
 [[vk::push_constant]] MarchPush march_push;
 
@@ -37,7 +34,7 @@ float4 marchMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position
     float cos_sun = dot(direction, frame.sun_direction);
     float3 sky_up = float3(0.0);
     float3 sky_down = float3(0.0);
-    if ((frame.flags & FRAME_ENVIRONMENT) != 0u) {
+    if (frame.environment != 0u) {
         sky_up = sampleCubeLod(frame.env_irradiance, linear, float3(0.0, 1.0, 0.0), 0.0).rgb * frame.env_intensity * clouds.ambient;
         sky_down = sampleCubeLod(frame.env_irradiance, linear, float3(0.0, -1.0, 0.0), 0.0).rgb * frame.env_intensity * clouds.ambient;
     }
@@ -129,10 +126,7 @@ float4 marchMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position
     return result;
 }
 
-struct NoisePush {
-    int3 size;
-    int tiles_x;
-};
+#include "cloud_passes.NoisePush.slang"
 
 [[vk::push_constant]] NoisePush noise_push;
 
@@ -211,11 +205,7 @@ float4 noiseMain(float4 fragment : SV_Position) : SV_Target {
         worley(uvw, 16));
 }
 
-struct CompositePush {
-    FrameConstants frame;
-    CloudRef clouds;
-    uint cloud_texture;
-};
+#include "cloud_passes.CompositePush.slang"
 
 [[vk::push_constant]] CompositePush composite_push;
 

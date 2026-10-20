@@ -63,12 +63,7 @@ struct EmitterData {
 
 struct EmitterRef { EmitterData* data; };
 
-struct SimPush {
-    FrameConstants frame;
-    EmitterRef emitter;
-    Particle* particles;
-    float4* trail;
-};
+#include "particles.SimPush.slang"
 
 [[vk::push_constant]] SimPush sim_push;
 
@@ -169,13 +164,7 @@ void simMain(uint3 id : SV_DispatchThreadID) {
     sim_push.particles[index] = particle;
 }
 
-struct SortKeysPush {
-    FrameConstants frame;
-    Particle* particles;
-    SortEntry* order;
-    uint capacity;
-    uint count;
-};
+#include "particles.SortKeysPush.slang"
 
 [[vk::push_constant]] SortKeysPush sort_keys_push;
 
@@ -196,12 +185,7 @@ void sortKeysMain(uint3 id : SV_DispatchThreadID) {
     sort_keys_push.order[index] = entry;
 }
 
-struct SortPush {
-    SortEntry* order;
-    uint count;
-    uint run;
-    uint stride;
-};
+#include "particles.SortPush.slang"
 
 [[vk::push_constant]] SortPush sort_push;
 
@@ -220,14 +204,7 @@ void sortMain(uint3 id : SV_DispatchThreadID) {
     }
 }
 
-struct SpriteVertexPush {
-    FrameConstants frame;
-    EmitterRef emitter;
-    Particle* particles;
-    uint depth_texture;
-    uint push_pad;
-    SortEntry* order;
-};
+#include "particles.SpriteVertexPush.slang"
 
 [[vk::push_constant]] SpriteVertexPush sprite_vertex_push;
 
@@ -300,9 +277,9 @@ SpriteVertexVaryings spriteVertexMain(uint vertex : SV_VulkanVertexID) {
     float view_depth = -(mul(frame.view, float4(particle.position, 1.0))).z;
     if ((emitter.flags & EMITTER_LIT) != 0u) {
         float3 light = float3(0.0);
-        if ((frame.flags & FRAME_GI) != 0u) {
-            light += giAmbient(frame, particle.position) * frame.gi_intensity;
-        } else if ((frame.flags & FRAME_ENVIRONMENT) != 0u) {
+        if (frame.gi.enabled != 0u) {
+            light += giAmbient(frame, particle.position) * frame.gi.gi_intensity;
+        } else if (frame.environment != 0u) {
             light += sampleCubeLod(frame.env_irradiance, frame.sampler_linear_clamp, float3(0.0, 1.0, 0.0), 0.0).rgb * frame.env_intensity;
         }
         float shadow = sunShadow(frame, particle.position, frame.sun_direction, 1.0, view_depth, 0.5);
@@ -324,14 +301,7 @@ SpriteVertexVaryings spriteVertexMain(uint vertex : SV_VulkanVertexID) {
     return result;
 }
 
-struct SpriteFragmentPush {
-    FrameConstants frame;
-    EmitterRef emitter;
-    Particle* particles;
-    uint depth_texture;
-    uint push_pad;
-    SortEntry* order;
-};
+#include "particles.SpriteFragmentPush.slang"
 
 [[vk::push_constant]] SpriteFragmentPush sprite_fragment_push;
 
@@ -368,15 +338,7 @@ SpriteFragmentOutput spriteFragmentMain(
     return result;
 }
 
-struct TrailVertexPush {
-    FrameConstants frame;
-    EmitterRef emitter;
-    Particle* particles;
-    uint depth_texture;
-    uint push_pad;
-    SortEntry* order;
-    float4* trail;
-};
+#include "particles.TrailVertexPush.slang"
 
 [[vk::push_constant]] TrailVertexPush trail_vertex_push;
 
@@ -458,9 +420,9 @@ TrailVertexVaryings trailVertexMain(uint vertex : SV_VulkanVertexID) {
     float view_depth = -(mul(frame.view, float4(particle.position, 1.0))).z;
     if ((emitter.flags & EMITTER_LIT) != 0u) {
         float3 light = float3(0.0);
-        if ((frame.flags & FRAME_GI) != 0u) {
-            light += giAmbient(frame, particle.position) * frame.gi_intensity;
-        } else if ((frame.flags & FRAME_ENVIRONMENT) != 0u) {
+        if (frame.gi.enabled != 0u) {
+            light += giAmbient(frame, particle.position) * frame.gi.gi_intensity;
+        } else if (frame.environment != 0u) {
             light += sampleCubeLod(frame.env_irradiance, frame.sampler_linear_clamp, float3(0.0, 1.0, 0.0), 0.0).rgb * frame.env_intensity;
         }
         float shadow = sunShadow(frame, particle.position, frame.sun_direction, 1.0, view_depth, 0.5);
@@ -476,13 +438,7 @@ TrailVertexVaryings trailVertexMain(uint vertex : SV_VulkanVertexID) {
     return result;
 }
 
-struct MeshVertexPush {
-    FrameConstants frame;
-    EmitterRef emitter;
-    Particle* particles;
-    uint vertex_offset;
-    float spin;
-};
+#include "particles.MeshVertexPush.slang"
 
 [[vk::push_constant]] MeshVertexPush mesh_vertex_push;
 
@@ -556,9 +512,9 @@ MeshVertexVaryings meshVertexMain(uint vertex_index : SV_VulkanVertexID, uint in
     color *= unpackUnorm(vertex.color);
     if ((emitter.flags & EMITTER_LIT) != 0u) {
         float3 light = float3(0.0);
-        if ((frame.flags & FRAME_GI) != 0u) {
-            light += giAmbient(frame, particle.position) * frame.gi_intensity;
-        } else if ((frame.flags & FRAME_ENVIRONMENT) != 0u) {
+        if (frame.gi.enabled != 0u) {
+            light += giAmbient(frame, particle.position) * frame.gi.gi_intensity;
+        } else if (frame.environment != 0u) {
             light += sampleCubeLod(frame.env_irradiance, frame.sampler_linear_clamp, normal, 0.0).rgb * frame.env_intensity;
         }
         float view_depth = -(mul(frame.view, float4(particle.position, 1.0))).z;
@@ -575,13 +531,7 @@ MeshVertexVaryings meshVertexMain(uint vertex_index : SV_VulkanVertexID, uint in
     return result;
 }
 
-struct MeshFragmentPush {
-    FrameConstants frame;
-    EmitterRef emitter;
-    Particle* particles;
-    uint vertex_offset;
-    float spin;
-};
+#include "particles.MeshFragmentPush.slang"
 
 [[vk::push_constant]] MeshFragmentPush mesh_fragment_push;
 

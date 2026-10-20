@@ -28,17 +28,13 @@ struct TlasInstance {
     uint blas_high;
 };
 
-struct Push {
-    Instance* records;
-    float3x4* previous;
-    TlasInstance* tlas;
 #ifdef REWRITE
-    Rewrite* updates;
+typedef Rewrite* Updates;
 #else
-    Move* updates;
+typedef Move* Updates;
 #endif
-    uint count;
-};
+
+#include "instance_update.Push.slang"
 
 [[vk::push_constant]] Push push;
 

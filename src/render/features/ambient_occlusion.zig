@@ -1,12 +1,15 @@
 //! Screen-space ambient occlusion (GTAO) with the light nearby occluders
 //! bounce: a depth pyramid, a trace below full resolution, and a filter that
 //! upsamples and blends over frames.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const ambient_occlusion_push = @import("../shaders/push/ambient_occlusion.zig");
 const std = @import("std");
 const view_math = @import("../renderer/view_math.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const gpu = @import("../gpu.zig");
 const api = @import("../api.zig");
 const features = @import("../core/features.zig");
+const resolution_feature = @import("resolution.zig");
 const renderer_state = @import("../state.zig");
 
 const ViewContext = features.ViewContext;
@@ -78,7 +81,7 @@ pub fn declare(ctx: *ViewContext) !void {
 
     const frame = try ctx.make(Frame);
     const seen: ?Target = if (settings.bounce > 0 and p.view.history_valid)
-        try g.import(p.view.history[@intCast((p.view_data.frames + 1) & 1)])
+        try g.import((try resolution_feature.history(ctx.renderer, p.view_data))[@intCast((p.view_data.frames + 1) & 1)])
     else
         null;
     frame.* = .{
@@ -92,7 +95,7 @@ pub fn declare(ctx: *ViewContext) !void {
         .light = if (seen != null) try ctx.history(.{ .name = "bounce", .width = p.width, .height = p.height, .format = .rgba16_float, .usage = color }) else null,
         .seen = seen,
     };
-    ctx.constants.flags |= gpu.frame_flags.ambient_occlusion;
+    ctx.constants.ambient_occlusion.enabled = 1;
     g.publish(.ambient_occlusion, frame.occlusion.current);
     if (frame.light) |light| g.publish(.occluder_light, light.current);
 
@@ -127,14 +130,14 @@ fn reduceDepth(frame: *Frame) !void {
     const cmd = ctx.cmd;
     const device = ctx.device;
     const pyramid = ctx.graph.texture(frame.pyramid);
-    const sampler = device.samplerIndex(ctx.renderer.sampler_nearest_clamp);
+    const sampler = device.samplerIndex(ctx.renderer.internal.sampler_nearest_clamp);
     for (0..device.textureInfo(pyramid).mip_levels) |mip| {
         if (mip != 0) cmd.transitionMip(pyramid, @intCast(mip - 1), .shader_read);
         try cmd.beginRendering(.{ .color = &.{.{ .texture = pyramid, .mip = @intCast(mip), .load = .discard }} });
-        cmd.bindPipeline(try ctx.renderer.pipelines.get(.ao_depth));
-        cmd.pushConstants(extern struct { source: u32, sampler: u32, first: u32, source_lod: i32, terms: [4]f32 }{
-            .source = if (mip == 0) ctx.index(frame.depth) else device.textureIndex(pyramid),
-            .sampler = sampler,
+        cmd.bindPipeline(try ctx.renderer.internal.pipelines.of(aoDepthPipeline));
+        cmd.pushConstants(ambient_occlusion_push.DepthPush{
+            .source_texture = if (mip == 0) ctx.index(frame.depth) else device.textureIndex(pyramid),
+            .sampler_index = sampler,
             .first = @intFromBool(mip == 0),
             .source_lod = if (mip == 0) 0 else @intCast(mip - 1),
             .terms = view_math.depthTerms(ctx.desc.camera),
@@ -147,11 +150,11 @@ fn reduceDepth(frame: *Frame) !void {
 fn trace(frame: *Frame) !void {
     const ctx = frame.ctx;
     const cmd = ctx.cmd;
-    cmd.bindPipeline(try ctx.renderer.pipelines.get(.gtao));
-    cmd.pushConstants(extern struct { frame: u64, depth: u32, color: u32, radius: f32, intensity: f32, slice_count: i32, step_count: i32 }{
+    cmd.bindPipeline(try ctx.renderer.internal.pipelines.of(gtaoPipeline));
+    cmd.pushConstants(ambient_occlusion_push.GtaoPush{
         .frame = ctx.frame_address,
-        .depth = ctx.index(frame.pyramid),
-        .color = if (frame.seen) |seen| ctx.index(seen) else gpu.invalid_id,
+        .depth_texture = ctx.index(frame.pyramid),
+        .color_texture = if (frame.seen) |seen| ctx.index(seen) else gpu.invalid_id,
         .radius = frame.settings.radius,
         .intensity = frame.settings.intensity,
         .slice_count = @intCast(frame.settings.slices),
@@ -164,15 +167,31 @@ fn filter(frame: *Frame) !void {
     const ctx = frame.ctx;
     const cmd = ctx.cmd;
     const previous = if (frame.settings.temporal_filter) frame.occlusion.previous else null;
-    cmd.bindPipeline(try ctx.renderer.pipelines.get(if (frame.light != null) .gtao_bounce_denoise else .gtao_denoise));
-    cmd.pushConstants(extern struct { frame: u64, ao: u32, depth: u32, history: u32, blend: f32, bounce: u32, bounce_history: u32 }{
+    cmd.bindPipeline(if (frame.light != null) try ctx.renderer.internal.pipelines.of(gtaoBounceDenoisePipeline) else try ctx.renderer.internal.pipelines.of(gtaoDenoisePipeline));
+    cmd.pushConstants(ambient_occlusion_push.DenoisePush{
         .frame = ctx.frame_address,
-        .ao = ctx.index(frame.traced),
-        .depth = ctx.index(frame.depth),
-        .history = if (previous) |target| ctx.index(target) else gpu.invalid_id,
-        .blend = 0.1,
-        .bounce = if (frame.light != null) ctx.index(frame.traced_light) else gpu.invalid_id,
-        .bounce_history = if (frame.light) |light| (if (light.previous) |target| ctx.index(target) else gpu.invalid_id) else gpu.invalid_id,
+        .ao_texture = ctx.index(frame.traced),
+        .depth_texture = ctx.index(frame.depth),
+        .history_texture = if (previous) |target| ctx.index(target) else gpu.invalid_id,
+        .history_blend = 0.1,
+        .bounce_texture = if (frame.light != null) ctx.index(frame.traced_light) else gpu.invalid_id,
+        .bounce_history_texture = if (frame.light) |light| (if (light.previous) |target| ctx.index(target) else gpu.invalid_id) else gpu.invalid_id,
     });
     cmd.drawFullscreen();
+}
+
+fn gtaoPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("gtao", pipelines_module.shaderCode("gtao.frag.spv"), &.{ .{ .format = .rg16_float }, .{ .format = .rgba16_float } });
+}
+
+fn aoDepthPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("ao depth", pipelines_module.shaderCode("ao_depth.frag.spv"), &.{.{ .format = .r16_float }});
+}
+
+fn gtaoBounceDenoisePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("gtao bounce denoise", pipelines_module.shaderCode("gtao_bounce_denoise.frag.spv"), &.{ .{ .format = .r16_float }, .{ .format = .rgba16_float } });
+}
+
+fn gtaoDenoisePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("gtao denoise", pipelines_module.shaderCode("gtao_denoise.frag.spv"), &.{.{ .format = .r16_float }});
 }

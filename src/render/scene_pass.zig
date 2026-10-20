@@ -1,5 +1,7 @@
 //! State and results shared between the passes of one view of a scene.
 //! Internal to the renderer.
+const cull_push = @import("shaders/push/cull.zig");
+const visibility_push = @import("shaders/push/visibility.zig");
 const rhi = @import("../rhi/rhi.zig");
 const math = @import("../math.zig");
 const gpu = @import("gpu.zig");
@@ -81,7 +83,6 @@ pub const Shared = struct {
     instance_total: u32,
     count_readback: rhi.Buffer,
     culling: *CullState,
-    gathered_gi: ?rhi.Texture = null,
     reflections: ?render.ReflectionTargets = null,
     path_traced: bool = false,
     resolved: *rhi.Texture,
@@ -157,7 +158,7 @@ pub const ScenePass = struct {
     }
 
     pub fn keepAs(p: *const ScenePass, renderer: *render.Renderer, desc: rhi.TextureDesc) !rhi.Texture {
-        return p.view_data.kept.single(renderer.gpa, renderer.device, desc, renderer.frame_index);
+        return p.view_data.kept.single(renderer.internal.gpa, renderer.device, desc, renderer.internal.frame_index);
     }
 
     /// `size` at an effect's fraction of the view's resolution.
@@ -204,76 +205,11 @@ pub const CullState = struct {
     receiver_culled: [gpu.cascade_count]bool,
 };
 
-/// Push constants of the meshlet passes: camera visibility and shadows.
-pub const DrawPush = extern struct {
-    frame: u64,
-    /// 1 in a shadow pass whose see-through casters go into the tint
-    /// instead of the depth.
-    tinted: u32 = 0,
-    /// Nonzero when `page` replaces `view_proj`.
-    paged: u32 = 0,
-    view_proj: Mat4,
-    /// LOD cross-fade in the camera pass: camera and selection scale, band
-    /// width, and near plane.
-    lod: [4]f32 = .{ 0, 0, 0, 0 },
-    lod_band: f32 = 1,
-    lod_near: f32 = 0,
-    /// With mesh shaders: the meshlet list for this draw and the address of
-    /// its length.
-    list: u64 = 0,
-    count: u64 = 0,
-    /// A page of the sun's virtual shadow map (`VisibilityPage` in
-    /// visibility_page.slang).
-    page: u64 = 0,
-};
+pub const DrawPush = visibility_push.GeometryPush;
 
-/// Push constants of the culling pass, for one view at a time.
-pub const CullPush = extern struct {
-    frame: u64,
-    view: u64,
-    commands: u64,
-    counts: u64,
-    visibility: u64,
-    ref_count: u32,
-    bucket_capacity: u32,
-    phase: u32,
-    hiz_texture: u32,
-    hiz_size: [2]f32,
-    skin_bounds: u64,
-    seen: u64,
-    mark_seen: u32 = 0,
-    entity_refs: u32 = 0,
-    candidates: u64 = 0,
-    dispatch: u64 = 0,
-    instance_visibility: u64 = 0,
-    entity_instances: u32 = 0,
-    masked_capacity: u32 = 0,
-    seen_total: u32 = 0,
-    mesh_lists: u32 = 0,
-    mesh_draws: u64 = 0,
-    lists: u64 = 0,
-};
+pub const CullPush = cull_push.MeshletPush;
 
-/// Push constants of the instance pass in cull.slang.
-pub const InstanceCullPush = extern struct {
-    frame: u64,
-    view: u64,
-    instances: u64,
-    candidates: u64,
-    dispatch: u64,
-    visibility: u64,
-    instance_count: u32,
-    phase: u32,
-    hiz_texture: u32,
-    entity_refs: u32,
-    hiz_size: [2]f32,
-    impostors: u64 = 0,
-    impostor_list: u64 = 0,
-    impostor_draw: u64 = 0,
-    /// Nonzero for the camera's view, where small copies become impostors.
-    impostor_view: u32 = 0,
-    pad: u32 = 0,
-};
+pub const InstanceCullPush = cull_push.InstancePush;
 
 /// A view's lights as the shaders read them and the shadow tiles assigned
 /// to them; made by `prepareLights`.

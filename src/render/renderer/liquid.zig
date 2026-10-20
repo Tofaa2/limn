@@ -20,6 +20,11 @@ const LiquidState = renderer_state.LiquidState;
 pub const Liquids = struct {
     table: handle.HandleTable(renderer_state.LiquidState, api.LiquidTag),
 
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.LiquidState) void {
+        entry.deinit(owner.device);
+    }
+
     fn renderer(liquids: *Liquids) *Renderer {
         return @alignCast(@fieldParentPtr("liquids", liquids));
     }
@@ -74,14 +79,14 @@ pub const Liquids = struct {
 /// Gives a liquid the see-through box that rays hit in its place.
 fn attachLiquidProxy(self: *Renderer, scene: Scene, liquid: Liquid, desc: LiquidDesc) !void {
     if (!self.device.caps.ray_tracing) return;
-    const model = self.liquid_proxy_model orelse made: {
+    const model = self.internal.liquid_proxy_model orelse made: {
         const positions = [8][3]f32{ .{ -0.5, -0.5, -0.5 }, .{ 0.5, -0.5, -0.5 }, .{ 0.5, 0.5, -0.5 }, .{ -0.5, 0.5, -0.5 }, .{ -0.5, -0.5, 0.5 }, .{ 0.5, -0.5, 0.5 }, .{ 0.5, 0.5, 0.5 }, .{ -0.5, 0.5, 0.5 } };
         const indices = [36]u32{ 0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 6, 2, 3, 7, 6, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5 };
         const created = try self.models.create(&.{.{ .positions = &positions, .indices = &indices, .material = .{ .base_color = .{ 1, 1, 1, 0.7 }, .metallic = 0, .roughness = 0.05, .alpha_mode = .blend, .double_sided = true } }});
         self.lock();
         defer self.unlock();
-        if (self.liquid_proxy_model == null) self.liquid_proxy_model = created;
-        break :made self.liquid_proxy_model.?;
+        if (self.internal.liquid_proxy_model == null) self.internal.liquid_proxy_model = created;
+        break :made self.internal.liquid_proxy_model.?;
     };
     const entity = try self.entities.spawn(scene, .{ .model = model, .transform = desc.transform, .visible = false, .tint = desc.color });
     self.lock();
@@ -136,6 +141,6 @@ fn createLiquidAlone(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
     state.setSources(desc.sources);
     const liquid = try self.liquids.table.insert(state);
     errdefer _ = self.liquids.table.remove(liquid);
-    try data.liquids.append(self.gpa, liquid);
+    try data.liquids.append(self.internal.gpa, liquid);
     return liquid;
 }

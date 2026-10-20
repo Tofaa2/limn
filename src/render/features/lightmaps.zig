@@ -1,4 +1,7 @@
 //! Bakes the lightmaps a scene has asked for, a little each frame.
+const rhi = @import("../../rhi/rhi.zig");
+const pipelines_module = @import("../renderer/pipelines.zig");
+const lightmap_push = @import("../shaders/push/lightmap.zig");
 const render = @import("../renderer.zig");
 const scene_pass = @import("../scene_pass.zig");
 const math = @import("../../math.zig");
@@ -28,7 +31,7 @@ pub fn bakeLightmaps(renderer: *Renderer, p: *const ScenePass) !void {
     const cmd = p.cmd;
     const scene = p.scene;
     if (!device.caps.ray_tracing or scene.lightmaps_baking == 0) return;
-    const bake = try renderer.pipelines.get(.lightmap_bake);
+    const bake = try renderer.internal.pipelines.of(lightmapBakePipeline);
     const tlas = scene.tlas orelse return;
     if (scene.tlas_hash == 0 or scene.tlas_hash != p.scene_frame.tlas_hash) return;
     var baking: u32 = 0;
@@ -45,16 +48,16 @@ pub fn bakeLightmaps(renderer: *Renderer, p: *const ScenePass) !void {
         cmd.beginScope("lightmap");
         try cmd.beginRendering(.{ .color = &.{.{ .texture = into, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
         cmd.bindPipeline(bake);
-        cmd.bindIndexBuffer(renderer.indices.get(), 0, .uint32);
+        cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
         for (source.instances) |instance| {
             const mesh = model.meshes[instance.mesh];
             if (mesh.blend) continue;
-            cmd.pushConstants(extern struct { frame: u64, tlas: u64, transform: [16]f32, vertex_offset: u32, gathered: u32, rounds: u32, rays: u32, reach: f32, pad: u32 = 0 }{
+            cmd.pushConstants(lightmap_push.BakePush{
                 .frame = p.frame_address,
                 .tlas = device.accelerationAddress(tlas),
                 .transform = math.mul(renderer.transformOf(handle), model.node_world[instance.node]),
                 .vertex_offset = mesh.vertex_offset,
-                .gathered = device.textureIndex(from),
+                .gathered_texture = device.textureIndex(from),
                 .rounds = lightmap.rounds,
                 .rays = lightmap.rays,
                 .reach = lightmap.reach,
@@ -62,16 +65,28 @@ pub fn bakeLightmaps(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.drawIndexed(mesh.lod0_index_count, 1, mesh.index_offset, 0, 0);
         }
         cmd.endRendering();
-        cmd.transition(into, .shader_read);
         try cmd.beginRendering(.{ .color = &.{.{ .texture = lightmap.shown, .load = .discard }} });
-        cmd.bindPipeline(try renderer.pipelines.get(.lightmap_dilate));
-        cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = p.frame_address, .source = device.textureIndex(into) });
+        cmd.bindPipeline(try renderer.internal.pipelines.of(lightmapDilatePipeline));
+        cmd.pushConstants(lightmap_push.DilatePush{ .frame = p.frame_address, .source_texture = device.textureIndex(into) });
         cmd.drawFullscreen();
         cmd.endRendering();
-        cmd.transition(lightmap.shown, .shader_read);
         cmd.endScope();
         lightmap.rounds += 1;
         if (lightmap.rounds == 1) renderer.restyleEntity(handle);
     }
     scene.lightmaps_baking = baking;
+}
+
+fn lightmapBakePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "lightmap bake",
+        .vertex = pipelines_module.shaderCode("lightmap_bake.vert.spv"),
+        .fragment = pipelines_module.shaderCode("lightmap_bake.frag.spv"),
+        .color_targets = &.{.{ .format = pipelines_module.hdr_format }},
+        .cull = .none,
+    } };
+}
+
+fn lightmapDilatePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("lightmap dilate", pipelines_module.shaderCode("lightmap_dilate.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
 }

@@ -1,4 +1,6 @@
 //! Environments: loaded panoramas and computed skies, filtered for image-based lighting. Internal to the renderer.
+const pipelines_module = @import("pipelines.zig");
+const environment_push = @import("../shaders/push/environment.zig");
 const std = @import("std");
 const handle = @import("../../handle.zig");
 const rhi = @import("../../rhi/rhi.zig");
@@ -26,24 +28,28 @@ const EnvironmentEntry = renderer_state.EnvironmentEntry;
 pub const Environments = struct {
     table: handle.HandleTable(renderer_state.EnvironmentEntry, api.EnvironmentTag),
 
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.EnvironmentEntry) void {
+        freeEnvironment(owner, entry);
+    }
+
     fn renderer(environments: *Environments) *Renderer {
         return @alignCast(@fieldParentPtr("environments", environments));
     }
 
-    /// Starts loading an environment: an equirectangular `.hdr`, or a KTX2
-    /// cube of half floats or BC6H. A BC6H cube's `brightest_direction`
+    /// Starts loading an environment. A BC6H cube's `brightest_direction`
     /// stays straight up.
-    pub fn load(environments: *Environments, path: []const u8, options: api.EnvironmentOptions) !Environment {
+    pub fn load(environments: *Environments, desc: api.EnvironmentDesc) !Environment {
         const self = environments.renderer();
         self.lock();
         defer self.unlock();
-        const job = try self.gpa.create(EnvironmentJob);
-        errdefer self.gpa.destroy(job);
-        job.* = .{ .gpa = self.options.job_allocator orelse std.heap.smp_allocator, .io = self.io, .path = try self.gpa.dupe(u8, path) };
-        errdefer self.gpa.free(job.path);
-        const environment = try self.environments.table.insert(.{ .job = job, .max_radiance = options.max_radiance });
-        job.group.concurrent(self.io, runEnvironmentJob, .{job}) catch job.group.async(self.io, runEnvironmentJob, .{job});
-        self.loading_count += 1;
+        const job = try self.internal.gpa.create(EnvironmentJob);
+        errdefer self.internal.gpa.destroy(job);
+        job.* = .{ .gpa = self.options.job_allocator orelse std.heap.smp_allocator, .io = self.internal.io, .path = try self.internal.gpa.dupe(u8, desc.path) };
+        errdefer self.internal.gpa.free(job.path);
+        const environment = try self.environments.table.insert(.{ .job = job, .max_radiance = desc.max_radiance });
+        job.group.concurrent(self.internal.io, runEnvironmentJob, .{job}) catch job.group.async(self.internal.io, runEnvironmentJob, .{job});
+        self.internal.loading_count += 1;
         return environment;
     }
 
@@ -59,7 +65,7 @@ pub const Environments = struct {
         try ensureEnvironmentTextures(self, entry);
         var cmd = try self.device.beginImmediate();
         try bakeSky(self, entry, &cmd, true);
-        try self.device.endImmediate();
+        try self.device.endImmediate(&cmd);
         entry.state = .ready;
         return environment;
     }
@@ -75,7 +81,7 @@ pub const Environments = struct {
         if (std.meta.eql(entry.sky_desc.?, desc)) return;
         entry.sky_desc = desc;
         entry.sky_dirty = true;
-        self.skies_dirty = true;
+        self.internal.skies_dirty = true;
     }
 
     /// A handle that names no environment reports `.failed`. Safe from any
@@ -103,7 +109,7 @@ pub const Environments = struct {
         self.lock();
         defer self.unlock();
         var removed = self.environments.table.remove(environment) orelse return;
-        if (removed.state == .loading) self.loading_count -= 1;
+        if (removed.state == .loading) self.internal.loading_count -= 1;
         freeEnvironment(self, &removed);
     }
 };
@@ -135,11 +141,11 @@ pub fn bakeSky(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.CommandEncod
         var clouds = std.mem.zeroes(gpu.Clouds);
         if (pass == 0) if (entry.clouds) |layer| {
             clouds = layer;
-            clouds.depth = self.device.samplerIndex(self.sampler_linear_clamp);
+            clouds.depth = self.device.samplerIndex(self.internal.sampler_linear_clamp);
         };
         try cmd.beginRendering(.{ .color = &.{.{ .texture = sky, .layer = face, .load = .discard }} });
-        cmd.bindPipeline(try self.pipelines.get(.env_sky));
-        cmd.pushConstants(extern struct { to_sun: [3]f32, face: u32, ground_color: [3]f32, turbidity: f32, intensity: f32, max_radiance: f32, sun_disc: f32, stars: f32, to_moon: [3]f32, moon: f32, ozone: f32, clouds: gpu.Clouds }{
+        cmd.bindPipeline(try self.internal.pipelines.of(envSkyPipeline));
+        cmd.pushConstants(environment_push.SkyPush{
             .to_sun = math.scale(math.normalize(desc.sun_direction), -1),
             .face = @intCast(face),
             .ground_color = desc.ground_color,
@@ -162,7 +168,7 @@ pub fn bakeSky(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.CommandEncod
         }
     }
     if (entry.bake_step >= total) entry.bake_step = 0;
-    if (entry.bake_step != 0 or entry.sky_dirty) self.skies_dirty = true;
+    if (entry.bake_step != 0 or entry.sky_dirty) self.internal.skies_dirty = true;
 }
 
 pub fn finalizeEnvironment(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.CommandEncoder) !void {
@@ -172,8 +178,8 @@ pub fn finalizeEnvironment(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.
     defer {
         if (job.image) |*image| image.deinit();
         if (job.cube) |cube| job.gpa.free(cube.data);
-        self.gpa.free(job.path);
-        self.gpa.destroy(job);
+        self.internal.gpa.free(job.path);
+        self.internal.gpa.destroy(job);
         entry.job = null;
     }
     if (job.failure) |err| return err;
@@ -239,13 +245,13 @@ fn drawEnvironmentFace(self: *Renderer, cmd: *rhi.CommandEncoder, entry: *const 
     var clouds = std.mem.zeroes(gpu.Clouds);
     if (layer) |value| {
         clouds = value;
-        clouds.depth = device.samplerIndex(self.sampler_linear_clamp);
+        clouds.depth = device.samplerIndex(self.internal.sampler_linear_clamp);
     }
     try cmd.beginRendering(.{ .color = &.{.{ .texture = target, .layer = face, .load = .discard }} });
-    cmd.bindPipeline(try self.pipelines.get(.env_cube));
-    cmd.pushConstants(extern struct { source: u32, sampler: u32, face: u32, max_radiance: f32, from_cube: u32, to_sun: [3]f32, sunlight: [3]f32, clouds: gpu.Clouds }{
-        .source = device.textureIndex(source),
-        .sampler = device.samplerIndex(if (from_cube) self.sampler_linear_clamp else self.sampler_linear_repeat),
+    cmd.bindPipeline(try self.internal.pipelines.of(envCubePipeline));
+    cmd.pushConstants(environment_push.CubePush{
+        .source_texture = device.textureIndex(source),
+        .sampler_index = device.samplerIndex(if (from_cube) self.internal.sampler_linear_clamp else self.internal.sampler_linear_repeat),
         .face = face,
         .max_radiance = entry.max_radiance,
         .from_cube = @intFromBool(from_cube),
@@ -276,7 +282,6 @@ pub fn bakeLoadedClouds(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.Com
         });
         entry.clear = clear;
         for (0..6) |face| try drawEnvironmentFace(self, cmd, entry, clear, sky, true, @intCast(face), null);
-        cmd.transition(clear, .shader_read);
     }
     const clear = entry.clear.?;
     if (entry.clouds) |layer| {
@@ -337,17 +342,16 @@ fn filterIrradiance(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.Command
     const irradiance = entry.irradiance.?;
     for (0..6) |face| {
         try cmd.beginRendering(.{ .color = &.{.{ .texture = irradiance, .layer = @intCast(face), .load = .discard }} });
-        cmd.bindPipeline(try self.pipelines.get(.env_irradiance));
-        cmd.pushConstants(extern struct { source: u32, sampler: u32, face: u32, source_size: f32 }{
-            .source = device.textureIndex(entry.sky.?),
-            .sampler = device.samplerIndex(self.sampler_linear_clamp),
+        cmd.bindPipeline(try self.internal.pipelines.of(envIrradiancePipeline));
+        cmd.pushConstants(environment_push.IrradiancePush{
+            .source_texture = device.textureIndex(entry.sky.?),
+            .sampler_index = device.samplerIndex(self.internal.sampler_linear_clamp),
             .face = @intCast(face),
             .source_size = env_cube_size,
         });
         cmd.drawFullscreen();
         cmd.endRendering();
     }
-    cmd.transition(irradiance, .shader_read);
 }
 
 /// One roughness level of the reflection cube, from the sky cube.
@@ -357,10 +361,10 @@ fn filterSpecularMip(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.Comman
     const roughness = @as(f32, @floatFromInt(mip)) / @as(f32, env_specular_mips - 1);
     for (0..6) |face| {
         try cmd.beginRendering(.{ .color = &.{.{ .texture = specular, .mip = mip, .layer = @intCast(face), .load = .discard }} });
-        cmd.bindPipeline(try self.pipelines.get(.env_prefilter));
-        cmd.pushConstants(extern struct { source: u32, sampler: u32, face: u32, source_size: f32, roughness: f32 }{
-            .source = device.textureIndex(entry.sky.?),
-            .sampler = device.samplerIndex(self.sampler_linear_clamp),
+        cmd.bindPipeline(try self.internal.pipelines.of(envPrefilterPipeline));
+        cmd.pushConstants(environment_push.PrefilterPush{
+            .source_texture = device.textureIndex(entry.sky.?),
+            .sampler_index = device.samplerIndex(self.internal.sampler_linear_clamp),
             .face = @intCast(face),
             .source_size = env_cube_size,
             .roughness = roughness,
@@ -368,7 +372,6 @@ fn filterSpecularMip(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.Comman
         cmd.drawFullscreen();
         cmd.endRendering();
     }
-    cmd.transition(specular, .shader_read);
 }
 
 pub fn freeEnvironment(self: *Renderer, entry: *EnvironmentEntry) void {
@@ -376,12 +379,28 @@ pub fn freeEnvironment(self: *Renderer, entry: *EnvironmentEntry) void {
         job.group.cancel(job.io);
         if (job.image) |*image| image.deinit();
         if (job.cube) |cube| job.gpa.free(cube.data);
-        self.gpa.free(job.path);
-        self.gpa.destroy(job);
+        self.internal.gpa.free(job.path);
+        self.internal.gpa.destroy(job);
         entry.job = null;
     }
     inline for (.{ "sky", "specular", "irradiance", "clear" }) |name| {
         if (@field(entry, name)) |texture| self.device.destroyTexture(texture);
         @field(entry, name) = null;
     }
+}
+
+fn envCubePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("env cube", pipelines_module.shaderCode("env_cube.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn envSkyPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("env sky", pipelines_module.shaderCode("env_sky.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn envIrradiancePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("env irradiance", pipelines_module.shaderCode("env_irradiance.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn envPrefilterPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("env prefilter", pipelines_module.shaderCode("env_prefilter.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
 }

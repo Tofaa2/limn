@@ -1,4 +1,7 @@
 //! Far copies of instance groups drawn as pictures of themselves.
+const rhi = @import("../../rhi/rhi.zig");
+const pipelines_module = @import("../renderer/pipelines.zig");
+const impostor_passes_push = @import("../shaders/push/impostor_passes.zig");
 const render = @import("../renderer.zig");
 const scene_pass = @import("../scene_pass.zig");
 const math = @import("../../math.zig");
@@ -75,13 +78,13 @@ pub fn bakeImpostors(renderer: *Renderer, p: *const ScenePass) !void {
             .color = &.{ .{ .texture = impostor.color, .load = .clear, .clear = .{ 0, 0, 0, 0 } }, .{ .texture = impostor.normal, .load = .clear, .clear = .{ 0.5, 0.5, 1, 0 } } },
             .depth = .{ .texture = depth, .clear = 0, .store = false },
         });
-        cmd.bindPipeline(try renderer.pipelines.get(.impostor_bake));
-        cmd.bindIndexBuffer(renderer.indices.get(), 0, .uint32);
+        cmd.bindPipeline(try renderer.internal.pipelines.of(impostorBakePipeline));
+        cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
         for (0..frames) |row| for (0..frames) |column| {
             const toward = unfold(.{ (@as(f32, @floatFromInt(column)) + 0.5) / frames, (@as(f32, @floatFromInt(row)) + 0.5) / frames });
             const camera = basis(toward);
             cmd.setViewport(@intCast(column * impostor.resolution), @intCast(row * impostor.resolution), impostor.resolution, impostor.resolution);
-            cmd.pushConstants(extern struct { frame: u64, node: [16]f32, center: [3]f32, radius: f32, right: [3]f32, vertex_offset: u32, up: [3]f32, material: u32, toward: [3]f32, pad: f32 = 0 }{
+            cmd.pushConstants(impostor_passes_push.BakePush{
                 .frame = p.frame_address,
                 .node = math.identity,
                 .center = bounds.bounds_center,
@@ -95,8 +98,6 @@ pub fn bakeImpostors(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.drawIndexed(mesh.lod0_index_count, 1, mesh.index_offset, 0, 0);
         };
         cmd.endRendering();
-        cmd.transition(impostor.color, .shader_read);
-        cmd.transition(impostor.normal, .shader_read);
         cmd.endScope();
         impostor.baked = true;
         scene.static_version += 1;
@@ -118,18 +119,37 @@ pub fn drawImpostors(renderer: *Renderer, p: *const ScenePass) !void {
         .color = &.{ .{ .texture = view.hdr, .load = .load }, .{ .texture = view.motion, .load = .load } },
         .depth = .{ .texture = view.depth, .load = .load },
     });
-    cmd.bindPipeline(try renderer.pipelines.get(.impostor));
-    cmd.pushConstants(extern struct { frame: u64, impostors: u64, instances: u64, list: u64, entity_instances: u32, pad: u32 = 0 }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(impostorPipeline));
+    cmd.pushConstants(impostor_passes_push.ShadePush{
         .frame = p.frame_address,
         .impostors = device.bufferAddress(table),
         .instances = device.bufferAddress(bounds),
         .list = device.bufferAddress(list),
         .entity_instances = @intCast(scene.layout.items.len),
     });
-    cmd.drawIndirect(renderer.impostor_draw, 0);
+    cmd.drawIndirect(renderer.internal.impostor_draw, 0);
     cmd.endRendering();
-    cmd.transition(view.hdr, .shader_read);
-    cmd.transition(view.motion, .shader_read);
-    cmd.transition(view.depth, .shader_read);
     cmd.endScope();
+}
+
+fn impostorPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "impostors",
+        .vertex = pipelines_module.shaderCode("impostor.vert.spv"),
+        .fragment = pipelines_module.shaderCode("impostor.frag.spv"),
+        .color_targets = &.{ .{ .format = pipelines_module.hdr_format, .blend = .premultiplied }, .{ .format = .rg16_float, .blend = .alpha } },
+        .depth = .{ .write = true, .compare = .greater_or_equal },
+        .cull = .none,
+    } };
+}
+
+fn impostorBakePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "impostor bake",
+        .vertex = pipelines_module.shaderCode("impostor_bake.vert.spv"),
+        .fragment = pipelines_module.shaderCode("impostor_bake.frag.spv"),
+        .color_targets = &.{ .{ .format = .rgba8_srgb }, .{ .format = .rgba8_unorm } },
+        .depth = .{ .write = true, .compare = .greater_or_equal },
+        .cull = .none,
+    } };
 }

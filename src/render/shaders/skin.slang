@@ -23,16 +23,7 @@ struct SkinJob {
 
 static const uint GROUPS_PER_ROW = 1024u;
 
-struct SkinPush {
-    Vertex* vertices;
-    SkinVertex* skin;
-    float4x4* joints;
-    MorphDelta* morph;
-    SkinJob* jobs;
-    uint* group_jobs;
-    float* weights;
-    uint group_count;
-};
+#include "skin.SkinPush.slang"
 
 [[vk::push_constant]] SkinPush skin_push;
 
@@ -79,15 +70,7 @@ struct BoundsJob {
     uint job_pad2;
 };
 
-struct BoundsPush {
-    Vertices vertices;
-    Indices indices;
-    Meshlets meshlets;
-    float4* bounds;
-    BoundsJob* jobs;
-    uint* group_jobs;
-    uint group_count;
-};
+#include "skin.BoundsPush.slang"
 
 [[vk::push_constant]] BoundsPush bounds_push;
 

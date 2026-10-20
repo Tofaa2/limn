@@ -1,10 +1,15 @@
 //! Path tracing in place of rasterized lighting.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const pathtrace_push = @import("../shaders/push/pathtrace.zig");
+const pathtrace_denoise_push = @import("../shaders/push/pathtrace_denoise.zig");
+const ffx_reflections_push = @import("../shaders/push/ffx_reflections.zig");
 const render = @import("../renderer.zig");
 const scene_pass = @import("../scene_pass.zig");
 const resolution_feature = @import("resolution.zig");
 const filled = @import("../api.zig").filled;
 const std = @import("std");
 const nrd = @import("../nrd.zig");
+const denoising = @import("../techniques/denoising.zig");
 const math = @import("../../math.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const api = @import("../api.zig");
@@ -56,6 +61,8 @@ pub const Nrd = struct {
 
 /// What a view keeps for path tracing from frame to frame.
 pub const View = struct {
+    /// The view was path traced last frame.
+    traced: bool = false,
     /// What the tracer found this frame, before anything is gathered: the
     /// textures behind `Signals`.
     raw_color: ?rhi.Texture = null,
@@ -71,8 +78,7 @@ pub const View = struct {
     raw_normal: ?rhi.Texture = null,
     /// NRD for this view, the textures it reads and writes, and the camera
     /// it last saw.
-    nrd: ?nrd.Denoiser = null,
-    nrd_refused: bool = false,
+    denoiser: denoising.Slot = .{},
     nrd_normal: ?rhi.Texture = null,
     nrd_depth: ?rhi.Texture = null,
     nrd_diffuse: ?rhi.Texture = null,
@@ -137,7 +143,7 @@ pub const View = struct {
     }
 
     pub fn deinit(self: *View, device: *rhi.Device) void {
-        dropNrd(self, device);
+        self.denoiser.deinit(device);
         inline for (@typeInfo(View).@"struct".fields) |field| {
             if (field.type != ?rhi.Texture) continue;
             if (@field(self, field.name)) |texture| device.destroyTexture(texture);
@@ -167,6 +173,7 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
         r.downgrade("path_tracing", "on", "off", .unsupported);
     }
     const s = &(setting.* orelse return);
+    r.rays = true;
     if (s.denoiser == .ray_reconstruction) {
         const reason: ?api.DowngradeReason = if (r.upscaler != .dlss or r.debugging or !r.upscalers.dlss_ray_reconstruction)
             .unavailable
@@ -201,20 +208,7 @@ fn trace(ctx: *ViewContext) !void {
 /// removes the grid a wide step leaves.
 const denoise_steps = [_]i32{ 1, 2, 4, 8, 3 };
 
-/// Push constants of pathtrace_denoise.slang.
-const DenoisePush = extern struct {
-    frame: u64,
-    color: u32,
-    guide: u32,
-    step_size: i32,
-    gathered: u32,
-    mode: enum(u32) { first = 0, last = 1, none = 2, between = 3 },
-    steady: u32,
-    facing: u32,
-    gloss: u32,
-    gloss_gathered: u32,
-    lamp: u32,
-};
+const DenoisePush = pathtrace_denoise_push.DenoisePush;
 
 /// Frames after the camera stops before the accumulated image is antialiased by
 /// itself, and frames over which TAA then fades out.
@@ -280,8 +274,7 @@ fn makeTargets(device: *rhi.Device, cmd: *rhi.CommandEncoder, state: *View, widt
         if (slot.*) |old| device.destroyTexture(old);
         slot.* = null;
     }
-    dropNrd(state, device);
-    state.nrd_refused = false;
+    state.denoiser.deinit(device);
     for (targets) |target| {
         const made = try device.createTexture(.{
             .name = target.name,
@@ -293,19 +286,10 @@ fn makeTargets(device: *rhi.Device, cmd: *rhi.CommandEncoder, state: *View, widt
         target.slot.* = made;
         try cmd.beginRendering(.{ .color = &.{.{ .texture = made, .load = .clear }} });
         cmd.endRendering();
-        cmd.transition(made, .shader_read);
     }
     state.size = .{ width, height };
     state.gathered = 0;
     state.reusable = false;
-}
-
-fn dropNrd(state: *View, device: *rhi.Device) void {
-    if (state.nrd) |*running| {
-        device.waitIdle() catch {};
-        running.destroy();
-    }
-    state.nrd = null;
 }
 
 /// The built-in denoiser's gathering, then NRD on the bounced light and the
@@ -314,16 +298,16 @@ fn dropNrd(state: *View, device: *rhi.Device) void {
 fn denoiseWithNrd(renderer: *Renderer, p: *const ScenePass, state: *View, signals: Signals, gathered: Gathered, reset: bool) !bool {
     const device = renderer.device;
     const cmd = p.cmd;
-    if (state.nrd_refused) return false;
-    if (state.nrd == null) {
-        state.nrd = nrd.Denoiser.create(device, state.size) orelse {
-            state.nrd_refused = true;
+    const was_refused = state.denoiser.refused != null;
+    const running = try state.denoiser.ensure(device, .{ .size = state.size }, device, denoising.Running.startNrd) orelse {
+        if (!was_refused) {
             std.log.warn("NRD would not start; the built-in denoiser stands in", .{});
-            renderer.downgrades.add(.{ .feature = "path_tracing.denoiser", .requested = "nrd", .used = "builtin", .reason = .unavailable });
-            return false;
-        };
-        state.nrd_frame = 0;
-    }
+            renderer.internal.downgrades.add(.{ .feature = "path_tracing.denoiser", .requested = "nrd", .used = "builtin", .reason = .unavailable });
+        }
+        return false;
+    };
+    if (state.denoiser.fresh) state.nrd_frame = 0;
+    _ = state.denoiser.continues(renderer.internal.frame_index);
     const made = [_]struct { slot: *?rhi.Texture, name: [:0]const u8, format: rhi.Format, written: bool }{
         .{ .slot = &state.nrd_normal, .name = "nrd: normal and roughness", .format = .rgba16_float, .written = false },
         .{ .slot = &state.nrd_depth, .name = "nrd: view depth", .format = .r32_float, .written = false },
@@ -350,8 +334,8 @@ fn denoiseWithNrd(renderer: *Renderer, p: *const ScenePass, state: *View, signal
     var attachments: [inputs.len]rhi.ColorAttachment = undefined;
     for (inputs, &attachments) |target, *attachment| attachment.* = .{ .texture = target, .load = .discard };
     try cmd.beginRendering(.{ .color = &attachments });
-    cmd.bindPipeline(try renderer.pipelines.get(.nrd_pack));
-    cmd.pushConstants(extern struct { frame: u64, surface: u32, diffuse: u32, specular: u32, albedo: u32, depth: u32, pad: u32 = 0 }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(nrdPackPipeline));
+    cmd.pushConstants(pathtrace_denoise_push.NrdPackPush{
         .frame = p.frame_address,
         .surface = device.textureIndex(signals.surface),
         .diffuse = device.textureIndex(signals.diffuse),
@@ -361,8 +345,6 @@ fn denoiseWithNrd(renderer: *Renderer, p: *const ScenePass, state: *View, signal
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    for (inputs) |target| cmd.transition(target, .shader_read);
-    cmd.transition(p.view.motion, .shader_read);
     cmd.transition(state.nrd_diffuse_out.?, .storage);
     cmd.transition(state.nrd_specular_out.?, .storage);
 
@@ -375,7 +357,7 @@ fn denoiseWithNrd(renderer: *Renderer, p: *const ScenePass, state: *View, signal
     state.nrd_view = p.view_matrix;
     state.nrd_projection = projection;
     state.nrd_frame +%= 1;
-    state.nrd.?.dispatch(device, cmd, .{
+    running.nrd.dispatch(device, cmd, .{
         .motion = p.view.motion,
         .normal_roughness = state.nrd_normal.?,
         .view_depth = state.nrd_depth.?,
@@ -395,9 +377,9 @@ fn denoiseWithNrd(renderer: *Renderer, p: *const ScenePass, state: *View, signal
         .history_frames = filled(p.settings.path_tracing).nrd.history_frames,
         .blur_radius = filled(p.settings.path_tracing).nrd.blur_radius,
     }) catch {
-        state.nrd_refused = true;
+        state.denoiser.refuse();
         std.log.warn("NRD failed; the built-in denoiser stands in", .{});
-        renderer.downgrades.add(.{ .feature = "path_tracing.denoiser", .requested = "nrd", .used = "builtin", .reason = .unavailable });
+        renderer.internal.downgrades.add(.{ .feature = "path_tracing.denoiser", .requested = "nrd", .used = "builtin", .reason = .unavailable });
         cmd.transition(state.nrd_diffuse_out.?, .shader_read);
         cmd.transition(state.nrd_specular_out.?, .shader_read);
         return false;
@@ -406,19 +388,18 @@ fn denoiseWithNrd(renderer: *Renderer, p: *const ScenePass, state: *View, signal
     cmd.transition(state.nrd_specular_out.?, .shader_read);
 
     try cmd.beginRendering(.{ .color = &.{.{ .texture = p.view.hdr, .load = .discard }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.nrd_compose));
-    cmd.pushConstants(extern struct { frame: u64, steady: u32, albedo: u32, lamp: u32, diffuse: u32, specular: u32, depth: u32 }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(nrdComposePipeline));
+    cmd.pushConstants(pathtrace_denoise_push.NrdComposePush{
         .frame = p.frame_address,
-        .steady = device.textureIndex(gathered.steady),
-        .albedo = device.textureIndex(gathered.albedo),
-        .lamp = device.textureIndex(gathered.lamp),
-        .diffuse = device.textureIndex(state.nrd_diffuse_out.?),
-        .specular = device.textureIndex(state.nrd_specular_out.?),
-        .depth = device.textureIndex(state.nrd_depth.?),
+        .steady_texture = device.textureIndex(gathered.steady),
+        .albedo_texture = device.textureIndex(gathered.albedo),
+        .lamp_texture = device.textureIndex(gathered.lamp),
+        .diffuse_texture = device.textureIndex(state.nrd_diffuse_out.?),
+        .specular_texture = device.textureIndex(state.nrd_specular_out.?),
+        .depth_texture = device.textureIndex(state.nrd_depth.?),
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(p.view.hdr, .shader_read);
     return true;
 }
 
@@ -458,61 +439,56 @@ fn denoiseReflections(renderer: *Renderer, p: *const ScenePass, state: *View, gl
     defer cmd.endScope();
 
     try cmd.beginRendering(.{ .color = &.{ .{ .texture = reprojected, .load = .discard }, .{ .texture = samples, .load = .discard } } });
-    cmd.bindPipeline(try renderer.pipelines.get(.reflection_reproject));
-    cmd.pushConstants(extern struct { frame: u64, radiance: u32, surface: u32, surface_history: u32, motion: u32, history: u32, samples_history: u32, reach: u32 }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(reflectionReprojectPipeline));
+    cmd.pushConstants(ffx_reflections_push.ReprojectPush{
         .frame = p.frame_address,
-        .radiance = device.textureIndex(gloss),
-        .surface = device.textureIndex(surface),
-        .surface_history = device.textureIndex(state.surface_old.?),
-        .motion = device.textureIndex(p.view.motion),
-        .history = device.textureIndex(state.reflection_resolved_old.?),
-        .samples_history = device.textureIndex(state.reflection_samples_old.?),
-        .reach = device.textureIndex(reach),
+        .radiance_texture = device.textureIndex(gloss),
+        .surface_texture = device.textureIndex(surface),
+        .surface_history_texture = device.textureIndex(state.surface_old.?),
+        .motion_texture = device.textureIndex(p.view.motion),
+        .history_texture = device.textureIndex(state.reflection_resolved_old.?),
+        .samples_history_texture = device.textureIndex(state.reflection_samples_old.?),
+        .reach_texture = device.textureIndex(reach),
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(reprojected, .shader_read);
-    cmd.transition(samples, .shader_read);
 
     try cmd.beginRendering(.{ .color = &.{.{ .texture = average, .load = .discard }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.reflection_average));
-    cmd.pushConstants(extern struct { frame: u64, radiance: u32, reprojected: u32, samples: u32, pad: u32 = 0 }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(reflectionAveragePipeline));
+    cmd.pushConstants(ffx_reflections_push.AveragePush{
         .frame = p.frame_address,
-        .radiance = device.textureIndex(gloss),
-        .reprojected = device.textureIndex(reprojected),
-        .samples = device.textureIndex(samples),
+        .radiance_texture = device.textureIndex(gloss),
+        .reprojected_texture = device.textureIndex(reprojected),
+        .samples_texture = device.textureIndex(samples),
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(average, .shader_read);
 
     try cmd.beginRendering(.{ .color = &.{.{ .texture = prefiltered, .load = .discard }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.reflection_prefilter));
-    cmd.pushConstants(extern struct { frame: u64, radiance: u32, reprojected: u32, surface: u32, average: u32 }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(reflectionPrefilterPipeline));
+    cmd.pushConstants(ffx_reflections_push.PrefilterPush{
         .frame = p.frame_address,
-        .radiance = device.textureIndex(gloss),
-        .reprojected = device.textureIndex(reprojected),
-        .surface = device.textureIndex(surface),
-        .average = device.textureIndex(average),
+        .radiance_texture = device.textureIndex(gloss),
+        .reprojected_texture = device.textureIndex(reprojected),
+        .surface_texture = device.textureIndex(surface),
+        .average_texture = device.textureIndex(average),
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(prefiltered, .shader_read);
 
     try cmd.beginRendering(.{ .color = &.{.{ .texture = resolved, .load = .discard }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.reflection_resolve));
-    cmd.pushConstants(extern struct { frame: u64, prefiltered: u32, reprojected: u32, samples: u32, surface: u32, average: u32, history_clip_weight: f32 }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(reflectionResolvePipeline));
+    cmd.pushConstants(ffx_reflections_push.ResolvePush{
         .frame = p.frame_address,
-        .prefiltered = device.textureIndex(prefiltered),
-        .reprojected = device.textureIndex(reprojected),
-        .samples = device.textureIndex(samples),
-        .surface = device.textureIndex(surface),
-        .average = device.textureIndex(average),
+        .prefiltered_texture = device.textureIndex(prefiltered),
+        .reprojected_texture = device.textureIndex(reprojected),
+        .samples_texture = device.textureIndex(samples),
+        .surface_texture = device.textureIndex(surface),
+        .average_texture = device.textureIndex(average),
         .history_clip_weight = reflection_stability,
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(resolved, .shader_read);
     return resolved;
 }
 
@@ -574,32 +550,8 @@ fn gather(renderer: *Renderer, p: *const ScenePass, state: *View, signals: Signa
     cmd.beginScope("path tracing gather");
     defer cmd.endScope();
     try cmd.beginRendering(.{ .color = &attachments });
-    cmd.bindPipeline(try renderer.pipelines.get(.path_gather));
-    cmd.pushConstants(extern struct {
-        frame: u64,
-        color: u32,
-        guide: u32,
-        soft: u32,
-        facing: u32,
-        lamp: u32,
-        gloss: u32,
-        surface: u32,
-        history_color: u32,
-        history_guide: u32,
-        history_soft: u32,
-        history_facing: u32,
-        history_lamp: u32,
-        history_gloss: u32,
-        history_surface: u32,
-        motion: u32,
-        depth: u32,
-        moved: u32,
-        reset: u32,
-        history_limit: f32,
-        lamp_limit: f32,
-        previous_camera: [3]f32,
-        pad: f32 = 0,
-    }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(pathGatherPipeline));
+    cmd.pushConstants(pathtrace_denoise_push.GatherPush{
         .frame = p.frame_address,
         .color = device.textureIndex(signals.direct),
         .guide = device.textureIndex(signals.albedo),
@@ -625,7 +577,6 @@ fn gather(renderer: *Renderer, p: *const ScenePass, state: *View, signals: Signa
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    for (targets) |target| cmd.transition(target, .shader_read);
     return gathered;
 }
 
@@ -639,41 +590,39 @@ fn compose(renderer: *Renderer, p: *const ScenePass, state: *View, signals: Gath
     defer cmd.endScope();
     var denoise = DenoisePush{
         .frame = p.frame_address,
-        .color = device.textureIndex(signals.noisy),
-        .guide = device.textureIndex(signals.albedo),
+        .color_texture = device.textureIndex(signals.noisy),
+        .guide_texture = device.textureIndex(signals.albedo),
         .step_size = 1,
         .gathered = state.gathered,
         .mode = .none,
-        .steady = device.textureIndex(signals.steady),
-        .facing = device.textureIndex(signals.facing),
-        .gloss = device.textureIndex(signals.gloss),
-        .gloss_gathered = device.textureIndex(signals.gloss),
-        .lamp = device.textureIndex(signals.lamp),
+        .steady_texture = device.textureIndex(signals.steady),
+        .facing_texture = device.textureIndex(signals.facing),
+        .gloss_texture = device.textureIndex(signals.gloss),
+        .gloss_gathered_texture = device.textureIndex(signals.gloss),
+        .lamp_texture = device.textureIndex(signals.lamp),
     };
     if (smooth) {
-        denoise.gloss = device.textureIndex(try denoiseReflections(renderer, p, state, signals.gloss, signals.albedo, signals.surface));
+        denoise.gloss_texture = device.textureIndex(try denoiseReflections(renderer, p, state, signals.gloss, signals.albedo, signals.surface));
         const between = [2]rhi.Texture{ state.filtered.?, state.filtered_other.? };
         for (denoise_steps[0 .. denoise_steps.len - 1], 0..) |step, run| {
             const smoothed = between[run % 2];
             denoise.step_size = step;
             denoise.mode = if (run == 0) .first else .between;
             try cmd.beginRendering(.{ .color = &.{.{ .texture = smoothed, .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.path_denoise));
+            cmd.bindPipeline(try renderer.internal.pipelines.of(pathDenoisePipeline));
             cmd.pushConstants(denoise);
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(smoothed, .shader_read);
-            denoise.color = device.textureIndex(smoothed);
+            denoise.color_texture = device.textureIndex(smoothed);
         }
         denoise.step_size = denoise_steps[denoise_steps.len - 1];
         denoise.mode = .last;
     }
     try cmd.beginRendering(.{ .color = &.{.{ .texture = p.view.hdr, .load = .discard }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.path_denoise_final));
+    cmd.bindPipeline(try renderer.internal.pipelines.of(pathDenoiseFinalPipeline));
     cmd.pushConstants(denoise);
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(p.view.hdr, .shader_read);
 }
 
 /// Puts the picture as traced this frame in the scene color for a denoising
@@ -682,23 +631,22 @@ fn handOver(renderer: *Renderer, p: *const ScenePass, signals: Signals) !void {
     const device = renderer.device;
     const cmd = p.cmd;
     try cmd.beginRendering(.{ .color = &.{.{ .texture = p.view.hdr, .load = .discard }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.path_denoise_final));
+    cmd.bindPipeline(try renderer.internal.pipelines.of(pathDenoiseFinalPipeline));
     cmd.pushConstants(DenoisePush{
         .frame = p.frame_address,
-        .color = device.textureIndex(signals.diffuse),
-        .guide = device.textureIndex(signals.albedo),
+        .color_texture = device.textureIndex(signals.diffuse),
+        .guide_texture = device.textureIndex(signals.albedo),
         .step_size = 1,
         .gathered = 0,
         .mode = .none,
-        .steady = device.textureIndex(signals.direct),
-        .facing = device.textureIndex(signals.facing),
-        .gloss = device.textureIndex(signals.specular),
-        .gloss_gathered = device.textureIndex(signals.specular),
-        .lamp = device.textureIndex(signals.lamp),
+        .steady_texture = device.textureIndex(signals.direct),
+        .facing_texture = device.textureIndex(signals.facing),
+        .gloss_texture = device.textureIndex(signals.specular),
+        .gloss_gathered_texture = device.textureIndex(signals.specular),
+        .lamp_texture = device.textureIndex(signals.lamp),
     });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(p.view.hdr, .shader_read);
 }
 
 /// Path traces the view if requested and the scene is ready; returns whether it
@@ -813,41 +761,15 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass, state: *View) !bool {
             for (traced, &attachments) |output, *attachment| attachment.* = .{ .texture = output, .load = .discard };
             try cmd.beginRendering(.{ .color = &attachments });
         }
-        cmd.bindPipeline(try renderer.pipelines.get(switch (filled(settings.path_tracing).direct) {
-            .ris => if (in_compute) .path_trace_compute else .path_trace,
-        }));
-        cmd.pushConstants(extern struct {
-            frame: u64,
-            scene: u64,
-            scene_instances: u64,
-            mesh_nodes: u64,
-            mesh_items: u64,
-            gathered: u32,
-            bounces: u32,
-            samples: u32,
-            clamp_radiance: f32,
-            sun_radius: f32,
-            light_count: u32,
-            glowing: u64,
-            glowing_count: u32,
-            moved: u32,
-            previous_camera: [3]f32,
-            centered: u32,
-            history_facing: u32,
-            history_reservoir: u32,
-            reusable: u32,
-            motion: u32,
-            depth: u32,
-            probes: u32,
-            reconstructed: u32,
-            pad: u32 = 0,
-            targets: u64,
-        }{
+        cmd.bindPipeline(switch (filled(settings.path_tracing).direct) {
+            .ris => if (in_compute) try renderer.internal.pipelines.of(pathTraceComputePipeline) else try renderer.internal.pipelines.of(pathTracePipeline),
+        });
+        cmd.pushConstants(pathtrace_push.Push{
             .frame = frame_address,
             .scene = where,
             .scene_instances = instances_address,
-            .mesh_nodes = device.bufferAddress(renderer.bvh_nodes.get()),
-            .mesh_items = device.bufferAddress(renderer.bvh_items.get()),
+            .mesh_nodes = device.bufferAddress(renderer.internal.rays.bvh_nodes.get()),
+            .mesh_items = device.bufferAddress(renderer.internal.rays.bvh_items.get()),
             .gathered = state.gathered,
             .bounces = std.math.clamp(filled(settings.path_tracing).bounces, 1, 16),
             .samples = std.math.clamp(filled(settings.path_tracing).samples, 1, 64),
@@ -893,10 +815,54 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass, state: *View) !bool {
         }
         state.gathered = @min(state.gathered + 1, still_history);
         state.reusable = true;
-        renderer.stats.path_traced_frames = state.gathered;
-        renderer.stats.path_tracing_hardware = device.caps.ray_tracing;
+        renderer.internal.stats.path_traced_frames = state.gathered;
+        renderer.internal.stats.path_tracing_hardware = device.caps.ray_tracing;
         path_traced = true;
     }
-    if ((settings.path_tracing != null) and !debugging and !path_traced) renderer.path_trace_misses +%= 1;
+    if ((settings.path_tracing != null) and !debugging and !path_traced) renderer.internal.path_trace_misses +%= 1;
     return path_traced;
+}
+
+fn pathGatherPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("path tracing gather", pipelines_module.shaderCode("pathtrace_gather.frag.spv"), &.{ .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float }, .{ .format = .rgba16_float } });
+}
+
+fn nrdComposePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("nrd compose", pipelines_module.shaderCode("nrd_compose.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn nrdPackPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("nrd inputs", pipelines_module.shaderCode("nrd_pack.frag.spv"), &.{ .{ .format = .rgba16_float }, .{ .format = .r32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba16_float } });
+}
+
+fn pathDenoisePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("path tracing denoise", pipelines_module.shaderCode("pathtrace_denoise.frag.spv"), &.{.{ .format = .rgba16_float }});
+}
+
+fn pathDenoiseFinalPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("path tracing denoise (last)", pipelines_module.shaderCode("pathtrace_denoise.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn reflectionReprojectPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("reflection denoise: reproject", pipelines_module.shaderCode("ffx_reflections_reproject.frag.spv"), &.{ .{ .format = .rgba16_float }, .{ .format = .r16_float } });
+}
+
+fn reflectionAveragePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("reflection denoise: average", pipelines_module.shaderCode("ffx_reflections_average.frag.spv"), &.{.{ .format = .rgba16_float }});
+}
+
+fn reflectionPrefilterPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("reflection denoise: prefilter", pipelines_module.shaderCode("ffx_reflections_prefilter.frag.spv"), &.{.{ .format = .rgba16_float }});
+}
+
+fn reflectionResolvePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("reflection denoise: resolve", pipelines_module.shaderCode("ffx_reflections_resolve.frag.spv"), &.{.{ .format = .rgba16_float }});
+}
+
+fn pathTraceComputePipeline(device: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "path tracing", .shader = if (device.caps.ray_tracing) pipelines_module.shaderCode("pathtrace_rt.comp.spv") else pipelines_module.shaderCode("pathtrace.comp.spv") } };
+}
+
+fn pathTracePipeline(device: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("path tracing", if (device.caps.ray_tracing) pipelines_module.shaderCode("pathtrace_rt.frag.spv") else pipelines_module.shaderCode("pathtrace.frag.spv"), &.{ .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float }, .{ .format = .rgba16_float }, .{ .format = .rgba32_float } });
 }

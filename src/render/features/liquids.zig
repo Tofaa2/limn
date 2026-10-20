@@ -1,4 +1,7 @@
 //! The surfaces of a scene's simulated liquids.
+const rhi = @import("../../rhi/rhi.zig");
+const pipelines_module = @import("../renderer/pipelines.zig");
+const liquid_push = @import("../shaders/push/liquid.zig");
 const render = @import("../renderer.zig");
 const renderer_state = @import("../state.zig");
 const scene_pass = @import("../scene_pass.zig");
@@ -46,30 +49,28 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
         defer cmd.endScope();
         for (scene.liquids.items) |item| {
             const state = renderer.liquids.table.get(item) orelse continue;
-            if (state.params_frame != renderer.frame_index or state.live == 0) continue;
+            if (state.params_frame != renderer.internal.frame_index or state.live == 0) continue;
             const radius = state.desc.particle_radius;
-            const ParticlePush = extern struct { frame: u64, liquid: u64, particles: u64, depth: u32, swell: f32 };
+            const ParticlePush = liquid_push.SpherePush;
             const particle_push = ParticlePush{
                 .frame = frame_address,
                 .liquid = state.params,
                 .particles = device.bufferAddress(state.particles),
-                .depth = device.textureIndex(view.depth),
+                .depth_texture = device.textureIndex(view.depth),
                 .swell = 1.7,
             };
             try cmd.beginRendering(.{ .depth = .{ .texture = targets.depth, .clear = 0 } });
-            cmd.bindPipeline(try renderer.pipelines.get(.liquid_depth));
+            cmd.bindPipeline(try renderer.internal.pipelines.of(liquidDepthPipeline));
             cmd.pushConstants(particle_push);
             cmd.draw(state.live * 6, 1, 0, 0);
             cmd.endRendering();
-            cmd.transition(targets.depth, .shader_read);
             try cmd.beginRendering(.{ .color = &.{.{ .texture = targets.thickness, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.liquid_thickness));
+            cmd.bindPipeline(try renderer.internal.pipelines.of(liquidThicknessPipeline));
             cmd.pushConstants(particle_push);
             cmd.draw(state.live * 6, 1, 0, 0);
             cmd.endRendering();
-            cmd.transition(targets.thickness, .shader_read);
-            const BlurPush = extern struct { frame: u64, source: u32, raw: u32, direction: [2]f32, width: f32, edge: f32 };
-            cmd.bindPipeline(try renderer.pipelines.get(.liquid_blur));
+            const BlurPush = liquid_push.BlurPush;
+            cmd.bindPipeline(try renderer.internal.pipelines.of(liquidBlurPipeline));
             var source = targets.depth;
             var raw: u32 = 1;
             for (0..2) |pass| {
@@ -77,7 +78,7 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = smoothed, .load = .discard }} });
                 cmd.pushConstants(BlurPush{
                     .frame = frame_address,
-                    .source = device.textureIndex(source),
+                    .source_texture = device.textureIndex(source),
                     .raw = raw,
                     .direction = if (pass % 2 == 0) .{ 1, 0 } else .{ 0, 1 },
                     .width = radius * 5,
@@ -85,33 +86,68 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
                 });
                 cmd.drawFullscreen();
                 cmd.endRendering();
-                cmd.transition(smoothed, .shader_read);
                 source = smoothed;
                 raw = 0;
             }
             try transparency_feature.copyScene(renderer, p, copy);
             try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.liquid));
-            cmd.pushConstants(extern struct { frame: u64, liquid: u64, distance: u32, thickness: u32, scene: u32, depth: u32 }{
+            cmd.bindPipeline(try renderer.internal.pipelines.of(liquidPipeline));
+            cmd.pushConstants(liquid_push.ShadePush{
                 .frame = frame_address,
                 .liquid = state.params,
-                .distance = device.textureIndex(targets.smooth[1]),
-                .thickness = device.textureIndex(targets.thickness),
-                .scene = device.textureIndex(copy),
-                .depth = device.textureIndex(view.depth),
+                .distance_texture = device.textureIndex(targets.smooth[1]),
+                .thickness_texture = device.textureIndex(targets.thickness),
+                .scene_texture = device.textureIndex(copy),
+                .depth_texture = device.textureIndex(view.depth),
             });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(view.hdr, .shader_read);
             if (state.desc.write_depth) {
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = view.motion, .load = .load }}, .depth = .{ .texture = view.depth, .load = .load } });
-                cmd.bindPipeline(try renderer.pipelines.get(.liquid_surface));
-                cmd.pushConstants(extern struct { frame: u64, distance: u32, pad: u32 = 0 }{ .frame = frame_address, .distance = device.textureIndex(targets.smooth[1]) });
+                cmd.bindPipeline(try renderer.internal.pipelines.of(liquidSurfacePipeline));
+                cmd.pushConstants(liquid_push.SurfacePush{ .frame = frame_address, .distance_texture = device.textureIndex(targets.smooth[1]) });
                 cmd.drawFullscreen();
                 cmd.endRendering();
-                cmd.transition(view.depth, .shader_read);
-                cmd.transition(view.motion, .shader_read);
             }
         }
     }
+}
+
+fn liquidSurfacePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "liquid surface depth",
+        .vertex = pipelines_module.shaderCode("fullscreen.vert.spv"),
+        .fragment = pipelines_module.shaderCode("liquid_surface.frag.spv"),
+        .color_targets = &.{.{ .format = .rg16_float }},
+        .depth = .{ .write = true, .compare = .greater },
+        .cull = .none,
+    } };
+}
+
+fn liquidDepthPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "liquid depth",
+        .vertex = pipelines_module.shaderCode("liquid.vert.spv"),
+        .fragment = pipelines_module.shaderCode("liquid_depth.frag.spv"),
+        .depth = .{ .write = true, .compare = .greater },
+        .cull = .none,
+    } };
+}
+
+fn liquidThicknessPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "liquid thickness",
+        .vertex = pipelines_module.shaderCode("liquid.vert.spv"),
+        .fragment = pipelines_module.shaderCode("liquid_thickness.frag.spv"),
+        .color_targets = &.{.{ .format = .r16_float, .blend = .additive }},
+        .cull = .none,
+    } };
+}
+
+fn liquidBlurPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("liquid smoothing", pipelines_module.shaderCode("liquid_blur.frag.spv"), &.{.{ .format = .r32_float }});
+}
+
+fn liquidPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("liquid", pipelines_module.shaderCode("liquid.frag.spv"), &.{.{ .format = pipelines_module.hdr_format, .blend = .alpha }});
 }

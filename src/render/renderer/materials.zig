@@ -29,7 +29,7 @@ fn textureIndex(self: *Renderer, entry: *ModelEntry, reference: ?gltf.TextureRef
 fn materialSampler(self: *Renderer, data: gltf.SamplerData, anisotropic: bool) !rhi.Sampler {
     const key = @as(usize, @intFromBool(anisotropic)) * 18 + @as(usize, @intFromBool(data.linear)) * 9 +
         @as(usize, @intFromEnum(data.repeat_u)) * 3 + @intFromEnum(data.repeat_v);
-    if (self.material_samplers[key]) |sampler| return sampler;
+    if (self.internal.material_samplers[key]) |sampler| return sampler;
     const filter: rhi.Filter = if (data.linear) .linear else .nearest;
     const sampler = try self.device.createSampler(.{
         .min_filter = .linear,
@@ -38,7 +38,7 @@ fn materialSampler(self: *Renderer, data: gltf.SamplerData, anisotropic: bool) !
         .address_v = addressMode(data.repeat_v),
         .max_anisotropy = if (anisotropic) self.options.textures.anisotropy else self.options.textures.data_anisotropy,
     });
-    self.material_samplers[key] = sampler;
+    self.internal.material_samplers[key] = sampler;
     return sampler;
 }
 
@@ -136,7 +136,7 @@ pub const Materials = struct {
         const count = source.materials.len;
         if (material) |index| if (index >= count) return error.InvalidMaterial;
         if (entry.material_images.len == 0) {
-            entry.material_images = try self.gpa.alloc(MaterialTextures, count);
+            entry.material_images = try self.internal.gpa.alloc(MaterialTextures, count);
             @memset(entry.material_images, .{});
         }
         for (entry.material_images, 0..) |*images, index| {
@@ -145,7 +145,7 @@ pub const Materials = struct {
         }
         if (entry.state != .ready) return;
         // Which instances are sampled as glowing depends on these textures.
-        self.asset_generation += 1;
+        self.internal.asset_generation += 1;
         for (source.materials, 0..) |item, index| {
             if (material) |only| if (only != index) continue;
             const encoded = try encodeMaterial(self, entry, item, index);

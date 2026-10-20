@@ -88,6 +88,7 @@ pub fn main(init: std.process.Init) !void {
     var bounces: u32 = 5;
     var orbit: f32 = 0.2;
     var hud_buffer: [160]u8 = undefined;
+    const tracer = renderer.capabilities().path_tracing;
 
     while (stage.begin()) |tick| {
         if (stage.keyPressed(glfw.GLFW_KEY_P)) traced = !traced;
@@ -101,7 +102,7 @@ pub fn main(init: std.process.Init) !void {
         const stats = renderer.getStats();
         try list.rect(.{ .x = 12, .y = 12, .width = 560, .height = 58 }, gfx.Color.rgba(10, 12, 20, 180));
         const line = if (traced)
-            try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · path traced by {s} · {d} bounces · {d} frames gathered", .{ stage.fps, stage.gpu_ms, switch (renderer.pathTracing()) {
+            try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · path traced by {s} · {d} bounces · {d} frames gathered", .{ stage.fps, stage.gpu_ms, switch (tracer) {
                 .hardware => "the GPU's ray tracing",
                 .shader => "a shader",
                 .unavailable => "nothing",

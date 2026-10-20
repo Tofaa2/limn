@@ -1,10 +1,6 @@
 #include "common.slang"
 
-struct Push {
-    FrameConstants frame;
-    float z_near;
-    float z_ratio;
-};
+#include "cluster.Push.slang"
 
 [[vk::push_constant]] Push push;
 
@@ -28,11 +24,11 @@ void computeMain(uint3 id : SV_DispatchThreadID) {
     float2 slope1 = (ndc1 + off_axis) / float2(frame.proj[0][0], frame.proj[1][1]);
     float2 slope_min = min(slope0, slope1);
     float2 slope_max = max(slope0, slope1);
-    Cluster* cluster = frame.clusters.data + index;
+    Cluster* cluster = frame.lights.clusters.data + index;
 
     uint count = 0u;
-    for (uint i = 0u; i < frame.light_count && count < CLUSTER_CAPACITY; i++) {
-        Light light = frame.lights.data[i];
+    for (uint i = 0u; i < frame.lights.light_count && count < CLUSTER_CAPACITY; i++) {
+        Light light = frame.lights.lights.data[i];
         float3 center = mul(frame.view, float4(light.position, 1.0)).xyz;
         float depth = -center.z;
         if ((light.flags & LIGHT_DIRECTIONAL) != 0u) {
@@ -54,8 +50,8 @@ void computeMain(uint3 id : SV_DispatchThreadID) {
 
     uint masks[CLUSTER_DECAL_WORDS];
     for (uint word = 0u; word < CLUSTER_DECAL_WORDS; word++) masks[word] = 0u;
-    for (uint i = 0u; i < min(frame.decal_count, CLUSTER_DECAL_WORDS * 32u); i++) {
-        float4 bounds = frame.decals.data[i].bounds;
+    for (uint i = 0u; i < min(frame.shading.decal_count, CLUSTER_DECAL_WORDS * 32u); i++) {
+        float4 bounds = frame.shading.decals.data[i].bounds;
         float3 center = mul(frame.view, float4(bounds.xyz, 1.0)).xyz;
         float depth = -center.z;
         if (depth + bounds.w < z0 || depth - bounds.w > z1) continue;

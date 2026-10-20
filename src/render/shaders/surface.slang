@@ -1,6 +1,7 @@
 #ifndef SURFACE_SLANG
 #define SURFACE_SLANG
 #include "trace.slang"
+#include "material_inputs.slang"
 
 /// How finely a ray hit reads its textures: at a fixed mip level, or at the
 /// level whose texels match `footprint`, the width of the ray where it lands.
@@ -86,6 +87,20 @@ HitGeometry geometryAt(FrameConstants frame, TraceHit hit, float3 origin, float3
     return geometry;
 }
 
+/// Texels at a ray hit, from the level its footprint asks for.
+struct RayTexels : IMaterialTexels {
+    Material material;
+    float2 uv;
+    float2 uvb;
+    SurfaceDetail detail;
+    float texture_per_world;
+
+    float4 texel(uint texture, uint channel, bool detail_sampler) {
+        float2 at = materialUv(material, ((material.uv_sets >> channel) & 1u) != 0u ? uvb : uv);
+        return sampleTextureLod(texture, material.sampler_index, at, detail.level(texture, texture_per_world));
+    }
+}
+
 HitSurface surfaceOf(HitGeometry geometry, SurfaceDetail detail) {
     HitSurface surface;
     Instance instance = geometry.instance;
@@ -119,27 +134,11 @@ HitSurface surfaceOf(HitGeometry geometry, SurfaceDetail detail) {
         texture_per_world = sqrt(abs(uv_edge_a.x * uv_edge_b.y - uv_edge_a.y * uv_edge_b.x) / max(length(cross(world_edge_a, world_edge_b)), 1e-12));
     }
 
-    float4 base_color = material.base_color;
-    if (material.base_color_texture != INVALID_ID)
-        base_color *= sampleTextureLod(material.base_color_texture, material.sampler_index, materialUv(material, (material.uv_sets & 1u) != 0u ? uvb : uv), detail.level(material.base_color_texture, texture_per_world));
-    base_color *= unpackUnorm(v0.color) * lambda.x + unpackUnorm(v1.color) * lambda.y + unpackUnorm(v2.color) * lambda.z;
-    base_color = float4(base_color.rgb * unpackUnorm(instance.tint).rgb, base_color.a);
-
-    surface.metallic = material.metallic;
-    surface.roughness = material.roughness;
-    float4 packed = float4(1.0);
-    if (material.metallic_roughness_texture != INVALID_ID)
-        packed = sampleTextureLod(material.metallic_roughness_texture, material.sampler_index, materialUv(material, uv), detail.level(material.metallic_roughness_texture, texture_per_world));
-    if ((material.flags & MATERIAL_SPECULAR_GLOSSINESS) != 0u) {
-        float3 color = base_color.rgb;
-        specularGlossiness(material, packed, color, surface.roughness, surface.metallic);
-        base_color.rgb = color;
-    } else {
-        surface.metallic *= packed.b;
-        surface.roughness *= packed.g;
-    }
-    surface.roughness = clamp(surface.roughness, 0.03, 1.0);
-    surface.base_color = base_color;
+    RayTexels texels = { material, uv, uvb, detail, texture_per_world };
+    MaterialInputs inputs = materialInputs(material, texels, unpackUnorm(instance.tint).rgb, unpackUnorm(v0.color) * lambda.x + unpackUnorm(v1.color) * lambda.y + unpackUnorm(v2.color) * lambda.z);
+    surface.metallic = inputs.metallic;
+    surface.roughness = clamp(inputs.roughness, 0.03, 1.0);
+    surface.base_color = inputs.base_color;
 
     if (detail.normal_maps && material.normal_texture != INVALID_ID) {
         float4 tangent_object = vertexTangent(v0) * lambda.x + vertexTangent(v1) * lambda.y + vertexTangent(v2) * lambda.z;
@@ -157,9 +156,7 @@ HitSurface surfaceOf(HitGeometry geometry, SurfaceDetail detail) {
         }
     }
 
-    surface.emissive = material.emissive;
-    if (material.emissive_texture != INVALID_ID && any(surface.emissive > 0.0))
-        surface.emissive *= sampleTextureLod(material.emissive_texture, material.sampler_index, materialUv(material, uv), detail.level(material.emissive_texture, texture_per_world)).rgb;
+    surface.emissive = inputs.emissive;
     surface.material_flags = material.flags;
     surface.instance_flags = instance.flags;
     surface.alpha_cutoff = material.alpha_cutoff;

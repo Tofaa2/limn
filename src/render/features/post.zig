@@ -1,6 +1,14 @@
 //! Bloom, exposure and tone mapping of an HDR picture into the view's
 //! target. Views without a scene go through this; views of a scene still
 //! use `passes/post.zig`.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const bloom_push = @import("../shaders/push/bloom.zig");
+const edge_antialiasing_push = @import("../shaders/push/edge_antialiasing.zig");
+const tonemap_push = @import("../shaders/push/tonemap.zig");
+const dof_push = @import("../shaders/push/dof.zig");
+const motion_blur_push = @import("../shaders/push/motion_blur.zig");
+const exposure_push = @import("../shaders/push/exposure.zig");
+const resolution_push = @import("../shaders/push/resolution.zig");
 const scene_pass = @import("../scene_pass.zig");
 const output_feature = @import("output.zig");
 const ScenePass = @import("../scene_pass.zig").ScenePass;
@@ -111,7 +119,7 @@ const Frame = struct {
     count: usize,
 };
 
-const BloomPush = extern struct { frame: u64, source: u32, first_level: u32, source_texel: [2]f32 };
+const BloomPush = bloom_push.DownPush;
 
 /// Adds the passes that take `hdr`, which fills the view's region, to the
 /// view's target.
@@ -185,11 +193,10 @@ fn reduce(frame: *Frame) !void {
     var source = frame.hdr;
     for (frame.levels[0..frame.count], 0..) |level, at| {
         try cmd.beginRendering(.{ .color = &.{.{ .texture = ctx.graph.texture(level), .load = .discard }} });
-        cmd.bindPipeline(try ctx.renderer.pipelines.get(.bloom_down));
-        cmd.pushConstants(BloomPush{ .frame = ctx.frame_address, .source = ctx.index(source), .first_level = @intFromBool(at == 0), .source_texel = texel(ctx, source) });
+        cmd.bindPipeline(try ctx.renderer.internal.pipelines.of(bloomDownPipeline));
+        cmd.pushConstants(BloomPush{ .frame = ctx.frame_address, .source_texture = ctx.index(source), .first_level = @intFromBool(at == 0), .source_texel = texel(ctx, source) });
         cmd.drawFullscreen();
         cmd.endRendering();
-        cmd.transition(ctx.graph.texture(level), .shader_read);
         source = level;
     }
 }
@@ -200,29 +207,17 @@ fn meter(frame: *Frame) !void {
     const settings = ctx.settings;
     const view = ctx.view.?;
     const smallest = ctx.index(frame.levels[frame.count - 1]);
-    cmd.bindPipeline(try ctx.renderer.pipelines.get(.exposure));
-    cmd.pushConstants(extern struct {
-        frame: u64,
-        source: u32,
-        automatic: u32,
-        compensation: f32,
-        min_luminance: f32,
-        max_luminance: f32,
-        speed: f32,
-        reset: u32,
-        depth: u32,
-        focus_speed: f32,
-        pad: u32 = 0,
-    }{
+    cmd.bindPipeline(try ctx.renderer.internal.pipelines.of(exposurePipeline));
+    cmd.pushConstants(exposure_push.Push{
         .frame = ctx.frame_address,
-        .source = smallest,
+        .source_texture = smallest,
         .automatic = @intFromBool(settings.post.automatic_exposure),
         .compensation = std.math.pow(f32, 2, settings.post.exposure_compensation),
         .min_luminance = std.math.clamp(settings.post.exposure_darkest, 1e-5, 64),
         .max_luminance = 64,
         .speed = @max(settings.post.exposure_speed, 0.01),
         .reset = @intFromBool(view.exposure_reset),
-        .depth = smallest,
+        .depth_texture = smallest,
         .focus_speed = 1,
     });
     cmd.dispatch(1, 1, 1);
@@ -237,11 +232,10 @@ fn spread(frame: *Frame) !void {
     while (level > 0) : (level -= 1) {
         const into = ctx.graph.texture(frame.levels[level - 1]);
         try cmd.beginRendering(.{ .color = &.{.{ .texture = into, .load = .load }} });
-        cmd.bindPipeline(try ctx.renderer.pipelines.get(.bloom_up));
-        cmd.pushConstants(BloomPush{ .frame = ctx.frame_address, .source = ctx.index(frame.levels[level]), .first_level = 0, .source_texel = texel(ctx, frame.levels[level]) });
+        cmd.bindPipeline(try ctx.renderer.internal.pipelines.of(bloomUpPipeline));
+        cmd.pushConstants(bloom_push.UpPush{ .frame = ctx.frame_address, .source_texture = ctx.index(frame.levels[level]), .pad = 0, .source_texel = texel(ctx, frame.levels[level]) });
         cmd.drawFullscreen();
         cmd.endRendering();
-        cmd.transition(into, .shader_read);
     }
 }
 
@@ -251,8 +245,8 @@ fn tonemap(frame: *Frame) !void {
     const region = ctx.output.region;
     var push = gradingPush(ctx.renderer, ctx.desc.*, ctx.output.format, false);
     push.frame = ctx.frame_address;
-    push.color = ctx.index(frame.hdr);
-    push.bloom = ctx.index(frame.levels[0]);
+    push.color_texture = ctx.index(frame.hdr);
+    push.bloom_texture = ctx.index(frame.levels[0]);
     push.bloom_scale = 1.0 / @as(f32, @floatFromInt(frame.count));
     push.sharpen = 0;
     push.origin = .{ @intCast(region.x), @intCast(region.y) };
@@ -262,44 +256,17 @@ fn tonemap(frame: *Frame) !void {
     cmd.drawFullscreen();
 }
 
-/// Push constants of tonemap.slang.
-pub const TonemapPush = extern struct {
-    frame: u64,
-    color: u32,
-    bloom: u32,
-    bloom_strength: f32,
-    encode_srgb: u32,
-    sharpen: f32,
-    bloom_scale: f32,
-    passthrough: u32,
-    /// Top-left corner of the area being written, in target pixels.
-    origin: [2]i32 = .{ 0, 0 },
-    vignette: f32 = 0,
-    grain: f32 = 0,
-    saturation: f32 = 1,
-    contrast: f32 = 1,
-    color_filter: [3]f32 = .{ 1, 1, 1 },
-    aberration: f32 = 0,
-    hdr_paper_white: f32 = 200,
-    hdr_peak: f32 = 1000,
-    lut: u32 = gpu.invalid_id,
-    lut_strength: f32 = 1,
-    flare: f32 = 0,
-    flare_pad: u32 = 0,
-};
+pub const TonemapPush = tonemap_push.Push;
 
 /// The tone mapping pipeline for `format`, created on first use.
 pub fn tonemapPipeline(renderer: *Renderer, format: rhi.Format) !rhi.Pipeline {
-    for (renderer.tonemap_pipelines.items) |entry| if (entry.format == format) return entry.pipeline;
-    const pipeline = try renderer.device.createGraphicsPipeline(.{
+    return renderer.internal.pipelines.get(.{ .graphics = .{
         .name = "tonemap",
         .vertex = render.shaderCode("fullscreen.vert.spv"),
         .fragment = render.shaderCode("tonemap.frag.spv"),
         .color_targets = &.{.{ .format = format }},
         .cull = .none,
-    });
-    try renderer.tonemap_pipelines.append(renderer.gpa, .{ .format = format, .pipeline = pipeline });
-    return pipeline;
+    } });
 }
 
 /// Depth of field, then motion blur. They run after TAA so the history stays
@@ -334,35 +301,33 @@ pub fn lensEffects(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textur
             const max_radius = @max(filled(settings.post.depth_of_field).max_blur, 1) * scale;
             const gather_target = dof_reduced orelse lens[0];
             try cmd.beginRendering(.{ .color = &.{.{ .texture = gather_target, .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.dof));
-            cmd.pushConstants(extern struct { frame: u64, color: u32, depth: u32, focus: f32, strength: f32, max_radius: f32, taps: i32, blades: u32, pad: u32 = 0 }{
+            cmd.bindPipeline(try renderer.internal.pipelines.of(dofPipeline));
+            cmd.pushConstants(dof_push.BlurPush{
                 .frame = frame_address,
-                .color = device.textureIndex(resolved),
-                .depth = device.textureIndex(view.depth),
-                .focus = focus,
+                .color_texture = device.textureIndex(resolved),
+                .depth_texture = device.textureIndex(view.depth),
+                .focus_distance = focus,
                 .strength = strength,
                 .max_radius = max_radius,
-                .taps = @intCast(std.math.clamp(filled(settings.post.depth_of_field).samples, 4, 128)),
+                .tap_count = @intCast(std.math.clamp(filled(settings.post.depth_of_field).samples, 4, 128)),
                 .blades = @min(filled(settings.post.depth_of_field).blades, 16),
             });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(gather_target, .shader_read);
             if (dof_reduced) |reduced| {
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = lens[0], .load = .discard }} });
-                cmd.bindPipeline(try renderer.pipelines.get(.dof_composite));
-                cmd.pushConstants(extern struct { frame: u64, color: u32, blurred: u32, depth: u32, focus: f32, strength: f32, max_radius: f32 }{
+                cmd.bindPipeline(try renderer.internal.pipelines.of(dofCompositePipeline));
+                cmd.pushConstants(dof_push.CompositePush{
                     .frame = frame_address,
-                    .color = device.textureIndex(resolved),
-                    .blurred = device.textureIndex(reduced),
-                    .depth = device.textureIndex(view.depth),
-                    .focus = focus,
+                    .color_texture = device.textureIndex(resolved),
+                    .blurred_texture = device.textureIndex(reduced),
+                    .depth_texture = device.textureIndex(view.depth),
+                    .focus_distance = focus,
                     .strength = strength,
                     .max_radius = max_radius,
                 });
                 cmd.drawFullscreen();
                 cmd.endRendering();
-                cmd.transition(lens[0], .shader_read);
             }
             cmd.endScope();
             resolved = lens[0];
@@ -370,19 +335,18 @@ pub fn lensEffects(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textur
         if ((if (settings.post.motion_blur) |on| on.strength else 0) > 0) {
             cmd.beginScope("motion blur");
             try cmd.beginRendering(.{ .color = &.{.{ .texture = lens[1], .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.motion_blur));
-            cmd.pushConstants(extern struct { frame: u64, color: u32, motion: u32, shutter: f32, max_length: f32, taps: i32, spread: u32 }{
+            cmd.bindPipeline(try renderer.internal.pipelines.of(motionBlurPipeline));
+            cmd.pushConstants(motion_blur_push.Push{
                 .frame = frame_address,
-                .color = device.textureIndex(resolved),
-                .motion = device.textureIndex(view.motion),
+                .color_texture = device.textureIndex(resolved),
+                .motion_texture = device.textureIndex(view.motion),
                 .shutter = std.math.clamp((if (settings.post.motion_blur) |on| on.strength else 0), 0, 2),
                 .max_length = 0.06,
-                .taps = @intCast(std.math.clamp(filled(settings.post.motion_blur).samples, 2, 64)),
+                .tap_count = @intCast(std.math.clamp(filled(settings.post.motion_blur).samples, 2, 64)),
                 .spread = @intFromBool(filled(settings.post.motion_blur).spread),
             });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(lens[1], .shader_read);
             cmd.endScope();
             resolved = lens[1];
         }
@@ -406,44 +370,31 @@ pub fn bloomAndExposure(renderer: *Renderer, p: *const ScenePass, resolved: rhi.
     for (bloom_chain[0..bloom_count], 0..) |level, index| {
         const source_info = device.textureInfo(source);
         try cmd.beginRendering(.{ .color = &.{.{ .texture = level, .load = .discard }} });
-        cmd.bindPipeline(try renderer.pipelines.get(.bloom_down));
+        cmd.bindPipeline(try renderer.internal.pipelines.of(bloomDownPipeline));
         cmd.pushConstants(BloomPush{
             .frame = frame_address,
-            .source = device.textureIndex(source),
+            .source_texture = device.textureIndex(source),
             .first_level = @intFromBool(index == 0),
             .source_texel = .{ 1.0 / @as(f32, @floatFromInt(source_info.width)), 1.0 / @as(f32, @floatFromInt(source_info.height)) },
         });
         cmd.drawFullscreen();
         cmd.endRendering();
-        cmd.transition(level, .shader_read);
         source = level;
     }
     cmd.endScope();
 
     cmd.beginScope("exposure");
-    cmd.bindPipeline(try renderer.pipelines.get(.exposure));
-    cmd.pushConstants(extern struct {
-        frame: u64,
-        source: u32,
-        automatic: u32,
-        compensation: f32,
-        min_luminance: f32,
-        max_luminance: f32,
-        speed: f32,
-        reset: u32,
-        depth: u32,
-        focus_speed: f32,
-        pad: u32 = 0,
-    }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(exposurePipeline));
+    cmd.pushConstants(exposure_push.Push{
         .frame = frame_address,
-        .source = device.textureIndex(bloom_chain[bloom_count - 1]),
+        .source_texture = device.textureIndex(bloom_chain[bloom_count - 1]),
         .automatic = @intFromBool(settings.post.automatic_exposure),
         .compensation = std.math.pow(f32, 2, settings.post.exposure_compensation),
         .min_luminance = std.math.clamp(settings.post.exposure_darkest, 1e-5, 64),
         .max_luminance = 64,
         .speed = @max(settings.post.exposure_speed, 0.01),
         .reset = @intFromBool(view_data.exposure_reset),
-        .depth = device.textureIndex(view.depth),
+        .depth_texture = device.textureIndex(view.depth),
         .focus_speed = @max(filled(settings.post.depth_of_field).autofocus_speed, 0.01),
     });
     cmd.dispatch(1, 1, 1);
@@ -457,16 +408,15 @@ pub fn bloomAndExposure(renderer: *Renderer, p: *const ScenePass, resolved: rhi.
         while (level > 0) : (level -= 1) {
             const source_info = device.textureInfo(bloom_chain[level]);
             try cmd.beginRendering(.{ .color = &.{.{ .texture = bloom_chain[level - 1], .load = .load }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.bloom_up));
-            cmd.pushConstants(BloomPush{
+            cmd.bindPipeline(try renderer.internal.pipelines.of(bloomUpPipeline));
+            cmd.pushConstants(bloom_push.UpPush{
                 .frame = frame_address,
-                .source = device.textureIndex(bloom_chain[level]),
-                .first_level = 0,
+                .source_texture = device.textureIndex(bloom_chain[level]),
+                .pad = 0,
                 .source_texel = .{ 1.0 / @as(f32, @floatFromInt(source_info.width)), 1.0 / @as(f32, @floatFromInt(source_info.height)) },
             });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(bloom_chain[level - 1], .shader_read);
         }
         cmd.endScope();
     }
@@ -497,10 +447,10 @@ pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textu
                 }
             };
             try cmd.beginRendering(.{ .color = &.{.{ .texture = edges, .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.fsr_easu));
-            cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0, con0: [4]u32, con1: [4]u32, con2: [4]u32, con3: [4]u32 }{
+            cmd.bindPipeline(try renderer.internal.pipelines.of(fsrEasuPipeline));
+            cmd.pushConstants(resolution_push.EasuPush{
                 .frame = frame_address,
-                .source = device.textureIndex(resolved),
+                .source_texture = device.textureIndex(resolved),
                 .con0 = Bits.of(.{ from[0] / to[0], from[1] / to[1], 0.5 * from[0] / to[0] - 0.5, 0.5 * from[1] / to[1] - 0.5 }),
                 .con1 = Bits.of(.{ 1 / from[0], 1 / from[1], 1 / from[0], -1 / from[1] }),
                 .con2 = Bits.of(.{ -1 / from[0], 2 / from[1], 1 / from[0], 2 / from[1] }),
@@ -508,25 +458,23 @@ pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textu
             });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(edges, .shader_read);
             const sharpness = std.math.pow(f32, 2, -2 * (1 - std.math.clamp(settings.resolution.sharpen, 0, 1)));
             try cmd.beginRendering(.{ .color = &.{.{ .texture = upscaled, .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.fsr_rcas));
-            cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0, con: [4]u32 }{
+            cmd.bindPipeline(try renderer.internal.pipelines.of(fsrRcasPipeline));
+            cmd.pushConstants(resolution_push.RcasPush{
                 .frame = frame_address,
-                .source = device.textureIndex(edges),
+                .source_texture = device.textureIndex(edges),
                 .con = Bits.of(.{ sharpness, sharpness, 0, 0 }),
             });
             cmd.drawFullscreen();
             cmd.endRendering();
         } else {
             try cmd.beginRendering(.{ .color = &.{.{ .texture = upscaled, .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.upscale));
-            cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(resolved) });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(upscalePipeline));
+            cmd.pushConstants(resolution_push.UpscalePush{ .frame = frame_address, .source_texture = device.textureIndex(resolved) });
             cmd.drawFullscreen();
             cmd.endRendering();
         }
-        cmd.transition(upscaled, .shader_read);
         cmd.endScope();
         resolved = upscaled;
     }
@@ -537,19 +485,18 @@ pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textu
     cmd.bindPipeline(try tonemapPipeline(renderer, target_format));
     var push = gradingPush(renderer, desc, target_format, debugging);
     push.frame = frame_address;
-    push.color = device.textureIndex(resolved);
-    push.bloom = device.textureIndex((try bloomLevels(renderer, p))[0]);
+    push.color_texture = device.textureIndex(resolved);
+    push.bloom_texture = device.textureIndex((try bloomLevels(renderer, p))[0]);
     push.bloom_scale = 1.0 / @as(f32, @floatFromInt(bloom_count));
     cmd.pushConstants(push);
     cmd.drawFullscreen();
     cmd.endRendering();
     cmd.endScope();
     if (!smoothing) return;
-    cmd.transition(drawn, .shader_read);
     cmd.beginScope("edge antialiasing");
     try cmd.beginRendering(.{ .color = &.{.{ .texture = target, .load = .discard }} });
     cmd.bindPipeline(try edgePipeline(renderer, target_format));
-    cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(drawn) });
+    cmd.pushConstants(edge_antialiasing_push.Push{ .frame = frame_address, .source_texture = device.textureIndex(drawn) });
     cmd.drawFullscreen();
     cmd.endRendering();
     cmd.endScope();
@@ -557,17 +504,13 @@ pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textu
 
 /// The edge antialiasing pipeline for `format`, created on first use.
 fn edgePipeline(renderer: *Renderer, format: rhi.Format) !rhi.Pipeline {
-    for (renderer.edge_pipelines.items) |entry| if (entry.format == format) return entry.pipeline;
-    const pipeline = try renderer.device.createGraphicsPipeline(.{
+    return renderer.internal.pipelines.get(.{ .graphics = .{
         .name = "edge antialiasing",
         .vertex = render.shaderCode("fullscreen.vert.spv"),
         .fragment = render.shaderCode("edge_antialiasing.frag.spv"),
         .color_targets = &.{.{ .format = format }},
         .cull = .none,
-    });
-    errdefer renderer.device.destroyPipeline(pipeline);
-    try renderer.edge_pipelines.append(renderer.gpa, .{ .format = format, .pipeline = pipeline });
-    return pipeline;
+    } });
 }
 
 /// The view's bloom chain: each level half the size of the one before.
@@ -587,8 +530,8 @@ pub fn gradingPush(renderer: *const Renderer, desc: ViewDesc, target_format: rhi
     const settings = desc.settings;
     return .{
         .frame = 0,
-        .color = gpu.invalid_id,
-        .bloom = gpu.invalid_id,
+        .color_texture = gpu.invalid_id,
+        .bloom_texture = gpu.invalid_id,
         .bloom_strength = settings.post.bloom,
         .encode_srgb = output_feature.outputEncoding(renderer, desc, target_format),
         .hdr_paper_white = @max(settings.output.paper_white, 1),
@@ -606,8 +549,44 @@ pub fn gradingPush(renderer: *const Renderer, desc: ViewDesc, target_format: rhi
             settings.post.color_filter[2] * (1 - 0.25 * std.math.clamp(settings.post.temperature, -1, 1)),
         },
         .aberration = if (debugging) 0 else std.math.clamp(settings.post.chromatic_aberration, 0, 1),
-        .lut = if (debugging) gpu.invalid_id else if (settings.post.color_lut) |image| image.index else gpu.invalid_id,
+        .lut_texture = if (debugging) gpu.invalid_id else if (settings.post.color_lut) |image| image.index else gpu.invalid_id,
         .lut_strength = std.math.clamp(settings.post.color_lut_strength, 0, 1),
         .flare = if (debugging) 0 else @max(settings.post.lens_flare, 0),
     };
+}
+
+fn upscalePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("upscale", pipelines_module.shaderCode("upscale.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn fsrEasuPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fsr upscale", pipelines_module.shaderCode("fsr_easu.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn fsrRcasPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fsr sharpen", pipelines_module.shaderCode("fsr_rcas.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn dofPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("depth of field", pipelines_module.shaderCode("dof.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn dofCompositePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("depth of field (join)", pipelines_module.shaderCode("dof_composite.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn motionBlurPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("motion blur", pipelines_module.shaderCode("motion_blur.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn bloomDownPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("bloom down", pipelines_module.shaderCode("bloom_down.frag.spv"), &.{.{ .format = pipelines_module.bloom_format }});
+}
+
+fn bloomUpPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("bloom up", pipelines_module.shaderCode("bloom_up.frag.spv"), &.{.{ .format = pipelines_module.bloom_format, .blend = .additive }});
+}
+
+fn exposurePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "exposure", .shader = pipelines_module.shaderCode("exposure.comp.spv") } };
 }

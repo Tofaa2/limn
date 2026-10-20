@@ -151,8 +151,8 @@ pub fn readBuffer(self: *Device, gpa: std.mem.Allocator, buffer: types.Buffer, s
     const staging = try self.createBuffer(.{ .name = "readback", .size = size, .usage = .{}, .memory = .gpu_to_cpu });
     defer self.destroyBuffer(staging);
     try waitQueue(self);
-    const encoder = try self.beginImmediate();
+    var encoder = try self.beginImmediate();
     self.vkd.cmdCopyBuffer(encoder.command, self.bufferResource(buffer).handle, self.bufferResource(staging).handle, &.{.{ .src_offset = 0, .dst_offset = 0, .size = size }});
-    try self.endImmediate();
+    try self.endImmediate(&encoder);
     return gpa.dupe(u8, self.mapped(staging)[0..@intCast(size)]);
 }

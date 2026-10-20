@@ -1,9 +1,13 @@
 //! Shadows of the sun and of local lights.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const liquid_push = @import("../shaders/push/liquid.zig");
 const render = @import("../renderer.zig");
+const ray_scene = @import("../scene/ray_scene.zig");
 const scene_pass = @import("../scene_pass.zig");
 const geometry_feature = @import("geometry.zig");
 const hair_feature = @import("hair.zig");
 const gpu = @import("../gpu.zig");
+const rhi = @import("../../rhi/rhi.zig");
 const filled = @import("../api.zig").filled;
 const std = @import("std");
 const math = @import("../../math.zig");
@@ -88,18 +92,111 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
         s.traced_lights = false;
         r.downgrade("shadows.traced_lights", "on", "off", .no_ray_tracing);
     }
+    if (s.traced_lights) r.rays = true;
     if (r.debugging) s.virtual = false;
 }
 
 /// Adds the feature's passes to a view of a scene. A path traced view leaves
 /// out those whose result the tracer replaces.
+/// A view's sun shadow maps, and the cascades they were last drawn for.
+pub const View = struct {
+    map: ?rhi.Texture = null,
+    /// Tint of sunlight passed by see-through casters, per cascade.
+    tint: ?rhi.Texture = null,
+    colored: bool = false,
+    cascade_cache: render.CascadeCache = .{},
+
+    pub fn init(_: *rhi.Device) !View {
+        return .{};
+    }
+
+    pub fn deinit(self: *View, device: *rhi.Device) void {
+        if (self.map) |texture| device.destroyTexture(texture);
+        if (self.tint) |texture| device.destroyTexture(texture);
+    }
+};
+
+/// Makes the maps a view with these shadows draws into; a change between
+/// plain and colored shadows redraws every cascade.
+pub fn fitMaps(renderer: *Renderer, view_data: *render.ViewData, enabled: bool, colored: bool) !*View {
+    const device = renderer.device;
+    const own = try features.stateOf(view_data, device, @This());
+    const resolution = renderer.options.shadows.resolution;
+    if (colored and own.tint == null) {
+        own.tint = try device.createTexture(.{
+            .name = "shadow tint",
+            .width = @max(resolution / 2, 1),
+            .height = @max(resolution / 2, 1),
+            .format = .rgba8_unorm,
+            .usage = .{ .sampled = true, .color_attachment = true },
+            .layers = gpu.cascade_count,
+            .kind = .@"2d_array",
+        });
+    }
+    if (own.colored != colored) {
+        own.colored = colored;
+        own.cascade_cache.valid = false;
+    }
+    if (enabled and own.map == null) {
+        own.map = try device.createTexture(.{
+            .name = "shadow cascades",
+            .width = resolution,
+            .height = resolution,
+            .format = .depth32_float,
+            .usage = .{ .sampled = true, .depth_attachment = true },
+            .layers = gpu.cascade_count,
+            .kind = .@"2d_array",
+        });
+    }
+    return own;
+}
+
+/// Makes the view's sun shadow maps and picks the cascades to redraw, then
+/// plans the local light shadows this frame draws.
+pub fn prepare(ctx: *ViewContext) !void {
+    const p = ctx.scene orelse return;
+    const renderer = ctx.renderer;
+    const device = ctx.device;
+    const settings = p.settings;
+    const enabled = p.shared.shadows_enabled;
+    const colored = enabled and filled(settings.shadows).colored and filled(settings.shadows).transparent;
+    const maps = try fitMaps(renderer, p.view_data, enabled, colored);
+    const plan = try updateCascades(renderer, p, enabled);
+    const cascades = maps.cascade_cache.cascades;
+    const map = if (enabled) maps.map.? else renderer.internal.shadow_map;
+    const sun = try ctx.make(SunShadows);
+    sun.* = .{ .enabled = enabled, .colored = colored, .map = map, .cascades = cascades, .count = plan.count, .update = plan.update };
+    const traced = (if (settings.shadows) |shadows| shadows.traced_lights else false) and ray_scene.ready(p.scene, p.scene_frame);
+    const tlas: u64 = if (traced) device.accelerationAddress(p.scene.tlas.?) else 0;
+    const local = try ctx.make(LocalShadows);
+    local.* = planLocalShadows(renderer, p, p.shared.lighting);
+    p.shared.sun = sun;
+    p.shared.local_shadows = local;
+    p.shared.shadow_tlas = tlas;
+    p.shared.colored_shadows = colored;
+    const c = ctx.constants;
+    c.shadows.cascade_view_proj = cascades.view_proj;
+    c.shadows.cascade_splits = cascades.splits;
+    c.shadows.cascade_texel_size = cascades.texel_size;
+    c.shadows.shadow_map = device.textureIndex(map);
+    c.shadows.shadow_sampler = device.samplerIndex(renderer.internal.sampler_shadow);
+    c.shadows.local_shadow_map = device.textureIndex(renderer.internal.local_shadow_map);
+    c.shadows.local_shadow_sampler = device.samplerIndex(renderer.internal.sampler_local_shadow);
+    c.shadows.tlas_low = @truncate(tlas);
+    c.shadows.tlas_high = @truncate(tlas >> 32);
+    c.shadows.shadow_color = if (colored) device.textureIndex(maps.tint.?) else gpu.invalid_id;
+    c.shadows.contact_depth = if (!p.debugging) device.textureIndex(p.view.depth) else gpu.invalid_id;
+    c.shadows.enabled = @intFromBool(enabled);
+    c.shadows.colored = @intFromBool(colored);
+}
+
 pub fn declare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
     const own = filled(p.settings.shadows);
-    ctx.constants.shadow_softness = own.softness;
-    ctx.constants.shadow_taps = own.samples;
-    ctx.constants.contact_length = @max(own.contact, 0);
-    ctx.constants.flags |= std.math.clamp(own.light_rays, 1, 15) << 16;
+    ctx.constants.shadows.shadow_softness = own.softness;
+    ctx.constants.shadows.shadow_taps = own.samples;
+    ctx.constants.shadows.contact_length = @max(own.contact, 0);
+    ctx.constants.shadows.light_rays = std.math.clamp(own.light_rays, 1, 15);
     const g = ctx.graph;
     try g.add(.{ .name = "sun shadows", .stage = .shadows, .always = true, .scope = false }, ctx, sunShadows);
     try g.add(.{ .name = "local shadows", .stage = .lighting, .always = true, .scope = false }, ctx, localShadows);
@@ -133,7 +230,7 @@ fn moverCastsInto(scene: *const SceneData, center: Vec3, radius: f32, sun_travel
 /// `Settings.shadows.cascade_stagger` far cascades are redrawn every 2nd, 4th
 /// and 8th frame, or early when the camera leaves their coverage or a moving
 /// caster reaches them.
-pub fn updateCascades(renderer: *Renderer, p: *const ScenePass, shadows_enabled: bool) CascadePlan {
+pub fn updateCascades(renderer: *Renderer, p: *const ScenePass, shadows_enabled: bool) !CascadePlan {
     const desc = p.desc;
     const settings = p.settings;
     const scene_handle = p.scene_handle;
@@ -145,7 +242,7 @@ pub fn updateCascades(renderer: *Renderer, p: *const ScenePass, shadows_enabled:
     const ideal = computeCascades(desc.camera, view_matrix, aspect, sun_travel, filled(settings.shadows).distance, renderer.options.shadows.resolution, cascade_total);
     var cascade_update: [gpu.cascade_count]bool = @splat(false);
     {
-        const cache = &view_data.cascade_cache;
+        const cache = &(try features.stateOf(view_data, renderer.device, @This())).cascade_cache;
         const stale = !cache.valid or cache.count != cascade_total or !std.meta.eql(cache.scene, scene_handle) or cache.shadow_distance != filled(settings.shadows).distance or cache.near != desc.camera.near or !std.meta.eql(cache.orthographic, desc.camera.orthographic) or
             math.length(math.sub(cache.sun, sun_travel)) > 1e-6;
         for (0..gpu.cascade_count) |cascade| {
@@ -181,7 +278,6 @@ pub fn drawSunShadows(renderer: *Renderer, p: *const ScenePass, sun: *const SunS
     const device = renderer.device;
     const cmd = p.cmd;
     const scene = p.scene;
-    const view_data = p.view_data;
     const frame_address = p.frame_address;
     const colored_shadows = sun.colored;
     const shadow_map = sun.map;
@@ -191,18 +287,18 @@ pub fn drawSunShadows(renderer: *Renderer, p: *const ScenePass, sun: *const SunS
     for (0..gpu.cascade_count) |cascade| {
         if (!cascade_update[cascade]) continue;
         try cmd.beginRendering(.{ .depth = .{ .texture = shadow_map, .layer = @intCast(cascade), .clear = 1 } });
-        cmd.bindIndexBuffer(renderer.indices.get(), 0, .uint32);
+        cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
         const cascade_push = DrawPush{ .frame = frame_address, .tinted = @intFromBool(colored_shadows), .view_proj = cascades.view_proj[cascade] };
-        cmd.bindPipeline(try renderer.pipelines.get(.shadow));
+        cmd.bindPipeline(try renderer.internal.pipelines.of(pipelines_module.shadowPipeline));
         geometry_feature.drawMeshlets(renderer, cmd, cascade_push, 1 + cascade, 0, scene.ref_count);
-        cmd.bindPipeline(try renderer.pipelines.get(.shadow_masked));
+        cmd.bindPipeline(try renderer.internal.pipelines.of(pipelines_module.shadowMaskedPipeline));
         geometry_feature.drawMeshlets(renderer, cmd, cascade_push, 1 + cascade, 1, scene.ref_count);
         try hair_feature.drawHairShadows(renderer, p, cascades.view_proj[cascade], cascades.texel_size[cascade], 0);
         for (scene.liquids.items) |item| {
             const state = renderer.liquids.table.get(item) orelse continue;
-            if (state.params_frame != renderer.frame_index or state.live == 0 or state.desc.shadow <= 0) continue;
-            cmd.bindPipeline(try renderer.pipelines.get(.liquid_shadow));
-            cmd.pushConstants(extern struct { frame: u64, liquid: u64, particles: u64, view_proj: Mat4, swell: f32, strength: f32 }{
+            if (state.params_frame != renderer.internal.frame_index or state.live == 0 or state.desc.shadow <= 0) continue;
+            cmd.bindPipeline(try renderer.internal.pipelines.of(liquidShadowPipeline));
+            cmd.pushConstants(liquid_push.ShadowPush{
                 .frame = frame_address,
                 .liquid = state.params,
                 .particles = device.bufferAddress(state.particles),
@@ -216,12 +312,12 @@ pub fn drawSunShadows(renderer: *Renderer, p: *const ScenePass, sun: *const SunS
     }
     cmd.transition(shadow_map, .shader_read);
     if (colored_shadows) {
-        const tint = view_data.shadow_color.?;
+        const tint = (try features.stateOf(p.view_data, renderer.device, @This())).tint.?;
         for (0..gpu.cascade_count) |cascade| {
             if (!cascade_update[cascade]) continue;
             try cmd.beginRendering(.{ .color = &.{.{ .texture = tint, .layer = @intCast(cascade), .load = .clear, .clear = .{ 1, 1, 1, 1 } }} });
-            cmd.bindIndexBuffer(renderer.indices.get(), 0, .uint32);
-            cmd.bindPipeline(try renderer.pipelines.get(.shadow_color));
+            cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
+            cmd.bindPipeline(try renderer.internal.pipelines.of(shadowColorPipeline));
             geometry_feature.drawMeshlets(renderer, cmd, .{ .frame = frame_address, .view_proj = cascades.view_proj[cascade] }, 1 + cascade, 1, scene.ref_count);
             cmd.endRendering();
         }
@@ -235,15 +331,15 @@ pub fn planLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *con
     const scene_handle = p.scene_handle;
     const scene = p.scene;
     const scene_frame = p.scene_frame;
-    const local_shadows_current = renderer.local_shadow_frame == renderer.frame_index and
-        renderer.local_shadow_scene != null and std.meta.eql(renderer.local_shadow_scene.?, scene_handle);
+    const local_shadows_current = renderer.internal.local_shadow_frame == renderer.internal.frame_index and
+        renderer.internal.local_shadow_scene != null and std.meta.eql(renderer.internal.local_shadow_scene.?, scene_handle);
     var shadow_key_hasher = std.hash.Wyhash.init(lighting.tiles_key);
     shadow_key_hasher.update(std.mem.asBytes(&scene.lights_version));
     shadow_key_hasher.update(std.mem.asBytes(&scene.layout_version));
     shadow_key_hasher.update(std.mem.asBytes(&scene.static_version));
     const shadow_key = shadow_key_hasher.final() | 1;
-    const same_atlas = renderer.local_shadow_key == shadow_key and
-        renderer.local_shadow_scene != null and std.meta.eql(renderer.local_shadow_scene.?, scene_handle);
+    const same_atlas = renderer.internal.local_shadow_key == shadow_key and
+        renderer.internal.local_shadow_scene != null and std.meta.eql(renderer.internal.local_shadow_scene.?, scene_handle);
     var tile_dirty: [max_local_shadow_views]bool = @splat(true);
     var any_tile_dirty = lighting.tile_count != 0;
     if (same_atlas and !local_shadows_current) {
@@ -264,12 +360,12 @@ pub fn planLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *con
                     break;
                 }
             };
-            tile_dirty[tile] = reached or renderer.local_tile_had_mover[tile];
-            renderer.local_tile_had_mover[tile] = reached;
+            tile_dirty[tile] = reached or renderer.internal.local_tile_had_mover[tile];
+            renderer.internal.local_tile_had_mover[tile] = reached;
             any_tile_dirty = any_tile_dirty or tile_dirty[tile];
         }
     } else if (!local_shadows_current) {
-        for (0..lighting.tile_count) |tile| renderer.local_tile_had_mover[tile] = scene_frame.any_moving;
+        for (0..lighting.tile_count) |tile| renderer.internal.local_tile_had_mover[tile] = scene_frame.any_moving;
     }
     const draw_local_shadows = any_tile_dirty and scene.ref_count != 0 and !local_shadows_current;
     return .{ .draw = draw_local_shadows, .same_atlas = same_atlas, .key = shadow_key, .tile_dirty = tile_dirty };
@@ -284,12 +380,12 @@ pub fn drawLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *con
     const same_atlas = local.same_atlas;
     const shadow_key = local.key;
     const tile_dirty = local.tile_dirty;
-    renderer.local_shadow_scene = scene_handle;
-    renderer.local_shadow_frame = renderer.frame_index;
-    renderer.local_shadow_key = shadow_key;
+    renderer.internal.local_shadow_scene = scene_handle;
+    renderer.internal.local_shadow_frame = renderer.internal.frame_index;
+    renderer.internal.local_shadow_key = shadow_key;
     cmd.beginScope("local shadows");
-    try cmd.beginRendering(.{ .depth = .{ .texture = renderer.local_shadow_map, .load = if (same_atlas) .load else .clear, .clear = 0 } });
-    cmd.bindIndexBuffer(renderer.indices.get(), 0, .uint32);
+    try cmd.beginRendering(.{ .depth = .{ .texture = renderer.internal.local_shadow_map, .load = if (same_atlas) .load else .clear, .clear = 0 } });
+    cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
     const tiles_per_side = std.math.clamp(renderer.options.shadows.local_tiles_per_side, 1, local_shadow_tiles_per_side);
     const tile_size = renderer.options.shadows.local_resolution / tiles_per_side;
     for (0..lighting.tile_count) |tile| {
@@ -303,12 +399,56 @@ pub fn drawLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *con
         );
         if (same_atlas) cmd.clearDepthRect(@intCast(tile % tiles_per_side * tile_size), @intCast(tile / tiles_per_side * tile_size), tile_size, tile_size, 0);
         const tile_push = DrawPush{ .frame = frame_address, .view_proj = lighting.tile_view_proj[tile] };
-        cmd.bindPipeline(try renderer.pipelines.get(.local_shadow));
+        cmd.bindPipeline(try renderer.internal.pipelines.of(localShadowPipeline));
         geometry_feature.drawMeshlets(renderer, cmd, tile_push, view_index, 0, scene.ref_count);
-        cmd.bindPipeline(try renderer.pipelines.get(.local_shadow_masked));
+        cmd.bindPipeline(try renderer.internal.pipelines.of(localShadowMaskedPipeline));
         geometry_feature.drawMeshlets(renderer, cmd, tile_push, view_index, 1, scene.ref_count);
     }
     cmd.endRendering();
-    cmd.transition(renderer.local_shadow_map, .shader_read);
     cmd.endScope();
+}
+
+fn localShadowPipeline(device: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "local shadow",
+        .vertex = pipelines_module.shaderCode("visibility.vert.spv"),
+        .mesh = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.mesh.spv") else null,
+        .task = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.task.spv") else null,
+        .depth = pipelines_module.local_shadow_depth,
+        .cull = .back,
+    } };
+}
+
+fn localShadowMaskedPipeline(device: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "local shadow masked",
+        .vertex = pipelines_module.shaderCode("visibility.vert.spv"),
+        .mesh = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.mesh.spv") else null,
+        .task = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.task.spv") else null,
+        .fragment = pipelines_module.shaderCode("shadow_masked.frag.spv"),
+        .depth = pipelines_module.local_shadow_depth,
+        .cull = .none,
+    } };
+}
+
+fn shadowColorPipeline(device: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "shadow tint",
+        .vertex = pipelines_module.shaderCode("visibility.vert.spv"),
+        .mesh = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.mesh.spv") else null,
+        .task = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.task.spv") else null,
+        .fragment = pipelines_module.shaderCode("shadow_color.frag.spv"),
+        .color_targets = &.{.{ .format = .rgba8_unorm, .blend = .tint }},
+        .cull = .none,
+    } };
+}
+
+fn liquidShadowPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "liquid shadow",
+        .vertex = pipelines_module.shaderCode("liquid_shadow.vert.spv"),
+        .fragment = pipelines_module.shaderCode("liquid_shadow.frag.spv"),
+        .depth = pipelines_module.shadow_depth,
+        .cull = .none,
+    } };
 }

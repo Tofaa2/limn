@@ -1,12 +1,6 @@
 #include "common.slang"
 
-struct Push {
-    FrameConstants frame;
-    uint history_texture;
-    uint depth_texture;
-    uint tile;
-    float contrast;
-};
+#include "shading_rate.Push.slang"
 
 [[vk::push_constant]] Push push;
 

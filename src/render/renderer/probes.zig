@@ -1,4 +1,6 @@
 //! Reflection probes and their capture. Internal to the renderer.
+const pipelines_module = @import("pipelines.zig");
+const environment_push = @import("../shaders/push/environment.zig");
 const std = @import("std");
 const handle = @import("../../handle.zig");
 const rhi = @import("../../rhi/rhi.zig");
@@ -24,6 +26,11 @@ const renderView = @import("view_render.zig").renderView;
 /// Local reflection probes.
 pub const Probes = struct {
     table: handle.HandleTable(renderer_state.ProbeData, api.ReflectionProbeTag),
+
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.ProbeData) void {
+        freeProbe(owner, entry);
+    }
 
     fn renderer(probes: *Probes) *Renderer {
         return @alignCast(@fieldParentPtr("probes", probes));
@@ -54,7 +61,7 @@ pub const Probes = struct {
         };
         const probe = try self.probes.table.insert(.{ .scene = scene, .desc = desc, .target = target, .view = view, .cubes = .{ .max_radiance = desc.max_radiance } });
         errdefer _ = self.probes.table.remove(probe);
-        try data.probes.append(self.gpa, probe);
+        try data.probes.append(self.internal.gpa, probe);
         return probe;
     }
 
@@ -83,13 +90,7 @@ pub const Probes = struct {
         const self = probes.renderer();
         self.lock();
         defer self.unlock();
-        var removed = self.probes.table.remove(probe) orelse return;
-        freeProbe(self, &removed);
-        const scene = self.scenes.table.get(removed.scene) orelse return;
-        for (scene.probes.items, 0..) |item, index| if (std.meta.eql(item, probe)) {
-            _ = scene.probes.swapRemove(index);
-            break;
-        };
+        render.destroyObject(self, "probes", "probes", probe);
     }
 };
 
@@ -98,7 +99,7 @@ pub fn freeProbe(self: *Renderer, probe: *ProbeData) void {
     self.device.destroyTexture(probe.target);
     if (self.views.table.remove(probe.view)) |removed_view| {
         var removed = removed_view;
-        removed.deinit(self.gpa, self.device);
+        removed.deinit(self.internal.gpa, self.device);
     }
 }
 
@@ -149,10 +150,10 @@ pub fn captureProbes(self: *Renderer, frame: rhi.Frame, delta_time: f32, arena: 
             const right = math.normalize(math.cross(forward, axes[1]));
             const up = math.cross(right, forward);
             try cmd.beginRendering(.{ .color = &.{.{ .texture = probe.cubes.sky.?, .layer = @intCast(face), .load = .discard }} });
-            cmd.bindPipeline(try self.pipelines.get(.probe_face));
-            cmd.pushConstants(extern struct { source: u32, sampler: u32, face: u32, max_radiance: f32, right: [3]f32, up: [3]f32, forward: [3]f32 }{
-                .source = device.textureIndex(state.hdr),
-                .sampler = device.samplerIndex(self.sampler_linear_clamp),
+            cmd.bindPipeline(try self.internal.pipelines.of(probeFacePipeline));
+            cmd.pushConstants(environment_push.ProbeFacePush{
+                .source_texture = device.textureIndex(state.hdr),
+                .sampler_index = device.samplerIndex(self.internal.sampler_linear_clamp),
                 .face = @intCast(face),
                 .max_radiance = probe.desc.max_radiance,
                 .right = right,
@@ -171,4 +172,8 @@ pub fn captureProbes(self: *Renderer, frame: rhi.Frame, delta_time: f32, arena: 
         probe.captured = true;
         return;
     };
+}
+
+fn probeFacePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("probe face", pipelines_module.shaderCode("probe_face.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
 }

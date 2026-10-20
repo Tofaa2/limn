@@ -1,4 +1,8 @@
 //! Smoke and fire of a scene's fluids.
+const rhi = @import("../../rhi/rhi.zig");
+const pipelines_module = @import("../renderer/pipelines.zig");
+const fluid_passes_push = @import("../shaders/push/fluid_passes.zig");
+const fog_push = @import("../shaders/push/fog.zig");
 const scene_pass = @import("../scene_pass.zig");
 const render = @import("../renderer.zig");
 const filled = @import("../api.zig").filled;
@@ -45,12 +49,21 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
 
 /// Adds the feature's passes to a view of a scene. A path traced view leaves
 /// out those whose result the tracer replaces.
+/// Makes the list of fluids that shading reads, filled as fluids draw.
+pub fn prepare(ctx: *ViewContext) !void {
+    const p = ctx.scene orelse return;
+    const list = try p.arena.alloc(ctx.device, gpu.FluidList, 1);
+    list.items[0] = .{};
+    p.shared.fluid_list = &list.items[0];
+    ctx.constants.fluids.list = list.address;
+}
+
 pub fn declare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
     if (p.scene.fluids.items.len != 0) {
         const own = filled(p.settings.fluids);
-        if (own.shadows) ctx.constants.flags |= gpu.frame_flags.fluid_shadows;
-        if (own.rays) ctx.constants.flags |= gpu.frame_flags.fluid_rays;
+        if (own.shadows) ctx.constants.fluids.shadows = 1;
+        if (own.rays) ctx.constants.fluids.rays = 1;
     }
     const g = ctx.graph;
     try g.add(.{ .name = "smoke", .stage = .volumes, .always = true, .scope = false }, ctx, smoke);
@@ -67,7 +80,7 @@ pub fn shadowingFluids(renderer: *Renderer, p: *const ScenePass) gpu.FluidList {
     var list = gpu.FluidList{};
     for (scene.fluids.items) |item| {
         const state = renderer.fluids.table.get(item) orelse continue;
-        if (state.params_frame != renderer.frame_index or state.desc.shadow <= 0) continue;
+        if (state.params_frame != renderer.internal.frame_index or state.desc.shadow <= 0) continue;
         list.fluids[list.count] = state.params;
         list.count += 1;
     }
@@ -89,10 +102,10 @@ pub fn lightFluids(renderer: *Renderer, p: *const ScenePass, lighting: *const Li
             const state = renderer.fluids.table.get(item) orelse continue;
             if (state.desc.light <= 0) continue;
             defer fluid_slot += 1;
-            if (state.params_frame != renderer.frame_index) continue;
-            if (!bound) cmd.bindPipeline(try renderer.pipelines.get(.fluid_light));
+            if (state.params_frame != renderer.internal.frame_index) continue;
+            if (!bound) cmd.bindPipeline(try renderer.internal.pipelines.of(fluidLightPipeline));
             bound = true;
-            cmd.pushConstants(extern struct { fluid: u64, lights: u64, index: u32, scale: f32, tall: f32, pad: u32 = 0 }{ .fluid = state.params, .lights = lighting.lights, .index = fluid_slot, .scale = state.desc.light * 8, .tall = std.math.clamp(state.desc.light_tall, 0, 1) });
+            cmd.pushConstants(fluid_passes_push.LightPush{ .fluid = state.params, .lights = lighting.lights, .index = fluid_slot, .scale = state.desc.light * 8, .tall = std.math.clamp(state.desc.light_tall, 0, 1) });
             cmd.dispatch(1, 1, 1);
         }
         if (bound) cmd.sync(.compute_to_all);
@@ -110,18 +123,19 @@ pub fn drawFluids(renderer: *Renderer, p: *const ScenePass) !void {
     const frame_address = p.frame_address;
     if (settings.fluids != null and scene.fluids.items.len != 0) fluids: {
         if (debugging) break :fluids;
-        var push = extern struct { frame: u64, depth: u32, count: u32, steps: i32, light_steps: i32, motion: u32, pad: u32 = 0, fluids: [max_fluids]u64 }{
+        var push = fluid_passes_push.VolumePush{
             .motion = @intFromBool(filled(settings.fluids).motion_vectors),
             .frame = frame_address,
-            .depth = device.textureIndex(view.depth),
+            .depth_texture = device.textureIndex(view.depth),
             .count = 0,
             .steps = @intCast(std.math.clamp(filled(settings.fluids).steps, 4, 256)),
             .light_steps = @intCast(std.math.clamp(filled(settings.fluids).light_steps, 1, 32)),
+            .motion_pad = 0,
             .fluids = @splat(0),
         };
         for (scene.fluids.items) |item| {
             const state = renderer.fluids.table.get(item) orelse continue;
-            if (state.params_frame != renderer.frame_index) continue;
+            if (state.params_frame != renderer.internal.frame_index) continue;
             push.fluids[push.count] = state.params;
             push.count += 1;
         }
@@ -133,30 +147,38 @@ pub fn drawFluids(renderer: *Renderer, p: *const ScenePass) !void {
         const fluid_target = try p.keep(renderer, "fluids", fluid_width, fluid_height, render.hdr_format);
         const fluid_motion = try p.keep(renderer, "fluid motion", fluid_width, fluid_height, .rgba16_float);
         try cmd.beginRendering(.{ .color = &.{ .{ .texture = fluid_target, .load = .discard }, .{ .texture = fluid_motion, .load = .discard } } });
-        cmd.bindPipeline(try renderer.pipelines.get(.fluid));
+        cmd.bindPipeline(try renderer.internal.pipelines.of(fluidPipeline));
         cmd.pushConstants(push);
         cmd.drawFullscreen();
         cmd.endRendering();
-        cmd.transition(fluid_target, .shader_read);
-        cmd.transition(fluid_motion, .shader_read);
         if (filled(settings.fluids).motion_vectors) {
             try cmd.beginRendering(.{ .color = &.{.{ .texture = view.motion, .load = .load }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.fluid_motion));
-            cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(fluid_motion) });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(fluidMotionPipeline));
+            cmd.pushConstants(fluid_passes_push.MotionPush{ .frame = frame_address, .source_texture = device.textureIndex(fluid_motion) });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(view.motion, .shader_read);
         }
         try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-        cmd.bindPipeline(try renderer.pipelines.get(.fog_composite));
-        cmd.pushConstants(extern struct { frame: u64, fog: u32, depth: u32 }{
+        cmd.bindPipeline(try renderer.internal.pipelines.of(pipelines_module.fogCompositePipeline));
+        cmd.pushConstants(fog_push.CompositePush{
             .frame = frame_address,
-            .fog = device.textureIndex(fluid_target),
-            .depth = device.textureIndex(view.depth),
+            .fog_texture = device.textureIndex(fluid_target),
+            .depth_texture = device.textureIndex(view.depth),
         });
         cmd.drawFullscreen();
         cmd.endRendering();
-        cmd.transition(view.hdr, .shader_read);
         cmd.endScope();
     }
+}
+
+fn fluidPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluids", pipelines_module.shaderCode("fluid.frag.spv"), &.{ .{ .format = pipelines_module.hdr_format }, .{ .format = .rgba16_float } });
+}
+
+fn fluidMotionPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluid motion", pipelines_module.shaderCode("fluid_motion.frag.spv"), &.{.{ .format = .rg16_float, .blend = .alpha }});
+}
+
+fn fluidLightPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "fluid light", .shader = pipelines_module.shaderCode("fluid_light.comp.spv") } };
 }

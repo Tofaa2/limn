@@ -4,6 +4,7 @@ const std = @import("std");
 const rhi = @import("../rhi/rhi.zig");
 const math = @import("../math.zig");
 const gltf = @import("../asset/gltf.zig");
+const api = @import("api.zig");
 const ktx2 = @import("../asset/ktx2.zig");
 const texture_codec = @import("texture_codec");
 const shader_sources = @import("shader_sources");
@@ -167,7 +168,7 @@ pub const Pool = struct {
 
     pub fn deinit(self: *Pool, renderer: *Renderer) void {
         if (self.buffer) |buffer| renderer.device.destroyBuffer(buffer);
-        self.ranges.free_ranges.deinit(renderer.gpa);
+        self.ranges.free_ranges.deinit(renderer.internal.gpa);
     }
 
     /// Makes the buffer at its initial size if nothing has been allocated yet.
@@ -206,7 +207,7 @@ pub const Pool = struct {
     }
 
     pub fn free(self: *Pool, renderer: *Renderer, offset: u32, count: u32) void {
-        self.ranges.free(renderer.gpa, offset, count);
+        self.ranges.free(renderer.internal.gpa, offset, count);
         self.trim(renderer) catch {};
     }
 
@@ -328,23 +329,10 @@ pub fn runModelJob(job: *ModelJob) std.Io.Cancelable!void {
     job.done.store(true, .release);
 }
 
-/// One build of the standard shading pass.
+/// A build of the standard shading pass that has been asked for.
 pub const ShadeVariant = struct {
     reflective: bool,
     features: u32,
-    pipeline: ?rhi.Pipeline = null,
-    job: ?*ShadeVariantJob = null,
-};
-
-pub const ShadeVariantJob = struct {
-    device: *const rhi.Device,
-    io: std.Io,
-    reflective: bool,
-    constants: [1]u32,
-    group: std.Io.Group = .init,
-    done: std.atomic.Value(bool) = .init(false),
-    compiled: ?rhi.Device.CompiledPipeline = null,
-    failure: ?anyerror = null,
 };
 
 pub fn shadeVariantDesc(device: *const rhi.Device, reflective: bool, constants: []const u32) rhi.GraphicsPipelineDesc {
@@ -358,15 +346,6 @@ pub fn shadeVariantDesc(device: *const rhi.Device, reflective: bool, constants: 
         .cull = .none,
         .fragment_constants = constants,
     };
-}
-
-/// Runs on a worker thread. The shader code it reads is only replaced
-/// after every job has been waited for.
-pub fn runShadeVariantJob(job: *ShadeVariantJob) std.Io.Cancelable!void {
-    if (job.device.compileGraphicsPipeline(std.heap.smp_allocator, shadeVariantDesc(job.device, job.reflective, &job.constants))) |compiled| {
-        job.compiled = compiled;
-    } else |err| job.failure = err;
-    job.done.store(true, .release);
 }
 
 pub const EnvironmentJob = struct {
@@ -473,24 +452,7 @@ pub const ModelMesh = struct {
     blas_building: ?rhi.AccelerationStructure = null,
 };
 
-/// Application images used as a material's textures (see
-/// `Renderer.materials.setTextures`). Null keeps the model's own. Channels
-/// follow glTF: roughness in green and metallic in blue, occlusion in red,
-/// coat strength in red, coat roughness in green, sheen roughness in alpha.
-pub const MaterialTextures = struct {
-    base_color: ?Image = null,
-    normal: ?Image = null,
-    metallic_roughness: ?Image = null,
-    occlusion: ?Image = null,
-    emissive: ?Image = null,
-    clearcoat: ?Image = null,
-    clearcoat_roughness: ?Image = null,
-    clearcoat_normal: ?Image = null,
-    sheen_color: ?Image = null,
-    sheen_roughness: ?Image = null,
-    /// Filtering and wrapping for all of them; null keeps the material's own.
-    sampler: ?gltf.SamplerData = null,
-};
+pub const MaterialTextures = api.MaterialTextures;
 
 pub const ModelEntry = struct {
     state: AssetState = .loading,
@@ -652,6 +614,8 @@ pub const SceneData = struct {
     environment: ?Environment = null,
     environment_intensity: f32 = 1,
     lights: std.ArrayList(Light) = .empty,
+    /// The handle of each light, where it has one; see `placed.zig`.
+    light_handles: std.ArrayList(?api.LightHandle) = .empty,
     /// Bumped whenever the lights are replaced or moved.
     lights_version: u64 = 0,
     emitters: std.ArrayList(Emitter) = .empty,
@@ -686,6 +650,8 @@ pub const SceneData = struct {
     trace_instances_capacity: u32 = 0,
     instance_slots: [rhi.frames_in_flight]InstanceSlot = @splat(.{}),
     decals: std.ArrayList(DecalDesc) = .empty,
+    /// The handle of each decal, where it has one.
+    decal_handles: std.ArrayList(?api.DecalHandle) = .empty,
     transmissive: bool = false,
     /// GPU instance indices of blended geometry, drawn in the forward pass.
     transparent: std.ArrayList(TransparentDraw) = .empty,
@@ -933,12 +899,6 @@ pub const ViewState = struct {
     visibility: rhi.Texture,
     motion: rhi.Texture,
     hdr: rhi.Texture,
-    history: [2]rhi.Texture,
-    /// Depth pyramid for occlusion culling (power-of-two, full mip chain).
-    hiz: rhi.Texture,
-    hiz_width: u32,
-    hiz_height: u32,
-    hiz_mips: u32,
     history_valid: bool = false,
 
     pub fn init(device: *rhi.Device, width: u32, height: u32, resolved_width: u32, resolved_height: u32) !ViewState {
@@ -957,25 +917,11 @@ pub const ViewState = struct {
         self.motion = try made.texture(.{ .name = "motion", .width = width, .height = height, .format = .rg16_float, .usage = color });
         self.previous_motion = try made.texture(.{ .name = "motion", .width = width, .height = height, .format = .rg16_float, .usage = color });
         self.hdr = try made.texture(.{ .name = "hdr", .width = width, .height = height, .format = hdr_format, .usage = color });
-        self.hiz_width = std.math.floorPowerOfTwo(u32, @max(width, 2));
-        self.hiz_height = std.math.floorPowerOfTwo(u32, @max(height, 2));
-        self.hiz_mips = rhi.TextureDesc.fullMipCount(self.hiz_width, self.hiz_height);
-        self.hiz = try made.texture(.{
-            .name = "depth pyramid",
-            .width = self.hiz_width,
-            .height = self.hiz_height,
-            .format = .r32_float,
-            .usage = .{ .sampled = true, .color_attachment = true, .storage = device.caps.storage_images },
-            .mip_levels = self.hiz_mips,
-        });
-        for (&self.history) |*texture| {
-            texture.* = try made.texture(.{ .name = "taa history", .width = resolved_width, .height = resolved_height, .format = hdr_format, .usage = .{ .sampled = true, .color_attachment = true, .storage = device.caps.storage_images, .copy_dst = true } });
-        }
         return self;
     }
 
     pub fn deinit(self: *ViewState, device: *rhi.Device) void {
-        for ([_]rhi.Texture{ self.depth, self.previous_depth, self.visibility, self.motion, self.previous_motion, self.hdr, self.hiz, self.history[0], self.history[1] }) |texture|
+        for ([_]rhi.Texture{ self.depth, self.previous_depth, self.visibility, self.motion, self.previous_motion, self.hdr }) |texture|
             device.destroyTexture(texture);
     }
 };
@@ -998,38 +944,16 @@ pub const ViewData = struct {
     /// Whether `previous_view_proj` is the camera of one frame ago: the view
     /// drew the previous frame into its current targets.
     camera_known: bool = false,
-    shadow_map: ?rhi.Texture = null,
-    /// Tint of sunlight passed by see-through casters, per cascade.
-    shadow_color: ?rhi.Texture = null,
-    shadows_colored: bool = false,
-    cascade_cache: CascadeCache = .{},
-    path_traced: bool = false,
     /// Targets features keep for this view from frame to frame.
     kept: target_store.Kept = .{},
     /// Each feature's own state for this view.
     features: features.ViewStates = features.emptyViewStates(),
-    /// One word per meshlet reference: was it visible last frame.
-    visibility: ?rhi.Buffer = null,
-    visibility_capacity: u32 = 0,
-    /// The vendor upscaler this view resolves with.
-    upscaler: @import("techniques/upscaling.zig").Slot = .{},
-    /// One word per instance of the instance groups: seen last frame
-    /// (`InstanceVisibility` in cull_view.slang).
-    instance_visibility: ?rhi.Buffer = null,
-    instance_visibility_capacity: u32 = 0,
-    visibility_scene: ?Scene = null,
-    visibility_layout: u64 = 0,
 
     pub fn deinit(self: *ViewData, gpa: std.mem.Allocator, device: *rhi.Device) void {
         self.kept.deinit(gpa, device);
         if (self.state) |*state| state.deinit(device);
         if (self.output) |texture| device.destroyTexture(texture);
-        if (self.shadow_map) |texture| device.destroyTexture(texture);
-        if (self.shadow_color) |texture| device.destroyTexture(texture);
-        if (self.visibility) |buffer| device.destroyBuffer(buffer);
-        if (self.instance_visibility) |buffer| device.destroyBuffer(buffer);
         features.deinitViewStates(&self.features, device);
-        self.upscaler.deinit(device);
         device.destroyBuffer(self.exposure);
     }
 };
@@ -1083,7 +1007,6 @@ pub const gi_visibility_texels = 16;
 /// Upper bound on `Options.ray_tracing.max_probes`: the scroll offset has 10 bits.
 pub const gi_probe_limit = 256;
 
-pub const FormatPipeline = struct { format: rhi.Format, pipeline: rhi.Pipeline };
 pub const PickRequest = struct { view: View, pixel: [2]u32 };
 pub const ReflectionTargets = struct {
     /// Mirror weight (rgb) and roughness (a) of every surface.
