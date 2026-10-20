@@ -294,7 +294,7 @@ pub fn main(init: std.process.Init) !void {
         simulation.wind = if (windy) .{ -4.5, 0.6, 2 } else .{ 0, 0, 0 };
         renderer.hairs.setSimulation(hair, if (moving) simulation else null);
 
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         list.clear();
         try list.rect(.{ .x = 12, .y = 12, .width = 600, .height = 104 }, gfx.Color.rgba(8, 10, 18, 190));
         try list.text(font, try std.fmt.bufPrint(&text, "{d} strands moved on the GPU, each drawn 4 times · {d} points\n{d:.1} ms GPU · {d:.2} ms CPU · {d:.0} fps", .{

@@ -265,7 +265,7 @@ pub fn main(init: std.process.Init) !void {
         try renderer.fluids.set(fluid, desc);
 
         list.clear();
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         try list.rect(.{ .x = 12, .y = 12, .width = 520, .height = 100 }, gfx.Color.rgba(10, 12, 20, 180));
         try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · cpu {d:.2} ms\nswirl {d:.0} · wind {d:.2}", .{
             stage.fps, stage.gpu_ms, stats.cpu_ms, desc.vorticity, wind,

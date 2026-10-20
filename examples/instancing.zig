@@ -137,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
             const high = math.add(item.position, .{ 0.4 * item.scale, 1.8 * item.scale, 0.4 * item.scale });
             try list.box3d(low, high, 2, gfx.Color.hex(0xffd23f));
         };
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         try list.rect(.{ .x = 12, .y = 12, .width = 420, .height = 118 }, gfx.Color.rgba(10, 12, 20, 180));
         try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · cpu {d:.2} ms\n{d} trees · {d} gpu instances · {d}k triangles", .{
             stage.fps, stage.gpu_ms, stats.cpu_ms, count, stats.instances, stats.triangles / 1000,

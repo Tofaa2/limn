@@ -227,6 +227,7 @@ pub fn main(init: std.process.Init) !void {
         .application_name = "particles",
         .cache = .{ .pipelines = "zig-out/pipeline.cache" },
         .validation = offscreen,
+        .deterministic = offscreen,
         .surface = if (window) |value| try value.surface(false) else null,
     });
     defer renderer.deinit();
@@ -358,7 +359,7 @@ pub fn main(init: std.process.Init) !void {
         const now: f64 = if (window) |value| value.time() else @as(f64, @floatFromInt(frames)) / 60.0;
         if (now - hud_time >= 0.5 or hud_text.len == 0) {
             var gpu_ms: f32 = 0;
-            for (renderer.device.passTimings()) |timing| {
+            for (if (screenshot != null) @as([]const gfx.rhi.PassTiming, &.{}) else renderer.device.passTimings()) |timing| {
                 if (timing.depth == 0) gpu_ms += timing.milliseconds;
             }
             hud_text = try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · {d} particle slots", .{

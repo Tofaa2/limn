@@ -171,7 +171,7 @@ pub fn main(init: std.process.Init) !void {
         try renderer.scenes.setClouds(scene, clouds);
 
         list.clear();
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         try list.rect(.{ .x = 12, .y = 12, .width = 470, .height = 100 }, gfx.Color.rgba(10, 12, 20, 180));
         try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · cpu {d:.2} ms\ncover {d:.2} · density {d:.3} · altitude {d:.0} m", .{
             stage.fps, stage.gpu_ms, stats.cpu_ms, clouds.coverage, clouds.density, altitude,

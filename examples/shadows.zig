@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
 
         var cascades_ms: f32 = 0;
         var virtual_ms: f32 = 0;
-        for (renderer.device.passTimings()) |timing| {
+        for (stage.passTimings()) |timing| {
             if (std.mem.eql(u8, timing.name, "shadows")) cascades_ms = timing.milliseconds;
             if (std.mem.eql(u8, timing.name, "virtual shadows")) virtual_ms = timing.milliseconds;
         }

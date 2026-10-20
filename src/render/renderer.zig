@@ -935,6 +935,7 @@ pub const Renderer = struct {
     pub fn render(self: *Renderer, desc: FrameDesc) !bool {
         const device = self.device;
         var failure: ?anyerror = null;
+        if (self.options.deterministic) try self.waitUntilLoaded();
         try device.waitForFrame();
         {
             self.lock();
