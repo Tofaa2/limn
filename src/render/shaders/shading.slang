@@ -25,6 +25,8 @@ struct Surface {
     float3 coat_normal;
     float3 sheen_color;
     float sheen_roughness;
+    /// Stretch of the highlights along `grain`, 0..1; below 0 the surface is
+    /// a hair fibre running along `grain`.
     float anisotropy;
     float3 grain;
     float subsurface;
@@ -182,7 +184,64 @@ float3 grainLight(Surface surface, float3 l, float3 radiance) {
     return (diffuse + fresnel * min(distribution * visibility, 1e4)) * radiance * n_dot_l;
 }
 
+/// Fresnel reflectance of a hair's cuticle, of index 1.55.
+float hairFresnel(float cos_theta) {
+    const float f0 = 0.0465;
+    return f0 + (1.0 - f0) * pow(1.0 - clamp(cos_theta, 0.0, 1.0), 5.0);
+}
+
+float hairLobe(float width, float angle) {
+    width = max(width, 1e-3);
+    return exp(-0.5 * angle * angle / (width * width)) / (sqrt(2.0 * PI) * width);
+}
+
+/// Light a hair fibre along `tangent` sends toward `view` from `l`, after
+/// Marschner: a white reflection off the cuticle shifted toward the tip,
+/// light through the fibre coloured by `color` toward a light behind, and a
+/// coloured reflection from inside it shifted toward the root. The lobes are
+/// Karis's fits.
+float3 hairFibre(float3 tangent, float3 view, float3 l, float3 color, float roughness) {
+    float sin_l = clamp(dot(tangent, l), -1.0, 1.0);
+    float sin_v = clamp(dot(tangent, view), -1.0, 1.0);
+    float cos_d = max(cos(0.5 * abs(asin(sin_v) - asin(sin_l))), 1e-3);
+    float3 across_l = l - sin_l * tangent;
+    float3 across_v = view - sin_v * tangent;
+    float cos_phi = dot(across_l, across_v) * rsqrt(dot(across_l, across_l) * dot(across_v, across_v) + 1e-4);
+    float cos_half_phi = sqrt(clamp(0.5 + 0.5 * cos_phi, 0.0, 1.0));
+    float width = max(roughness * roughness, 0.002);
+    const float shift = 0.035;
+    float3 result = float3(0.0);
+
+    float tilt_sin = sin(-2.0 * shift);
+    float tilt_cos = cos(-2.0 * shift);
+    float tilt = 2.0 * tilt_sin * (tilt_cos * cos_half_phi * sqrt(max(1.0 - sin_v * sin_v, 0.0)) + tilt_sin * sin_v);
+    float reflected = hairLobe(width * sqrt(2.0) * cos_half_phi, sin_l + sin_v - tilt) * 0.25 * cos_half_phi;
+    result += reflected * hairFresnel(sqrt(clamp(0.5 + 0.5 * dot(view, l), 0.0, 1.0)));
+
+    float bent = 1.0 / (1.19 / cos_d + 0.36 * cos_d);
+    float offset = cos_half_phi * (1.0 + bent * (0.6 - 0.8 * cos_phi));
+    float entering = hairFresnel(cos_d * sqrt(clamp(1.0 - offset * offset, 0.0, 1.0)));
+    float3 passed = pow(color, 0.5 * sqrt(clamp(1.0 - offset * offset * bent * bent, 0.0, 1.0)) / cos_d);
+    result += hairLobe(width * 0.5, sin_l + sin_v - shift) * exp(-3.65 * cos_phi - 3.98) * (1.0 - entering) * (1.0 - entering) * passed;
+
+    float inner = hairFresnel(cos_d * 0.5);
+    result += hairLobe(width * 2.0, sin_l + sin_v - 4.0 * shift) * exp(17.0 * cos_phi - 16.78) * (1.0 - inner) * (1.0 - inner) * inner * pow(color, 0.8 / cos_d);
+    return max(result, float3(0.0));
+}
+
+/// Light scattered back and forth among neighbouring fibres, which gives hair
+/// its body and the glow of fair hair; `through` is what is left of it after
+/// crossing other fibres on the way in.
+float3 hairScatter(float3 tangent, float3 view, float3 l, float3 color, float3 through) {
+    float across = 1.0 - abs(dot(tangent, l));
+    float3 facing = view - tangent * dot(view, tangent);
+    facing *= rsqrt(max(dot(facing, facing), 1e-8));
+    float wrapped = clamp((dot(facing, l) + 1.0) * 0.25, 0.0, 1.0);
+    return color * through * (lerp(wrapped, across, 0.33) / PI);
+}
+
 float3 surfaceLight(Surface surface, float3 l, float3 radiance) {
+    if (surface.anisotropy < 0.0) return (hairFibre(surface.grain, surface.view, l, surface.diffuse_color, surface.roughness) + hairScatter(surface.grain, surface.view, l, surface.diffuse_color, float3(1.0))) * radiance;
     float3 base;
     if (surface.anisotropy > 0.0) base = grainLight(surface, l, radiance);
     else base = directLight(surface.normal, surface.view, l, radiance, surface.diffuse_color, surface.f0, surface.roughness);
@@ -350,7 +409,7 @@ float localShadow(FrameConstants frame, Light light, float3 world_position, floa
 
 float3 sphereLight(Surface surface, float3 to_light, float distance_to_light, float radius, float3 radiance, float3 tube_center, float3 tube_axis, float tube_length) {
     float3 l = to_light / max(distance_to_light, 1e-5);
-    if (radius <= 0.0 && tube_length == 0.0) return surfaceLight(surface, l, radiance);
+    if ((radius <= 0.0 && tube_length == 0.0) || surface.anisotropy < 0.0) return surfaceLight(surface, l, radiance);
     float3 mirror = reflect(-surface.view, surface.normal);
     float3 center = to_light;
     float line_normalization = 1.0;

@@ -125,6 +125,7 @@ const PickRequest = renderer_state.PickRequest;
 pub const ReflectionTargets = renderer_state.ReflectionTargets;
 pub const cloud_noise_size = renderer_state.cloud_noise_size;
 pub const cloud_noise_tiles = renderer_state.cloud_noise_tiles;
+pub const cloud_weather_size = renderer_state.cloud_weather_size;
 pub const packTint = renderer_state.packTint;
 pub const max_fluids = renderer_state.max_fluids;
 const max_worker_threads = renderer_state.max_worker_threads;
@@ -301,6 +302,7 @@ pub const Internal = struct {
     frame_index: u64 = 0,
     time: f32 = 0,
     cloud_noise: ?rhi.Texture = null,
+    cloud_weather: ?rhi.Texture = null,
     stats: Stats = .{},
     skin_jobs: std.ArrayList(SkinJob) = .empty,
     /// Morph target weights of this frame's skin jobs, back to back.
@@ -591,6 +593,7 @@ pub const Renderer = struct {
             device.destroyTexture(self.internal.brdf_lut);
         }
         if (self.internal.cloud_noise) |texture| device.destroyTexture(texture);
+        if (self.internal.cloud_weather) |texture| device.destroyTexture(texture);
         self.internal.skin_jobs.deinit(self.internal.gpa);
         self.internal.skin_weights.deinit(self.internal.gpa);
         self.internal.bounds_jobs.deinit(self.internal.gpa);

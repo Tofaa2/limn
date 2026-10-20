@@ -21,7 +21,8 @@
 //!   S        the strands move, or stay as they were combed
 //!   A/D      orbit the camera
 //!
-//! `--wind 1` starts with the wind on, `--still 1` with the head still.
+//! `--wind 1` starts with the wind on, `--still 1` with the head still,
+//! `--orbit N` sets the camera angle and `--blonde 1` makes the hair fair.
 //! `--frames N`, `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");
@@ -192,6 +193,8 @@ pub fn main(init: std.process.Init) !void {
     var head_path: []const u8 = "examples/assets/hair/woman.obj";
     var windy = false;
     var turning = true;
+    var start_orbit: f32 = 0.9;
+    var blonde = false;
     var arguments = try init.minimal.args.iterateAllocator(gpa);
     defer arguments.deinit();
     while (arguments.next()) |argument| {
@@ -199,6 +202,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, argument, "--head")) head_path = arguments.next() orelse return error.MissingArgument;
         if (std.mem.eql(u8, argument, "--wind")) windy = true;
         if (std.mem.eql(u8, argument, "--still")) turning = false;
+        if (std.mem.eql(u8, argument, "--orbit")) start_orbit = try std.fmt.parseFloat(f32, arguments.next() orelse "0.9");
+        if (std.mem.eql(u8, argument, "--blonde")) blonde = true;
     }
 
     var stage = try Stage.create(init, "Limn hair", .{});
@@ -257,8 +262,8 @@ pub fn main(init: std.process.Init) !void {
         .taper = 0.7,
         .copies = 4,
         .spread = 0.7,
-        .root_color = .{ 0.16, 0.10, 0.05 },
-        .tip_color = .{ 0.36, 0.25, 0.14 },
+        .root_color = if (blonde) .{ 0.55, 0.42, 0.26 } else .{ 0.16, 0.10, 0.05 },
+        .tip_color = if (blonde) .{ 0.85, 0.72, 0.50 } else .{ 0.36, 0.25, 0.14 },
         .simulation = simulation,
     });
 
@@ -267,7 +272,7 @@ pub fn main(init: std.process.Init) !void {
     const font = renderer.fonts.default();
     var text: [200]u8 = undefined;
     var moving = true;
-    var orbit: f32 = 0.9;
+    var orbit: f32 = start_orbit;
     var turned: f32 = 0;
     var turn_time: f32 = 0;
 

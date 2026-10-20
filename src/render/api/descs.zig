@@ -50,7 +50,13 @@ pub const LiquidDesc = struct {
     gravity: Vec3 = .{ 0, -9.8, 0 },
     /// Color taken on with depth, and how quickly; `murk` 0 is clear.
     color: [3]f32 = .{ 0.1, 0.38, 0.5 },
-    murk: f32 = 3,
+    murk: f32 = 1.5,
+    /// Light scattered inside per world unit, which gives the liquid a lit
+    /// body of its own colour; 0 is perfectly clear.
+    scatter: f32 = 0.15,
+    /// How readily the liquid froths white where it is churned or flung
+    /// apart, 0..1; foam fades over a second or so.
+    foam: f32 = 0.6,
     /// Sun shadow opacity, 0..1; above 0 costs a draw per refreshed cascade.
     shadow: f32 = 0.5,
     /// Write depth, so fog, particles, antialiasing, depth of field and motion
@@ -108,13 +114,25 @@ pub const HairDesc = struct {
     taper: f32 = 0.3,
     root_color: [3]f32 = .{ 0.10, 0.06, 0.03 },
     tip_color: [3]f32 = .{ 0.30, 0.20, 0.11 },
-    /// Highlight roughness, as for a material.
+    /// Width of the highlights along the strands, 0..1.
     roughness: f32 = 0.35,
+    /// How much the strands differ in pigment, 0..1: some darker and
+    /// richer, some paler.
+    variation: f32 = 0.5,
     /// Draws each strand this many times, offset sideways.
     copies: u32 = 1,
     /// Maximum sideways offset of the copies, in hair-space units; less toward
     /// the root.
     spread: f32 = 0,
+    /// How much the copies gather back to their strand toward the tip, 0..1,
+    /// which parts the hair into locks.
+    clump: f32 = 0.3,
+    /// Radius of the copies' curls round their strand, in hair-space units,
+    /// and how many turns they make from root to tip.
+    curl: f32 = 0,
+    curl_turns: f32 = 4,
+    /// Stray kinks of the copies toward the tip, in hair-space units.
+    frizz: f32 = 0,
     /// Null leaves the strands static.
     simulation: ?HairSimulation = null,
 };
@@ -311,6 +329,19 @@ pub const CloudDesc = struct {
     scale: f32 = 1,
     /// Edge erosion by detail noise, 0..1.
     detail: f32 = 0.35,
+    /// Swirl of the shapes and their edges by curling noise, 0..1.
+    curl: f32 = 0.5,
+    /// The kind of cloud where the weather does not say: 0 flat sheets, 0.5
+    /// heaped cumulus, 1 towers filling the layer.
+    kind: f32 = 0.5,
+    /// Weather over the land, stretched over `weather_size` and repeated: red
+    /// above one half adds cover and below it takes cover away, by up to
+    /// `variation`; green above one half makes the clouds taller and below it
+    /// flatter. Null uses built-in weather.
+    weather: ?Image = null,
+    /// World units the weather image covers; 0 is 16 times the cloud shapes'
+    /// repeat.
+    weather_size: f32 = 0,
     /// Drift, in world units per second.
     wind: Vec3 = .{ 12, 0, 5 },
     /// Tint of the scattered light.

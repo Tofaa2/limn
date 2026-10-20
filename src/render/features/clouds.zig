@@ -14,6 +14,7 @@ const features = @import("../core/features.zig");
 const ScenePass = scene_pass.ScenePass;
 const cloud_noise_tiles = render.cloud_noise_tiles;
 const cloud_noise_size = render.cloud_noise_size;
+const cloud_weather_size = render.cloud_weather_size;
 const Renderer = render.Renderer;
 const Vec3 = math.Vec3;
 const ViewContext = features.ViewContext;
@@ -98,6 +99,21 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             cmd.drawFullscreen();
             cmd.endRendering();
         }
+        if (renderer.internal.cloud_weather == null) {
+            const weather = try device.createTexture(.{
+                .name = "cloud weather",
+                .width = cloud_weather_size,
+                .height = cloud_weather_size,
+                .format = .rgba8_unorm,
+                .usage = .{ .sampled = true, .color_attachment = true },
+            });
+            renderer.internal.cloud_weather = weather;
+            try cmd.beginRendering(.{ .color = &.{.{ .texture = weather, .load = .discard }} });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(cloudWeatherPipeline));
+            cmd.pushConstants(cloud_passes_push.WeatherPush{ .size = cloud_weather_size });
+            cmd.drawFullscreen();
+            cmd.endRendering();
+        }
         const period = 9000 * @max(layer.scale, 0.01);
         if (scene.cloud_time != renderer.internal.time) {
             const elapsed = renderer.internal.time - scene.cloud_time;
@@ -162,7 +178,13 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             .shadow_strength = std.math.clamp(layer.shadow, 0, 1),
             .cirrus = std.math.clamp(layer.cirrus, 0, 1),
             .anvil = std.math.clamp(layer.anvil, 0, 1),
+            .weather = if (layer.weather) |image| image.index else device.textureIndex(renderer.internal.cloud_weather.?),
+            .weather_size = if (layer.weather_size > 0) layer.weather_size else period * 16,
             .flash = flash,
+            .pattern = device.textureIndex(renderer.internal.cloud_weather.?),
+            .repeat_sampler = device.samplerIndex(renderer.internal.sampler_linear_repeat),
+            .curl = std.math.clamp(layer.curl, 0, 1),
+            .kind = std.math.clamp(layer.kind, 0, 1),
         };
         cloud_address = params.address;
         if (scene.environment) |handle_value| if (renderer.environments.table.get(handle_value)) |sky_entry| {
@@ -211,6 +233,10 @@ pub fn drawClouds(renderer: *Renderer, p: *const ScenePass, cloud_address: u64) 
 
 fn cloudNoisePipeline(_: *rhi.Device) pipelines_module.Desc {
     return pipelines_module.pass("cloud noise", pipelines_module.shaderCode("cloud_noise.frag.spv"), &.{.{ .format = .rgba8_unorm }});
+}
+
+fn cloudWeatherPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("cloud weather", pipelines_module.shaderCode("cloud_weather.frag.spv"), &.{.{ .format = .rgba8_unorm }});
 }
 
 fn cloudPipeline(_: *rhi.Device) pipelines_module.Desc {

@@ -9,33 +9,71 @@ float cloudRemap(float value, float low, float high) {
     return clamp((value - low) / max(high - low, 1e-5), 0.0, 1.0);
 }
 
+/// Share of the layer's height a cloud fills at `height`: flat sheets at
+/// kind 0, heaped cumulus at 0.5, towers through the whole layer at 1.
+float cloudProfile(float height, float kind) {
+    float sheet = smoothstep(0.0, 0.05, height) * smoothstep(0.3, 0.1, height);
+    float heap = smoothstep(0.0, 0.12, height) * smoothstep(1.0, 0.35, height);
+    float tower = smoothstep(0.0, 0.08, height) * (1.0 - smoothstep(0.93, 1.0, height));
+    return kind < 0.5 ? lerp(sheet, heap, kind * 2.0) : lerp(heap, tower, kind * 2.0 - 1.0);
+}
+
 float cloudDensity(CloudData clouds, uint s, float3 position, float altitude, bool detailed) {
     float height = (altitude - clouds.bottom) / (clouds.top - clouds.bottom);
     if (height <= 0.0 || height >= 1.0) return 0.0;
-    float3 p = (position + clouds.offset) / clouds.period;
-    float3 uvw = float3(p.x, p.z, p.y);
+    float3 moved = position + clouds.offset;
+    float4 weather = sampleTextureLod(clouds.weather_texture, clouds.repeat_sampler, moved.xz / clouds.weather_size, 0.0);
+    float coverage = clamp(clouds.coverage + (weather.r - 0.5) * clouds.variation, 0.0, 1.0);
+    float storm = clouds.anvil * smoothstep(0.6, 0.85, weather.r);
+    float kind = max(clamp(clouds.kind + weather.g - 0.5, 0.0, 1.0), storm);
+    float profile = cloudProfile(height, kind);
+    if (profile <= 0.0) return 0.0;
+    float2 swirl = (sampleTextureLod(clouds.pattern_texture, clouds.repeat_sampler, moved.xz / (clouds.period * 1.7) + float2(height * 0.23, height * 0.11), 0.0).ba * 2.0 - 1.0) * clouds.curl;
+    float3 p = moved / clouds.period;
+    float3 uvw = float3(p.x + swirl.x * 0.05, p.z + swirl.y * 0.05, p.y);
     float4 noise = sampleVolumeRepeat(clouds.noise_texture, s, uvw, CLOUD_NOISE_SIZE, CLOUD_NOISE_TILES);
     float billows = noise.g * 0.625 + noise.b * 0.25 + noise.a * 0.125;
-    float shape = noise.r;
-    float profile = smoothstep(0.0, 0.12, height) * smoothstep(1.0, 0.35, height);
-    float weather = sampleVolumeRepeat(clouds.noise_texture, s, float3(uvw.xy * 0.17 + 0.31, 0.37), CLOUD_NOISE_SIZE, CLOUD_NOISE_TILES).r;
-    float coverage = clamp(clouds.coverage + (weather - 0.55) * clouds.variation, 0.0, 1.0);
-    float threshold = 1.0 - coverage * 0.5;
-    if (clouds.anvil > 0.0) {
-        float storm = clouds.anvil * smoothstep(0.6, 0.85, weather);
-        profile = lerp(profile, smoothstep(0.0, 0.08, height) * (1.0 - smoothstep(0.93, 1.0, height)), storm);
-        threshold -= storm * 0.3 * smoothstep(0.65, 0.95, height);
-    }
-    float density = cloudRemap(shape * profile, threshold, threshold + 0.22);
+    float threshold = 1.0 - coverage * 0.5 - storm * 0.3 * smoothstep(0.65, 0.95, height);
+    float density = cloudRemap(noise.r * profile, threshold, threshold + 0.22);
     density = cloudRemap(density, (1.0 - billows) * 0.35, 1.0);
     if (density <= 0.0) return 0.0;
     if (detailed && clouds.detail > 0.0) {
-        float4 fine = sampleVolumeRepeat(clouds.noise_texture, s, uvw * 6.0 + 0.5, CLOUD_NOISE_SIZE, CLOUD_NOISE_TILES);
+        float3 fine_uvw = uvw * 6.0 + 0.5 + float3(swirl, 0.0) * lerp(0.12, 0.03, height);
+        float4 fine = sampleVolumeRepeat(clouds.noise_texture, s, fine_uvw, CLOUD_NOISE_SIZE, CLOUD_NOISE_TILES);
         float wisps = fine.g * 0.625 + fine.b * 0.25 + fine.a * 0.125;
         float erosion = lerp(wisps, 1.0 - wisps, clamp(height * 4.0, 0.0, 1.0));
         density = cloudRemap(density, erosion * clouds.detail, 1.0);
     }
     return density * clouds.density;
+}
+
+/// The air between the eye and a point `distance` away along `direction`:
+/// the light it scatters toward the eye, and how much of the point shows
+/// through. It is the air of the sky behind, thinning with height, with the
+/// haze of a sky of the default turbidity.
+void cloudAir(FrameConstants frame, float3 sky, float3 camera, float3 direction, float distance, float planet_radius, out float3 through, out float3 air) {
+    const float3 rayleigh = float3(5.8e-6, 13.5e-6, 33.1e-6);
+    const float mie = 1e-5;
+    float mu = dot(direction, frame.sun_direction);
+    float phase_rayleigh = 3.0 / (16.0 * PI) * (1.0 + mu * mu);
+    const float g = 0.76;
+    float phase_mie = 3.0 / (8.0 * PI) * ((1.0 - g * g) * (1.0 + mu * mu)) / ((2.0 + g * g) * pow(1.0 + g * g - 2.0 * g * mu, 1.5));
+    const int steps = 6;
+    float step_length = distance / float(steps);
+    float level = 1.0 - direction.y * direction.y;
+    float3 optical = float3(0.0);
+    air = float3(0.0);
+    for (int i = 0; i < steps; i++) {
+        float s = (float(i) + 0.5) * step_length;
+        float altitude = max(camera.y + direction.y * s + s * s * level / (2.0 * planet_radius), 0.0);
+        float3 by_air = rayleigh * exp(-altitude / 8000.0);
+        float by_haze = mie * exp(-altitude / 1200.0);
+        float3 extinction = by_air + 1.1 * by_haze;
+        float3 scattered = frame.sun_radiance * (by_air * phase_rayleigh + by_haze * phase_mie) + sky * (by_air + by_haze);
+        air += exp(-optical) * scattered * (1.0 - exp(-extinction * step_length)) / max(extinction, float3(1e-12));
+        optical += extinction * step_length;
+    }
+    through = exp(-optical);
 }
 
 float cloudShadow(FrameConstants frame, float3 position) {

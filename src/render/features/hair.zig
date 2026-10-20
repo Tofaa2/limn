@@ -13,6 +13,7 @@ const ScenePass = scene_pass.ScenePass;
 const Renderer = render.Renderer;
 const density_size = render.hair_density_size;
 const ViewContext = features.ViewContext;
+const HairState = @import("../state.zig").HairState;
 
 /// Adds the feature's passes to a view of a scene. A path traced view leaves
 /// out those whose result the tracer replaces.
@@ -160,6 +161,51 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
     cmd.endScope();
 }
 
+/// The grid round a hair as it is drawn: its low corner and cell size.
+const Grid = struct { low: [3]f32, cell: f32 };
+
+fn gridOf(hair: *const HairState) Grid {
+    const middle = math.transformPoint(hair.desc.transform, hair.bounds[0..3].*);
+    const half = hair.bounds[3] * math.maxScale(hair.desc.transform) * 1.5;
+    return .{ .low = .{ middle[0] - half, middle[1] - half, middle[2] - half }, .cell = 2 * half / @as(f32, density_size) };
+}
+
+/// The points a hair is drawn from this frame, and the transform that
+/// places them.
+fn drawnPoints(hair: *const HairState) struct { points: rhi.Buffer, previous: rhi.Buffer, transform: [16]f32 } {
+    if (hair.moving) |moving| if (moving.steps != 0) return .{ .points = moving.points[moving.current], .previous = moving.points[1 - moving.current], .transform = math.identity };
+    return .{ .points = hair.points, .previous = hair.points, .transform = hair.desc.transform };
+}
+
+/// Uploads how a hair is drawn and returns its address.
+fn uploadLook(renderer: *Renderer, p: *const ScenePass, hair: *const HairState) !u64 {
+    const device = renderer.device;
+    const scale = math.maxScale(hair.desc.transform);
+    const in_world: f32 = if (hair.moving) |moving| (if (moving.steps != 0) scale else 1) else 1;
+    const width = hair.desc.width * in_world;
+    const grid = gridOf(hair);
+    const look = try p.arena.alloc(device, hair_push.HairLook, 1);
+    look.items[0] = .{
+        .light = if (hair.shade) |shade| device.bufferAddress(shade.light) else 0,
+        .root_color = hair.desc.root_color,
+        .root_width = width,
+        .tip_color = hair.desc.tip_color,
+        .tip_width = width * std.math.clamp(hair.desc.taper, 0, 1),
+        .grid_low = grid.low,
+        .grid_cell = grid.cell,
+        .roughness = hair.desc.roughness,
+        .variation = std.math.clamp(hair.desc.variation, 0, 1),
+        .spread = hair.desc.spread * scale,
+        .clump = std.math.clamp(hair.desc.clump, 0, 1),
+        .curl = @max(hair.desc.curl, 0) * scale,
+        .curl_turns = hair.desc.curl_turns,
+        .frizz = @max(hair.desc.frizz, 0) * scale,
+        .points_per_strand = hair.desc.points_per_strand,
+        .grid_size = density_size,
+    };
+    return look.address;
+}
+
 /// Draws the scene's hair into a sun shadow map in the open render pass, with
 /// `view_proj` or into virtual shadow map page `page` if not 0. `texel` is the
 /// world size of a shadow texel.
@@ -170,26 +216,78 @@ pub fn drawHairShadows(renderer: *Renderer, p: *const ScenePass, view_proj: [16]
     cmd.bindPipeline(try renderer.internal.pipelines.of(hairShadowPipeline));
     for (p.scene.hairs.items) |handle| {
         const hair = renderer.hairs.table.get(handle) orelse continue;
-        const moving = if (hair.moving) |moving| (if (moving.steps != 0) moving else null) else null;
-        const width = hair.desc.width * (if (moving != null) math.maxScale(hair.desc.transform) else 1);
-        const spread = hair.desc.spread * (if (moving != null) math.maxScale(hair.desc.transform) else 1);
-        const least = texel * 0.75 / (if (moving != null) 1 else @max(math.maxScale(hair.desc.transform), 1e-9));
+        const drawn = drawnPoints(hair);
         cmd.pushConstants(hair_push.ShadowPush{
             .frame = p.frame_address,
-            .points = device.bufferAddress(if (moving) |state| state.points[state.current] else hair.points),
+            .points = device.bufferAddress(drawn.points),
             .page = page,
+            .look = try uploadLook(renderer, p, hair),
             .view_proj = view_proj,
-            .transform = if (moving != null) math.identity else hair.desc.transform,
+            .transform = drawn.transform,
             .light = math.normalize(p.scene.sun.direction),
-            .root_width = width,
-            .tip_width = width * std.math.clamp(hair.desc.taper, 0, 1),
-            .least_width = least,
-            .points_per_strand = hair.desc.points_per_strand,
+            .least_width = texel * 0.75,
             .paged = @intFromBool(page != 0),
-            .spread = spread,
         });
         cmd.draw(hair.stretches * 6, @max(hair.desc.copies, 1), 0, 0);
     }
+}
+
+const grid_bytes = density_size * density_size * density_size * @sizeOf(u32);
+const light_bytes = density_size * density_size * density_size * 4 * @sizeOf(f32);
+
+/// Counts each hair's points into its grid and works out how much light
+/// reaches each cell of it.
+fn lightHair(renderer: *Renderer, p: *const ScenePass) !void {
+    const device = renderer.device;
+    const cmd = p.cmd;
+    cmd.sync(.all_to_transfer);
+    for (p.scene.hairs.items) |handle| {
+        const hair = renderer.hairs.table.get(handle) orelse continue;
+        if (hair.shade == null) {
+            const counts = try device.createBuffer(.{ .name = "hair counts", .size = grid_bytes, .usage = .{ .storage = true, .copy_dst = true } });
+            errdefer device.destroyBuffer(counts);
+            const light = try device.createBuffer(.{ .name = "hair light", .size = light_bytes, .usage = .{ .storage = true } });
+            hair.shade = .{ .counts = counts, .light = light };
+        }
+        cmd.fillBuffer(hair.shade.?.counts, 0, grid_bytes, 0);
+    }
+    cmd.sync(.transfer_to_all);
+    cmd.bindPipeline(try renderer.internal.pipelines.of(hairCountPipeline));
+    for (p.scene.hairs.items) |handle| {
+        const hair = renderer.hairs.table.get(handle) orelse continue;
+        const drawn = drawnPoints(hair);
+        const grid = gridOf(hair);
+        const point_count = hair.strands * hair.desc.points_per_strand;
+        cmd.pushConstants(hair_push.CountPush{
+            .points = device.bufferAddress(drawn.points),
+            .counts = device.bufferAddress(hair.shade.?.counts),
+            .transform = drawn.transform,
+            .grid_low = grid.low,
+            .grid_cell = grid.cell,
+            .point_count = point_count,
+            .grid_size = density_size,
+        });
+        cmd.dispatch((point_count + 63) / 64, 1, 1);
+    }
+    cmd.sync(.compute_to_all);
+    cmd.bindPipeline(try renderer.internal.pipelines.of(hairLightPipeline));
+    for (p.scene.hairs.items) |handle| {
+        const hair = renderer.hairs.table.get(handle) orelse continue;
+        const grid = gridOf(hair);
+        const scale = math.maxScale(hair.desc.transform);
+        const width = hair.desc.width * (1 + std.math.clamp(hair.desc.taper, 0, 1)) * 0.5 * scale;
+        const copies: f32 = @floatFromInt(@max(hair.desc.copies, 1));
+        cmd.pushConstants(hair_push.LightPush{
+            .counts = device.bufferAddress(hair.shade.?.counts),
+            .light = device.bufferAddress(hair.shade.?.light),
+            .to_sun = math.scale(math.normalize(p.scene.sun.direction), -1),
+            .fibre = std.math.pi / 4.0 * hair.segment * scale * width * copies / (grid.cell * grid.cell * grid.cell),
+            .grid_cell = grid.cell,
+            .grid_size = density_size,
+        });
+        cmd.dispatch((density_size * density_size * density_size + 63) / 64, 1, 1);
+    }
+    cmd.sync(.compute_to_all);
 }
 
 /// Draws the scene's hair over the lit scene, writing depth.
@@ -199,6 +297,7 @@ pub fn drawHair(renderer: *Renderer, p: *const ScenePass) !void {
     const view = p.view;
     if (p.scene.hairs.items.len == 0 or p.debugging) return;
     cmd.beginScope("hair");
+    try lightHair(renderer, p);
     try cmd.beginRendering(.{
         .color = &.{ .{ .texture = view.hdr, .load = .load }, .{ .texture = view.motion, .load = .load } },
         .depth = .{ .texture = view.depth, .load = .load },
@@ -206,22 +305,14 @@ pub fn drawHair(renderer: *Renderer, p: *const ScenePass) !void {
     cmd.bindPipeline(try renderer.internal.pipelines.of(hairPipeline));
     for (p.scene.hairs.items) |handle| {
         const hair = renderer.hairs.table.get(handle) orelse continue;
-        const moving = if (hair.moving) |moving| (if (moving.steps != 0) moving else null) else null;
-        const in_world: f32 = if (moving != null) math.maxScale(hair.desc.transform) else 1;
-        const width = hair.desc.width * in_world;
+        const drawn = drawnPoints(hair);
         cmd.pushConstants(HairPush{
             .frame = p.frame_address,
-            .points = device.bufferAddress(if (moving) |state| state.points[state.current] else hair.points),
-            .previous_points = device.bufferAddress(if (moving) |state| state.points[1 - state.current] else hair.points),
-            .transform = if (moving != null) math.identity else hair.desc.transform,
-            .previous_transform = if (moving != null) math.identity else hair.shown_transform orelse hair.desc.transform,
-            .root_color = hair.desc.root_color,
-            .root_width = width,
-            .tip_color = hair.desc.tip_color,
-            .tip_width = width * std.math.clamp(hair.desc.taper, 0, 1),
-            .points_per_strand = hair.desc.points_per_strand,
-            .roughness = hair.desc.roughness,
-            .spread = hair.desc.spread * in_world,
+            .points = device.bufferAddress(drawn.points),
+            .previous_points = device.bufferAddress(drawn.previous),
+            .look = try uploadLook(renderer, p, hair),
+            .transform = drawn.transform,
+            .previous_transform = if (hair.moving != null and hair.moving.?.steps != 0) math.identity else hair.shown_transform orelse hair.desc.transform,
         });
         cmd.draw(hair.stretches * 6, @max(hair.desc.copies, 1), 0, 0);
         hair.shown_transform = hair.desc.transform;
@@ -234,15 +325,23 @@ fn hairSimulationPipeline(_: *rhi.Device) pipelines_module.Desc {
     return .{ .compute = .{ .name = "hair simulation", .shader = pipelines_module.shaderCode("hair_sim.comp.spv") } };
 }
 
+fn hairCountPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "hair counts", .shader = pipelines_module.shaderCode("hair_count.comp.spv") } };
+}
+
+fn hairLightPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "hair light", .shader = pipelines_module.shaderCode("hair_light.comp.spv") } };
+}
+
 fn hairShadowPipeline(_: *rhi.Device) pipelines_module.Desc {
     return .{ .graphics = .{
         .name = "hair shadow",
         .vertex = pipelines_module.shaderCode("hair_shadow.vert.spv"),
+        .fragment = pipelines_module.shaderCode("hair_shadow.frag.spv"),
         .depth = pipelines_module.shadow_depth,
         .cull = .none,
     } };
 }
-
 fn hairPipeline(_: *rhi.Device) pipelines_module.Desc {
     return .{ .graphics = .{
         .name = "hair",

@@ -39,6 +39,10 @@
 - `ViewDesc.cut`: temporal history starts over after a camera jump.
 - `Options.deterministic`: runs of the same frames give the same picture; `--screenshot` turns it on.
 - `rhi.TextureKind.@"3d"`; storage images can be read, used in any shader stage and bound per layer.
+- `CloudDesc.weather`, `weather_size`, `kind` and `curl`.
+- `HairDesc.variation`, `clump`, `curl`, `curl_turns` and `frizz`.
+- `LiquidDesc.scatter` and `foam`: lit liquid body and whitewater.
+- The `clouds` example takes `--kind`, `hair` takes `--orbit` and `--blonde`, `liquid` takes `--orbit`.
 
 ### Changed
 - Breaking: handles are 64 bits.
@@ -95,6 +99,11 @@
 - Cheaper GI probes and texture streaming.
 - Path tracing keeps its picture while the scene changes.
 - Path traced lamp light is no longer blurred.
+- Clouds fade into the air between them and the eye, take the sun's full colour, and are lit by sky through the cloud around them.
+- The sky reaches below level when seen from high up.
+- Hair is shaded as fibres (Marschner lobes), shadows itself through its density, and lets light through in shadow maps.
+- Liquid particles are drawn as ellipsoids along their neighbours; the liquid reflects the scene.
+- Breaking: `LiquidDesc.murk` defaults to 1.5.
 
 
 

@@ -10,7 +10,7 @@ struct LiquidParticle {
     float3 guess_b;
     float pad1;
     float3 velocity;
-    float pad2;
+    float foam;
 };
 
 struct LiquidSource {
@@ -48,8 +48,12 @@ struct LiquidData {
     uint4 source_end;
     float viscosity;
     float detail;
-    float pad_b;
-    float pad_c;
+    float scatter;
+    float fill;
+    float foam;
+    float foam_kept;
+    float swell;
+    float frame_dt;
     float4 source_lead;
     LiquidSource sources[4];
     float4 spheres[16];
@@ -111,6 +115,102 @@ float3 contained(float3 position) {
     return clamp(position, float3(liquid.radius), liquid.extent - float3(liquid.radius));
 }
 
+/// One Jacobi rotation of the symmetric `a` that zeroes its (p, q) entry,
+/// gathered into the eigenvectors `v`, one per column.
+void jacobiRotate(inout float3x3 a, inout float3x3 v, int p, int q) {
+    if (abs(a[p][q]) < 1.0e-20) return;
+    float theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+    float t = (theta >= 0.0 ? 1.0 : -1.0) / (abs(theta) + sqrt(theta * theta + 1.0));
+    float c = rsqrt(t * t + 1.0);
+    float s = t * c;
+    for (int k = 0; k < 3; k++) {
+        float kp = a[k][p];
+        float kq = a[k][q];
+        a[k][p] = c * kp - s * kq;
+        a[k][q] = s * kp + c * kq;
+    }
+    for (int k = 0; k < 3; k++) {
+        float pk = a[p][k];
+        float qk = a[q][k];
+        a[p][k] = c * pk - s * qk;
+        a[q][k] = s * pk + c * qk;
+    }
+    for (int k = 0; k < 3; k++) {
+        float kp = v[k][p];
+        float kq = v[k][q];
+        v[k][p] = c * kp - s * kq;
+        v[k][q] = s * kp + c * kq;
+    }
+}
+
+/// The shape a particle is drawn as, after Yu and Turk: stretched along the
+/// spread of its neighbours, so the surface reads as sheets rather than
+/// beads, and centred a little toward them; a particle nearly alone is a
+/// small drop. Also whitens liquid that is churned (neighbours rushing past
+/// each other) or flung apart, and lets that foam fade.
+void shapeParticle(uint index) {
+    LiquidData* liquid = sim_push.liquid;
+    float3 own = positionOf(index);
+    float3 own_velocity = sim_push.particles[index].velocity;
+    int3 home = cellOf(own);
+    float inverse_h = 1.0 / liquid.h;
+    float total = 0.0;
+    float3 first = float3(0.0);
+    float3x3 second = float3x3(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    float near = 0.0;
+    float churn = 0.0;
+    int3 grid = liquid.cells;
+    for (int z = -1; z <= 1; z++) for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+        int3 cell = home + int3(x, y, z);
+        if (any(cell < int3(0)) || any(cell >= grid)) continue;
+        uint base = uint(cell.x + grid.x * (cell.y + grid.y * cell.z));
+        uint count = min(sim_push.counts[base], liquid.slots);
+        for (uint slot = 0u; slot < count; slot++) {
+            uint other = sim_push.cells[base * liquid.slots + slot];
+            float3 apart = positionOf(other) - own;
+            float q = length(apart) * inverse_h;
+            if (q >= 1.0) continue;
+            float w = 1.0 - q * q * q;
+            total += w;
+            first += apart * w;
+            second += float3x3(apart * apart.x, apart * apart.y, apart * apart.z) * w;
+            if (other == index) continue;
+            near += 1.0;
+            float3 rushing = sim_push.particles[other].velocity - own_velocity;
+            float speed = length(rushing);
+            if (speed > 1.0e-4) churn += speed * (1.0 - dot(rushing / speed, -apart / max(length(apart), 1.0e-6))) * (1.0 - q);
+        }
+    }
+    float3 middle = first / max(total, 1.0e-6);
+    float3x3 spread = second / max(total, 1.0e-6) - float3x3(middle * middle.x, middle * middle.y, middle * middle.z);
+    float3x3 axes = float3x3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    for (int sweep = 0; sweep < 5; sweep++) {
+        jacobiRotate(spread, axes, 0, 1);
+        jacobiRotate(spread, axes, 0, 2);
+        jacobiRotate(spread, axes, 1, 2);
+    }
+    float3 stretch = sqrt(max(float3(spread[0][0], spread[1][1], spread[2][2]), float3(1.0e-12)));
+    float widest = max(stretch.x, max(stretch.y, stretch.z));
+    stretch = max(stretch, float3(widest * 0.25));
+    stretch /= pow(stretch.x * stretch.y * stretch.z, 1.0 / 3.0);
+    float crowd = smoothstep(4.0, 12.0, near);
+    float3 radii = liquid.radius * lerp(float3(0.7), liquid.swell * stretch, crowd);
+    float3 center = own + middle * 0.5 * crowd;
+
+    float speed = length(own_velocity);
+    float flung = (1.0 - crowd) * smoothstep(15.0, 40.0, speed / liquid.radius);
+    float surface = 1.0 - smoothstep(18.0, 28.0, near);
+    float churned = surface * smoothstep(80.0, 320.0, churn / liquid.radius);
+    float foam = max(sim_push.particles[index].foam * liquid.foam_kept, max(churned, flung) * liquid.foam);
+    sim_push.particles[index].foam = foam;
+
+    float4* shape = sim_push.shapes + index * 4u;
+    shape[0] = float4(center, foam);
+    shape[1] = float4(axes[0][0], axes[1][0], axes[2][0], 0.0) * radii.x;
+    shape[2] = float4(axes[0][1], axes[1][1], axes[2][1], 0.0) * radii.y;
+    shape[3] = float4(axes[0][2], axes[1][2], axes[2][2], 0.0) * radii.z;
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void simMain(uint3 id : SV_DispatchThreadID) {
@@ -132,12 +232,17 @@ void simMain(uint3 id : SV_DispatchThreadID) {
         return;
     }
     if (index >= liquid.live) return;
+    if (sim_push.mode == 7u) {
+        shapeParticle(index);
+        return;
+    }
 
     if (sim_push.mode == 0u) {
         LiquidParticle particle = sim_push.particles[index];
         if (index >= liquid.live_before) {
             uint state = hash(index * 0x9e3779b9u + liquid.seed);
             particle.velocity = float3(0.0);
+            particle.foam = 0.0;
             if (index < liquid.block_count) {
                 uint column = index % liquid.block_nx;
                 uint row = (index / liquid.block_nx) % liquid.block_nz;
@@ -277,55 +382,102 @@ void simMain(uint3 id : SV_DispatchThreadID) {
 [[vk::push_constant]] SpherePush sphere_push;
 
 struct SphereVaryings {
-    [[vk::location(0)]] float2 corner;
-    [[vk::location(1)]] float4 sphere;
+    [[vk::location(0)]] float3 at;
+    [[vk::location(1)]] nointerpolation float4 center;
+    [[vk::location(2)]] nointerpolation float3 across_a;
+    [[vk::location(3)]] nointerpolation float3 across_b;
+    [[vk::location(4)]] nointerpolation float3 across_c;
     float4 position : SV_Position;
 };
 
-/// One camera-facing square per particle, carrying the sphere it stands for
-/// in view space.
+/// One camera-facing square per particle, wide enough for the ellipsoid it
+/// is drawn as, carrying that ellipsoid in view space: its centre and foam,
+/// and the rows that take a point into the space where it is a unit ball.
 [shader("vertex")]
 SphereVaryings sphereVertexMain(uint vertex : SV_VulkanVertexID) {
     FrameConstants frame = sphere_push.frame;
     LiquidData* liquid = sphere_push.liquid;
     uint slot = vertex / 6u;
     SphereVaryings result;
-    result.corner = liquid_corners[vertex % 6u];
     if (slot >= liquid.live) {
         result.position = float4(0.0, 0.0, 2.0, 1.0);
-        result.sphere = float4(0.0);
+        result.at = float3(0.0);
+        result.center = float4(0.0);
+        result.across_a = float3(0.0);
+        result.across_b = float3(0.0);
+        result.across_c = float3(0.0);
         return result;
     }
-    float3 world = mul(liquid.from_box, float4(sphere_push.particles[slot].position, 1.0)).xyz;
-    float3 center = mul(frame.view, float4(world, 1.0)).xyz;
-    float radius = liquid.radius * sphere_push.swell;
-    result.sphere = float4(center, radius);
-    result.position = mul(frame.proj, float4(center + float3(result.corner * radius, 0.0), 1.0));
+    float4* shape = sphere_push.shapes + slot * 4u;
+    float4 middle = shape[0];
+    float3x3 to_view = mul((float3x3)frame.view, (float3x3)liquid.from_box);
+    float3 a = mul(to_view, shape[1].xyz);
+    float3 b = mul(to_view, shape[2].xyz);
+    float3 c = mul(to_view, shape[3].xyz);
+    float3 center = mul(frame.view, float4(mul(liquid.from_box, float4(middle.xyz, 1.0)).xyz, 1.0)).xyz;
+    float reach = sqrt(max(dot(a, a), max(dot(b, b), dot(c, c))));
+    float2 corner = liquid_corners[vertex % 6u];
+    result.at = center + float3(corner * reach, 0.0);
+    result.center = float4(center, middle.w);
+    result.across_a = a / max(dot(a, a), 1.0e-12);
+    result.across_b = b / max(dot(b, b), 1.0e-12);
+    result.across_c = c / max(dot(c, c), 1.0e-12);
+    result.position = mul(frame.proj, float4(result.at, 1.0));
     return result;
 }
 
-/// The nearest point of each sphere in front of the scene, as depth.
+/// Where the ray through a pixel enters and leaves a particle's ellipsoid,
+/// as distances along the ray from `origin`; none when it misses.
+bool ellipsoidSpan(SphereVaryings input, out float3 origin, out float3 way, out float2 span) {
+    if (sphere_push.frame.parallel != 0.0) {
+        way = float3(0.0, 0.0, -1.0);
+        origin = float3(input.at.xy, input.center.z + 1.0e4);
+    } else {
+        way = normalize(input.at);
+        origin = float3(0.0);
+    }
+    float3 from = origin - input.center.xyz;
+    float3 o = float3(dot(input.across_a, from), dot(input.across_b, from), dot(input.across_c, from));
+    float3 d = float3(dot(input.across_a, way), dot(input.across_b, way), dot(input.across_c, way));
+    float a = dot(d, d);
+    float b = dot(o, d);
+    float c = dot(o, o) - 1.0;
+    float discriminant = b * b - a * c;
+    span = float2(0.0);
+    if (discriminant <= 0.0 || a <= 0.0) return false;
+    float root = sqrt(discriminant);
+    span = float2(-b - root, -b + root) / a;
+    return true;
+}
+
+/// The nearest point of each ellipsoid in front of the scene, as depth.
 [shader("fragment")]
 float sphereDepthMain(SphereVaryings input) : SV_Depth {
-    float off_center = dot(input.corner, input.corner);
-    if (off_center > 1.0) discard;
-    float3 surface = input.sphere.xyz + float3(input.corner, sqrt(1.0 - off_center)) * input.sphere.w;
-    float4 clip = mul(sphere_push.frame.proj, float4(surface, 1.0));
+    float3 origin;
+    float3 way;
+    float2 span;
+    if (!ellipsoidSpan(input, origin, way, span)) discard;
+    float4 clip = mul(sphere_push.frame.proj, float4(origin + way * span.x, 1.0));
     float depth = clip.z / clip.w;
     float scene = fetchTexel(sphere_push.depth_texture, int2(input.position.xy)).r;
     if (depth < scene) discard;
     return depth;
 }
 
-/// How much liquid each sphere puts in front of the scene, summed by blending.
+/// How much liquid each ellipsoid puts in front of the scene, and how much
+/// of it is foam, summed by blending. `fill` turns the overlapping shapes'
+/// depth into the liquid's.
 [shader("fragment")]
-float sphereThicknessMain(SphereVaryings input) : SV_Target {
-    float off_center = dot(input.corner, input.corner);
-    if (off_center > 1.0) discard;
-    float4 clip = mul(sphere_push.frame.proj, float4(input.sphere.xyz, 1.0));
+float2 sphereThicknessMain(SphereVaryings input) : SV_Target {
+    float3 origin;
+    float3 way;
+    float2 span;
+    if (!ellipsoidSpan(input, origin, way, span)) discard;
+    float4 clip = mul(sphere_push.frame.proj, float4(input.center.xyz, 1.0));
     float scene = fetchTexel(sphere_push.depth_texture, int2(input.position.xy)).r;
     if (clip.z / clip.w < scene) discard;
-    return 2.0 * input.sphere.w * sqrt(1.0 - off_center) * 0.24;
+    float through = (span.y - span.x) * sphere_push.liquid.fill;
+    return float2(through, through * input.center.w);
 }
 
 #include "liquid.ShadowPush.slang"
@@ -437,6 +589,40 @@ struct ShadeOutput {
     float4 color : SV_Target0;
 };
 
+/// What the screen shows along a reflected ray, and how far to trust it:
+/// none where the ray leaves the screen or passes behind what it shows.
+float4 screenReflection(FrameConstants frame, float3 origin, float3 direction, float reach, float jitter) {
+    const int steps = 24;
+    float previous_t = 0.0;
+    float hit_t = -1.0;
+    float2 hit_uv = float2(0.0);
+    for (int i = 1; i <= steps; i++) {
+        float fraction = (float(i) - 1.0 + jitter) / float(steps);
+        float t = reach * fraction * fraction;
+        float4 clip = mul(frame.view_proj, float4(origin + direction * t, 1.0));
+        float along = clipDepth(frame, clip);
+        if (along <= frame.near) break;
+        float2 uv = clip.xy / clip.w * 0.5 + 0.5;
+        if (any(uv < 0.0) || any(uv > 1.0)) break;
+        float depth = sampleTextureLod(shade_push.depth_texture, frame.sampler_nearest_clamp, uv, 0.0).r;
+        float behind = along - (depth > 0.0 ? linearDepth(depth, frame.depth_terms) : 1.0e30);
+        if (behind > 0.0 && behind < (t - previous_t) + reach * 0.02) {
+            hit_t = t;
+            hit_uv = uv;
+            break;
+        }
+        previous_t = t;
+    }
+    if (hit_t < 0.0) return float4(0.0);
+    float2 border = min(hit_uv, 1.0 - hit_uv);
+    float trust = smoothstep(0.0, 0.08, min(border.x, border.y)) * (1.0 - smoothstep(0.7, 1.0, hit_t / reach));
+    return float4(sampleTextureLod(shade_push.scene_texture, frame.sampler_linear_clamp, hit_uv, 0.0).rgb, trust);
+}
+
+/// The liquid's surface: the scene and sky it reflects, by Fresnel; under
+/// that, what lies behind, bent and dimmed by what the liquid absorbs and
+/// scatters on the way through, with the light it scatters toward the eye;
+/// and white foam where it is churned.
 [shader("fragment")]
 ShadeOutput shadeMain(
     float4 fragment : SV_Position) {
@@ -449,7 +635,9 @@ ShadeOutput shadeMain(
     float here = fetchTexel(shade_push.distance_texture, pixel).r;
     if (here <= 0.0) discard;
     float2 uv = fragment.xy * frame.inv_resolution;
-    float thickness = sampleTextureLod(shade_push.thickness_texture, linear, uv, 0.0).r;
+    float2 depth_and_foam = sampleTextureLod(shade_push.thickness_texture, linear, uv, 0.0).rg;
+    float thickness = depth_and_foam.x;
+    float foam = clamp(depth_and_foam.y / max(thickness, 1.0e-6), 0.0, 1.0);
 
     float3 position = pointAt(pixel, here);
     float left = fetchTexel(shade_push.distance_texture, pixel + int2(-1, 0)).r;
@@ -470,6 +658,7 @@ ShadeOutput shadeMain(
     }
     float n_dot_v = clamp(dot(normal, view), 0.0, 1.0);
     float fresnel = 0.02 + 0.98 * pow(1.0 - n_dot_v, 5.0);
+    float noise = interleavedGradientNoise(fragment.xy, frame.frame_index);
 
     float2 bend = (mul(frame.view, float4(normal, 0.0))).xy * float2(1.0, -1.0) * liquid.refraction * min(thickness * 2.0, 1.0) / max(here, 0.5);
     float2 behind_uv = clamp(uv - bend, float2(0.001), float2(0.999));
@@ -477,25 +666,30 @@ ShadeOutput shadeMain(
     if (behind_depth > 0.0 && linearDepth(behind_depth, frame.depth_terms) < here) behind_uv = uv;
     float3 behind = sampleTextureLod(shade_push.scene_texture, linear, behind_uv, 0.0).rgb;
 
-    float3 clear = exp(-liquid.murk * thickness * (float3(1.0) - liquid.color));
-    float3 ambient = float3(0.0);
-    if (frame.environment != 0u)
-        ambient = sampleCubeLod(frame.env_irradiance, linear, normal, 0.0).rgb * frame.env_intensity;
-    float sun_shadow = sunShadow(frame, position, normal, 1.0, here, 0.5);
-    float sun_facing = clamp(dot(normal, frame.sun_direction), 0.0, 1.0);
-    float3 lit = ambient + frame.sun_radiance * sun_facing * sun_shadow;
-    float3 under = behind * clear + liquid.color * lit * 0.12 * (1.0 - exp(-liquid.murk * thickness * 0.5));
+    float3 sky_light = float3(0.0);
+    if (frame.environment != 0u) sky_light = sampleCubeLod(frame.env_irradiance, linear, float3(0.0, 1.0, 0.0), 0.0).rgb * frame.env_intensity;
+    float sun_shadow = sunShadow(frame, position, normal, 1.0, here, noise);
+    float3 sunlight = frame.sun_radiance * sun_shadow;
+
+    float3 absorbed = liquid.murk * (float3(1.0) - liquid.color);
+    float3 extinction = absorbed + liquid.scatter;
+    float3 through = exp(-extinction * thickness);
+    float3 lit_inside = (sky_light + sunlight * 0.25 / PI) * exp(-absorbed * thickness * 0.5);
+    float3 scattered = lit_inside * (liquid.scatter / max(extinction, float3(1.0e-6))) * (float3(1.0) - through);
+    float3 under = behind * through + scattered;
 
     float3 mirror = reflect(-view, normal);
-    float3 reflected = float3(0.0);
-    if (frame.environment != 0u)
-        reflected = sampleCubeLod(frame.env_specular, linear, mirror, 0.04 * (frame.env_specular_mips - 1.0)).rgb * frame.env_intensity;
+    float3 reflected = ambientReflection(frame, position, view, normal, 0.03, 1.0);
+    float4 seen = screenReflection(frame, position + normal * liquid.radius * 0.5, mirror, max(here, 1.0) * 2.0, noise);
+    reflected = lerp(reflected, seen.rgb, seen.a);
     float3 halfway = normalize(view + frame.sun_direction);
-    float glint = pow(clamp(dot(normal, halfway), 0.0, 1.0), 220.0) * sun_shadow;
-    float3 color = lerp(under, reflected, fresnel) + frame.sun_radiance * glint * 1.5;
+    float n_dot_h = clamp(dot(normal, halfway), 0.0, 1.0);
+    const float alpha = 0.03 * 0.03;
+    float glint = alpha / (PI * pow(n_dot_h * n_dot_h * (alpha - 1.0) + 1.0, 2.0)) / (4.0 * max(n_dot_v, 0.05));
+    float3 color = lerp(under, reflected, fresnel) + sunlight * glint * fresnel;
 
-    float drop = 1.0 - smoothstep(liquid.radius * 0.15, liquid.radius * 0.9, thickness);
-    color = lerp(color, lit * 0.5 + reflected * 0.3, drop * 0.35);
+    float3 foam_lit = (sampleCubeLod(frame.env_irradiance, linear, normal, 0.0).rgb * frame.env_intensity * float(frame.environment != 0u) + sunlight * (dot(normal, frame.sun_direction) * 0.5 + 0.5) / PI) * 0.9;
+    color = lerp(color, foam_lit, foam);
     result.color = float4(color, 1.0);
     return result;
 }

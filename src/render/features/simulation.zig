@@ -119,6 +119,10 @@ pub fn splashDesc(desc: WaterDesc) EmitterDesc {
     };
 }
 
+/// How much larger than its particle a liquid's drawn shape is, so that
+/// neighbouring shapes meet.
+pub const liquid_swell = 1.5;
+
 /// Steps every liquid of a scene, once per frame.
 pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, arena: *FrameArena, delta_time: f32) !void {
     if (scene.liquids.items.len == 0) return;
@@ -166,6 +170,12 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             .keep = @exp(-@max(desc.damping, 0) * dt),
             .viscosity = std.math.clamp(desc.viscosity, 0, 1),
             .detail = std.math.clamp(desc.ripple_detail, 0, 2),
+            .scatter = @max(desc.scatter, 0),
+            .fill = spacing * spacing * spacing / (4.0 / 3.0 * std.math.pi * std.math.pow(f32, radius * liquid_swell, 3)),
+            .foam = std.math.clamp(desc.foam, 0, 1),
+            .foam_kept = @exp(-frame_dt * 1.5),
+            .swell = liquid_swell,
+            .frame_dt = frame_dt,
         };
         for (state.sources[0..state.source_count], record.sources[0..state.source_count]) |source, *out| {
             const from_corner = math.sub(source.position, box.corner);
@@ -197,6 +207,7 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
         var push = Push{
             .liquid = 0,
             .particles = device.bufferAddress(state.particles),
+            .shapes = device.bufferAddress(state.shapes),
             .counts = device.bufferAddress(state.counts),
             .cells = device.bufferAddress(state.cells),
             .mode = 0,
@@ -279,6 +290,13 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             push.mode = 5;
             cmd.pushConstants(push);
             cmd.dispatch(groups, 1, 1);
+            cmd.sync(.compute_to_all);
+        }
+        if (steps != 0 and state.live != 0) {
+            push.liquid = params_address + (steps - 1) * stride;
+            push.mode = 7;
+            cmd.pushConstants(push);
+            cmd.dispatch((state.live + 63) / 64, 1, 1);
             cmd.sync(.compute_to_all);
         }
         state.params = params_address + (records.items.len - 1) * stride;
