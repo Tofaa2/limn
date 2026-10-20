@@ -93,16 +93,7 @@ FfxSurface ffxSurface(float4 texel) {
     return surface;
 }
 
-struct ReprojectPush {
-    FrameConstants frame;
-    uint radiance_texture;
-    uint surface_texture;
-    uint surface_history_texture;
-    uint motion_texture;
-    uint history_texture;
-    uint samples_history_texture;
-    uint reach_texture;
-};
+#include "ffx_reflections.ReprojectPush.slang"
 
 [[vk::push_constant]] ReprojectPush reproject_push;
 
@@ -255,13 +246,7 @@ Output reprojectMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Posi
     return result;
 }
 
-struct PrefilterPush {
-    FrameConstants frame;
-    uint radiance_texture;
-    uint reprojected_texture;
-    uint surface_texture;
-    uint average_texture;
-};
+#include "ffx_reflections.PrefilterPush.slang"
 
 [[vk::push_constant]] PrefilterPush prefilter_push;
 
@@ -305,15 +290,7 @@ float4 prefilterMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Posi
     return float4(accumulated_radiance / accumulated_weight, accumulated_variance / (accumulated_weight * accumulated_weight));
 }
 
-struct ResolvePush {
-    FrameConstants frame;
-    uint prefiltered_texture;
-    uint reprojected_texture;
-    uint samples_texture;
-    uint surface_texture;
-    uint average_texture;
-    float history_clip_weight;
-};
+#include "ffx_reflections.ResolvePush.slang"
 
 [[vk::push_constant]] ResolvePush resolve_push;
 
@@ -362,12 +339,7 @@ float4 resolveMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Positi
     return float4(new_signal, new_variance);
 }
 
-struct AveragePush {
-    FrameConstants frame;
-    uint radiance_texture;
-    uint reprojected_texture;
-    uint samples_texture;
-};
+#include "ffx_reflections.AveragePush.slang"
 
 [[vk::push_constant]] AveragePush average_push;
 

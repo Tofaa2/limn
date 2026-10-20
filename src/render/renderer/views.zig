@@ -15,6 +15,11 @@ const Image = api.Image;
 pub const Views = struct {
     table: handle.HandleTable(renderer_state.ViewData, api.ViewTag),
 
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.ViewData) void {
+        entry.deinit(owner.internal.gpa, owner.device);
+    }
+
     fn renderer(views: *Views) *Renderer {
         return @alignCast(@fieldParentPtr("views", views));
     }
@@ -33,9 +38,9 @@ pub const Views = struct {
         const self = views.renderer();
         self.lock();
         defer self.unlock();
-        if (std.meta.eql(view, self.main_view)) return;
+        if (std.meta.eql(view, self.internal.main_view)) return;
         var removed = self.views.table.remove(view) orelse return;
-        removed.deinit(self.gpa, self.device);
+        removed.deinit(self.internal.gpa, self.device);
     }
 
     /// Creates a texture views can draw into (`Target.texture`) and draw
@@ -55,8 +60,7 @@ pub const Views = struct {
         var cmd = try self.device.beginImmediate();
         try cmd.beginRendering(.{ .color = &.{.{ .texture = texture, .load = .clear, .clear = .{ 0, 0, 0, 1 } }} });
         cmd.endRendering();
-        cmd.transition(texture, .shader_read);
-        try self.device.endImmediate();
+        try self.device.endImmediate(&cmd);
         return texture;
     }
 
@@ -78,8 +82,7 @@ pub const Views = struct {
         var cmd = try self.device.beginImmediate();
         try cmd.beginRendering(.{ .color = &.{.{ .texture = texture, .load = .clear, .clear = .{ 0, 0, 0, 1 } }} });
         cmd.endRendering();
-        cmd.transition(texture, .shader_read);
-        try self.device.endImmediate();
+        try self.device.endImmediate(&cmd);
         return texture;
     }
 
@@ -113,6 +116,6 @@ pub fn insertView(self: *Renderer) !View {
 }
 
 pub fn targetWritten(self: *const Renderer, target: rhi.Texture) bool {
-    for (self.frame_targets[0..self.frame_target_count]) |written| if (std.meta.eql(written, target)) return true;
+    for (self.internal.frame_targets[0..self.internal.frame_target_count]) |written| if (std.meta.eql(written, target)) return true;
     return false;
 }

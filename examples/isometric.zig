@@ -1,6 +1,6 @@
 //! A diorama seen through an orthographic camera: terraced blocks under a
 //! low sun, and lamp-carrying markers drawn into the scene under bloom and
-//! tone mapping, with name tags over it.
+//! tone mapping, with name tags over it and a backdrop under it.
 //!
 //!   Q/E      turn the view a quarter
 //!   Up/Down  zoom
@@ -63,6 +63,8 @@ pub fn main(init: std.process.Init) !void {
     defer world.deinit();
     var hud = gfx.DrawList.init(init.gpa);
     defer hud.deinit();
+    var backdrop = gfx.DrawList.init(init.gpa);
+    defer backdrop.deinit();
     const font = renderer.fonts.default();
     var lights: [walker_names.len]gfx.Light = undefined;
     var turn: f32 = 0;
@@ -85,6 +87,15 @@ pub fn main(init: std.process.Init) !void {
 
         world.clear();
         hud.clear();
+        backdrop.clear();
+        const width: f32 = @floatFromInt(tick.size[0]);
+        const height: f32 = @floatFromInt(tick.size[1]);
+        const bands = 32;
+        for (0..bands) |band| {
+            const along = @as(f32, @floatFromInt(band)) / bands;
+            const shade = gfx.Color.rgb(@intFromFloat(18 + 40 * along), @intFromFloat(22 + 60 * along), @intFromFloat(48 + 90 * along));
+            try backdrop.rect(.{ .x = 0, .y = height * along, .width = width, .height = height / bands + 1 }, shade);
+        }
         for (walker_names, 0..) |name, index| {
             const seed: f32 = @floatFromInt(index);
             const x = @sin(clock * (0.23 + seed * 0.05) + seed * 2.1) * 5.5;
@@ -112,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = camera,
-                .draw_lists = &.{ .{ .list = &world, .stage = .scene }, .{ .list = &hud } },
+                .draw_lists = &.{ .{ .list = &backdrop, .stage = .under }, .{ .list = &world, .stage = .scene }, .{ .list = &hud } },
                 .target = stage.target(),
                 .settings = .{
                     .shadows = .{ .distance = 80 },

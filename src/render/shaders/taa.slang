@@ -1,15 +1,6 @@
 #include "common.slang"
 
-struct Push {
-    FrameConstants frame;
-    uint color_texture;
-    uint history_texture;
-    uint motion_texture;
-    uint depth_texture;
-    uint history_valid;
-    float settled;
-    uint previous_motion_texture;
-};
+#include "taa.Push.slang"
 
 [[vk::push_constant]] Push push;
 

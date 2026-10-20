@@ -79,6 +79,7 @@ pub fn submitFrame(self: *Device) !void {
         self.in_frame = false;
         abandonAcquiredImage(self, frame);
     }
+    self.encoder.settle();
     const presenting = self.swapchain != null;
     if (presenting) {
         recordGeneratedFrame(self, frame);
@@ -155,7 +156,7 @@ pub fn flushUploadsBlocking(self: *Device) !void {
     if (self.uploads.items.len == 0) return;
     var encoder = try self.beginImmediate();
     try encoder.flushUploads();
-    try self.endImmediate();
+    try self.endImmediate(&encoder);
     collectGarbage(self, true);
 }
 
@@ -184,6 +185,8 @@ pub fn beginDetached(self: *Device) !?CommandEncoder {
 
 /// Submits without waiting; poll `detachedDone`, then `releaseDetached`.
 pub fn submitDetached(self: *Device, encoder: CommandEncoder) !Detached {
+    var settled = encoder;
+    settled.settle();
     errdefer self.vkd.freeCommandBuffers(self.detached_pool, &.{encoder.command});
     try self.vkd.endCommandBuffer(encoder.command);
     const fence = try self.vkd.createFence(&.{}, null);
@@ -194,18 +197,19 @@ pub fn submitDetached(self: *Device, encoder: CommandEncoder) !Detached {
         .p_command_buffer_infos = @ptrCast(&command_info),
     }}, fence);
     self.detached_outstanding += 1;
-    return .{ .command = encoder.command, .fence = fence };
+    return .{ .command = @intFromEnum(encoder.command), .fence = @intFromEnum(fence) };
 }
 
 pub fn detachedDone(self: *Device, job: Detached) bool {
-    return (self.vkd.getFenceStatus(job.fence) catch return false) == .success;
+    return (self.vkd.getFenceStatus(@enumFromInt(job.fence)) catch return false) == .success;
 }
 
 /// Waits for the job if it is still running.
 pub fn releaseDetached(self: *Device, job: Detached) void {
-    _ = self.vkd.waitForFences(&.{job.fence}, .true, std.math.maxInt(u64)) catch {};
-    self.vkd.destroyFence(job.fence, null);
-    self.vkd.freeCommandBuffers(self.detached_pool, &.{job.command});
+    const fence: vk.Fence = @enumFromInt(job.fence);
+    _ = self.vkd.waitForFences(&.{fence}, .true, std.math.maxInt(u64)) catch {};
+    self.vkd.destroyFence(fence, null);
+    self.vkd.freeCommandBuffers(self.detached_pool, &.{@as(vk.CommandBuffer, @enumFromInt(job.command))});
     self.detached_outstanding -= 1;
 }
 
@@ -221,7 +225,8 @@ pub fn beginImmediate(self: *Device) !CommandEncoder {
 
 /// Submits and blocks until the GPU is idle, then runs all deferred
 /// destruction. The encoder must not be used afterwards.
-pub fn endImmediate(self: *Device) !void {
+pub fn endImmediate(self: *Device, encoder: *CommandEncoder) !void {
+    encoder.settle();
     try self.vkd.endCommandBuffer(self.immediate_command);
     const fence = try self.vkd.createFence(&.{}, null);
     defer self.vkd.destroyFence(fence, null);

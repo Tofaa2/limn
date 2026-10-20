@@ -7,8 +7,6 @@ const frame_constants = @import("core/frame_constants.zig");
 pub const FrameConstants = frame_constants.FrameConstants;
 pub const GiCascade = frame_constants.GiCascade;
 pub const gi_cascade_max = frame_constants.gi_cascade_max;
-/// `FrameConstants.flags` bits.
-pub const frame_flags = frame_constants.flags;
 /// `SHADE_FEATURES` bits.
 pub const shade_features = frame_constants.features;
 
@@ -295,11 +293,11 @@ pub const ShadowTile = extern struct {
 
 /// Froxel grid for light and decal lookup (`CLUSTERS_X`, `_Y`, `_Z` in
 /// common.slang). Depth slices are logarithmic; see
-/// `FrameConstants.cluster_z_scale`.
+/// `FrameConstants.lights.cluster_z_scale`.
 pub const clusters_x = 16;
 pub const clusters_y = 9;
 pub const clusters_z = 24;
-/// Records in the buffer at `FrameConstants.clusters`.
+/// Records in the buffer at `FrameConstants.lights.clusters`.
 pub const cluster_count = clusters_x * clusters_y * clusters_z;
 /// Most lights one cluster lists (`CLUSTER_CAPACITY` in common.slang); the
 /// rest are dropped. Count plus list fill 128 words.
@@ -517,33 +515,7 @@ comptime {
 }
 
 /// `CloudData` in common.slang.
-pub const Clouds = extern struct {
-    offset: [3]f32,
-    period: f32,
-    albedo: [3]f32,
-    density: f32,
-    bottom: f32,
-    top: f32,
-    coverage: f32,
-    detail: f32,
-    planet_radius: f32,
-    max_distance: f32,
-    variation: f32,
-    ambient: f32,
-    noise: u32,
-    steps: i32,
-    light_steps: i32,
-    history: u32,
-    history_blend: f32,
-    anisotropy: f32,
-    depth: u32,
-    shadow_strength: f32 = 0,
-    cirrus: f32 = 0,
-    anvil: f32 = 0,
-    cloud_pad: [2]f32 = .{ 0, 0 },
-    /// A lightning flash inside the layer: position and brightness.
-    flash: [4]f32 = .{ 0, 0, 0, 0 },
-};
+pub const Clouds = @import("features/constants/clouds.zig").Clouds;
 
 /// Length of `Fluid.sources`; `FluidData` in common.slang declares the same 8.
 pub const max_fluid_sources = 8;

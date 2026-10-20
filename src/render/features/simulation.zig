@@ -1,4 +1,8 @@
 //! Steps a scene's fluids, water, liquids, hair and particles once a frame.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const liquid_push = @import("../shaders/push/liquid.zig");
+const water_passes_push = @import("../shaders/push/water_passes.zig");
+const fluid_passes_push = @import("../shaders/push/fluid_passes.zig");
 const render = @import("../renderer.zig");
 const hair_feature = @import("hair.zig");
 const particles_feature = @import("particles.zig");
@@ -121,7 +125,7 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
     const device = renderer.device;
     cmd.beginScope("liquid simulation");
     defer cmd.endScope();
-    const Push = extern struct { liquid: u64, particles: u64, counts: u64, cells: u64, mode: u32, flip: u32 };
+    const Push = liquid_push.SimPush;
     for (scene.liquids.items) |item| {
         const state = renderer.liquids.table.get(item) orelse continue;
         const desc = state.desc;
@@ -153,7 +157,7 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             .gravity = .{ math.dot(desc.gravity, box.axes[0]), math.dot(desc.gravity, box.axes[1]), math.dot(desc.gravity, box.axes[2]) },
             .radius = radius,
             .block_origin = .{ radius, radius, radius },
-            .seed = @truncate(renderer.frame_index *% 2654435761),
+            .seed = @truncate(renderer.internal.frame_index *% 2654435761),
             .color = desc.color,
             .murk = @max(desc.murk, 0),
             .source_count = state.source_count,
@@ -189,7 +193,7 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             record.sphere_count += 1;
         };
 
-        cmd.bindPipeline(try renderer.pipelines.get(.liquid_sim));
+        cmd.bindPipeline(try renderer.internal.pipelines.of(liquidSimPipeline));
         var push = Push{
             .liquid = 0,
             .particles = device.bufferAddress(state.particles),
@@ -272,7 +276,7 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             cmd.sync(.compute_to_all);
         }
         state.params = params_address + (records.items.len - 1) * stride;
-        state.params_frame = renderer.frame_index;
+        state.params_frame = renderer.internal.frame_index;
         if (state.proxy) |stand_in| if (renderer.entities.table.get(stand_in)) |proxy| {
             const volume = @as(f32, @floatFromInt(state.live)) * spacing * spacing * spacing;
             const filled = std.math.clamp(volume / (box.extent[0] * box.extent[1] * box.extent[2]), 0.002, 1);
@@ -298,7 +302,6 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             for (state.state) |texture| {
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = texture, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
                 cmd.endRendering();
-                cmd.transition(texture, .shader_read);
             }
             state.cleared = true;
         }
@@ -307,7 +310,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         const width = @max(math.length(.{ t[0], t[1], t[2] }), 1e-6);
         const up = @max(math.length(.{ t[4], t[5], t[6] }), 1e-6);
         state.rain_pending += @max(desc.rain, 0) * dt;
-        var random = std.Random.DefaultPrng.init(renderer.frame_index *% 0x9e3779b97f4a7c15 +% 7);
+        var random = std.Random.DefaultPrng.init(renderer.internal.frame_index *% 0x9e3779b97f4a7c15 +% 7);
         const rng = random.random();
         while (state.rain_pending >= 1 and state.ripple_count < state.ripples.len) : (state.rain_pending -= 1) {
             state.ripples[state.ripple_count] = .{
@@ -328,7 +331,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             for (scene.entities.items) |entity_handle| {
                 if (state.ripple_count == state.ripples.len) break;
                 const entity = renderer.entities.table.get(entity_handle) orelse continue;
-                if (!entity.visible or renderer.entity_marks.items[entity_handle.index].travelled < 1e-4) continue;
+                if (!entity.visible or renderer.internal.entity_marks.items[entity_handle.index].travelled < 1e-4) continue;
                 const model = renderer.models.table.get(entity.model) orelse continue;
                 if (model.state != .ready) continue;
                 const center = math.transformPoint(renderer.transformOf(entity_handle), model.info.bounds_center);
@@ -337,7 +340,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
                 const above = local[1] * up;
                 if (@abs(above) >= radius or @abs(local[0]) > 0.5 or @abs(local[2]) > 0.5) continue;
                 const cut = @sqrt(radius * radius - above * above);
-                const speed = renderer.entity_marks.items[entity_handle.index].travelled / @max(delta_time, 1e-4);
+                const speed = renderer.internal.entity_marks.items[entity_handle.index].travelled / @max(delta_time, 1e-4);
                 if (speed * cut > splash_strength) {
                     splash_strength = speed * cut;
                     splash_at = math.transformPoint(t, .{ local[0], 0, local[2] });
@@ -347,7 +350,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
                 state.ripples[state.ripple_count] = .{
                     .position = .{ local[0] + 0.5, local[2] + 0.5 },
                     .radius = @min(cut, radius) / width,
-                    .depth = @min(renderer.entity_marks.items[entity_handle.index].travelled * 0.35 * desc.object_ripples, radius * 0.5) / up,
+                    .depth = @min(renderer.internal.entity_marks.items[entity_handle.index].travelled * 0.35 * desc.object_ripples, radius * 0.5) / up,
                 };
                 state.ripple_count += 1;
             }
@@ -366,7 +369,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             .transform = t,
             .size = .{ @intCast(state.size[0]), @intCast(state.size[1]) },
             .state = device.textureIndex(state.state[state.current]),
-            .sampler_linear = device.samplerIndex(renderer.sampler_linear_clamp),
+            .sampler_linear = device.samplerIndex(renderer.internal.sampler_linear_clamp),
             .dt = dt,
             .speed = @max(desc.wave_speed, 0) * @as(f32, @floatFromInt(state.size[0])) / width,
             .keep = @exp(-@max(desc.damping, 0) * dt),
@@ -389,17 +392,16 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         if (dt > 0) {
             const new = 1 - state.current;
             try cmd.beginRendering(.{ .color = &.{.{ .texture = state.state[new], .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.water_sim));
-            cmd.pushConstants(extern struct { water: u64 }{ .water = params.address });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(waterSimPipeline));
+            cmd.pushConstants(water_passes_push.SimPush{ .water = params.address });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(state.state[new], .shader_read);
             state.current = new;
             record.state = device.textureIndex(state.state[new]);
         }
         params.items[1] = record;
         state.params = params.address + @sizeOf(gpu.Water);
-        state.params_frame = renderer.frame_index;
+        state.params_frame = renderer.internal.frame_index;
     }
 }
 
@@ -416,7 +418,6 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
             for (state.textures()) |texture| {
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = texture.*, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
                 cmd.endRendering();
-                cmd.transition(texture.*, .shader_read);
             }
             state.cleared = true;
             state.mask_key = 0;
@@ -448,8 +449,8 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
             .fire_intensity = @max(desc.fire_intensity, 0),
             .fire_color = desc.fire_color,
             .shadow = std.math.clamp(desc.shadow, 0, 1),
-            .sampler_linear = device.samplerIndex(renderer.sampler_linear_clamp),
-            .sampler_nearest = device.samplerIndex(renderer.sampler_nearest_clamp),
+            .sampler_linear = device.samplerIndex(renderer.internal.sampler_linear_clamp),
+            .sampler_nearest = device.samplerIndex(renderer.internal.sampler_nearest_clamp),
             .scalars = 0,
             .anisotropy = std.math.clamp(desc.anisotropy, 0, 0.95),
             .ambient = @max(desc.ambient, 0),
@@ -473,8 +474,7 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
         };
         const address = params.address;
         state.params = address;
-        state.params_frame = renderer.frame_index;
-        const Push = extern struct { fluid: u64, a: u32 = 0, b: u32 = 0, c: u32 = 0, pad: u32 = 0 };
+        state.params_frame = renderer.internal.frame_index;
         params.items[0].solid = device.textureIndex(state.solid);
         const scene_tlas: u64 = if (desc.scene_obstacles and device.caps.ray_tracing and scene.tlas_hash != 0)
             (if (scene.tlas) |tlas| device.accelerationAddress(tlas) else 0)
@@ -502,11 +502,10 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
             if (state.mask_key != mask_key) {
                 state.mask_key = mask_key;
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = state.solid, .load = .discard }} });
-                cmd.bindPipeline(if (scene_tlas != 0) try renderer.pipelines.get(.fluid_solid_traced) else try renderer.pipelines.get(.fluid_solid));
-                cmd.pushConstants(extern struct { fluid: u64, tlas: u64 }{ .fluid = address, .tlas = scene_tlas });
+                cmd.bindPipeline(if (scene_tlas != 0) try renderer.internal.pipelines.of(fluidSolidTracedPipeline) else try renderer.internal.pipelines.of(fluidSolidPipeline));
+                cmd.pushConstants(fluid_passes_push.SolidPush{ .fluid = address, .tlas = scene_tlas });
                 cmd.drawFullscreen();
                 cmd.endRendering();
-                cmd.transition(state.solid, .shader_read);
             }
         }
         if (dt > 0) {
@@ -514,75 +513,65 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
             const new = 1 - old;
             if (desc.sharp_advection) {
                 try cmd.beginRendering(.{ .color = &.{ .{ .texture = state.carried, .load = .discard }, .{ .texture = state.carried_velocity, .load = .discard } } });
-                cmd.bindPipeline(try renderer.pipelines.get(.fluid_carry));
-                cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[old]), .b = device.textureIndex(state.scalars[old]) });
+                cmd.bindPipeline(try renderer.internal.pipelines.of(fluidCarryPipeline));
+                cmd.pushConstants(fluid_passes_push.CarryPush{ .fluid = address, .velocity_texture = device.textureIndex(state.velocity[old]), .scalars_texture = device.textureIndex(state.scalars[old]) });
                 cmd.drawFullscreen();
                 cmd.endRendering();
-                cmd.transition(state.carried, .shader_read);
-                cmd.transition(state.carried_velocity, .shader_read);
             }
             try cmd.beginRendering(.{ .color = &.{
                 .{ .texture = state.velocity[new], .load = .discard },
                 .{ .texture = state.scalars[new], .load = .discard },
             } });
-            cmd.bindPipeline(try renderer.pipelines.get(.fluid_advect));
-            cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[old]), .b = device.textureIndex(state.scalars[old]), .c = if (desc.sharp_advection) device.textureIndex(state.carried) else gpu.invalid_id, .pad = if (desc.sharp_advection and desc.sharp_velocity) device.textureIndex(state.carried_velocity) else gpu.invalid_id });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(fluidAdvectPipeline));
+            cmd.pushConstants(fluid_passes_push.AdvectPush{ .fluid = address, .velocity_texture = device.textureIndex(state.velocity[old]), .scalars_texture = device.textureIndex(state.scalars[old]), .carried_texture = if (desc.sharp_advection) device.textureIndex(state.carried) else gpu.invalid_id, .carried_velocity_texture = if (desc.sharp_advection and desc.sharp_velocity) device.textureIndex(state.carried_velocity) else gpu.invalid_id });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(state.velocity[new], .shader_read);
-            cmd.transition(state.scalars[new], .shader_read);
 
             try cmd.beginRendering(.{ .color = &.{.{ .texture = state.curl, .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.fluid_curl));
-            cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[new]) });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(fluidCurlPipeline));
+            cmd.pushConstants(fluid_passes_push.CurlPush{ .fluid = address, .velocity_texture = device.textureIndex(state.velocity[new]) });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(state.curl, .shader_read);
 
             try cmd.beginRendering(.{ .color = &.{.{ .texture = state.velocity[old], .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.fluid_force));
-            cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[new]), .b = device.textureIndex(state.scalars[new]), .c = device.textureIndex(state.curl) });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(fluidForcePipeline));
+            cmd.pushConstants(fluid_passes_push.ForcePush{ .fluid = address, .velocity_texture = device.textureIndex(state.velocity[new]), .scalars_texture = device.textureIndex(state.scalars[new]), .curl_texture = device.textureIndex(state.curl) });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(state.velocity[old], .shader_read);
 
             try cmd.beginRendering(.{ .color = &.{.{ .texture = state.divergence, .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.fluid_divergence));
-            cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[old]) });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(fluidDivergencePipeline));
+            cmd.pushConstants(fluid_passes_push.DivergencePush{ .fluid = address, .velocity_texture = device.textureIndex(state.velocity[old]) });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(state.divergence, .shader_read);
 
-            cmd.bindPipeline(try renderer.pipelines.get(.fluid_pressure));
+            cmd.bindPipeline(try renderer.internal.pipelines.of(fluidPressurePipeline));
             for (0..std.math.clamp(desc.pressure_iterations, 1, 200)) |_| {
                 const from = state.pressure_current;
                 const to = 1 - from;
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = state.pressure[to], .load = .discard }} });
-                cmd.bindPipeline(try renderer.pipelines.get(.fluid_pressure));
-                cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.pressure[from]), .b = device.textureIndex(state.divergence) });
+                cmd.bindPipeline(try renderer.internal.pipelines.of(fluidPressurePipeline));
+                cmd.pushConstants(fluid_passes_push.PressurePush{ .fluid = address, .pressure_texture = device.textureIndex(state.pressure[from]), .divergence_texture = device.textureIndex(state.divergence) });
                 cmd.drawFullscreen();
                 cmd.endRendering();
-                cmd.transition(state.pressure[to], .shader_read);
                 state.pressure_current = to;
             }
 
             try cmd.beginRendering(.{ .color = &.{.{ .texture = state.velocity[new], .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.fluid_project));
-            cmd.pushConstants(Push{ .fluid = address, .a = device.textureIndex(state.velocity[old]), .b = device.textureIndex(state.pressure[state.pressure_current]) });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(fluidProjectPipeline));
+            cmd.pushConstants(fluid_passes_push.ProjectPush{ .fluid = address, .velocity_texture = device.textureIndex(state.velocity[old]), .pressure_texture = device.textureIndex(state.pressure[state.pressure_current]) });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(state.velocity[new], .shader_read);
             state.current = new;
         }
         params.items[0].scalars = device.textureIndex(state.scalars[state.current]);
         params.items[0].velocity = device.textureIndex(state.velocity[state.current]);
         if (state.picture) |picture| {
             try cmd.beginRendering(.{ .color = &.{.{ .texture = picture, .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.fluid_present));
-            cmd.pushConstants(Push{ .fluid = address });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(fluidPresentPipeline));
+            cmd.pushConstants(fluid_passes_push.PresentPush{ .fluid = address });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(picture, .shader_read);
         }
         if (state.flipbook) |sheet| {
             const book = state.flipbook_desc;
@@ -593,15 +582,62 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
                 if (due) {
                     const frame = state.flipbook_frame;
                     cmd.setViewport((state.flipbook_recorded % book.columns) * frame[0], (state.flipbook_recorded / book.columns) * frame[1], frame[0], frame[1]);
-                    cmd.bindPipeline(try renderer.pipelines.get(.fluid_present));
-                    cmd.pushConstants(Push{ .fluid = address });
+                    cmd.bindPipeline(try renderer.internal.pipelines.of(fluidPresentPipeline));
+                    cmd.pushConstants(fluid_passes_push.PresentPush{ .fluid = address });
                     cmd.drawFullscreen();
                     state.flipbook_recorded += 1;
                 }
                 cmd.endRendering();
-                cmd.transition(sheet, .shader_read);
             }
             if (dt > 0) state.flipbook_wait = (state.flipbook_wait + 1) % @max(book.interval, 1);
         }
     }
+}
+
+fn fluidAdvectPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluid advect", pipelines_module.shaderCode("fluid_advect.frag.spv"), &.{ .{ .format = .rgba16_float }, .{ .format = .rgba16_float } });
+}
+
+fn fluidCurlPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluid curl", pipelines_module.shaderCode("fluid_curl.frag.spv"), &.{.{ .format = .rgba16_float }});
+}
+
+fn fluidForcePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluid forces", pipelines_module.shaderCode("fluid_force.frag.spv"), &.{.{ .format = .rgba16_float }});
+}
+
+fn fluidDivergencePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluid divergence", pipelines_module.shaderCode("fluid_divergence.frag.spv"), &.{.{ .format = .rg16_float }});
+}
+
+fn fluidPressurePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluid pressure", pipelines_module.shaderCode("fluid_pressure.frag.spv"), &.{.{ .format = .rg16_float }});
+}
+
+fn fluidProjectPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluid projection", pipelines_module.shaderCode("fluid_project.frag.spv"), &.{.{ .format = .rgba16_float }});
+}
+
+fn fluidPresentPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluid picture", pipelines_module.shaderCode("fluid_present.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn waterSimPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("water simulation", pipelines_module.shaderCode("water_sim.frag.spv"), &.{.{ .format = .rg16_float }});
+}
+
+fn liquidSimPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "liquid simulation", .shader = pipelines_module.shaderCode("liquid_sim.comp.spv") } };
+}
+
+fn fluidSolidPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluid obstacles", pipelines_module.shaderCode("fluid_solid.frag.spv"), &.{.{ .format = .r8_unorm }});
+}
+
+fn fluidSolidTracedPipeline(device: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluid obstacles (scene)", if (device.caps.ray_tracing) pipelines_module.shaderCode("fluid_solid_rt.frag.spv") else pipelines_module.shaderCode("fluid_solid.frag.spv"), &.{.{ .format = .r8_unorm }});
+}
+
+fn fluidCarryPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("fluid carry", pipelines_module.shaderCode("fluid_carry.frag.spv"), &.{ .{ .format = .rgba16_float }, .{ .format = .rgba16_float } });
 }

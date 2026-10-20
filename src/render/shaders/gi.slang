@@ -21,7 +21,7 @@ int3 giUnpackScroll(uint packed) {
 }
 
 GiGrid giGrid(FrameConstants frame, uint index) {
-    GiCascade cascade = frame.gi_cascades[index];
+    GiCascade cascade = frame.gi.gi_cascades[index];
     GiGrid grid;
     grid.nearest = frame.sampler_nearest_clamp;
     grid.origin = cascade.origin;
@@ -92,7 +92,7 @@ float giNestedCoverage(GiGrid grid, float3 position) {
 }
 
 float giCoverage(FrameConstants frame, float3 position) {
-    uint last = max(frame.gi_cascade_count, 1u) - 1u;
+    uint last = max(frame.gi.gi_cascade_count, 1u) - 1u;
     float covered = 0.0;
     float rest = 1.0;
     for (uint i = 0u; i < last && rest > 0.0; i++) {
@@ -146,7 +146,7 @@ float3 giGridIrradiance(FrameConstants frame, GiGrid grid, float3 position, floa
 }
 
 float3 giIrradiance(FrameConstants frame, float3 position, float3 normal, float3 view) {
-    uint last = max(frame.gi_cascade_count, 1u) - 1u;
+    uint last = max(frame.gi.gi_cascade_count, 1u) - 1u;
     float3 result = float3(0.0);
     float rest = 1.0;
     for (uint i = 0u; i < last && rest > 0.0; i++) {
@@ -178,7 +178,7 @@ float3 giGridAmbient(FrameConstants frame, GiGrid grid, float3 position) {
 }
 
 float3 giAmbient(FrameConstants frame, float3 position) {
-    uint last = max(frame.gi_cascade_count, 1u) - 1u;
+    uint last = max(frame.gi.gi_cascade_count, 1u) - 1u;
     float3 result = float3(0.0);
     float rest = 1.0;
     for (uint i = 0u; i < last && rest > 0.0; i++) {

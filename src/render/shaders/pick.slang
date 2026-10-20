@@ -9,13 +9,7 @@ struct PickResult {
     uint pad1;
 };
 
-struct Push {
-    FrameConstants frame;
-    PickResult* result;
-    uint visibility_texture;
-    uint depth_texture;
-    int2 pixel;
-};
+#include "pick.Push.slang"
 
 [[vk::push_constant]] Push push;
 

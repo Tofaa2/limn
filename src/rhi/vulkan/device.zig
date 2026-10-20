@@ -67,7 +67,10 @@ pub const BufferResource = struct {
 };
 
 const SubView = struct { mip: u32, layer: u32, view: vk.ImageView };
+/// `layer` is `all_layers` for a view of every layer, in the table of
+/// whole textures.
 const StorageSlot = struct { mip: u32, layer: u32, slot: u32 };
+pub const all_layers = std.math.maxInt(u32);
 
 /// From `Device.textureResource`.
 pub const TextureResource = struct {
@@ -84,7 +87,7 @@ pub const TextureResource = struct {
     /// State of each mip as of the commands recorded so far; maintained by
     /// the encoder's transitions.
     states: [max_mip_levels]types.TextureState = @splat(.undefined),
-    /// Single mip/layer views, made on demand by `Device.subView`.
+    /// Single mip/layer views, made on demand by `subView` in textures.zig.
     sub_views: std.ArrayList(SubView) = .empty,
     /// Storage image slots per mip, made on demand by `Device.storageIndex`.
     storage_slots: std.ArrayList(StorageSlot) = .empty,
@@ -114,6 +117,10 @@ pub const AccelerationResource = struct {
     compactable: bool = false,
     /// Where the size of that copy is written; see `measureBlasCommand`.
     compaction_slot: ?u32 = null,
+    /// Top level: built so that it can be updated.
+    updatable: bool = false,
+    /// Top level: instances in the last build, which an update must keep.
+    instance_count: u32 = 0,
 };
 
 /// From `Device.pipelineResource`.
@@ -139,8 +146,8 @@ const PendingDeletion = struct { frame: u64, object: Deletion };
 
 /// Work submitted to the second queue by `Device.submitDetached`.
 pub const Detached = struct {
-    command: vk.CommandBuffer,
-    fence: vk.Fence,
+    command: u64,
+    fence: u64,
 };
 
 pub const PendingUpload = union(enum) {
@@ -432,7 +439,23 @@ pub const Device = struct {
         const queue_count: u32 = @min(selected.queue_count, 2);
         self.properties = selected.properties;
         if (self.properties.limits.max_push_constants_size < push_constant_size) return error.NoSuitableDevice;
-        self.caps.max_texture_size = self.properties.limits.max_image_dimension_2d;
+        const limits = self.properties.limits;
+        self.caps.max_texture_size = limits.max_image_dimension_2d;
+        self.caps.max_volume_size = limits.max_image_dimension_3d;
+        self.caps.max_texture_layers = limits.max_image_array_layers;
+        self.caps.max_workgroup_size = limits.max_compute_work_group_invocations;
+        self.caps.max_workgroups = limits.max_compute_work_group_count;
+        for (std.enums.values(types.Format)) |format| {
+            const flags = self.instance.getPhysicalDeviceFormatProperties(self.physical, vkFormat(format)).optimal_tiling_features;
+            self.caps.formats.set(format, .{
+                .sampled = flags.sampled_image_bit,
+                .filtered = flags.sampled_image_filter_linear_bit,
+                .color_attachment = flags.color_attachment_bit,
+                .blended = flags.color_attachment_blend_bit,
+                .depth_attachment = flags.depth_stencil_attachment_bit,
+                .storage = flags.storage_image_bit,
+            });
+        }
 
         self.caps.ray_tracing = desc.ray_tracing and try supportsRayQueries(gpa, self.instance, self.physical);
         self.caps.nvidia_ngx = desc.nvidia_ngx and for (ngx_extensions) |extension| {
@@ -558,7 +581,7 @@ pub const Device = struct {
             self.vkd.destroyDescriptorPool(self.descriptor_pool, null);
             self.vkd.destroyDescriptorSetLayout(self.descriptor_layout, null);
         }
-        const push_range = vk.PushConstantRange{ .stage_flags = self.shaderStages(), .offset = 0, .size = push_constant_size };
+        const push_range = vk.PushConstantRange{ .stage_flags = pipelines_module.shaderStages(self), .offset = 0, .size = push_constant_size };
         self.pipeline_layout = try self.vkd.createPipelineLayout(&.{
             .set_layout_count = 1,
             .p_set_layouts = @ptrCast(&self.descriptor_layout),
@@ -746,7 +769,7 @@ pub const Device = struct {
     pub const textureExists = textures_module.textureExists;
     pub const textureIndex = textures_module.textureIndex;
     pub const storageIndex = textures_module.storageIndex;
-    pub const subView = textures_module.subView;
+    pub const storageArrayIndex = textures_module.storageArrayIndex;
     pub const uploadTexture = textures_module.uploadTexture;
     pub const uploadTextureLevels = textures_module.uploadTextureLevels;
     pub const uploadTextureRegion = textures_module.uploadTextureRegion;
@@ -774,13 +797,9 @@ pub const Device = struct {
     pub const accelerationResource = acceleration_module.accelerationResource;
     pub const accelerationAddress = acceleration_module.accelerationAddress;
     pub const accelerationBuilt = acceleration_module.accelerationBuilt;
-    pub const buildBlasCommand = acceleration_module.buildBlasCommand;
-    pub const measureBlasCommand = acceleration_module.measureBlasCommand;
     pub const compactedBlasSize = acceleration_module.compactedBlasSize;
     pub const blasMeasured = acceleration_module.blasMeasured;
     pub const createCompactBlas = acceleration_module.createCompactBlas;
-    pub const compactBlasCommand = acceleration_module.compactBlasCommand;
-    pub const buildTlasCommand = acceleration_module.buildTlasCommand;
     pub const createSampler = textures_module.createSampler;
     pub const destroySampler = textures_module.destroySampler;
     pub const samplerIndex = textures_module.samplerIndex;
@@ -790,6 +809,7 @@ pub const Device = struct {
     pub const discardPipeline = pipelines_module.discardPipeline;
     pub const compileGraphicsPipeline = pipelines_module.compileGraphicsPipeline;
     pub const createComputePipeline = pipelines_module.createComputePipeline;
+    pub const compileComputePipeline = pipelines_module.compileComputePipeline;
     pub const destroyPipeline = pipelines_module.destroyPipeline;
     pub const pipelineResource = pipelines_module.pipelineResource;
     pub const backbufferFormat = presentation_module.backbufferFormat;
@@ -809,7 +829,6 @@ pub const Device = struct {
     pub const waitIdle = frames_module.waitIdle;
     pub const flushUploadsBlocking = frames_module.flushUploadsBlocking;
     pub const pendingUploadBytes = frames_module.pendingUploadBytes;
-    pub const shaderStages = pipelines_module.shaderStages;
     pub const beginDetached = frames_module.beginDetached;
     pub const submitDetached = frames_module.submitDetached;
     pub const detachedDone = frames_module.detachedDone;
@@ -820,10 +839,10 @@ pub const Device = struct {
 
     fn createDescriptorTable(self: *Device) !void {
         const all_bindings = [_]vk.DescriptorSetLayoutBinding{
-            .{ .binding = 0, .descriptor_type = .sampled_image, .descriptor_count = texture_capacity, .stage_flags = self.shaderStages() },
-            .{ .binding = 1, .descriptor_type = .sampler, .descriptor_count = sampler_capacity, .stage_flags = self.shaderStages() },
-            .{ .binding = 2, .descriptor_type = .storage_image, .descriptor_count = storage_capacity, .stage_flags = self.shaderStages() },
-            .{ .binding = 3, .descriptor_type = .storage_image, .descriptor_count = storage_volume_capacity, .stage_flags = self.shaderStages() },
+            .{ .binding = 0, .descriptor_type = .sampled_image, .descriptor_count = texture_capacity, .stage_flags = pipelines_module.shaderStages(self) },
+            .{ .binding = 1, .descriptor_type = .sampler, .descriptor_count = sampler_capacity, .stage_flags = pipelines_module.shaderStages(self) },
+            .{ .binding = 2, .descriptor_type = .storage_image, .descriptor_count = storage_capacity, .stage_flags = pipelines_module.shaderStages(self) },
+            .{ .binding = 3, .descriptor_type = .storage_image, .descriptor_count = storage_volume_capacity, .stage_flags = pipelines_module.shaderStages(self) },
         };
         const count: u32 = if (self.caps.storage_images) all_bindings.len else all_bindings.len - 2;
         const binding_flags: [all_bindings.len]vk.DescriptorBindingFlags = @splat(.{

@@ -33,7 +33,7 @@ pub const TextureOptions = api.TextureOptions;
 pub const GeometryOptions = api.GeometryOptions;
 pub const CacheOptions = api.CacheOptions;
 pub const ImageDesc = api.ImageDesc;
-pub const EnvironmentOptions = api.EnvironmentOptions;
+pub const EnvironmentDesc = api.EnvironmentDesc;
 pub const SceneEnvironment = api.SceneEnvironment;
 pub const ShaderAssignment = api.ShaderAssignment;
 /// Hooks for an external CPU profiler; see `Options.profiler`.
@@ -158,7 +158,7 @@ pub const MaterialShader = api.MaterialShader;
 /// `Renderer.scenes.setDecals`.
 pub const DecalDesc = api.DecalDesc;
 /// Replacement textures for a material; see `Renderer.materials.setTextures`.
-pub const MaterialTextures = renderer.MaterialTextures;
+pub const MaterialTextures = api.MaterialTextures;
 /// A layer of volumetric clouds over a scene; see `Renderer.scenes.setClouds`.
 pub const CloudDesc = api.CloudDesc;
 /// Handle to a box of simulated smoke and fire; see `Renderer.fluids.create`.
@@ -217,6 +217,10 @@ pub const CloudFlash = api.CloudFlash;
 pub const bc7_partitions = @import("texture_codec").partitions;
 /// Handle to a local reflection probe; see `Renderer.probes.create`.
 pub const ReflectionProbe = api.ReflectionProbe;
+/// One light of a scene, set and removed on its own; see `Renderer.lights`.
+pub const LightHandle = api.LightHandle;
+/// One decal of a scene, set and removed on its own; see `Renderer.decals`.
+pub const DecalHandle = api.DecalHandle;
 /// A local reflection capture, used inside its box where neither the screen nor
 /// a ray gives a reflection.
 pub const ReflectionProbeDesc = api.ReflectionProbeDesc;
@@ -231,6 +235,8 @@ pub const PickResult = api.PickResult;
 pub const Pass = api.Pass;
 /// The points in a view's frame where a `Pass` can run.
 pub const PassStage = api.PassStage;
+/// What a `Pass` can read; see `Pass.reads`.
+pub const PassRead = api.PassRead;
 /// What a `Pass` is given: the device, the encoder and the view's textures.
 pub const PassContext = api.PassContext;
 /// Format of `PassContext.color` before tone mapping (RGBA16F).
@@ -285,6 +291,7 @@ test {
     _ = @import("render/renderer.zig");
     _ = @import("render/renderer/images.zig");
     _ = @import("render/renderer/view_math.zig");
+    _ = @import("render/core/pipeline_cache.zig");
     _ = @import("render/core/graph.zig");
     _ = @import("render/core/spirv_readonly.zig");
     _ = @import("render/core/features.zig");

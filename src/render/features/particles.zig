@@ -1,4 +1,6 @@
 //! A scene's particles.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const particles_push = @import("../shaders/push/particles.zig");
 const render = @import("../renderer.zig");
 const math = @import("../../math.zig");
 const gpu = @import("../gpu.zig");
@@ -36,7 +38,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
     const device = renderer.device;
     cmd.beginScope("particle simulation");
     defer cmd.endScope();
-    cmd.bindPipeline(try renderer.pipelines.get(.particle_sim));
+    cmd.bindPipeline(try renderer.internal.pipelines.of(particleSimPipeline));
     for (scene.emitters.items) |handle_value| {
         const emitter = renderer.emitters.table.get(handle_value) orelse continue;
         const desc = emitter.desc;
@@ -47,7 +49,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
             emitter.pending += @max(desc.rate, 0) * delta_time;
             const births: u32 = @min(@as(u32, @intFromFloat(@min(emitter.pending, 1e9))), emitter.capacity);
             emitter.pending -= @floatFromInt(births);
-            const carrier: u64 = if (desc.fluid) |fluid| (if (renderer.fluids.table.get(fluid)) |state| (if (state.params_frame == renderer.frame_index) state.params else 0) else 0) else 0;
+            const carrier: u64 = if (desc.fluid) |fluid| (if (renderer.fluids.table.get(fluid)) |state| (if (state.params_frame == renderer.internal.frame_index) state.params else 0) else 0) else 0;
             var trail_record = false;
             const trail_interval = @max(desc.trail_seconds, 1e-3) / @as(f32, @floatFromInt(@max(emitter.trail_points, 1)));
             if (emitter.trail_points != 0) {
@@ -78,7 +80,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
                     (if (carrier != 0) gpu.emitter_fluid else 0) | (if (desc.collide and collision_depth != null) gpu.emitter_collide else 0) | (if (emitter.order != null) gpu.emitter_sorted else 0),
                 .image = if (desc.image) |image| image.index else gpu.invalid_id,
                 .softness = desc.softness,
-                .seed = @truncate(renderer.frame_index *% 0x9e3779b97f4a7c15 >> 16),
+                .seed = @truncate(renderer.internal.frame_index *% 0x9e3779b97f4a7c15 >> 16),
                 .shift = emitter.shift,
                 .follow = @max(desc.fluid_follow, 0),
                 .bounce = std.math.clamp(desc.bounce, 0, 1),
@@ -101,7 +103,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
             emitter.shift = .{ 0, 0, 0 };
             emitter.cursor = (emitter.cursor + births) % emitter.capacity;
             emitter.frame_params = params.address;
-            cmd.pushConstants(extern struct { frame: u64, emitter: u64, particles: u64, trail: u64 }{
+            cmd.pushConstants(particles_push.SimPush{
                 .trail = if (emitter.trail) |trail| device.bufferAddress(trail) else 0,
                 .frame = frame_address,
                 .emitter = params.address,
@@ -138,8 +140,8 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         if (emitter.frame_params == 0) continue;
         const count = emitter.order_count;
         const order_address = device.bufferAddress(order);
-        cmd.bindPipeline(try renderer.pipelines.get(.particle_sort_keys));
-        cmd.pushConstants(extern struct { frame: u64, particles: u64, order: u64, capacity: u32, count: u32 }{
+        cmd.bindPipeline(try renderer.internal.pipelines.of(particleSortKeysPipeline));
+        cmd.pushConstants(particles_push.SortKeysPush{
             .frame = frame_address,
             .particles = device.bufferAddress(emitter.buffer),
             .order = order_address,
@@ -148,18 +150,18 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         });
         cmd.dispatch((count + 63) / 64, 1, 1);
         cmd.sync(.compute_to_all);
-        cmd.bindPipeline(try renderer.pipelines.get(.particle_sort));
+        cmd.bindPipeline(try renderer.internal.pipelines.of(particleSortPipeline));
         var run: u32 = 2;
         while (run <= count) : (run *= 2) {
             var stride = run / 2;
             while (stride > 0) : (stride /= 2) {
-                cmd.pushConstants(extern struct { order: u64, count: u32, run: u32, stride: u32, pad: u32 = 0 }{ .order = order_address, .count = count, .run = run, .stride = stride });
+                cmd.pushConstants(particles_push.SortPush{ .order = order_address, .count = count, .run = run, .stride = stride });
                 cmd.dispatch((count + 63) / 64, 1, 1);
                 cmd.sync(.compute_to_all);
             }
         }
     }
-    var fallback = std.heap.stackFallback(64 * @sizeOf(Emitter), renderer.gpa);
+    var fallback = std.heap.stackFallback(64 * @sizeOf(Emitter), renderer.internal.gpa);
     const ordering = fallback.get();
     const ordered = try ordering.alloc(Emitter, scene.emitters.items.len);
     defer ordering.free(ordered);
@@ -190,11 +192,11 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
                 .color = &.{ .{ .texture = view.hdr, .load = .load }, .{ .texture = view.motion, .load = .load } },
                 .depth = .{ .texture = view.depth, .load = .load },
             });
-            cmd.bindPipeline(try renderer.pipelines.get(.particle_mesh));
-            cmd.bindIndexBuffer(renderer.indices.get(), 0, .uint32);
+            cmd.bindPipeline(try renderer.internal.pipelines.of(particleMeshPipeline));
+            cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
             mesh_pass = true;
         }
-        cmd.pushConstants(extern struct { frame: u64, emitter: u64, particles: u64, vertex_offset: u32, spin: f32 }{
+        cmd.pushConstants(particles_push.MeshFragmentPush{
             .frame = frame_address,
             .emitter = emitter.frame_params,
             .particles = device.bufferAddress(emitter.buffer),
@@ -206,39 +208,79 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     }
     if (mesh_pass) {
         cmd.endRendering();
-        cmd.transition(view.depth, .shader_read);
     }
     try cmd.beginRendering(.{ .color = &.{ .{ .texture = view.hdr, .load = .load }, .{ .texture = view.motion, .load = .load } } });
-    cmd.bindPipeline(try renderer.pipelines.get(.particles));
+    cmd.bindPipeline(try renderer.internal.pipelines.of(particlesPipeline));
     var total: u32 = 0;
     for (ordered) |handle_value| {
         const emitter = renderer.emitters.table.get(handle_value) orelse continue;
         if (emitter.frame_params == 0) continue;
         if (emitter.trail) |trail| {
-            cmd.bindPipeline(try renderer.pipelines.get(.particle_trails));
-            cmd.pushConstants(extern struct { frame: u64, emitter: u64, particles: u64, depth: u32, pad: u32 = 0, order: u64 = 0, trail: u64 }{
+            cmd.bindPipeline(try renderer.internal.pipelines.of(particleTrailsPipeline));
+            cmd.pushConstants(particles_push.TrailVertexPush{
                 .frame = frame_address,
                 .emitter = emitter.frame_params,
                 .particles = device.bufferAddress(emitter.buffer),
-                .depth = device.textureIndex(view.depth),
+                .depth_texture = device.textureIndex(view.depth),
                 .trail = device.bufferAddress(trail),
             });
             cmd.draw(emitter.capacity * emitter.trail_points * 6, 1, 0, 0);
-            cmd.bindPipeline(try renderer.pipelines.get(.particles));
+            cmd.bindPipeline(try renderer.internal.pipelines.of(particlesPipeline));
         }
         if (emitterMesh(renderer, emitter) != null) continue;
-        cmd.pushConstants(extern struct { frame: u64, emitter: u64, particles: u64, depth: u32, pad: u32 = 0, order: u64 }{
+        cmd.pushConstants(particles_push.SpriteFragmentPush{
             .frame = frame_address,
             .emitter = emitter.frame_params,
             .particles = device.bufferAddress(emitter.buffer),
-            .depth = device.textureIndex(view.depth),
+            .depth_texture = device.textureIndex(view.depth),
             .order = if (emitter.order) |order| device.bufferAddress(order) else 0,
         });
         cmd.draw(emitter.capacity * 6, 1, 0, 0);
         total += emitter.capacity;
     }
     cmd.endRendering();
-    cmd.transition(view.hdr, .shader_read);
-    cmd.transition(view.motion, .shader_read);
-    renderer.stats.particles = total + mesh_total;
+    renderer.internal.stats.particles = total + mesh_total;
+}
+
+fn particleSimPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "particle simulation", .shader = pipelines_module.shaderCode("particle_sim.comp.spv") } };
+}
+
+fn particleSortKeysPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "particle sort keys", .shader = pipelines_module.shaderCode("particle_sort_keys.comp.spv") } };
+}
+
+fn particleSortPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "particle sort", .shader = pipelines_module.shaderCode("particle_sort.comp.spv") } };
+}
+
+fn particlesPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "particles",
+        .vertex = pipelines_module.shaderCode("particle.vert.spv"),
+        .fragment = pipelines_module.shaderCode("particle.frag.spv"),
+        .color_targets = &.{ .{ .format = pipelines_module.hdr_format, .blend = .premultiplied }, .{ .format = .rg16_float, .blend = .alpha } },
+        .cull = .none,
+    } };
+}
+
+fn particleTrailsPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "particle trails",
+        .vertex = pipelines_module.shaderCode("particle_trail.vert.spv"),
+        .fragment = pipelines_module.shaderCode("particle.frag.spv"),
+        .color_targets = &.{ .{ .format = pipelines_module.hdr_format, .blend = .premultiplied }, .{ .format = .rg16_float, .blend = .alpha } },
+        .cull = .none,
+    } };
+}
+
+fn particleMeshPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "mesh particles",
+        .vertex = pipelines_module.shaderCode("particle_mesh.vert.spv"),
+        .fragment = pipelines_module.shaderCode("particle_mesh.frag.spv"),
+        .color_targets = &.{ .{ .format = pipelines_module.hdr_format, .blend = .premultiplied }, .{ .format = .rg16_float, .blend = .alpha } },
+        .depth = .{ .write = true, .compare = .greater_or_equal },
+        .cull = .none,
+    } };
 }

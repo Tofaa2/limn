@@ -1,12 +1,7 @@
 #include "vsm.slang"
 #include "cull_view.slang"
 
-struct MarkPush {
-    FrameConstants frame;
-    VsmData* vsm;
-    uint depth_texture;
-    uint pad;
-};
+#include "vsm_passes.MarkPush.slang"
 
 [[vk::push_constant]] MarkPush mark_push;
 
@@ -29,13 +24,7 @@ void markMain(uint3 id : SV_DispatchThreadID) {
     vsm.requested[vsmSlot(level, page)] = vsm.frame;
 }
 
-struct AllocatePush {
-    FrameConstants frame;
-    VsmData* vsm;
-    uint* views;
-    uint first_page_view;
-    uint pad;
-};
+#include "vsm_passes.AllocatePush.slang"
 
 [[vk::push_constant]] AllocatePush allocate_push;
 
@@ -187,9 +176,7 @@ void allocateMain() {
     }
 }
 
-struct ClearPush {
-    VsmPageView* page_views;
-};
+#include "vsm_passes.ClearPush.slang"
 
 [[vk::push_constant]] ClearPush clear_push;
 

@@ -1,4 +1,8 @@
 //! How see-through surfaces are drawn.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const forward_push = @import("../shaders/push/forward.zig");
+const fullscreen_push = @import("../shaders/push/fullscreen.zig");
+const oit_composite_push = @import("../shaders/push/oit_composite.zig");
 const renderer_state = @import("../state.zig");
 const scene_pass = @import("../scene_pass.zig");
 const render = @import("../renderer.zig");
@@ -56,11 +60,10 @@ fn transparency(ctx: *ViewContext) !void {
 pub fn copyScene(renderer: *Renderer, p: *const ScenePass, copy: rhi.Texture) !void {
     const cmd = p.cmd;
     try cmd.beginRendering(.{ .color = &.{.{ .texture = copy, .load = .discard }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.copy));
-    cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = p.frame_address, .source = renderer.device.textureIndex(p.view.hdr) });
+    cmd.bindPipeline(try renderer.internal.pipelines.of(copyPipeline));
+    cmd.pushConstants(fullscreen_push.CopyPush{ .frame = p.frame_address, .source_texture = renderer.device.textureIndex(p.view.hdr) });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(copy, .shader_read);
 }
 
 /// Draws the scene's blended surfaces as `Settings.transparency.mode` selects.
@@ -93,7 +96,7 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
             .accumulation = try p.keep(renderer, "transparency accumulation", p.width, p.height, render.hdr_format),
             .reveal = try p.keep(renderer, "transparency reveal", p.width, p.height, .r8_unorm),
         };
-        const ForwardPush = extern struct { frame: u64, instance: u32, mode: u32, scene: u32, opaque_depth: u32 = gpu.invalid_id, peel_depth: u32 = gpu.invalid_id, pad: u32 = 0 };
+        const ForwardPush = forward_push.ForwardPush;
         if (peel_targets) |peel| {
             try cmd.beginRendering(.{ .color = &.{.{ .texture = peel.accumulation, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
             cmd.endRendering();
@@ -105,32 +108,29 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
                     .color = &.{.{ .texture = peel.layer, .load = .clear, .clear = .{ 0, 0, 0, 0 } }},
                     .depth = .{ .texture = depth_now, .clear = 0 },
                 });
-                cmd.bindPipeline(try renderer.pipelines.get(.forward_peel));
-                cmd.bindIndexBuffer(renderer.indices.get(), 0, .uint32);
+                cmd.bindPipeline(try renderer.internal.pipelines.of(forwardPeelPipeline));
+                cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
                 for (scene.transparent.items) |draw| {
                     cmd.pushConstants(ForwardPush{
                         .frame = frame_address,
-                        .instance = draw.instance,
+                        .instance_index = draw.instance,
                         .mode = 2,
-                        .scene = behind,
+                        .scene_texture = behind,
                         .opaque_depth = device.textureIndex(view.depth),
                         .peel_depth = if (layer == 0) gpu.invalid_id else device.textureIndex(depth_before),
                     });
                     cmd.drawIndexed(draw.index_count, 1, draw.first_index, 0, 0);
                 }
                 cmd.endRendering();
-                cmd.transition(peel.layer, .shader_read);
-                cmd.transition(depth_now, .shader_read);
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = peel.accumulation, .load = .load }} });
-                cmd.bindPipeline(try renderer.pipelines.get(.peel_under));
-                cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(peel.layer) });
+                cmd.bindPipeline(try renderer.internal.pipelines.of(peelUnderPipeline));
+                cmd.pushConstants(fullscreen_push.CopyPush{ .frame = frame_address, .source_texture = device.textureIndex(peel.layer) });
                 cmd.drawFullscreen();
                 cmd.endRendering();
             }
-            cmd.transition(peel.accumulation, .shader_read);
             try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.peel_composite));
-            cmd.pushConstants(extern struct { frame: u64, source: u32, pad: u32 = 0 }{ .frame = frame_address, .source = device.textureIndex(peel.accumulation) });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(peelCompositePipeline));
+            cmd.pushConstants(fullscreen_push.CopyPush{ .frame = frame_address, .source_texture = device.textureIndex(peel.accumulation) });
             cmd.drawFullscreen();
             cmd.endRendering();
         } else if (oit_targets) |oit| {
@@ -142,29 +142,27 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
                 },
                 .depth = .{ .texture = view.depth, .load = .load },
             });
-            cmd.bindPipeline(try renderer.pipelines.get(.forward_weighted));
-            cmd.bindIndexBuffer(renderer.indices.get(), 0, .uint32);
+            cmd.bindPipeline(try renderer.internal.pipelines.of(forwardWeightedPipeline));
+            cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
             for (scene.transparent.items) |draw| {
-                cmd.pushConstants(ForwardPush{ .frame = frame_address, .instance = draw.instance, .mode = 1, .scene = behind });
+                cmd.pushConstants(ForwardPush{ .frame = frame_address, .instance_index = draw.instance, .mode = 1, .scene_texture = behind });
                 cmd.drawIndexed(draw.index_count, 1, draw.first_index, 0, 0);
             }
             cmd.endRendering();
-            cmd.transition(oit.accumulation, .shader_read);
-            cmd.transition(oit.reveal, .shader_read);
             try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.oit_composite));
-            cmd.pushConstants(extern struct { frame: u64, accumulation: u32, reveal: u32 }{
+            cmd.bindPipeline(try renderer.internal.pipelines.of(oitCompositePipeline));
+            cmd.pushConstants(oit_composite_push.Push{
                 .frame = frame_address,
-                .accumulation = device.textureIndex(oit.accumulation),
-                .reveal = device.textureIndex(oit.reveal),
+                .accumulation_texture = device.textureIndex(oit.accumulation),
+                .reveal_texture = device.textureIndex(oit.reveal),
             });
             cmd.drawFullscreen();
             cmd.endRendering();
         } else {
-            renderer.transparent_order.clearRetainingCapacity();
-            try renderer.transparent_order.appendSlice(renderer.gpa, scene.transparent.items);
-            for (renderer.transparent_order.items) |*draw| draw.depth = -math.transformPoint(view_matrix, draw.center)[2];
-            std.mem.sort(TransparentDraw, renderer.transparent_order.items, {}, struct {
+            renderer.internal.transparent_order.clearRetainingCapacity();
+            try renderer.internal.transparent_order.appendSlice(renderer.internal.gpa, scene.transparent.items);
+            for (renderer.internal.transparent_order.items) |*draw| draw.depth = -math.transformPoint(view_matrix, draw.center)[2];
+            std.mem.sort(TransparentDraw, renderer.internal.transparent_order.items, {}, struct {
                 fn farther(_: void, a: TransparentDraw, b: TransparentDraw) bool {
                     return a.depth > b.depth;
                 }
@@ -174,27 +172,23 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
                 .depth = .{ .texture = view.depth, .load = .load },
             };
             try cmd.beginRendering(forward_target);
-            cmd.bindPipeline(try renderer.pipelines.get(.forward));
-            cmd.bindIndexBuffer(renderer.indices.get(), 0, .uint32);
+            cmd.bindPipeline(try renderer.internal.pipelines.of(forwardPipeline));
+            cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
             var drawn_any = false;
-            for (renderer.transparent_order.items) |draw| {
+            for (renderer.internal.transparent_order.items) |draw| {
                 if (settings.transparency.layered_refraction and draw.transmissive and drawn_any) if (scene_copy) |copy| {
                     cmd.endRendering();
-                    cmd.transition(view.hdr, .shader_read);
                     try copyScene(renderer, p, copy);
                     try cmd.beginRendering(forward_target);
-                    cmd.bindPipeline(try renderer.pipelines.get(.forward));
-                    cmd.bindIndexBuffer(renderer.indices.get(), 0, .uint32);
+                    cmd.bindPipeline(try renderer.internal.pipelines.of(forwardPipeline));
+                    cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
                 };
-                cmd.pushConstants(ForwardPush{ .frame = frame_address, .instance = draw.instance, .mode = 0, .scene = behind });
+                cmd.pushConstants(ForwardPush{ .frame = frame_address, .instance_index = draw.instance, .mode = 0, .scene_texture = behind });
                 cmd.drawIndexed(draw.index_count, 1, draw.first_index, 0, 0);
                 drawn_any = true;
             }
             cmd.endRendering();
         }
-        cmd.transition(view.hdr, .shader_read);
-        cmd.transition(view.motion, .shader_read);
-        cmd.transition(view.depth, .shader_read);
         cmd.endScope();
     }
 }
@@ -202,4 +196,53 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
 /// The scene before see-through surfaces, for them to refract.
 pub fn sceneCopy(renderer: *Renderer, p: *const ScenePass) !rhi.Texture {
     return p.keep(renderer, "scene behind glass", p.width, p.height, render.hdr_format);
+}
+
+fn forwardPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "forward transparent",
+        .vertex = pipelines_module.shaderCode("forward.vert.spv"),
+        .fragment = pipelines_module.shaderCode("forward.frag.spv"),
+        .color_targets = &.{ .{ .format = pipelines_module.hdr_format, .blend = .premultiplied }, .{ .format = .rg16_float, .blend = .alpha } },
+        .depth = .{ .write = false, .compare = .greater_or_equal },
+        .cull = .none,
+    } };
+}
+
+fn forwardWeightedPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "forward transparent (weighted)",
+        .vertex = pipelines_module.shaderCode("forward.vert.spv"),
+        .fragment = pipelines_module.shaderCode("forward_weighted.frag.spv"),
+        .color_targets = &.{ .{ .format = pipelines_module.hdr_format, .blend = .additive }, .{ .format = .rg16_float, .blend = .alpha }, .{ .format = .r8_unorm, .blend = .revealage } },
+        .depth = .{ .write = false, .compare = .greater_or_equal },
+        .cull = .none,
+    } };
+}
+
+fn oitCompositePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("transparency composite", pipelines_module.shaderCode("oit_composite.frag.spv"), &.{.{ .format = pipelines_module.hdr_format, .blend = .alpha }});
+}
+
+fn forwardPeelPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "forward transparent (peel)",
+        .vertex = pipelines_module.shaderCode("forward.vert.spv"),
+        .fragment = pipelines_module.shaderCode("forward_peel.frag.spv"),
+        .color_targets = &.{.{ .format = pipelines_module.hdr_format }},
+        .depth = .{ .write = true, .compare = .greater },
+        .cull = .none,
+    } };
+}
+
+fn peelUnderPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("peel under", pipelines_module.shaderCode("copy.frag.spv"), &.{.{ .format = pipelines_module.hdr_format, .blend = .under }});
+}
+
+fn peelCompositePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("peel composite", pipelines_module.shaderCode("copy.frag.spv"), &.{.{ .format = pipelines_module.hdr_format, .blend = .premultiplied }});
+}
+
+fn copyPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("copy", pipelines_module.shaderCode("copy.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
 }

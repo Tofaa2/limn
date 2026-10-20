@@ -12,20 +12,27 @@ const scratch_alignment = device_module.scratch_alignment;
 /// Most structures that can wait for their compacted size at once.
 pub const compaction_capacity = 512;
 
-fn blasGeometry(self: *Device, desc: types.BlasDesc) vk.AccelerationStructureGeometryKHR {
-    return .{
-        .geometry_type = .triangles_khr,
-        .flags = .{ .opaque_bit_khr = desc.solid },
-        .geometry = .{ .triangles = .{
-            .vertex_format = .r32g32b32_sfloat,
-            .vertex_data = .{ .device_address = self.bufferAddress(desc.vertices) + desc.vertex_offset },
-            .vertex_stride = desc.vertex_stride,
-            .max_vertex = desc.vertex_count - 1,
-            .index_type = .uint32,
-            .index_data = .{ .device_address = self.bufferAddress(desc.indices) + desc.index_offset },
-            .transform_data = .{ .device_address = 0 },
-        } },
-    };
+/// The geometries and triangle counts of `desc`, in `geometries` and
+/// `triangles`; the count of geometries.
+fn blasGeometries(self: *Device, desc: types.BlasDesc, geometries: *[types.max_blas_geometries]vk.AccelerationStructureGeometryKHR, triangles: *[types.max_blas_geometries]u32) !u32 {
+    if (desc.geometries.len == 0 or desc.geometries.len > types.max_blas_geometries) return error.InvalidBlasDesc;
+    for (desc.geometries, 0..) |geometry, index| {
+        geometries[index] = .{
+            .geometry_type = .triangles_khr,
+            .flags = .{ .opaque_bit_khr = geometry.solid },
+            .geometry = .{ .triangles = .{
+                .vertex_format = .r32g32b32_sfloat,
+                .vertex_data = .{ .device_address = self.bufferAddress(geometry.vertices) + geometry.vertex_offset },
+                .vertex_stride = geometry.vertex_stride,
+                .max_vertex = geometry.vertex_count - 1,
+                .index_type = .uint32,
+                .index_data = .{ .device_address = self.bufferAddress(geometry.indices) + geometry.index_offset },
+                .transform_data = .{ .device_address = 0 },
+            } },
+        };
+        triangles[index] = geometry.index_count / 3;
+    }
+    return @intCast(desc.geometries.len);
 }
 
 fn createAcceleration(self: *Device, top_level: bool, size: u64, scratch_size: u64, capacity: u32) !types.AccelerationStructure {
@@ -52,29 +59,32 @@ fn createAcceleration(self: *Device, top_level: bool, size: u64, scratch_size: u
 /// Sized for `desc`; build with `CommandEncoder.buildBlas`.
 pub fn createBlas(self: *Device, desc: types.BlasDesc) !types.AccelerationStructure {
     if (!self.caps.ray_tracing) return error.RayTracingUnavailable;
-    const geometry = blasGeometry(self, desc);
+    var geometries: [types.max_blas_geometries]vk.AccelerationStructureGeometryKHR = undefined;
+    var triangles: [types.max_blas_geometries]u32 = undefined;
+    const count = try blasGeometries(self, desc, &geometries, &triangles);
     var sizes: vk.AccelerationStructureBuildSizesInfoKHR = .{
         .acceleration_structure_size = 0,
         .update_scratch_size = 0,
         .build_scratch_size = 0,
     };
-    const triangles = desc.index_count / 3;
     self.vkd.getAccelerationStructureBuildSizesKHR(.device_khr, &.{
         .type = .bottom_level_khr,
         .flags = .{ .prefer_fast_trace_bit_khr = !desc.dynamic, .prefer_fast_build_bit_khr = desc.dynamic, .allow_update_bit_khr = desc.dynamic, .allow_compaction_bit_khr = !desc.dynamic },
         .mode = .build_khr,
-        .geometry_count = 1,
-        .p_geometries = @ptrCast(&geometry),
+        .geometry_count = count,
+        .p_geometries = &geometries,
         .scratch_data = .{ .device_address = 0 },
-    }, @ptrCast(&triangles), &sizes);
-    const blas = try createAcceleration(self, false, sizes.acceleration_structure_size, sizes.build_scratch_size, triangles);
+    }, &triangles, &sizes);
+    var total: u32 = 0;
+    for (triangles[0..count]) |value| total += value;
+    const blas = try createAcceleration(self, false, sizes.acceleration_structure_size, @max(sizes.build_scratch_size, sizes.update_scratch_size), total);
     self.accelerationResource(blas).dynamic = desc.dynamic;
     self.accelerationResource(blas).compactable = !desc.dynamic;
     return blas;
 }
 
-/// Allocates a top-level structure with room for `max_instances`.
-pub fn createTlas(self: *Device, max_instances: u32) !types.AccelerationStructure {
+/// Allocates a top-level structure with room for `desc.max_instances`.
+pub fn createTlas(self: *Device, desc: types.TlasDesc) !types.AccelerationStructure {
     if (!self.caps.ray_tracing) return error.RayTracingUnavailable;
     const geometry = tlasGeometry(0);
     var sizes: vk.AccelerationStructureBuildSizesInfoKHR = .{
@@ -84,17 +94,23 @@ pub fn createTlas(self: *Device, max_instances: u32) !types.AccelerationStructur
     };
     self.vkd.getAccelerationStructureBuildSizesKHR(.device_khr, &.{
         .type = .top_level_khr,
-        .flags = .{ .prefer_fast_build_bit_khr = true },
+        .flags = tlasFlags(desc.updatable),
         .mode = .build_khr,
         .geometry_count = 1,
         .p_geometries = @ptrCast(&geometry),
         .scratch_data = .{ .device_address = 0 },
-    }, @ptrCast(&max_instances), &sizes);
-    const acceleration = try createAcceleration(self, true, sizes.acceleration_structure_size, sizes.build_scratch_size, max_instances);
+    }, @ptrCast(&desc.max_instances), &sizes);
+    const scratch_size = @max(sizes.build_scratch_size, sizes.update_scratch_size);
+    const acceleration = try createAcceleration(self, true, sizes.acceleration_structure_size, scratch_size, desc.max_instances);
     errdefer self.destroyAcceleration(acceleration);
     const resource = self.accelerationResource(acceleration);
-    resource.scratch = try self.createBuffer(.{ .name = "tlas scratch", .size = sizes.build_scratch_size + scratch_alignment, .usage = .{ .storage = true } });
+    resource.updatable = desc.updatable;
+    resource.scratch = try self.createBuffer(.{ .name = "tlas scratch", .size = scratch_size + scratch_alignment, .usage = .{ .storage = true } });
     return acceleration;
+}
+
+fn tlasFlags(updatable: bool) vk.BuildAccelerationStructureFlagsKHR {
+    return .{ .prefer_fast_build_bit_khr = true, .allow_update_bit_khr = updatable };
 }
 
 /// Deferred like `destroyBuffer`; also releases its buffers.
@@ -121,34 +137,46 @@ pub fn accelerationBuilt(self: *Device, acceleration: types.AccelerationStructur
     return self.accelerationResource(acceleration).built;
 }
 
-/// Called by `CommandEncoder.buildBlas`; use that. `desc` must have the
-/// triangle count the structure was created for. A `dynamic` structure is
-/// refitted after its first build.
-pub fn buildBlasCommand(self: *Device, command: vk.CommandBuffer, blas: types.AccelerationStructure, desc: types.BlasDesc) !void {
-    const resource = self.accelerationResource(blas);
-    const geometry = blasGeometry(self, desc);
-    if (resource.dynamic and resource.scratch == null)
-        resource.scratch = try self.createBuffer(.{ .name = "blas scratch", .size = resource.scratch_size + scratch_alignment, .usage = .{ .storage = true } });
-    const scratch = resource.scratch orelse try self.createBuffer(.{ .name = "blas scratch", .size = resource.scratch_size + scratch_alignment, .usage = .{ .storage = true } });
-    defer if (resource.scratch == null) self.destroyBuffer(scratch);
-    const range = vk.AccelerationStructureBuildRangeInfoKHR{
-        .primitive_count = desc.index_count / 3,
-        .primitive_offset = 0,
-        .first_vertex = 0,
-        .transform_offset = 0,
-    };
-    const ranges = [_][*]const vk.AccelerationStructureBuildRangeInfoKHR{@ptrCast(&range)};
-    self.vkd.cmdBuildAccelerationStructuresKHR(command, &.{.{
-        .type = .bottom_level_khr,
-        .flags = .{ .prefer_fast_trace_bit_khr = !resource.dynamic, .prefer_fast_build_bit_khr = resource.dynamic, .allow_update_bit_khr = resource.dynamic, .allow_compaction_bit_khr = resource.compactable },
-        .mode = if (resource.dynamic and resource.built) .update_khr else .build_khr,
-        .src_acceleration_structure = if (resource.dynamic and resource.built) resource.handle else .null_handle,
-        .dst_acceleration_structure = resource.handle,
-        .geometry_count = 1,
-        .p_geometries = @ptrCast(&geometry),
-        .scratch_data = .{ .device_address = std.mem.alignForward(u64, self.bufferAddress(scratch), scratch_alignment) },
-    }}, &ranges);
-    resource.built = true;
+/// Structures `buildBlasesCommand` records in one call.
+const batch_size = 16;
+
+/// Called by `CommandEncoder.buildBlases`; use that. Each `desc` must have
+/// the geometries and triangle counts its structure was created for. A
+/// `dynamic` structure is refitted after its first build.
+pub fn buildBlasesCommand(self: *Device, command: vk.CommandBuffer, builds: []const types.BlasBuild) !void {
+    var start: usize = 0;
+    while (start < builds.len) : (start += batch_size) {
+        const batch = builds[start..@min(start + batch_size, builds.len)];
+        var geometries: [batch_size][types.max_blas_geometries]vk.AccelerationStructureGeometryKHR = undefined;
+        var triangles: [batch_size][types.max_blas_geometries]u32 = undefined;
+        var ranges: [batch_size][types.max_blas_geometries]vk.AccelerationStructureBuildRangeInfoKHR = undefined;
+        var range_pointers: [batch_size][*]const vk.AccelerationStructureBuildRangeInfoKHR = undefined;
+        var infos: [batch_size]vk.AccelerationStructureBuildGeometryInfoKHR = undefined;
+        for (batch, 0..) |build, index| {
+            const resource = self.accelerationResource(build.blas);
+            const count = try blasGeometries(self, build.desc, &geometries[index], &triangles[index]);
+            for (0..count) |at| ranges[index][at] = .{ .primitive_count = triangles[index][at], .primitive_offset = 0, .first_vertex = 0, .transform_offset = 0 };
+            range_pointers[index] = &ranges[index];
+            if (resource.dynamic and resource.scratch == null)
+                resource.scratch = try self.createBuffer(.{ .name = "blas scratch", .size = resource.scratch_size + scratch_alignment, .usage = .{ .storage = true } });
+            const scratch = resource.scratch orelse try self.createBuffer(.{ .name = "blas scratch", .size = resource.scratch_size + scratch_alignment, .usage = .{ .storage = true } });
+            const scratch_address = std.mem.alignForward(u64, self.bufferAddress(scratch), scratch_alignment);
+            if (resource.scratch == null) self.destroyBuffer(scratch);
+            const refit = resource.dynamic and resource.built;
+            infos[index] = .{
+                .type = .bottom_level_khr,
+                .flags = .{ .prefer_fast_trace_bit_khr = !resource.dynamic, .prefer_fast_build_bit_khr = resource.dynamic, .allow_update_bit_khr = resource.dynamic, .allow_compaction_bit_khr = resource.compactable },
+                .mode = if (refit) .update_khr else .build_khr,
+                .src_acceleration_structure = if (refit) resource.handle else .null_handle,
+                .dst_acceleration_structure = resource.handle,
+                .geometry_count = count,
+                .p_geometries = &geometries[index],
+                .scratch_data = .{ .device_address = scratch_address },
+            };
+            resource.built = true;
+        }
+        self.vkd.cmdBuildAccelerationStructuresKHR(command, infos[0..batch.len], range_pointers[0..batch.len]);
+    }
 }
 
 /// Called by `CommandEncoder.measureBlas`; use that. Asks for the size a
@@ -205,11 +233,14 @@ pub fn compactBlasCommand(self: *Device, command: vk.CommandBuffer, source: type
     to.built = true;
 }
 
-/// Called by `CommandEncoder.buildTlas`, which adds the barriers; use
-/// that. `instance_count` must not exceed the TLAS's `max_instances`.
-pub fn buildTlasCommand(self: *Device, command: vk.CommandBuffer, tlas: types.AccelerationStructure, instances_address: u64, instance_count: u32) void {
+/// Called by `CommandEncoder.buildTlas` and `updateTlas`, which add the
+/// barriers; use those. `instance_count` must not exceed the TLAS's
+/// `max_instances`. `update` is honoured only for an updatable structure
+/// built before with the same instance count.
+pub fn buildTlasCommand(self: *Device, command: vk.CommandBuffer, tlas: types.AccelerationStructure, instances_address: u64, instance_count: u32, update: bool) void {
     const resource = self.accelerationResource(tlas);
     std.debug.assert(instance_count <= resource.capacity);
+    const refit = update and resource.updatable and resource.built and resource.instance_count == instance_count;
     const geometry = tlasGeometry(instances_address);
     const range = vk.AccelerationStructureBuildRangeInfoKHR{
         .primitive_count = instance_count,
@@ -220,13 +251,16 @@ pub fn buildTlasCommand(self: *Device, command: vk.CommandBuffer, tlas: types.Ac
     const ranges = [_][*]const vk.AccelerationStructureBuildRangeInfoKHR{@ptrCast(&range)};
     self.vkd.cmdBuildAccelerationStructuresKHR(command, &.{.{
         .type = .top_level_khr,
-        .flags = .{ .prefer_fast_build_bit_khr = true },
-        .mode = .build_khr,
+        .flags = tlasFlags(resource.updatable),
+        .mode = if (refit) .update_khr else .build_khr,
+        .src_acceleration_structure = if (refit) resource.handle else .null_handle,
         .dst_acceleration_structure = resource.handle,
         .geometry_count = 1,
         .p_geometries = @ptrCast(&geometry),
         .scratch_data = .{ .device_address = std.mem.alignForward(u64, self.bufferAddress(resource.scratch.?), scratch_alignment) },
     }}, &ranges);
+    resource.built = true;
+    resource.instance_count = instance_count;
 }
 
 fn tlasGeometry(instances_address: u64) vk.AccelerationStructureGeometryKHR {

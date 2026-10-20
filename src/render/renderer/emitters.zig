@@ -17,6 +17,13 @@ const EmitterDesc = api.EmitterDesc;
 pub const Emitters = struct {
     table: handle.HandleTable(renderer_state.EmitterData, api.EmitterTag),
 
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.EmitterData) void {
+        owner.device.destroyBuffer(entry.buffer);
+        if (entry.order) |order| owner.device.destroyBuffer(order);
+        if (entry.trail) |trail| owner.device.destroyBuffer(trail);
+    }
+
     fn renderer(emitters: *Emitters) *Renderer {
         return @alignCast(@fieldParentPtr("emitters", emitters));
     }
@@ -80,8 +87,8 @@ pub fn createEmitterLocked(self: *Renderer, scene: Scene, desc: EmitterDesc) !Em
         .usage = .{ .storage = true },
     });
     errdefer self.device.destroyBuffer(buffer);
-    const zeros = try self.gpa.alloc(u8, capacity * @sizeOf(gpu.Particle));
-    defer self.gpa.free(zeros);
+    const zeros = try self.internal.gpa.alloc(u8, capacity * @sizeOf(gpu.Particle));
+    defer self.internal.gpa.free(zeros);
     @memset(zeros, 0);
     try self.device.uploadBuffer(buffer, 0, zeros);
     const order_count = std.math.ceilPowerOfTwo(u32, capacity) catch capacity;
@@ -100,7 +107,7 @@ pub fn createEmitterLocked(self: *Renderer, scene: Scene, desc: EmitterDesc) !Em
     errdefer if (trail) |value| self.device.destroyBuffer(value);
     const emitter = try self.emitters.table.insert(.{ .scene = scene, .desc = desc, .buffer = buffer, .capacity = capacity, .order = order, .order_count = order_count, .trail = trail, .trail_points = trail_points });
     errdefer _ = self.emitters.table.remove(emitter);
-    try data.emitters.append(self.gpa, emitter);
+    try data.emitters.append(self.internal.gpa, emitter);
     return emitter;
 }
 

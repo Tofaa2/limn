@@ -69,12 +69,12 @@ bool lampOnHit(FrameConstants frame, Light* light, float3 position, float3 norma
 float3 lightsOnHit(Tracer tracer, float3 position, float3 normal, float3 albedo) {
     FrameConstants frame = tracer.frame;
     float3 radiance = float3(0.0);
-    uint light_count = min(frame.light_count, max((frame.flags >> 20) & 1023u, 1u));
+    uint light_count = min(frame.lights.light_count, max(frame.gi.bounce_lights, 1u));
     for (uint i = 0u; i < light_count; i++) {
         float3 toward;
         float reach;
         float3 arriving;
-        Light* lamp = &frame.lights.data[i];
+        Light* lamp = &frame.lights.lights.data[i];
         if ((lamp.flags & LIGHT_DIRECTIONAL) == 0u) {
             float3 to_lamp = lamp.position - position;
             float range = lamp.range;
@@ -116,9 +116,9 @@ LitRay traceLit(Tracer tracer, float3 origin, float3 direction, float reach, flo
         if (!rayOccluded(tracer, position + normal * 0.02, frame.sun_direction, 1e4))
             radiance += albedo / PI * frame.sun_radiance * n_dot_l;
     }
-    if ((frame.flags & FRAME_GI_LOCAL_LIGHTS) != 0u) radiance += lightsOnHit(tracer, position, normal, albedo);
-    if ((frame.flags & FRAME_GI) == 0u) {
-        radiance += albedo * ((frame.flags & FRAME_ENVIRONMENT) != 0u
+    if (frame.gi.local_lights != 0u) radiance += lightsOnHit(tracer, position, normal, albedo);
+    if (frame.gi.enabled == 0u) {
+        radiance += albedo * (frame.environment != 0u
             ? sampleCubeLod(frame.env_irradiance, frame.sampler_linear_clamp, normal, 0.0).rgb * frame.env_intensity
             : float3(0.03));
     } else if (probe_light && giCoverage(frame, position) > 0.0) {
@@ -132,21 +132,21 @@ LitRay traceLit(Tracer tracer, float3 origin, float3 direction, float reach, flo
 /// is behind them where the frame asks reflections to include them.
 LitRay tracePicture(Tracer tracer, float3 origin, float3 direction, float reach, float lod) {
     FrameConstants frame = tracer.frame;
-    if ((frame.flags & FRAME_REFLECT_TRANSPARENT) == 0u) return traceLit(tracer, origin, direction, reach, lod, true, RAY_SOLID);
+    if (frame.reflections.transparent == 0u) return traceLit(tracer, origin, direction, reach, lod, true, RAY_SOLID);
     LitRay front = traceLit(tracer, origin, direction, reach, lod, true, RAY_ALL);
     if (front.met != RAY_HIT || front.opacity >= 0.999) return front;
     LitRay beyond = traceLit(tracer, origin + direction * (front.distance + 0.01), direction, max(reach - front.distance, 0.02), lod, true, RAY_SOLID);
     float3 behind = beyond.radiance;
-    if (beyond.met == RAY_MISS && (frame.flags & FRAME_ENVIRONMENT) != 0u)
+    if (beyond.met == RAY_MISS && frame.environment != 0u)
         behind = sampleCubeLod(frame.env_specular, frame.sampler_linear_clamp, direction, lod * 0.5).rgb * frame.env_intensity;
     front.radiance = front.radiance * front.opacity + behind * (1.0 - front.opacity);
     return front;
 }
 
 float3 throughFluids(FrameConstants frame, float3 origin, float3 direction, float distance_seen, float3 radiance) {
-    if ((frame.flags & FRAME_FLUID_RAYS) == 0u || frame.fluids.count == 0u) return radiance;
+    if (frame.fluids.rays == 0u || frame.fluids.list.count == 0u) return radiance;
     float3 ambient = float3(0.0);
-    if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
+    if (frame.environment != 0u)
         ambient = sampleCubeLod(frame.env_irradiance, frame.sampler_linear_clamp, float3(0.0, 1.0, 0.0), 0.0).rgb * frame.env_intensity * 0.5;
     float3 added;
     float through = fluidAlong(frame, origin, direction, distance_seen, ambient, added);

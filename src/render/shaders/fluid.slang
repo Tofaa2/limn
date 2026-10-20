@@ -97,11 +97,11 @@ float3 fireGlow(float temperature) {
 /// How much light reaches `position` from `direction` through the smoke of the
 /// frame's fluids.
 float fluidShadowToward(FrameConstants frame, float3 position, float3 direction, float reach) {
-    if ((SHADE_FEATURES & FEATURE_FLUID_SHADOWS) == 0u || (frame.flags & FRAME_FLUID_SHADOWS) == 0u) return 1.0;
+    if ((SHADE_FEATURES & FEATURE_FLUID_SHADOWS) == 0u || frame.fluids.shadows == 0u) return 1.0;
     float through = 1.0;
-    uint count = frame.fluids.count;
+    uint count = frame.fluids.list.count;
     for (uint i = 0u; i < count; i++) {
-        FluidRef fluid = frame.fluids.fluids[i];
+        FluidRef fluid = frame.fluids.list.fluids[i];
         float4x4 world_to_box = fluid.data.world_to_box;
         float3 origin = mul(world_to_box, float4(position, 1.0)).xyz;
         float3 along = mul(world_to_box, float4(direction, 0.0)).xyz;
@@ -134,9 +134,9 @@ float fluidShadow(FrameConstants frame, float3 position) {
 float fluidAlong(FrameConstants frame, float3 position, float3 direction, float reach, float3 ambient, out float3 added) {
     added = float3(0.0);
     float through = 1.0;
-    uint count = frame.fluids.count;
+    uint count = frame.fluids.list.count;
     for (uint i = 0u; i < count; i++) {
-        FluidRef fluid = frame.fluids.fluids[i];
+        FluidRef fluid = frame.fluids.list.fluids[i];
         float4x4 world_to_box = fluid.data.world_to_box;
         float3 origin = mul(world_to_box, float4(position, 1.0)).xyz;
         float3 along = mul(world_to_box, float4(direction, 0.0)).xyz;

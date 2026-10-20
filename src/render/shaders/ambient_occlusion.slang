@@ -1,12 +1,6 @@
 #include "common.slang"
 
-struct DepthPush {
-    uint source_texture;
-    uint sampler_index;
-    uint first;
-    int source_lod;
-    float4 terms;
-};
+#include "ambient_occlusion.DepthPush.slang"
 
 [[vk::push_constant]] DepthPush depth_push;
 
@@ -30,15 +24,7 @@ float depthMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position)
     return dot(depths, weights) / dot(weights, float4(1.0));
 }
 
-struct GtaoPush {
-    FrameConstants frame;
-    uint depth_texture;
-    uint color_texture;
-    float radius;
-    float intensity;
-    int slice_count;
-    int step_count;
-};
+#include "ambient_occlusion.GtaoPush.slang"
 
 [[vk::push_constant]] GtaoPush gtao_push;
 
@@ -152,15 +138,7 @@ GtaoOutput gtaoMain([[vk::location(0)]] float2 in_uv, float4 pixel : SV_Position
     return result;
 }
 
-struct DenoisePush {
-    FrameConstants frame;
-    uint ao_texture;
-    uint depth_texture;
-    uint history_texture;
-    float history_blend;
-    uint bounce_texture;
-    uint bounce_history_texture;
-};
+#include "ambient_occlusion.DenoisePush.slang"
 
 [[vk::push_constant]] DenoisePush denoise_push;
 

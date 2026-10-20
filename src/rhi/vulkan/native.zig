@@ -50,9 +50,10 @@ pub fn image(source: *rhi.Device, texture: rhi.Texture) Image {
     };
 }
 
-/// The encoder's `VkCommandBuffer`, for an SDK to record into. Call `restore`
-/// once it has.
-pub fn commandBuffer(cmd: *const rhi.CommandEncoder) usize {
+/// The encoder's `VkCommandBuffer`, for an SDK to record into, with every
+/// owed texture back in `shader_read`. Call `restore` once it has.
+pub fn commandBuffer(cmd: *rhi.CommandEncoder) usize {
+    cmd.settle();
     return @intFromEnum(cmd.command);
 }
 

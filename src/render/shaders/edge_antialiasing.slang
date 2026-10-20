@@ -1,9 +1,6 @@
 #include "common.slang"
 
-struct Push {
-    FrameConstants frame;
-    uint source_texture;
-};
+#include "edge_antialiasing.Push.slang"
 
 [[vk::push_constant]] Push push;
 

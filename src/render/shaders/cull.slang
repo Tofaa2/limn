@@ -20,31 +20,7 @@ struct MeshDraw {
 
 static const uint meshlets_per_task = 32u;
 
-struct MeshletPush {
-    FrameConstants frame;
-    CullView view;
-    DrawCommand* commands;
-    uint* counts;
-    uint* visibility;
-    uint ref_count;
-    uint bucket_capacity;
-    uint phase;
-    uint hiz_texture;
-    float2 hiz_size;
-    float4* skin_bounds;
-    uint* seen;
-    uint mark_seen;
-    uint entity_refs;
-    uint* candidates;
-    CullDispatch dispatch;
-    uint* instance_visibility;
-    uint entity_instances;
-    uint masked_capacity;
-    uint seen_total;
-    uint mesh_lists;
-    MeshDraw* mesh_draws;
-    uint* lists;
-};
+#include "cull.MeshletPush.slang"
 
 [[vk::push_constant]] MeshletPush meshlet_push;
 
@@ -217,24 +193,7 @@ struct ImpostorDraw {
     uint first_instance;
 };
 
-struct InstancePush {
-    FrameConstants frame;
-    CullView view;
-    StaticCull* instances;
-    uint* candidates;
-    CullDispatch dispatch;
-    uint* visibility;
-    uint instance_count;
-    uint phase;
-    uint hiz_texture;
-    uint entity_refs;
-    float2 hiz_size;
-    Impostor* impostors;
-    uint* impostor_list;
-    ImpostorDraw* impostor_draw;
-    uint impostor_view;
-    uint push_pad;
-};
+#include "cull.InstancePush.slang"
 
 [[vk::push_constant]] InstancePush instance_push;
 

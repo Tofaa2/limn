@@ -1,16 +1,7 @@
 #include "ray_light.slang"
 #include "common.slang"
 
-struct BakePush {
-    FrameConstants frame;
-    uint64_t tlas;
-    float4x4 transform;
-    uint vertex_offset;
-    uint gathered_texture;
-    uint rounds;
-    uint rays;
-    float reach;
-};
+#include "lightmap.BakePush.slang"
 
 [[vk::push_constant]] BakePush bake_push;
 
@@ -59,7 +50,7 @@ float4 bakeFragmentMain(Varyings input) : SV_Target {
         float3 radiance = seen.radiance;
         if (seen.met == RAY_MISS) {
             radiance = float3(0.0);
-            if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
+            if (frame.environment != 0u)
                 radiance = sampleCubeLod(frame.env_specular, frame.sampler_linear_clamp, direction, 2.0).rgb * frame.env_intensity;
         }
         total += min(radiance, float3(64.0));
@@ -70,10 +61,7 @@ float4 bakeFragmentMain(Varyings input) : SV_Target {
     return float4(lerp(before.rgb, gathered, weight), 1.0);
 }
 
-struct DilatePush {
-    FrameConstants frame;
-    uint source_texture;
-};
+#include "lightmap.DilatePush.slang"
 
 [[vk::push_constant]] DilatePush dilate_push;
 

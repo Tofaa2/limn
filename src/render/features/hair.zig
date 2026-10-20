@@ -1,4 +1,6 @@
 //! Strands of a scene's hair.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const hair_push = @import("../shaders/push/hair.zig");
 const scene_pass = @import("../scene_pass.zig");
 const gpu = @import("../gpu.zig");
 const math = @import("../../math.zig");
@@ -26,22 +28,7 @@ fn drawHairPass(ctx: *ViewContext) !void {
     try drawHair(ctx.renderer, p);
 }
 
-/// Push constants of the hair strand shaders (`HairPush` in hair.slang).
-const HairPush = extern struct {
-    frame: u64,
-    points: u64,
-    previous_points: u64,
-    transform: [16]f32,
-    previous_transform: [16]f32,
-    root_color: [3]f32,
-    root_width: f32,
-    tip_color: [3]f32,
-    tip_width: f32,
-    points_per_strand: u32,
-    roughness: f32,
-    spread: f32,
-    pad: f32 = 0,
-};
+const HairPush = hair_push.HairPush;
 
 /// Must match `Params` in hair.slang.
 const SimulationParams = extern struct {
@@ -113,7 +100,7 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
     if (!any) return;
     cmd.sync(.transfer_to_all);
     cmd.beginScope("hair simulation");
-    cmd.bindPipeline(try renderer.pipelines.get(.hair_simulation));
+    cmd.bindPipeline(try renderer.internal.pipelines.of(hairSimulationPipeline));
     for (p.scene.hairs.items) |handle| {
         const hair = renderer.hairs.table.get(handle) orelse continue;
         const simulation = hair.simulation orelse continue;
@@ -144,7 +131,7 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
             .density_cell_before = if (moving.steps == 0) density_cell else moving.density_cell,
             .density_low_now = density_low,
             .density_cell_now = density_cell,
-            .time = renderer.time,
+            .time = renderer.internal.time,
             .dt = dt,
             .previous_dt = moving.previous_dt,
             .stiffness = simulation.stiffness,
@@ -161,7 +148,7 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
             .density_size = density_size,
             .colliders = hair.colliders,
         };
-        cmd.pushConstants(extern struct { frame: u64, params: u64 }{ .frame = p.frame_address, .params = params.address });
+        cmd.pushConstants(hair_push.SimPush{ .frame = p.frame_address, .params = params.address });
         cmd.dispatch((hair.strands + 63) / 64, 1, 1);
         moving.current = next;
         moving.steps +|= 1;
@@ -180,14 +167,14 @@ pub fn drawHairShadows(renderer: *Renderer, p: *const ScenePass, view_proj: [16]
     const device = renderer.device;
     const cmd = p.cmd;
     if (p.scene.hairs.items.len == 0) return;
-    cmd.bindPipeline(try renderer.pipelines.get(.hair_shadow));
+    cmd.bindPipeline(try renderer.internal.pipelines.of(hairShadowPipeline));
     for (p.scene.hairs.items) |handle| {
         const hair = renderer.hairs.table.get(handle) orelse continue;
         const moving = if (hair.moving) |moving| (if (moving.steps != 0) moving else null) else null;
         const width = hair.desc.width * (if (moving != null) math.maxScale(hair.desc.transform) else 1);
         const spread = hair.desc.spread * (if (moving != null) math.maxScale(hair.desc.transform) else 1);
         const least = texel * 0.75 / (if (moving != null) 1 else @max(math.maxScale(hair.desc.transform), 1e-9));
-        cmd.pushConstants(extern struct { frame: u64, points: u64, page: u64, view_proj: [16]f32, transform: [16]f32, light: [3]f32, root_width: f32, tip_width: f32, least_width: f32, points_per_strand: u32, paged: u32, spread: f32, pad: f32 = 0 }{
+        cmd.pushConstants(hair_push.ShadowPush{
             .frame = p.frame_address,
             .points = device.bufferAddress(if (moving) |state| state.points[state.current] else hair.points),
             .page = page,
@@ -216,7 +203,7 @@ pub fn drawHair(renderer: *Renderer, p: *const ScenePass) !void {
         .color = &.{ .{ .texture = view.hdr, .load = .load }, .{ .texture = view.motion, .load = .load } },
         .depth = .{ .texture = view.depth, .load = .load },
     });
-    cmd.bindPipeline(try renderer.pipelines.get(.hair));
+    cmd.bindPipeline(try renderer.internal.pipelines.of(hairPipeline));
     for (p.scene.hairs.items) |handle| {
         const hair = renderer.hairs.table.get(handle) orelse continue;
         const moving = if (hair.moving) |moving| (if (moving.steps != 0) moving else null) else null;
@@ -240,8 +227,29 @@ pub fn drawHair(renderer: *Renderer, p: *const ScenePass) !void {
         hair.shown_transform = hair.desc.transform;
     }
     cmd.endRendering();
-    cmd.transition(view.hdr, .shader_read);
-    cmd.transition(view.motion, .shader_read);
-    cmd.transition(view.depth, .shader_read);
     cmd.endScope();
+}
+
+fn hairSimulationPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "hair simulation", .shader = pipelines_module.shaderCode("hair_sim.comp.spv") } };
+}
+
+fn hairShadowPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "hair shadow",
+        .vertex = pipelines_module.shaderCode("hair_shadow.vert.spv"),
+        .depth = pipelines_module.shadow_depth,
+        .cull = .none,
+    } };
+}
+
+fn hairPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "hair",
+        .vertex = pipelines_module.shaderCode("hair.vert.spv"),
+        .fragment = pipelines_module.shaderCode("hair.frag.spv"),
+        .color_targets = &.{ .{ .format = pipelines_module.hdr_format, .blend = .premultiplied }, .{ .format = .rg16_float, .blend = .alpha } },
+        .depth = .{ .write = true, .compare = .greater_or_equal },
+        .cull = .none,
+    } };
 }

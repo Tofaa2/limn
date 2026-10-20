@@ -22,6 +22,11 @@ pub const Hairs = struct {
     table: handle.HandleTable(renderer_state.HairState, api.HairTag),
     fields: handle.HandleTable(renderer_state.CollisionFieldState, api.CollisionFieldTag),
 
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.HairState) void {
+        freeHair(owner, entry.*);
+    }
+
     fn renderer(hairs: *Hairs) *Renderer {
         return @alignCast(@fieldParentPtr("hairs", hairs));
     }
@@ -35,8 +40,8 @@ pub const Hairs = struct {
         if (desc.points_per_strand < 2 or desc.points.len < desc.points_per_strand or desc.points.len % desc.points_per_strand != 0) return error.InvalidHair;
         if (desc.simulation != null and desc.points_per_strand > 64) return error.TooManyPointsPerStrand;
         const Point = extern struct { position: [3]f32, along: f32 };
-        const staged = try self.gpa.alloc(Point, desc.points.len);
-        defer self.gpa.free(staged);
+        const staged = try self.internal.gpa.alloc(Point, desc.points.len);
+        defer self.internal.gpa.free(staged);
         const last: f32 = @floatFromInt(desc.points_per_strand - 1);
         for (staged, desc.points, 0..) |*point, position, index| {
             point.* = .{ .position = position, .along = @as(f32, @floatFromInt(index % desc.points_per_strand)) / last };
@@ -54,7 +59,7 @@ pub const Hairs = struct {
         const strands: u32 = @intCast(desc.points.len / desc.points_per_strand);
         const hair = try self.hairs.table.insert(.{ .scene = scene, .desc = kept, .points = points, .stretches = strands * (desc.points_per_strand - 1), .strands = strands });
         errdefer _ = self.hairs.table.remove(hair);
-        try data.hairs.append(self.gpa, hair);
+        try data.hairs.append(self.internal.gpa, hair);
         const state = self.hairs.table.get(hair).?;
         var low: Vec3 = desc.points[0];
         var high: Vec3 = desc.points[0];
@@ -73,10 +78,10 @@ pub const Hairs = struct {
     /// open only downward along its z axis.
     pub fn createCollisionField(hairs: *Hairs, positions: []const [3]f32, indices: []const u32, resolution: u32) !CollisionField {
         const self = hairs.renderer();
-        const field = try collision_field.build(self.gpa, positions, indices, resolution);
-        defer field.deinit(self.gpa);
-        const halves = try self.gpa.alloc(f16, field.distances.len);
-        defer self.gpa.free(halves);
+        const field = try collision_field.build(self.internal.gpa, positions, indices, resolution);
+        defer field.deinit(self.internal.gpa);
+        const halves = try self.internal.gpa.alloc(f16, field.distances.len);
+        defer self.internal.gpa.free(halves);
         for (halves, field.distances) |*half, distance| half.* = @floatCast(distance);
         self.lock();
         defer self.unlock();
@@ -133,13 +138,7 @@ pub const Hairs = struct {
         const self = hairs.renderer();
         self.lock();
         defer self.unlock();
-        const removed = self.hairs.table.remove(hair) orelse return;
-        freeHair(self, removed);
-        const scene = self.scenes.table.get(removed.scene) orelse return;
-        for (scene.hairs.items, 0..) |item, index| if (std.meta.eql(item, hair)) {
-            _ = scene.hairs.orderedRemove(index);
-            break;
-        };
+        render.destroyObject(self, "hairs", "hairs", hair);
     }
 };
 

@@ -197,6 +197,41 @@ const Checks = struct {
         std.log.info("failed pass: reported, and the next frame drew", .{});
     }
 
+    fn placedLightsAndDecals(self: *Checks) !void {
+        const renderer = self.renderer;
+        try renderer.scenes.setLights(self.scene, &.{.{ .position = .{ 0, 2, 0 }, .intensity = 3 }});
+        const first = try renderer.lights.create(self.scene, .{ .position = .{ 1, 2, 0 }, .intensity = 1 });
+        const second = try renderer.lights.create(self.scene, .{ .position = .{ -1, 2, 0 }, .intensity = 2 });
+        renderer.lights.destroy(first);
+        renderer.lights.set(second, .{ .position = .{ -1, 2, 0 }, .intensity = 5 });
+        renderer.lights.destroy(first);
+        const decal = try renderer.decals.create(self.scene, .{ .transform = math.identity, .color = .{ 1, 0, 0, 1 } });
+        try self.draw(2);
+        const data = renderer.scenes.table.get(self.scene).?;
+        if (data.lights.items.len != 2 or data.lights.items[0].intensity != 3 or data.lights.items[1].intensity != 5) return error.PlacedLightsWrong;
+        if (data.decals.items.len != 1) return error.PlacedDecalMissing;
+        renderer.decals.destroy(decal);
+        try renderer.scenes.setLights(self.scene, &.{});
+        renderer.lights.set(second, .{ .position = .{ 0, 0, 0 }, .intensity = 9 });
+        if (data.lights.items.len != 0 or data.decals.items.len != 0 or renderer.lights.table.get(second) != null) return error.PlacedHandlesOutlivedTheirLists;
+        try self.draw(2);
+        std.log.info("placed lights and decals: created, set and destroyed by handle beside the whole list", .{});
+    }
+
+    fn scenePassReads(self: *Checks) !void {
+        var seen = Seen{};
+        const passes: []const gfx.Pass = &.{
+            .{ .stage = .after_opaque, .reads = &.{ .visibility, .ambient_occlusion }, .context = &seen, .run = readingPass },
+            .{ .stage = .after_resolve, .context = &seen, .run = readingPass },
+        };
+        for (0..2) |_| _ = try self.renderer.render(.{ .views = &.{.{ .scene = self.scene, .camera = self.camera, .target = .{ .texture = self.target }, .passes = passes }} });
+        if (seen.stages[@intFromEnum(gfx.PassStage.after_opaque)] != 2 or seen.stages[@intFromEnum(gfx.PassStage.after_resolve)] != 2) return error.ScenePassNotRun;
+        if (!seen.visibility or !seen.ambient_occlusion) return error.PassReadsMissing;
+        if (seen.unasked) return error.PassGotUnaskedReads;
+        try self.draw(2);
+        std.log.info("scene passes: run after opaque and after resolve, with the textures they read", .{});
+    }
+
     fn plainViewPasses(self: *Checks) !void {
         var calls: u32 = 0;
         for ([_]gfx.PassStage{ .after_tonemap, .after_opaque }) |stage| {
@@ -413,6 +448,22 @@ fn fillingPass(context: ?*anyopaque, pass: gfx.PassContext) anyerror!void {
     pass.cmd.endRendering();
 }
 
+const Seen = struct {
+    stages: [std.enums.values(gfx.PassStage).len]u32 = @splat(0),
+    visibility: bool = false,
+    ambient_occlusion: bool = false,
+    unasked: bool = false,
+};
+
+fn readingPass(context: ?*anyopaque, pass: gfx.PassContext) anyerror!void {
+    const seen: *Seen = @ptrCast(@alignCast(context.?));
+    seen.stages[@intFromEnum(pass.stage)] += 1;
+    if (pass.stage == .after_opaque) {
+        seen.visibility = seen.visibility or pass.visibility != null;
+        seen.ambient_occlusion = seen.ambient_occlusion or pass.ambient_occlusion != null;
+    } else if (pass.visibility != null or pass.ambient_occlusion != null) seen.unasked = true;
+}
+
 fn failingPass(_: ?*anyopaque, pass: gfx.PassContext) anyerror!void {
     try pass.cmd.beginRendering(.{ .color = &.{.{ .texture = pass.color, .load = .load }} });
     return error.InjectedFailure;
@@ -506,6 +557,8 @@ pub fn main(init: std.process.Init) !void {
     try checks.threads();
     try checks.failedPass();
     try checks.plainViewPasses();
+    try checks.scenePassReads();
+    try checks.placedLightsAndDecals();
     try checks.shaderReload();
     try checks.streaming();
     try checks.compaction();

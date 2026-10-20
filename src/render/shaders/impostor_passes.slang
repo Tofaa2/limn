@@ -2,13 +2,7 @@
 #include "common.slang"
 #include "shading.slang"
 
-struct DrawPush {
-    FrameConstants frame;
-    Impostor* impostors;
-    StaticCull* instances;
-    uint* list;
-    uint entity_instances;
-};
+#include "impostor_passes.DrawPush.slang"
 
 [[vk::push_constant]] DrawPush draw_push;
 
@@ -56,13 +50,7 @@ DrawVaryings drawMain(uint vertex : SV_VulkanVertexID, uint copy_index : SV_Vulk
     return result;
 }
 
-struct ShadePush {
-    FrameConstants frame;
-    Impostor* impostors;
-    StaticCull* instances;
-    uint* list;
-    uint entity_instances;
-};
+#include "impostor_passes.ShadePush.slang"
 
 [[vk::push_constant]] ShadePush shade_push;
 
@@ -110,18 +98,7 @@ Output shadeMain(
     return result;
 }
 
-struct BakePush {
-    FrameConstants frame;
-    float4x4 node;
-    float3 center;
-    float radius;
-    float3 right;
-    uint vertex_offset;
-    float3 up;
-    uint material;
-    float3 toward;
-    float pad;
-};
+#include "impostor_passes.BakePush.slang"
 
 [[vk::push_constant]] BakePush bake_push;
 

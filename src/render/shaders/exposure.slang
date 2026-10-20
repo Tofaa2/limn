@@ -1,17 +1,6 @@
 #include "common.slang"
 
-struct Push {
-    FrameConstants frame;
-    uint source_texture;
-    uint automatic;
-    float compensation;
-    float min_luminance;
-    float max_luminance;
-    float speed;
-    uint reset;
-    uint depth_texture;
-    float focus_speed;
-};
+#include "exposure.Push.slang"
 
 [[vk::push_constant]] Push push;
 

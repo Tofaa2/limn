@@ -39,8 +39,8 @@ float cloudDensity(CloudData clouds, uint s, float3 position, float altitude, bo
 }
 
 float cloudShadow(FrameConstants frame, float3 position) {
-    if ((SHADE_FEATURES & FEATURE_CLOUD_SHADOWS) == 0u || (frame.flags & FRAME_CLOUD_SHADOWS) == 0u) return 1.0;
-    CloudData clouds = *frame.clouds.data;
+    if ((SHADE_FEATURES & FEATURE_CLOUD_SHADOWS) == 0u || frame.clouds.shadows == 0u) return 1.0;
+    CloudData clouds = *frame.clouds.layer.data;
     float3 to_sun = frame.sun_direction;
     float altitude = lerp(clouds.bottom, clouds.top, 0.3);
     if (to_sun.y < 0.03 || position.y >= altitude) return 1.0;

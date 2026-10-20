@@ -49,6 +49,13 @@ pub const Slot = enum {
     ambient_occlusion,
     /// Light bounced off nearby surfaces, found with the occlusion.
     occluder_light,
+    /// Light from the irradiance probes gathered at a reduced resolution,
+    /// which shading upsamples; absent when shading reads the probes itself.
+    diffuse_gi,
+    /// What shading writes for the reflection technique: each surface's
+    /// mirror weight and roughness, and its normal and sky visibility.
+    reflection_weight,
+    reflection_surface,
     /// The view's output, in display colors.
     picture,
 };
@@ -308,7 +315,7 @@ pub const Graph = struct {
 
     /// Runs the planned passes. Targets a pass names are in the shader-read
     /// state when it runs, apart from the attachments rendering has begun
-    /// into, and are returned to it afterwards.
+    /// into; what it writes besides attachments is returned to it afterwards.
     pub fn execute(self: *Graph, gpa: std.mem.Allocator, device: *rhi.Device, cmd: *rhi.CommandEncoder, pool: *targets.Pool, frame: u64) !void {
         const planned = try self.plan();
         var held: [max_targets]bool = @splat(false);
@@ -339,8 +346,6 @@ pub const Graph = struct {
             if (attached) cmd.endRendering();
             if (pass.scope) cmd.endScope();
             try outcome;
-            for (self.colored(pass.color)) |color| cmd.transition(self.texture(color.target), .shader_read);
-            if (pass.depth) |depth| cmd.transition(self.texture(depth.target), .shader_read);
             for (self.linked(pass.writes)) |target| cmd.transition(self.texture(target), .shader_read);
             for (self.nodes[0..self.node_count], 0..) |made, target| {
                 if (!held[target] or made.last != step) continue;

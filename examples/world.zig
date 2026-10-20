@@ -151,7 +151,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("device: {s}", .{renderer.device.name()});
 
     const scene = try renderer.scenes.create();
-    const environment = try renderer.environments.load("examples/assets/world/venice_sunset_2k.hdr", .{ .max_radiance = 24 });
+    const environment = try renderer.environments.load(.{ .path = "examples/assets/world/venice_sunset_2k.hdr", .max_radiance = 24 });
     const sponza = try renderer.models.load("examples/assets/world/Sponza.glb");
     const robot = try renderer.models.load("examples/assets/world/RobotExpressive.glb");
     renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 1.0 });

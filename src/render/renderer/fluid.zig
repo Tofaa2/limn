@@ -22,6 +22,11 @@ const FluidState = renderer_state.FluidState;
 pub const Fluids = struct {
     table: handle.HandleTable(renderer_state.FluidState, api.FluidTag),
 
+    /// Frees what one of them holds, as when the renderer is destroyed.
+    pub fn free(owner: *Renderer, entry: *renderer_state.FluidState) void {
+        destroyFluidTextures(owner, entry);
+    }
+
     fn renderer(fluids: *Fluids) *Renderer {
         return @alignCast(@fieldParentPtr("fluids", fluids));
     }
@@ -41,7 +46,7 @@ pub const Fluids = struct {
         errdefer destroyFluidTextures(self, &state);
         const fluid = try self.fluids.table.insert(state);
         errdefer _ = self.fluids.table.remove(fluid);
-        try data.fluids.append(self.gpa, fluid);
+        try data.fluids.append(self.internal.gpa, fluid);
         return fluid;
     }
 
@@ -162,24 +167,18 @@ pub const Fluids = struct {
         const self = fluids.renderer();
         self.lock();
         defer self.unlock();
-        var removed = self.fluids.table.remove(fluid) orelse return;
-        destroyFluidTextures(self, &removed);
-        const scene = self.scenes.table.get(removed.scene) orelse return;
-        for (scene.fluids.items, 0..) |item, index| if (std.meta.eql(item, fluid)) {
-            _ = scene.fluids.orderedRemove(index);
-            break;
-        };
+        render.destroyObject(self, "fluids", "fluids", fluid);
     }
 };
 
 /// Writes a half-float, linear, straight-alpha texture as an 8-bit
 /// sRGB PNG.
 fn saveHdrPicture(self: *Renderer, texture: rhi.Texture, width: u32, height: u32, path: []const u8) !void {
-    const raw = try self.device.readTexture(self.gpa, texture);
-    defer self.gpa.free(raw);
+    const raw = try self.device.readTexture(self.internal.gpa, texture);
+    defer self.internal.gpa.free(raw);
     const count = @as(usize, width) * height;
-    const pixels = try self.gpa.alloc(u8, count * 4);
-    defer self.gpa.free(pixels);
+    const pixels = try self.internal.gpa.alloc(u8, count * 4);
+    defer self.internal.gpa.free(pixels);
     for (0..count) |index| {
         inline for (0..4) |channel| {
             const half: f16 = @bitCast(std.mem.readInt(u16, raw[index * 8 + channel * 2 ..][0..2], .little));
@@ -188,7 +187,7 @@ fn saveHdrPicture(self: *Renderer, texture: rhi.Texture, width: u32, height: u32
             pixels[index * 4 + channel] = @intFromFloat(encoded * 255 + 0.5);
         }
     }
-    try png.write(self.gpa, self.io, path, .{ .width = width, .height = height, .pixels = pixels });
+    try png.write(self.internal.gpa, self.internal.io, path, .{ .width = width, .height = height, .pixels = pixels });
 }
 
 fn createFluidTextures(self: *Renderer, state: *FluidState) !void {

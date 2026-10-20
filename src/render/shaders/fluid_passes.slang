@@ -4,13 +4,7 @@
 #include "gi.slang"
 #include "media.slang"
 
-struct AdvectPush {
-    FluidRef fluid;
-    uint velocity_texture;
-    uint scalars_texture;
-    uint carried_texture;
-    uint carried_velocity_texture;
-};
+#include "fluid_passes.AdvectPush.slang"
 
 [[vk::push_constant]] AdvectPush advect_push;
 
@@ -105,11 +99,7 @@ AdvectOutput advectMain(float4 fragment : SV_Position) {
     return result;
 }
 
-struct CarryPush {
-    FluidRef fluid;
-    uint velocity_texture;
-    uint scalars_texture;
-};
+#include "fluid_passes.CarryPush.slang"
 
 [[vk::push_constant]] CarryPush carry_push;
 
@@ -135,10 +125,7 @@ CarryOutput carryMain(float4 fragment : SV_Position) {
     return result;
 }
 
-struct CurlPush {
-    FluidRef fluid;
-    uint velocity_texture;
-};
+#include "fluid_passes.CurlPush.slang"
 
 [[vk::push_constant]] CurlPush curl_push;
 
@@ -163,10 +150,7 @@ float4 curlMain(float4 fragment : SV_Position) : SV_Target {
     return float4(curl, length(curl));
 }
 
-struct DivergencePush {
-    FluidRef fluid;
-    uint velocity_texture;
-};
+#include "fluid_passes.DivergencePush.slang"
 
 [[vk::push_constant]] DivergencePush divergence_push;
 
@@ -186,12 +170,7 @@ float4 divergenceMain(float4 fragment : SV_Position) : SV_Target {
     return float4(0.5 * divergence, 0.0, 0.0, 0.0);
 }
 
-struct ForcePush {
-    FluidRef fluid;
-    uint velocity_texture;
-    uint scalars_texture;
-    uint curl_texture;
-};
+#include "fluid_passes.ForcePush.slang"
 
 [[vk::push_constant]] ForcePush force_push;
 
@@ -225,11 +204,7 @@ float4 forceMain(float4 fragment : SV_Position) : SV_Target {
     return float4(velocity, 0.0);
 }
 
-struct PressurePush {
-    FluidRef fluid;
-    uint pressure_texture;
-    uint divergence_texture;
-};
+#include "fluid_passes.PressurePush.slang"
 
 [[vk::push_constant]] PressurePush pressure_push;
 
@@ -253,11 +228,7 @@ float4 pressureMain(float4 fragment : SV_Position) : SV_Target {
     return float4((total - divergence.r) / neighbours, 0.0, 0.0, 0.0);
 }
 
-struct ProjectPush {
-    FluidRef fluid;
-    uint velocity_texture;
-    uint pressure_texture;
-};
+#include "fluid_passes.ProjectPush.slang"
 
 [[vk::push_constant]] ProjectPush project_push;
 
@@ -297,12 +268,7 @@ float4 projectMain(float4 fragment : SV_Position) : SV_Target {
 #ifdef RAY_TRACED
 #endif
 
-struct SolidPush {
-    FluidRef fluid;
-#ifdef RAY_TRACED
-    uint64_t tlas;
-#endif
-};
+#include "fluid_passes.SolidPush.slang"
 
 [[vk::push_constant]] SolidPush solid_push;
 
@@ -343,13 +309,7 @@ float4 solidMain(float4 fragment : SV_Position) : SV_Target {
     return float4(solid);
 }
 
-struct LightPush {
-    FluidRef fluid;
-    Light* lights;
-    uint index;
-    float scale;
-    float tall;
-};
+#include "fluid_passes.LightPush.slang"
 
 [[vk::push_constant]] LightPush light_push;
 
@@ -391,9 +351,7 @@ void lightMain() {
     light.color = mean_glow * fluid.data.fire_color * (fluid.data.fire_intensity * volume * light_push.scale);
 }
 
-struct PresentPush {
-    FluidRef fluid;
-};
+#include "fluid_passes.PresentPush.slang"
 
 [[vk::push_constant]] PresentPush present_push;
 
@@ -417,10 +375,7 @@ float4 presentMain([[vk::location(0)]] float2 in_uv) : SV_Target {
     return float4(color / max(alpha, 1e-4), alpha);
 }
 
-struct MotionPush {
-    FrameConstants frame;
-    uint source_texture;
-};
+#include "fluid_passes.MotionPush.slang"
 
 [[vk::push_constant]] MotionPush motion_push;
 
@@ -433,16 +388,7 @@ static const uint MAX_FLUIDS = 8u;
 
 static const uint MAX_FLUID_LAMPS = 16u;
 
-struct VolumePush {
-    FrameConstants frame;
-    uint depth_texture;
-    uint count;
-    int steps;
-    int light_steps;
-    uint motion;
-    uint motion_pad;
-    FluidRef fluids[MAX_FLUIDS];
-};
+#include "fluid_passes.VolumePush.slang"
 
 [[vk::push_constant]] VolumePush volume_push;
 
@@ -496,7 +442,7 @@ VolumeOutput volumeMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_P
     float3 moving_position = float3(0.0);
     float3 moving_velocity = float3(0.0);
     float moving_weight = 0.0;
-    if ((frame.flags & FRAME_ENVIRONMENT) != 0u) {
+    if (frame.environment != 0u) {
         uint s = frame.sampler_linear_clamp;
         sky_ambient = 0.5 * (sampleCubeLod(frame.env_irradiance, s, float3(0.0, 1.0, 0.0), 0.0).rgb +
             sampleCubeLod(frame.env_irradiance, s, float3(0.0, -1.0, 0.0), 0.0).rgb) * frame.env_intensity;
@@ -520,9 +466,9 @@ VolumeOutput volumeMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_P
 
         float3 middle = mul(box_to_world, float4(0.5, 0.5, 0.5, 1.0)).xyz;
         float3 ambient = sky_ambient;
-        if ((frame.flags & FRAME_GI) != 0u) {
+        if (frame.gi.enabled != 0u) {
             float coverage = giCoverage(frame, middle);
-            if (coverage > 0.0) ambient = lerp(sky_ambient, giAmbient(frame, middle) * frame.gi_intensity, coverage);
+            if (coverage > 0.0) ambient = lerp(sky_ambient, giAmbient(frame, middle) * frame.gi.gi_intensity, coverage);
         }
         ambient *= fluid.data.ambient;
         float3 sun = frame.sun_radiance * henyeyGreenstein(dot(direction, frame.sun_direction), fluid.data.anisotropy);
@@ -533,8 +479,8 @@ VolumeOutput volumeMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_P
         uint near_lights[MAX_FLUID_LAMPS];
         uint near_count = 0u;
         float box_radius = 0.5 * length(matrixColumn(box_to_world, 0) + matrixColumn(box_to_world, 1) + matrixColumn(box_to_world, 2));
-        for (uint i = 0u; i < frame.light_count && near_count < MAX_FLUID_LAMPS; i++) {
-            Light light = frame.lights.data[i];
+        for (uint i = 0u; i < frame.lights.light_count && near_count < MAX_FLUID_LAMPS; i++) {
+            Light light = frame.lights.lights.data[i];
             if ((light.flags & LIGHT_DIRECTIONAL) != 0u) continue;
             if (distance(light.position, middle) < light.range + box_radius) near_lights[near_count++] = i;
         }
@@ -561,7 +507,7 @@ VolumeOutput volumeMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_P
                 light += sun * exp(-optical_depth * self_shadow) * cascadeVisibility(frame, position) * cloudShadow(frame, position);
             }
             for (uint k = 0u; k < near_count && sigma > 1e-4; k++) {
-                Light lamp = frame.lights.data[near_lights[k]];
+                Light lamp = frame.lights.lights.data[near_lights[k]];
                 float3 to_lamp = lamp.position - position;
                 float distance_squared = dot(to_lamp, to_lamp);
                 float range_squared = lamp.range * lamp.range;

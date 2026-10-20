@@ -1,4 +1,7 @@
 //! Volumetric clouds of a scene that has them.
+const rhi = @import("../../rhi/rhi.zig");
+const pipelines_module = @import("../renderer/pipelines.zig");
+const cloud_passes_push = @import("../shaders/push/cloud_passes.zig");
 const scene_pass = @import("../scene_pass.zig");
 const render = @import("../renderer.zig");
 const gpu = @import("../gpu.zig");
@@ -45,6 +48,15 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
 
 /// Adds the feature's passes to a view of a scene. A path traced view leaves
 /// out those whose result the tracer replaces.
+/// Writes the scene's clouds for the shaders that read them.
+pub fn prepare(ctx: *ViewContext) !void {
+    const p = ctx.scene orelse return;
+    const address = try prepareClouds(ctx.renderer, p);
+    p.shared.cloud_address = address;
+    ctx.constants.clouds.layer = address;
+    if (address != 0 and p.scene.clouds.?.shadow > 0) ctx.constants.clouds.shadows = 1;
+}
+
 pub fn declare(ctx: *ViewContext) !void {
     if (ctx.scene == null) return;
     const g = ctx.graph;
@@ -71,7 +83,7 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
     var cloud_address: u64 = 0;
     if (scene.clouds != null and settings.clouds != null) clouds: {
         const layer = scene.clouds orelse break :clouds;
-        if (renderer.cloud_noise == null) {
+        if (renderer.internal.cloud_noise == null) {
             const noise = try device.createTexture(.{
                 .name = "cloud noise",
                 .width = cloud_noise_size[0] * cloud_noise_tiles,
@@ -79,32 +91,31 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
                 .format = .rgba8_unorm,
                 .usage = .{ .sampled = true, .color_attachment = true },
             });
-            renderer.cloud_noise = noise;
+            renderer.internal.cloud_noise = noise;
             try cmd.beginRendering(.{ .color = &.{.{ .texture = noise, .load = .discard }} });
-            cmd.bindPipeline(try renderer.pipelines.get(.cloud_noise));
-            cmd.pushConstants(extern struct { size: [3]i32, tiles_x: i32 }{ .size = cloud_noise_size, .tiles_x = cloud_noise_tiles });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(cloudNoisePipeline));
+            cmd.pushConstants(cloud_passes_push.NoisePush{ .size = cloud_noise_size, .tiles_x = cloud_noise_tiles });
             cmd.drawFullscreen();
             cmd.endRendering();
-            cmd.transition(noise, .shader_read);
         }
         const period = 9000 * @max(layer.scale, 0.01);
-        if (scene.cloud_time != renderer.time) {
-            const elapsed = renderer.time - scene.cloud_time;
+        if (scene.cloud_time != renderer.internal.time) {
+            const elapsed = renderer.internal.time - scene.cloud_time;
             inline for (0..3) |axis| scene.cloud_drift[axis] = @mod(scene.cloud_drift[axis] + @as(f64, layer.wind[axis]) * elapsed, period * 64);
-            scene.cloud_time = renderer.time;
+            scene.cloud_time = renderer.internal.time;
         }
         var offset: Vec3 = undefined;
         inline for (0..3) |axis| offset[axis] = @floatCast(@mod(scene.origin[axis] - scene.cloud_drift[axis], period * 64));
         const cloud_width = ScenePass.scaled(filled(settings.clouds).resolution, p.width);
         const cloud_height = ScenePass.scaled(filled(settings.clouds).resolution, p.height);
-        const targets = try p.view_data.kept.history(renderer.gpa, device, .{ .name = "clouds", .width = cloud_width, .height = cloud_height, .format = render.hdr_format, .usage = .{ .sampled = true, .color_attachment = true } }, renderer.frame_index);
+        const targets = try p.view_data.kept.history(renderer.internal.gpa, device, .{ .name = "clouds", .width = cloud_width, .height = cloud_height, .format = render.hdr_format, .usage = .{ .sampled = true, .color_attachment = true } }, renderer.internal.frame_index);
         const bottom = @max(layer.bottom, 0);
         const bottom_altitude: f64 = bottom;
-        if (layer.lightning > 0 and renderer.time - scene.flash_start > 0.6 and renderer.time != scene.flash_checked) {
-            var random = std.Random.DefaultPrng.init(renderer.frame_index *% 0x9e3779b97f4a7c15 +% 0x51ed);
+        if (layer.lightning > 0 and renderer.internal.time - scene.flash_start > 0.6 and renderer.internal.time != scene.flash_checked) {
+            var random = std.Random.DefaultPrng.init(renderer.internal.frame_index *% 0x9e3779b97f4a7c15 +% 0x51ed);
             const draw = random.random();
             if (draw.float(f32) < layer.lightning / 60.0 * delta_time) {
-                scene.flash_start = renderer.time;
+                scene.flash_start = renderer.internal.time;
                 scene.flash_position = .{
                     scene.origin[0] + desc.camera.position[0] + (draw.float(f32) - 0.5) * 8000,
                     bottom_altitude + @max(layer.thickness, 1) * (0.3 + 0.4 * draw.float(f32)),
@@ -112,9 +123,9 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
                 };
             }
         }
-        scene.flash_checked = renderer.time;
+        scene.flash_checked = renderer.internal.time;
         scene.flash_brightness = 0;
-        const flash_age = renderer.time - scene.flash_start;
+        const flash_age = renderer.internal.time - scene.flash_start;
         if (layer.lightning > 0 and flash_age >= 0 and flash_age < 0.6) {
             for ([_]f32{ 0, 0.11, 0.19 }) |stroke| {
                 if (flash_age >= stroke) scene.flash_brightness += @exp(-(flash_age - stroke) * 22);
@@ -141,7 +152,7 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             .max_distance = @max(filled(settings.clouds).distance, 100),
             .variation = std.math.clamp(layer.variation, 0, 2),
             .ambient = @max(layer.ambient, 0),
-            .noise = device.textureIndex(renderer.cloud_noise.?),
+            .noise = device.textureIndex(renderer.internal.cloud_noise.?),
             .steps = @intCast(std.math.clamp(filled(settings.clouds).steps, 8, 256)),
             .light_steps = @intCast(std.math.clamp(filled(settings.clouds).light_steps, 1, 16)),
             .history = if (targets.previous != null and filled(settings.clouds).temporal_filter) device.textureIndex(targets.previous.?) else gpu.invalid_id,
@@ -156,14 +167,14 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
         cloud_address = params.address;
         if (scene.environment) |handle_value| if (renderer.environments.table.get(handle_value)) |sky_entry| {
             if ((sky_entry.sky_desc != null or sky_entry.state == .ready) and layer.environment_interval > 0 and
-                (sky_entry.clouds == null or renderer.time - sky_entry.cloud_bake_time >= layer.environment_interval))
+                (sky_entry.clouds == null or renderer.internal.time - sky_entry.cloud_bake_time >= layer.environment_interval))
             {
                 sky_entry.clouds = params.items[0];
-                sky_entry.cloud_bake_time = renderer.time;
+                sky_entry.cloud_bake_time = renderer.internal.time;
                 sky_entry.cloud_to_sun = math.scale(math.normalize(scene.sun.direction), -1);
                 sky_entry.cloud_sunlight = math.scale(scene.sun.color, scene.sun.intensity);
                 sky_entry.sky_dirty = true;
-                renderer.skies_dirty = true;
+                renderer.internal.skies_dirty = true;
             }
         };
     }
@@ -171,7 +182,7 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
         if (sky_entry.clouds != null) {
             sky_entry.clouds = null;
             sky_entry.sky_dirty = true;
-            renderer.skies_dirty = true;
+            renderer.internal.skies_dirty = true;
         }
     };
     return cloud_address;
@@ -183,20 +194,29 @@ pub fn drawClouds(renderer: *Renderer, p: *const ScenePass, cloud_address: u64) 
     const cmd = p.cmd;
     const view = p.view;
     const frame_address = p.frame_address;
-    const current = p.view_data.kept.latest("clouds", renderer.frame_index).?;
+    const current = p.view_data.kept.latest("clouds", renderer.internal.frame_index).?;
     cmd.beginScope("clouds");
-    const CloudPush = extern struct { frame: u64, clouds: u64, texture: u32 = 0, pad: u32 = 0 };
     try cmd.beginRendering(.{ .color = &.{.{ .texture = current, .load = .discard }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.cloud));
-    cmd.pushConstants(CloudPush{ .frame = frame_address, .clouds = cloud_address });
+    cmd.bindPipeline(try renderer.internal.pipelines.of(cloudPipeline));
+    cmd.pushConstants(cloud_passes_push.MarchPush{ .frame = frame_address, .clouds = cloud_address });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(current, .shader_read);
     try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
-    cmd.bindPipeline(try renderer.pipelines.get(.cloud_composite));
-    cmd.pushConstants(CloudPush{ .frame = frame_address, .clouds = cloud_address, .texture = device.textureIndex(current) });
+    cmd.bindPipeline(try renderer.internal.pipelines.of(cloudCompositePipeline));
+    cmd.pushConstants(cloud_passes_push.CompositePush{ .frame = frame_address, .clouds = cloud_address, .cloud_texture = device.textureIndex(current) });
     cmd.drawFullscreen();
     cmd.endRendering();
-    cmd.transition(view.hdr, .shader_read);
     cmd.endScope();
+}
+
+fn cloudNoisePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("cloud noise", pipelines_module.shaderCode("cloud_noise.frag.spv"), &.{.{ .format = .rgba8_unorm }});
+}
+
+fn cloudPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("clouds", pipelines_module.shaderCode("cloud.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+fn cloudCompositePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("cloud composite", pipelines_module.shaderCode("cloud_composite.frag.spv"), &.{.{ .format = pipelines_module.hdr_format, .blend = .premultiplied }});
 }

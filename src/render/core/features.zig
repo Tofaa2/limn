@@ -108,6 +108,9 @@ pub const Resolve = struct {
     upscaler: api.Upscaler = .temporal,
     /// How the device would path trace.
     path_tracing: api.PathTracingSupport = .unavailable,
+    /// Set by a feature's `resolve` when the view traces rays through the
+    /// scene, which then keeps its ray tracing structure.
+    rays: bool = false,
     downgrades: *Downgrades,
 
     /// Records that `feature` was asked for `requested` and gets `used`.
@@ -130,6 +133,15 @@ pub const Downgrades = struct {
     }
 };
 
+/// Runs each feature's `prepare`, in list order, for a view of a scene:
+/// what passes of other features read and the feature's own frame
+/// constants are set there, before any feature declares its passes.
+pub fn prepare(ctx: *ViewContext) !void {
+    inline for (list) |Feature| {
+        if (@hasDecl(Feature, "prepare")) try Feature.prepare(ctx);
+    }
+}
+
 /// Fills each feature's settings in with what the view will really get.
 pub fn resolve(settings: *api.Settings, r: *Resolve) void {
     inline for (list) |Feature| {
@@ -150,6 +162,17 @@ pub fn declare(ctx: *ViewContext) !void {
 
 /// One view of one frame, as features see it while they add their passes
 /// and while those run.
+/// `Feature`'s state for `view`, made by `Feature.View.init` on first use.
+pub fn stateOf(view: *renderer_state.ViewData, device: *rhi.Device, comptime Feature: type) !*Feature.View {
+    inline for (list, 0..) |Listed, at| {
+        if (Listed != Feature) continue;
+        const slot = &view.features[at];
+        if (slot.* == null) slot.* = try Feature.View.init(device);
+        return &slot.*.?;
+    }
+    @compileError("not a listed feature");
+}
+
 pub const ViewContext = struct {
     renderer: *render.Renderer,
     device: *rhi.Device,
@@ -171,6 +194,8 @@ pub const ViewContext = struct {
     frame_address: u64,
     /// Set on a view of a scene.
     scene: ?*const scene_pass.ScenePass = null,
+    /// A feature asked for rays through the scene; see `Resolve.rays`.
+    rays: bool = false,
 
     /// Room for a pass's context, valid until the graph has run.
     pub fn make(self: *ViewContext, comptime T: type) !*T {
@@ -180,19 +205,13 @@ pub const ViewContext = struct {
     /// `Feature`'s state for this view, made by `Feature.View.init` on
     /// first use.
     pub fn state(self: *ViewContext, comptime Feature: type) !*Feature.View {
-        inline for (list, 0..) |Listed, at| {
-            if (Listed != Feature) continue;
-            const slot = &self.view.?.features[at];
-            if (slot.* == null) slot.* = try Feature.View.init(self.device);
-            return &slot.*.?;
-        }
-        @compileError("not a listed feature");
+        return stateOf(self.view.?, self.device, Feature);
     }
 
     /// A target kept for this view from frame to frame; see `targets.Kept`.
     pub fn kept(self: *ViewContext, desc: rhi.TextureDesc) !Target {
         const view = self.view.?;
-        return self.graph.import(try view.kept.single(self.renderer.gpa, self.device, desc, self.renderer.frame_index));
+        return self.graph.import(try view.kept.single(self.renderer.internal.gpa, self.device, desc, self.renderer.internal.frame_index));
     }
 
     pub const History = struct { current: Target, previous: ?Target };
@@ -200,7 +219,7 @@ pub const ViewContext = struct {
     /// A kept target to draw this frame and the one drawn last frame.
     pub fn history(self: *ViewContext, desc: rhi.TextureDesc) !History {
         const view = self.view.?;
-        const pair = try view.kept.history(self.renderer.gpa, self.device, desc, self.renderer.frame_index);
+        const pair = try view.kept.history(self.renderer.internal.gpa, self.device, desc, self.renderer.internal.frame_index);
         return .{
             .current = try self.graph.import(pair.current),
             .previous = if (pair.previous) |previous| try self.graph.import(previous) else null,

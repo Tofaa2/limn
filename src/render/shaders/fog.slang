@@ -2,16 +2,7 @@
 #include "media.slang"
 #include "common.slang"
 
-struct FogPush {
-    FrameConstants frame;
-    uint depth_texture;
-    float density;
-    float anisotropy;
-    float height_falloff;
-    float max_distance;
-    float ambient;
-    int step_count;
-};
+#include "fog.FogPush.slang"
 
 [[vk::push_constant]] FogPush fog_push;
 
@@ -26,7 +17,7 @@ float4 fogMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position) 
     ray_length = min(ray_length, fog_push.max_distance);
 
     float3 sky_ambient = float3(0.0);
-    if ((frame.flags & FRAME_ENVIRONMENT) != 0u) {
+    if (frame.environment != 0u) {
         uint s = frame.sampler_linear_clamp;
         sky_ambient = 0.5 * (sampleCubeLod(frame.env_irradiance, s, float3(0.0, 1.0, 0.0), 0.0).rgb +
             sampleCubeLod(frame.env_irradiance, s, float3(0.0, -1.0, 0.0), 0.0).rgb) * frame.env_intensity * fog_push.ambient;
@@ -44,9 +35,9 @@ float4 fogMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position) 
         float sigma = fog_push.density * exp(-max(position.y, 0.0) * fog_push.height_falloff);
         if (i % ambient_interval == 0) {
             ambient = sky_ambient;
-            if ((frame.flags & FRAME_GI) != 0u) {
+            if (frame.gi.enabled != 0u) {
                 float coverage = giCoverage(frame, position);
-                if (coverage > 0.0) ambient = lerp(sky_ambient, giAmbient(frame, position) * frame.gi_intensity * fog_push.ambient, coverage);
+                if (coverage > 0.0) ambient = lerp(sky_ambient, giAmbient(frame, position) * frame.gi.gi_intensity * fog_push.ambient, coverage);
             }
         }
         float3 light = sun * sunVisibility(frame, position) + ambient;
@@ -57,11 +48,7 @@ float4 fogMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position) 
     return float4(scattered, transmittance);
 }
 
-struct CompositePush {
-    FrameConstants frame;
-    uint fog_texture;
-    uint depth_texture;
-};
+#include "fog.CompositePush.slang"
 
 [[vk::push_constant]] CompositePush composite_push;
 

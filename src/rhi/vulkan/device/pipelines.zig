@@ -18,18 +18,19 @@ pub fn createGraphicsPipeline(self: *Device, desc: types.GraphicsPipelineDesc) !
 }
 
 /// Compiled by `compileGraphicsPipeline`, not yet adopted.
-pub const CompiledPipeline = struct { handle: vk.Pipeline };
+pub const CompiledPipeline = struct { handle: u64, compute: bool = false };
 
 /// Registers a compiled pipeline. Render thread only.
 pub fn adoptPipeline(self: *Device, compiled: CompiledPipeline, label: [:0]const u8) !types.Pipeline {
-    errdefer self.vkd.destroyPipeline(compiled.handle, null);
-    setName(self, .pipeline, @intFromEnum(compiled.handle), label);
-    return try self.pipelines.insert(.{ .handle = compiled.handle, .bind_point = .graphics });
+    const handle: vk.Pipeline = @enumFromInt(compiled.handle);
+    errdefer self.vkd.destroyPipeline(handle, null);
+    setName(self, .pipeline, compiled.handle, label);
+    return try self.pipelines.insert(.{ .handle = handle, .bind_point = if (compiled.compute) .compute else .graphics });
 }
 
 /// Frees a compiled pipeline that will not be adopted.
 pub fn discardPipeline(self: *const Device, compiled: CompiledPipeline) void {
-    self.vkd.destroyPipeline(compiled.handle, null);
+    self.vkd.destroyPipeline(@enumFromInt(compiled.handle), null);
 }
 
 /// Compiles without registering. May be called from any thread, also
@@ -44,19 +45,8 @@ pub fn compileGraphicsPipeline(self: *const Device, gpa: std.mem.Allocator, desc
     defer if (task != .null_handle) self.vkd.destroyShaderModule(task, null);
     const fragment = if (desc.fragment) |bytes| try shaderModule(self, gpa, bytes) else .null_handle;
     defer if (fragment != .null_handle) self.vkd.destroyShaderModule(fragment, null);
-    var constant_entries: [16]vk.SpecializationMapEntry = undefined;
-    if (desc.fragment_constants.len > constant_entries.len) return error.TooManyShaderConstants;
-    for (desc.fragment_constants, 0..) |_, index| constant_entries[index] = .{
-        .constant_id = @intCast(index),
-        .offset = @intCast(index * @sizeOf(u32)),
-        .size = @sizeOf(u32),
-    };
-    const constants = vk.SpecializationInfo{
-        .map_entry_count = @intCast(desc.fragment_constants.len),
-        .p_map_entries = &constant_entries,
-        .data_size = desc.fragment_constants.len * @sizeOf(u32),
-        .p_data = @ptrCast(desc.fragment_constants.ptr),
-    };
+    var constant_entries: [max_constants]vk.SpecializationMapEntry = undefined;
+    const constants = try specialization(desc.fragment_constants, &constant_entries);
     var stages: [3]vk.PipelineShaderStageCreateInfo = undefined;
     var geometry_stages: u32 = 0;
     if (desc.mesh == null) {
@@ -199,22 +189,46 @@ pub fn compileGraphicsPipeline(self: *const Device, gpa: std.mem.Allocator, desc
         .subpass = 0,
         .base_pipeline_index = -1,
     }}, null, &result);
-    return .{ .handle = result[0] };
+    return .{ .handle = @intFromEnum(result[0]) };
 }
 
 /// Compiles on the calling thread and registers the pipeline.
 pub fn createComputePipeline(self: *Device, desc: types.ComputePipelineDesc) !types.Pipeline {
-    const module = try createShaderModule(self, desc.shader);
+    const compiled = try self.compileComputePipeline(self.gpa, desc);
+    return self.adoptPipeline(compiled, desc.name);
+}
+
+/// As `compileGraphicsPipeline`, for a compute pipeline.
+pub fn compileComputePipeline(self: *const Device, gpa: std.mem.Allocator, desc: types.ComputePipelineDesc) !CompiledPipeline {
+    const module = try shaderModule(self, gpa, desc.shader);
     defer self.vkd.destroyShaderModule(module, null);
+    var constant_entries: [max_constants]vk.SpecializationMapEntry = undefined;
+    const constants = try specialization(desc.constants, &constant_entries);
     var result: [1]vk.Pipeline = undefined;
     _ = try self.vkd.createComputePipelines(self.pipeline_cache, &.{.{
-        .stage = .{ .stage = .{ .compute_bit = true }, .module = module, .p_name = "main" },
+        .stage = .{ .stage = .{ .compute_bit = true }, .module = module, .p_name = "main", .p_specialization_info = &constants },
         .layout = self.pipeline_layout,
         .base_pipeline_index = -1,
     }}, null, &result);
-    errdefer self.vkd.destroyPipeline(result[0], null);
-    setName(self, .pipeline, @intFromEnum(result[0]), desc.name);
-    return try self.pipelines.insert(.{ .handle = result[0], .bind_point = .compute });
+    return .{ .handle = @intFromEnum(result[0]), .compute = true };
+}
+
+const max_constants = 16;
+
+/// `values` as constants 0 to n-1; `entries` must outlive the result.
+fn specialization(values: []const u32, entries: *[max_constants]vk.SpecializationMapEntry) !vk.SpecializationInfo {
+    if (values.len > max_constants) return error.TooManyShaderConstants;
+    for (0..values.len) |index| entries[index] = .{
+        .constant_id = @intCast(index),
+        .offset = @intCast(index * @sizeOf(u32)),
+        .size = @sizeOf(u32),
+    };
+    return .{
+        .map_entry_count = @intCast(values.len),
+        .p_map_entries = entries,
+        .data_size = values.len * @sizeOf(u32),
+        .p_data = @ptrCast(values.ptr),
+    };
 }
 
 /// Deferred like `destroyBuffer`, so the frame that last draws with it
@@ -233,10 +247,6 @@ pub fn pipelineResource(self: *Device, pipeline: types.Pipeline) *PipelineResour
 /// The shader stages push constants and the table of textures reach.
 pub fn shaderStages(self: *const Device) vk.ShaderStageFlags {
     return .{ .vertex_bit = true, .fragment_bit = true, .compute_bit = true, .task_bit_ext = self.caps.mesh_shaders, .mesh_bit_ext = self.caps.mesh_shaders };
-}
-
-fn createShaderModule(self: *Device, bytes: []const u8) !vk.ShaderModule {
-    return shaderModule(self, self.gpa, bytes);
 }
 
 fn shaderModule(self: *const Device, gpa: std.mem.Allocator, bytes: []const u8) !vk.ShaderModule {

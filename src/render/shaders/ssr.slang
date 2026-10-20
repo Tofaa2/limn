@@ -6,22 +6,7 @@
 #else
 #endif
 
-struct TracePush {
-    FrameConstants frame;
-    uint depth_texture;
-    uint color_texture;
-    uint reflection_texture;
-    uint surface_texture;
-    float max_roughness;
-    float thickness;
-    float max_distance;
-    int step_count;
-    uint history_texture;
-    float history_blend;
-#ifdef RAY_TRACED
-    uint64_t tlas;
-#endif
-};
+#include "ssr.TracePush.slang"
 
 [[vk::push_constant]] TracePush trace_push;
 
@@ -120,16 +105,7 @@ float4 traceMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position
     return result;
 }
 
-struct CompositePush {
-    FrameConstants frame;
-    uint depth_texture;
-    uint reflection_texture;
-    uint surface_texture;
-    uint traced_texture;
-    float max_roughness;
-    int blur_taps;
-    uint reduced;
-};
+#include "ssr.CompositePush.slang"
 
 [[vk::push_constant]] CompositePush composite_push;
 
@@ -197,7 +173,7 @@ Output compositeMain(
     }
 
     float3 sky = float3(0.0);
-    if (((frame.flags & FRAME_ENVIRONMENT) != 0u || frame.probe_count != 0u) && traced.a < 1.0) {
+    if ((frame.environment != 0u || frame.shading.probe_count != 0u) && traced.a < 1.0) {
         float3 position = worldPositionFromDepth(in_uv, depth, frame.inv_view_proj);
         float3 view = normalize(eyePoint(frame, position) - position);
         sky = ambientReflection(frame, position, view, decodeNormal(surface.rg), mirror.a, surface.b);

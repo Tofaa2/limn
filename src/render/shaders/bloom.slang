@@ -1,11 +1,6 @@
 #include "common.slang"
 
-struct DownPush {
-    FrameConstants frame;
-    uint source_texture;
-    uint first_level;
-    float2 source_texel;
-};
+#include "bloom.DownPush.slang"
 
 [[vk::push_constant]] DownPush down_push;
 
@@ -52,12 +47,7 @@ float4 downMain([[vk::location(0)]] float2 in_uv) : SV_Target {
     return float4(max(color, float3(0.0)), 1.0);
 }
 
-struct UpPush {
-    FrameConstants frame;
-    uint source_texture;
-    uint pad;
-    float2 source_texel;
-};
+#include "bloom.UpPush.slang"
 
 [[vk::push_constant]] UpPush up_push;
 

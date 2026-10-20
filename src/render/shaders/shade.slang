@@ -2,19 +2,9 @@
 #define CONTACT_SHADOWS
 #include "common.slang"
 #include "shading.slang"
+#include "material_inputs.slang"
 
-struct Push {
-    FrameConstants frame;
-    uint visibility_texture;
-    uint ao_texture;
-    uint debug_view;
-    uint gi_texture;
-    uint material_shader;
-    uint shadow_history;
-    uint bounce_texture;
-    float bounce_strength;
-    uint shadow_depth;
-};
+#include "shade.Push.slang"
 
 [[vk::push_constant]] Push push;
 
@@ -26,6 +16,34 @@ struct ShadeOutput {
     float4 surface : SV_Target3;
 #endif
 };
+
+#define UV_PICK(bit, second, first) (((material.uv_sets >> bit) & 1u) != 0u ? second : first)
+#define UV_OF(bit) textureUv(frame, material, uint(bit), UV_PICK(bit, uvb, uv), UV_PICK(bit, raw1, raw0), true), textureUv(frame, material, uint(bit), UV_PICK(bit, uvb_dx, uv_dx), UV_PICK(bit, raw1_dx, raw0_dx), false), textureUv(frame, material, uint(bit), UV_PICK(bit, uvb_dy, uv_dy), UV_PICK(bit, raw1_dy, raw0_dy), false)
+
+/// Texels where raster shading draws, with the gradients of the visibility
+/// buffer's barycentrics.
+struct RasterTexels : IMaterialTexels {
+    FrameConstants frame;
+    Material material;
+    uint s;
+    uint d;
+    float2 uv;
+    float2 uv_dx;
+    float2 uv_dy;
+    float2 uvb;
+    float2 uvb_dx;
+    float2 uvb_dy;
+    float2 raw0;
+    float2 raw0_dx;
+    float2 raw0_dy;
+    float2 raw1;
+    float2 raw1_dx;
+    float2 raw1_dy;
+
+    float4 texel(uint texture, uint channel, bool detail) {
+        return sampleTextureGrad(texture, detail ? d : s, UV_OF(channel));
+    }
+}
 
 struct MaterialSurface {
     float3 base_color;
@@ -123,7 +141,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
         float4 current = mul(frame.view_proj_unjittered, float4(direction, 0.0));
         float4 previous = mul(frame.prev_view_proj_unjittered, float4(direction, 0.0));
         float3 sky = float3(0.0);
-        if ((frame.flags & FRAME_ENVIRONMENT) != 0u)
+        if (frame.environment != 0u)
             sky = sampleCubeLod(frame.env_sky, frame.sampler_linear_clamp, direction, 0.0).rgb * frame.env_intensity;
         result.color = float4(sky, 1.0);
 #ifndef PLAIN
@@ -182,8 +200,6 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     float2 uvb = materialUv(material, raw1);
     float2 uvb_dx = materialUvDerivative(material, raw1_dx);
     float2 uvb_dy = materialUvDerivative(material, raw1_dy);
-#define UV_PICK(bit, second, first) (((material.uv_sets >> bit) & 1u) != 0u ? second : first)
-#define UV_OF(bit) textureUv(frame, material, uint(bit), UV_PICK(bit, uvb, uv), UV_PICK(bit, raw1, raw0), true), textureUv(frame, material, uint(bit), UV_PICK(bit, uvb_dx, uv_dx), UV_PICK(bit, raw1_dx, raw0_dx), false), textureUv(frame, material, uint(bit), UV_PICK(bit, uvb_dy, uv_dy), UV_PICK(bit, raw1_dy, raw0_dy), false)
 
     float3 world_position = w0 * lambda.x + w1 * lambda.y + w2 * lambda.z;
     float3x3 normal_rows = cofactorRows(instance.transform);
@@ -198,25 +214,13 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     }
 
     uint s = material.sampler_index;
-    float4 base_color = material.base_color;
-    if (material.base_color_texture != INVALID_ID)
-        base_color *= sampleTextureGrad(material.base_color_texture, s, UV_OF(0));
-    base_color = float4(base_color.rgb * unpackUnorm(instance.tint).rgb, base_color.a);
-    base_color *= unpackUnorm(v0.color) * lambda.x + unpackUnorm(v1.color) * lambda.y + unpackUnorm(v2.color) * lambda.z;
-
     uint d = material.detail_sampler;
-    float roughness = material.roughness;
-    float metallic = material.metallic;
-    float4 mr = float4(1.0);
-    if (material.metallic_roughness_texture != INVALID_ID) mr = sampleTextureGrad(material.metallic_roughness_texture, d, UV_OF(2));
-    if ((material.flags & MATERIAL_SPECULAR_GLOSSINESS) != 0u) {
-        specularGlossiness(material, mr, base_color.rgb, roughness, metallic);
-    } else {
-        roughness *= mr.g;
-        metallic *= mr.b;
-    }
-    roughness = clamp(roughness, 0.045, 1.0);
-    metallic = clamp(metallic, 0.0, 1.0);
+    RasterTexels texels = { frame, material, s, d, uv, uv_dx, uv_dy, uvb, uvb_dx, uvb_dy, raw0, raw0_dx, raw0_dy, raw1, raw1_dx, raw1_dy };
+    MaterialInputs inputs = materialInputs(material, texels, unpackUnorm(instance.tint).rgb, unpackUnorm(v0.color) * lambda.x + unpackUnorm(v1.color) * lambda.y + unpackUnorm(v2.color) * lambda.z);
+    float4 base_color = inputs.base_color;
+    float roughness = clamp(inputs.roughness, 0.045, 1.0);
+    float metallic = clamp(inputs.metallic, 0.0, 1.0);
+    float4 mr = inputs.packed;
 
     float ao = 1.0;
     if (material.occlusion_texture != INVALID_ID) {
@@ -226,12 +230,10 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
         ao = lerp(1.0, sampled, material.occlusion_strength);
     }
     float screen_ao = 1.0;
-    if ((frame.flags & FRAME_AMBIENT_OCCLUSION) != 0u)
+    if (frame.ambient_occlusion.enabled != 0u)
         screen_ao = fetchTexel(push.ao_texture, pixel).r;
 
-    float3 emissive = material.emissive;
-    if (material.emissive_texture != INVALID_ID && dot(emissive, float3(1.0)) > 0.0)
-        emissive *= sampleTextureGrad(material.emissive_texture, d, UV_OF(4)).rgb;
+    float3 emissive = inputs.emissive;
 
     float3 coat_normal = normal;
     float clearcoat = material.clearcoat;
@@ -282,7 +284,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     }
 #endif
     DECAL_LOOP_BEGIN(world_position, fragment.xy)
-        Decal decal = frame.decals.data[i];
+        Decal decal = frame.shading.decals.data[i];
         float3 local = (mul(decal.world_to_decal, float4(world_position, 1.0))).xyz;
         if (any((abs(local) > float3(0.5)))) continue;
         float3 axis = normalize(float3(decal.world_to_decal[2][0], decal.world_to_decal[2][1], decal.world_to_decal[2][2]));
@@ -326,7 +328,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     float4 previous_clip = mul(frame.prev_view_proj_unjittered, float4(previous_world, 1.0));
     result.motion = (current_clip.xy / current_clip.w - previous_clip.xy / previous_clip.w) * 0.5;
 
-    if ((frame.flags & FRAME_SPECULAR_AA) != 0u) {
+    if (frame.shading.specular_aa != 0u) {
         float3 normal_dx = ddx(normal);
         float3 normal_dy = ddy(normal);
         float variance = 0.25 * (dot(normal_dx, normal_dx) + dot(normal_dy, normal_dy));
@@ -374,10 +376,10 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
         case 7u: {
             uint cascade = 0u;
             for (uint i = 0u; i < 3u; i++) {
-                if (surface.view_depth > frame.cascade_splits[i]) cascade = i + 1u;
+                if (surface.view_depth > frame.shadows.cascade_splits[i]) cascade = i + 1u;
             }
             const float3 tints[4] = { float3(1.0, 0.3, 0.3), float3(0.3, 1.0, 0.3), float3(0.3, 0.4, 1.0), float3(1.0, 1.0, 0.3) };
-            float3 tint = surface.view_depth > frame.cascade_splits[3] ? float3(0.5) : tints[cascade];
+            float3 tint = surface.view_depth > frame.shadows.cascade_splits[3] ? float3(0.5) : tints[cascade];
             debug = tint * (0.3 + 0.7 * luminance(base_color.rgb));
             break;
         }
@@ -419,7 +421,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     soft_history_slack = 0.05 * soft_history_depth + 2.0 * fwidth(soft_history_depth);
     if (instance.lightmap != INVALID_ID) gathered = float4(sampleTextureLod(instance.lightmap, frame.sampler_linear_clamp, raw1, 0.0).rgb, 1.0);
     float3 lit = emissive + shadeSurface(frame, surface, fragment.xy, noise, gathered);
-    if ((SHADE_FEATURES & FEATURE_AERIAL) != 0u && frame.aerial != 0.0 && (frame.flags & FRAME_ENVIRONMENT) != 0u) {
+    if ((SHADE_FEATURES & FEATURE_AERIAL) != 0u && frame.shading.aerial != 0.0 && frame.environment != 0u) {
         float3 air_through;
         float3 air;
         aerialHaze(frame, view_direction, length(world_position - eyePoint(frame, world_position)), air_through, air);

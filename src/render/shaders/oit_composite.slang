@@ -1,10 +1,6 @@
 #include "common.slang"
 
-struct Push {
-    FrameConstants frame;
-    uint accumulation_texture;
-    uint reveal_texture;
-};
+#include "oit_composite.Push.slang"
 
 [[vk::push_constant]] Push push;
 

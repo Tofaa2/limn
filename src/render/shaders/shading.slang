@@ -33,22 +33,22 @@ struct Surface {
 static const float2 vogel_disk[16] = { float2(0.1768, 0.0000), float2(-0.2257, 0.2068), float2(0.0345, -0.3938), float2(0.2845, 0.3703), float2(-0.5265, -0.0696), float2(0.4594, -0.3632), float2(-0.1158, 0.6272), float2(-0.4117, -0.5510), float2(0.7123, 0.1728), float2(-0.6434, 0.4302), float2(0.2334, -0.7767), float2(0.4298, 0.7324), float2(-0.8291, -0.2950), float2(0.8183, -0.4133), float2(-0.3632, 0.8715), float2(-0.3838, -0.9010) };
 
 float sampleCascade(FrameConstants frame, uint cascade, float3 world_position, float3 normal, float n_dot_l, float rotation) {
-    float texel = frame.cascade_texel_size[cascade];
+    float texel = frame.shadows.cascade_texel_size[cascade];
     float3 biased = world_position + normal * texel * (1.5 + 2.5 * (1.0 - n_dot_l));
-    float4 clip = mul(frame.cascade_view_proj[cascade], float4(biased, 1.0));
+    float4 clip = mul(frame.shadows.cascade_view_proj[cascade], float4(biased, 1.0));
     float3 coord = float3(clip.xy * 0.5 + 0.5, clip.z);
     if (coord.z >= 1.0) return 1.0;
     float c = cos(rotation);
     float s = sin(rotation);
     float2x2 rotate = float2x2(c, s, -s, c);
-    float radius = frame.shadow_softness / (texel * float(textureArraySize(frame.shadow_map).x));
-    #define SHADOW_TAP(index) textures_2d_array[NonUniformResourceIndex(frame.shadow_map)].SampleCmpLevelZero( \
-        samplers_shadow[NonUniformResourceIndex(frame.shadow_sampler)], \
+    float radius = frame.shadows.shadow_softness / (texel * float(textureArraySize(frame.shadows.shadow_map).x));
+    #define SHADOW_TAP(index) textures_2d_array[NonUniformResourceIndex(frame.shadows.shadow_map)].SampleCmpLevelZero( \
+        samplers_shadow[NonUniformResourceIndex(frame.shadows.shadow_sampler)], \
         float3(coord.xy + mul(vogel_disk[index], rotate) * radius, float(cascade)), coord.z)
     float lit = SHADOW_TAP(3) + SHADOW_TAP(7) + SHADOW_TAP(11) + SHADOW_TAP(15);
     if (lit <= 0.0 || lit >= 4.0) return lit * 0.25;
-    if (frame.shadow_taps <= 4u) return lit * 0.25;
-    int stride = frame.shadow_taps >= 16u ? 1 : 2;
+    if (frame.shadows.shadow_taps <= 4u) return lit * 0.25;
+    int stride = frame.shadows.shadow_taps >= 16u ? 1 : 2;
     float taps = 4.0;
     for (int i = 0; i < 16; i += stride) {
         if ((i & 3) == 3) continue;
@@ -60,15 +60,15 @@ float sampleCascade(FrameConstants frame, uint cascade, float3 world_position, f
 }
 
 float cascadeShadow(FrameConstants frame, float3 world_position, float3 normal, float n_dot_l, float view_depth, float noise) {
-    if ((frame.flags & FRAME_SHADOWS) == 0u) return 1.0;
+    if (frame.shadows.enabled == 0u) return 1.0;
     uint cascade = 0u;
     for (uint i = 0u; i < 3u; i++) {
-        if (view_depth > frame.cascade_splits[i]) cascade = i + 1u;
+        if (view_depth > frame.shadows.cascade_splits[i]) cascade = i + 1u;
     }
-    if (view_depth > frame.cascade_splits[3]) return 1.0;
+    if (view_depth > frame.shadows.cascade_splits[3]) return 1.0;
     float rotation = noise * 2.0 * PI;
     float lit = sampleCascade(frame, cascade, world_position, normal, n_dot_l, rotation);
-    float split = frame.cascade_splits[cascade];
+    float split = frame.shadows.cascade_splits[cascade];
     float band = split * 0.1;
     float blend = clamp((view_depth - (split - band)) / band, 0.0, 1.0);
     if (blend > 0.0) {
@@ -80,7 +80,7 @@ float cascadeShadow(FrameConstants frame, float3 world_position, float3 normal, 
 }
 
 float virtualShadow(FrameConstants frame, float3 world_position, float3 normal, float n_dot_l) {
-    VsmData* vsm = frame.vsm.data;
+    VsmData* vsm = frame.shadows.vsm.data;
     float2 unmoved = (mul(vsm.light_view, float4(world_position, 1.0))).xy;
     for (uint level = vsmLevel(vsm, unmoved); level < vsm.levels; level++) {
         float texel = vsmExtent(vsm, level) / (float(vsm_pages) * vsm_page_texels);
@@ -96,7 +96,7 @@ float virtualShadow(FrameConstants frame, float3 world_position, float3 normal, 
         for (int tap = 0; tap < 4; tap++) {
             float2 offset = float2((tap & 1) == 0 ? -0.5 : 0.5, (tap & 2) == 0 ? -0.5 : 0.5) / vsm_page_texels;
             float2 inside = clamp(within + offset, float2(1.0 / vsm_page_texels), float2(1.0 - 1.0 / vsm_page_texels));
-            lit += textures_2d[NonUniformResourceIndex(vsm.atlas_texture)].SampleCmpLevelZero(samplers_shadow[NonUniformResourceIndex(frame.shadow_sampler)], (corner + inside) / float(vsm_atlas_pages), depth);
+            lit += textures_2d[NonUniformResourceIndex(vsm.atlas_texture)].SampleCmpLevelZero(samplers_shadow[NonUniformResourceIndex(frame.shadows.shadow_sampler)], (corner + inside) / float(vsm_atlas_pages), depth);
         }
         return lit * 0.25;
     }
@@ -105,22 +105,22 @@ float virtualShadow(FrameConstants frame, float3 world_position, float3 normal, 
 
 float sunShadow(FrameConstants frame, float3 world_position, float3 normal, float n_dot_l, float view_depth, float noise) {
     float past_geometry = -1.0;
-    if ((frame.flags & FRAME_VSM) != 0u) past_geometry = virtualShadow(frame, world_position, normal, n_dot_l);
+    if (frame.shadows.virtual_maps != 0u) past_geometry = virtualShadow(frame, world_position, normal, n_dot_l);
     if (past_geometry < 0.0) past_geometry = cascadeShadow(frame, world_position, normal, n_dot_l, view_depth, noise);
     return past_geometry * cloudShadow(frame, world_position) * fluidShadow(frame, world_position);
 }
 
 float3 sunTint(FrameConstants frame, float3 world_position, float view_depth) {
-    if ((SHADE_FEATURES & FEATURE_COLORED_SHADOWS) == 0u || (frame.flags & FRAME_COLORED_SHADOWS) == 0u) return float3(1.0);
+    if ((SHADE_FEATURES & FEATURE_COLORED_SHADOWS) == 0u || frame.shadows.colored == 0u) return float3(1.0);
     uint cascade = 0u;
     for (uint i = 0u; i < 3u; i++) {
-        if (view_depth > frame.cascade_splits[i]) cascade = i + 1u;
+        if (view_depth > frame.shadows.cascade_splits[i]) cascade = i + 1u;
     }
-    if (view_depth > frame.cascade_splits[3]) return float3(1.0);
-    float4 clip = mul(frame.cascade_view_proj[cascade], float4(world_position, 1.0));
+    if (view_depth > frame.shadows.cascade_splits[3]) return float3(1.0);
+    float4 clip = mul(frame.shadows.cascade_view_proj[cascade], float4(world_position, 1.0));
     float2 uv = clip.xy * 0.5 + 0.5;
     if (any((uv < float2(0.0))) || any((uv > float2(1.0)))) return float3(1.0);
-    Texture2DArray shadow_color = textures_2d_array[NonUniformResourceIndex(frame.shadow_color)];
+    Texture2DArray shadow_color = textures_2d_array[NonUniformResourceIndex(frame.shadows.shadow_color)];
     SamplerState linear = samplers[NonUniformResourceIndex(frame.sampler_linear_clamp)];
     float4 tint = shadow_color.SampleLevel(linear, float3(uv, float(cascade)), 0.0);
     float4 depths = shadow_color.GatherAlpha(linear, float3(uv, float(cascade)));
@@ -130,9 +130,9 @@ float3 sunTint(FrameConstants frame, float3 world_position, float view_depth) {
 
 float contactShadow(FrameConstants frame, float3 position, float noise) {
 #ifdef CONTACT_SHADOWS
-    if (frame.contact_depth == INVALID_ID || frame.contact_length <= 0.0) return 1.0;
+    if (frame.shadows.contact_depth == INVALID_ID || frame.shadows.contact_length <= 0.0) return 1.0;
     const int steps = 12;
-    float3 stride = frame.sun_direction * (frame.contact_length / float(steps));
+    float3 stride = frame.sun_direction * (frame.shadows.contact_length / float(steps));
     float3 point = position + stride * noise;
     for (int i = 0; i < steps; i++) {
         point += stride;
@@ -141,9 +141,9 @@ float contactShadow(FrameConstants frame, float3 position, float noise) {
         if (along <= frame.near) break;
         float2 uv = clip.xy / clip.w * 0.5 + 0.5;
         if (any((uv < float2(0.0))) || any((uv > float2(1.0)))) break;
-        float scene = linearDepth(sampleTextureLod(frame.contact_depth, frame.sampler_nearest_clamp, uv, 0.0).r, frame.depth_terms);
+        float scene = linearDepth(sampleTextureLod(frame.shadows.contact_depth, frame.sampler_nearest_clamp, uv, 0.0).r, frame.depth_terms);
         float behind = along - scene;
-        if (behind > 0.01 * along + 0.005 && behind < frame.contact_length) return 0.0;
+        if (behind > 0.01 * along + 0.005 && behind < frame.shadows.contact_length) return 0.0;
     }
 #endif
     return 1.0;
@@ -221,15 +221,15 @@ float specularOcclusion(float n_dot_v, float ao, float roughness) {
 
 uint clusterIndex(FrameConstants frame, float2 pixel, float view_depth) {
     uint2 tile = min(uint2(pixel * frame.inv_resolution * float2(CLUSTERS_X, CLUSTERS_Y)), uint2(CLUSTERS_X - 1u, CLUSTERS_Y - 1u));
-    float slice = log2(max(view_depth, 1e-4)) * frame.cluster_z_scale + frame.cluster_z_bias;
+    float slice = log2(max(view_depth, 1e-4)) * frame.lights.cluster_z_scale + frame.lights.cluster_z_bias;
     uint z = uint(clamp(slice, 0.0, float(CLUSTERS_Z - 1u)));
     return tile.x + tile.y * CLUSTERS_X + z * CLUSTERS_X * CLUSTERS_Y;
 }
 
 #define DECAL_LOOP_BEGIN(position, pixel) \
     uint decal_cluster = clusterIndex(frame, pixel, -(mul(frame.view, float4(position, 1.0))).z); \
-    for (uint decal_word = 0u; decal_word < ((SHADE_FEATURES & FEATURE_DECALS) == 0u || (instance.flags & INSTANCE_NO_DECALS) != 0u ? 0u : (frame.decal_count + 31u) >> 5u); decal_word++) \
-    for (uint decal_bits = frame.clusters.data[decal_cluster].decals[decal_word]; decal_bits != 0u; decal_bits &= decal_bits - 1u) { \
+    for (uint decal_word = 0u; decal_word < ((SHADE_FEATURES & FEATURE_DECALS) == 0u || (instance.flags & INSTANCE_NO_DECALS) != 0u ? 0u : (frame.shading.decal_count + 31u) >> 5u); decal_word++) \
+    for (uint decal_bits = frame.lights.clusters.data[decal_cluster].decals[decal_word]; decal_bits != 0u; decal_bits &= decal_bits - 1u) { \
         uint i = decal_word * 32u + uint(firstbitlow(decal_bits));
 
 #ifdef RAY_TRACED
@@ -243,11 +243,11 @@ bool rtOccluded(FrameConstants frame, uint64_t tlas, float3 origin, float3 direc
 
 float tracedShadow(FrameConstants frame, Light light, float3 position, float3 normal, float3 l, float reach, float noise) {
 #ifdef RAY_TRACED
-    if ((SHADE_FEATURES & FEATURE_TRACED_LIGHT_SHADOWS) == 0u || (light.flags & LIGHT_TRACED_SHADOW) == 0u || (frame.tlas_low | frame.tlas_high) == 0u) return 1.0;
-    uint64_t tlas = uint64_t(frame.tlas_low) | (uint64_t(frame.tlas_high) << 32);
+    if ((SHADE_FEATURES & FEATURE_TRACED_LIGHT_SHADOWS) == 0u || (light.flags & LIGHT_TRACED_SHADOW) == 0u || (frame.shadows.tlas_low | frame.shadows.tlas_high) == 0u) return 1.0;
+    uint64_t tlas = uint64_t(frame.shadows.tlas_low) | (uint64_t(frame.shadows.tlas_high) << 32);
     float3 origin = position + normal * 0.03;
     if ((light.flags & LIGHT_DIRECTIONAL) != 0u && light.source_radius > 0.0) {
-        uint rays = max((frame.flags >> 16) & 15u, 1u);
+        uint rays = max(frame.shadows.light_rays, 1u);
         float3 side = normalize(cross(abs(l.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0), l));
         float3 up = cross(l, side);
         float lit = 0.0;
@@ -259,7 +259,7 @@ float tracedShadow(FrameConstants frame, Light light, float3 position, float3 no
         return lit / float(rays);
     }
     if ((light.flags & LIGHT_DIRECTIONAL) == 0u && (light.source_radius > 0.0 || light.source_length > 0.0)) {
-        uint rays = max((frame.flags >> 16) & 15u, 1u);
+        uint rays = max(frame.shadows.light_rays, 1u);
         float base = noise;
         float lit = 0.0;
         for (uint ray = 0u; ray < rays; ray++) {
@@ -299,8 +299,8 @@ float localShadow(FrameConstants frame, Light light, float3 world_position, floa
         else if (a.y >= a.z) tile_index += d.y > 0.0 ? 2u : 3u;
         else tile_index += d.z > 0.0 ? 4u : 5u;
     }
-    ShadowTile tile = frame.shadow_tiles.data[tile_index];
-    float2 atlas_size = textureSize(frame.local_shadow_map);
+    ShadowTile tile = frame.lights.shadow_tiles.data[tile_index];
+    float2 atlas_size = textureSize(frame.shadows.local_shadow_map);
     float texel_world = distance_to_light * 2.0 / (tile.rect.x * atlas_size.x);
     float3 biased = world_position + normal * texel_world * 2.0 + to_light * texel_world;
     float4 clip = mul(tile.view_proj, float4(biased, 1.0));
@@ -322,7 +322,7 @@ float localShadow(FrameConstants frame, Light light, float3 world_position, floa
         float blocker_z = 0.0;
         for (int i = 0; i < 16; i += 2) {
             float2 at = clamp(tile_uv * tile.rect.xy + tile.rect.zw + mul(vogel_disk[i], rotate) * texel * search, low, high);
-            float z = sampleTextureLod(frame.local_shadow_map, frame.sampler_nearest_clamp, at, 0.0).r;
+            float z = sampleTextureLod(frame.shadows.local_shadow_map, frame.sampler_nearest_clamp, at, 0.0).r;
             if (z > ndc.z) {
                 blockers += 1.0;
                 blocker_z += z;
@@ -338,8 +338,8 @@ float localShadow(FrameConstants frame, Light light, float3 world_position, floa
             tile_uv = ndc.xy * 0.5 + 0.5;
         }
     }
-    #define LOCAL_SHADOW_TAP(index) textures_2d[NonUniformResourceIndex(frame.local_shadow_map)].SampleCmpLevelZero( \
-        samplers_shadow[NonUniformResourceIndex(frame.local_shadow_sampler)], \
+    #define LOCAL_SHADOW_TAP(index) textures_2d[NonUniformResourceIndex(frame.shadows.local_shadow_map)].SampleCmpLevelZero( \
+        samplers_shadow[NonUniformResourceIndex(frame.shadows.local_shadow_sampler)], \
         clamp(tile_uv * tile.rect.xy + tile.rect.zw + mul(vogel_disk[index], rotate) * texel * kernel, low, high), ndc.z)
     float lit = LOCAL_SHADOW_TAP(3) + LOCAL_SHADOW_TAP(7) + LOCAL_SHADOW_TAP(11) + LOCAL_SHADOW_TAP(15);
     if (lit <= 0.0 || lit >= 4.0) return lit * 0.25;
@@ -419,15 +419,15 @@ float softShadowHistory(FrameConstants frame) {
 static float soft_shadow_visibility = 2.0;
 
 float3 localLights(FrameConstants frame, Surface surface, float2 pixel, float noise) {
-    if ((SHADE_FEATURES & FEATURE_LOCAL_LIGHTS) == 0u || frame.light_count == 0u) return float3(0.0);
+    if ((SHADE_FEATURES & FEATURE_LOCAL_LIGHTS) == 0u || frame.lights.light_count == 0u) return float3(0.0);
     float3 color = float3(0.0);
     float3 soft_light = float3(0.0);
     float soft_weight = 0.0;
     float soft_lit = 0.0;
     uint cluster = clusterIndex(frame, pixel, surface.view_depth);
-    uint count = frame.clusters.data[cluster].count;
+    uint count = frame.lights.clusters.data[cluster].count;
     for (uint i = 0u; i < count; i++) {
-        Light light = frame.lights.data[frame.clusters.data[cluster].lights[i]];
+        Light light = frame.lights.lights.data[frame.lights.clusters.data[cluster].lights[i]];
         if ((light.flags & LIGHT_DIRECTIONAL) != 0u) {
             float3 l = -light.direction;
             if (dot(surface.normal, l) > 0.0) {
@@ -529,13 +529,13 @@ float3 environmentReflection(FrameConstants frame, float3 view, float3 normal, f
 }
 
 void aerialHaze(FrameConstants frame, float3 view, float distance_seen, out float3 through, out float3 air) {
-    if (frame.aerial < 0.0) {
-        through = float3(exp(distance_seen * frame.aerial));
+    if (frame.shading.aerial < 0.0) {
+        through = float3(exp(distance_seen * frame.shading.aerial));
         air = sampleCubeLod(frame.env_specular, frame.sampler_linear_clamp, -view, frame.env_specular_mips * 0.6).rgb * frame.env_intensity;
         return;
     }
-    float3 by_air = frame.aerial * 0.6 * float3(0.43, 1.0, 2.45);
-    float by_haze = frame.aerial * 0.4;
+    float3 by_air = frame.shading.aerial * 0.6 * float3(0.43, 1.0, 2.45);
+    float by_haze = frame.shading.aerial * 0.4;
     float3 lost = by_air + by_haze;
     through = exp(-lost * distance_seen);
     float mu = dot(-view, frame.sun_direction);
@@ -547,11 +547,11 @@ void aerialHaze(FrameConstants frame, float3 view, float distance_seen, out floa
 }
 
 float reflectionReach(FrameConstants frame, float3 position, float3 normal, float3 irradiance, float sky_visibility) {
-    if (frame.probe_count == 0u) return sky_visibility;
+    if (frame.shading.probe_count == 0u) return sky_visibility;
     float reach = 0.0;
     float covered = 0.0;
-    for (uint i = 0u; i < frame.probe_count && covered < 0.999; i++) {
-        ReflectionProbeData probe = frame.probes.data[i];
+    for (uint i = 0u; i < frame.shading.probe_count && covered < 0.999; i++) {
+        ReflectionProbeData probe = frame.shading.probes.data[i];
         float3 inside = 1.0 - abs(position - probe.center) / probe.extent;
         float weight = clamp(min(inside.x, min(inside.y, inside.z)) / max(probe.fade, 1e-3), 0.0, 1.0) * (1.0 - covered);
         if (weight <= 0.0) continue;
@@ -564,15 +564,15 @@ float reflectionReach(FrameConstants frame, float3 position, float3 normal, floa
 
 float3 ambientReflection(FrameConstants frame, float3 position, float3 view, float3 normal, float roughness, float reach) {
     float3 sky = float3(0.0);
-    if ((frame.flags & FRAME_ENVIRONMENT) != 0u) sky = environmentReflection(frame, view, normal, roughness);
-    if (frame.probe_count == 0u) return sky * reach;
+    if (frame.environment != 0u) sky = environmentReflection(frame, view, normal, roughness);
+    if (frame.shading.probe_count == 0u) return sky * reach;
     float3 r = reflect(-view, normal);
     r = normalize(lerp(r, normal, roughness * roughness * roughness));
     float3 safe = select(abs(r) < float3(1e-5), float3(1e-5), r);
     float3 local = float3(0.0);
     float covered = 0.0;
-    for (uint i = 0u; i < frame.probe_count && covered < 0.999; i++) {
-        ReflectionProbeData probe = frame.probes.data[i];
+    for (uint i = 0u; i < frame.shading.probe_count && covered < 0.999; i++) {
+        ReflectionProbeData probe = frame.shading.probes.data[i];
         float3 offset = position - probe.center;
         float3 inside = 1.0 - abs(offset) / probe.extent;
         float weight = clamp(min(inside.x, min(inside.y, inside.z)) / max(probe.fade, 1e-3), 0.0, 1.0) * (1.0 - covered);
@@ -590,8 +590,8 @@ static float4 deferred_reflection = float4(0.0);
 #endif
 
 float3 ambientLight(FrameConstants frame, Surface surface, float4 gathered) {
-    bool has_environment = (frame.flags & FRAME_ENVIRONMENT) != 0u;
-    bool has_gi = (frame.flags & FRAME_GI) != 0u;
+    bool has_environment = frame.environment != 0u;
+    bool has_gi = frame.gi.enabled != 0u;
     uint s = frame.sampler_linear_clamp;
     float n_dot_v = max(dot(surface.normal, surface.view), 1e-4);
 
@@ -603,7 +603,7 @@ float3 ambientLight(FrameConstants frame, Surface surface, float4 gathered) {
         float coverage = giCoverage(frame, surface.position);
         if (coverage > 0.0) {
             float3 probes = gathered.rgb;
-            if (gathered.a <= 0.0) probes = giIrradiance(frame, surface.position, surface.normal, surface.view) * frame.gi_intensity;
+            if (gathered.a <= 0.0) probes = giIrradiance(frame, surface.position, surface.normal, surface.view) * frame.gi.gi_intensity;
             irradiance = lerp(sky_irradiance, probes, coverage);
             float ratio = luminance(probes) / max(luminance(sky_irradiance), 1e-4);
             sky_visibility = lerp(1.0, clamp(ratio, 0.0, 1.0), coverage);
@@ -621,7 +621,7 @@ float3 ambientLight(FrameConstants frame, Surface surface, float4 gathered) {
     bool add_environment = has_environment;
 #ifdef DEFER_REFLECTIONS
     deferred_reflection = float4(reflection_weight, sky_visibility);
-    if ((frame.flags & FRAME_SSR) != 0u) add_environment = false;
+    if (frame.reflections.enabled != 0u) add_environment = false;
 #endif
     float3 mirror_normal = surface.normal;
     if (surface.anisotropy > 0.0) {

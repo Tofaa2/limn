@@ -1,4 +1,5 @@
 //! Draw lists: 2D shapes, images and text drawn into a view.
+const canvas_push = @import("../shaders/push/canvas.zig");
 const output_feature = @import("output.zig");
 const std = @import("std");
 const rhi = @import("../../rhi/rhi.zig");
@@ -67,7 +68,7 @@ pub const Canvas = struct {
         if (spirv.len == 0 or spirv.len % 4 != 0) return error.InvalidShader;
         for (&canvas.shaders, 0..) |*slot, index| {
             if (slot.* != null) continue;
-            const words = try self.gpa.alloc(u32, spirv.len / 4);
+            const words = try self.internal.gpa.alloc(u32, spirv.len / 4);
             @memcpy(std.mem.sliceAsBytes(words), spirv);
             slot.* = words;
             return .{ .slot = @intCast(index) };
@@ -92,7 +93,7 @@ pub const Canvas = struct {
             self.device.destroyPipeline(entry.pipeline);
             _ = canvas.pipelines.swapRemove(index);
         }
-        self.gpa.free(words);
+        self.internal.gpa.free(words);
         canvas.shaders[shader.slot] = null;
     }
 
@@ -147,7 +148,7 @@ pub const Canvas = struct {
             } }},
             .cull = .none,
         });
-        try canvas.pipelines.append(self.gpa, .{ .format = format, .blend = blend, .shader = shader, .pipeline = made });
+        try canvas.pipelines.append(self.internal.gpa, .{ .format = format, .blend = blend, .shader = shader, .pipeline = made });
         return made;
     }
 };
@@ -185,31 +186,7 @@ const Range = struct {
     shader: ?draw_list.CanvasShader,
 };
 
-const Push = extern struct {
-    vertices: u64,
-    indices: u64,
-    transform: Mat4,
-    camera_right: Vec3,
-    encode_srgb: u32,
-    camera_up: Vec3,
-    sdf_spread: f32,
-    viewport: [2]f32,
-    sampler_linear: u32,
-    sampler_nearest: u32,
-    /// Scene depth to test against, or `invalid_id`.
-    depth_texture: u32,
-    /// HDR10 targets: brightness of white in nits.
-    hdr_paper_white: f32,
-    origin: [2]f32,
-    /// 1 to read text from the three-channel field.
-    sharp_text: u32,
-    /// Seconds since the renderer started, for custom shaders.
-    time: f32,
-    /// `Quad` records; the draw unfolds them when `unfold` is set.
-    quads: u64 = 0,
-    unfold: u32 = 0,
-    pad: u32 = 0,
-};
+const Push = canvas_push.Push;
 
 /// The draw lists of one stage, and what they are drawn into.
 const Layer = struct {
@@ -229,7 +206,7 @@ fn upload(ctx: *ViewContext, list: *const draw_list.DrawList, batch: *const draw
     const self = ctx.renderer;
     const canvas = &self.canvas;
     const device = ctx.device;
-    const frame = self.frame_index;
+    const frame = self.internal.frame_index;
     const key = [4]u64{ list.generation, batch.vertices.items.len, batch.indices.items.len, batch.quads.items.len };
     const sizes = [3]u64{
         std.mem.alignForward(u64, batch.vertices.items.len * @sizeOf(draw_list.Vertex), 16),
@@ -239,7 +216,7 @@ fn upload(ctx: *ViewContext, list: *const draw_list.DrawList, batch: *const draw
     const entry: *Retained = for (canvas.retained.items) |*seen| {
         if (seen.list == list.id and seen.world == world) break seen;
     } else blk: {
-        try canvas.retained.append(self.gpa, .{ .list = list.id, .world = world, .key = key, .used = frame });
+        try canvas.retained.append(self.internal.gpa, .{ .list = list.id, .world = world, .key = key, .used = frame });
         break :blk &canvas.retained.items[canvas.retained.items.len - 1];
     };
     if (!std.meta.eql(entry.key, key)) {
@@ -272,8 +249,8 @@ fn upload(ctx: *ViewContext, list: *const draw_list.DrawList, batch: *const draw
         @memcpy(quads.items, batch.quads.items);
         result = .{ .vertices = vertices.address, .indices = indices.address, .quads = quads.address };
     }
-    try canvas.uploads.append(self.gpa, result);
-    self.stats.draw_list_triangles += @intCast(batch.indices.items.len / 3 + batch.quads.items.len * 2);
+    try canvas.uploads.append(self.internal.gpa, result);
+    self.internal.stats.draw_list_triangles += @intCast(batch.indices.items.len / 3 + batch.quads.items.len * 2);
     return @intCast(canvas.uploads.items.len - 1);
 }
 
@@ -298,7 +275,7 @@ fn gather(ctx: *ViewContext, stage: api.DrawStage, depth: ?features.Target) !?*L
             for (0..batch.states.items.len + 1) |next| {
                 const until_index = if (next < batch.states.items.len) batch.states.items[next].first_index else index_total;
                 const until_quad = if (next < batch.states.items.len) batch.states.items[next].first_quad else quad_total;
-                if (until_index > state.first_index or until_quad > state.first_quad) try canvas.ranges.append(self.gpa, .{
+                if (until_index > state.first_index or until_quad > state.first_quad) try canvas.ranges.append(self.internal.gpa, .{
                     .upload = uploaded,
                     .world = world,
                     .first_index = state.first_index,
@@ -322,14 +299,14 @@ fn gather(ctx: *ViewContext, stage: api.DrawStage, depth: ?features.Target) !?*L
         }
     }.before);
     const layer = try ctx.make(Layer);
-    layer.* = .{ .ctx = ctx, .stage = stage, .first_range = first, .range_count = @intCast(made.len), .world = any_world, .depth = if (any_world) depth else null };
+    layer.* = .{ .ctx = ctx, .stage = stage, .first_range = first, .range_count = @intCast(made.len), .world = any_world, .depth = if (any_world or stage == .under) depth else null };
     return layer;
 }
 
 /// Whether a view without a scene draws any list as a scene, and so needs
 /// an HDR picture and the passes that take it to the target.
 pub fn lit(desc: *const api.ViewDesc) bool {
-    for (desc.draw_lists) |layer| if (layer.stage == .scene) return true;
+    for (desc.draw_lists) |layer| if (layer.stage != .overlay) return true;
     return hooks_feature.lit(desc);
 }
 
@@ -340,16 +317,25 @@ pub fn declare(ctx: *ViewContext) !void {
     const g = ctx.graph;
     const depth = g.slot(.depth);
     const reads = [1]features.Target{depth orelse undefined};
+    const under = try gather(ctx, .under, depth);
     const scene = try gather(ctx, .scene, depth);
     if (ctx.scene != null) {
+        if (under) |layer| if (g.slot(.hdr)) |hdr| if (depth != null)
+            try g.add(.{ .name = "draw lists (under the scene)", .stage = .after_opaque, .reads = &reads, .color = &.{.{ .target = hdr, .load = .load }}, .always = true }, layer, drawUnder);
         if (scene) |layer| try g.add(.{ .name = "draw lists (scene)", .stage = .resolved, .reads = reads[0..@intFromBool(layer.depth != null)], .always = true }, layer, drawResolved);
     } else if (g.slot(.hdr)) |hdr| {
-        const layer = scene orelse blk: {
-            const empty = try ctx.make(Layer);
-            empty.* = .{ .ctx = ctx, .stage = .scene, .first_range = 0, .range_count = 0, .world = false, .depth = null };
-            break :blk empty;
-        };
-        try g.add(.{ .name = "draw lists (scene)", .stage = .resolved, .color = &.{.{ .target = hdr, .load = .clear, .clear = ctx.output.clear }} }, layer, drawLit);
+        if (under) |layer| {
+            layer.depth = null;
+            try g.add(.{ .name = "draw lists (under)", .stage = .resolved, .color = &.{.{ .target = hdr, .load = .clear, .clear = ctx.output.clear }} }, layer, drawLit);
+        }
+        if (scene != null or under == null) {
+            const layer = scene orelse blk: {
+                const empty = try ctx.make(Layer);
+                empty.* = .{ .ctx = ctx, .stage = .scene, .first_range = 0, .range_count = 0, .world = false, .depth = null };
+                break :blk empty;
+            };
+            try g.add(.{ .name = "draw lists (scene)", .stage = .resolved, .color = &.{.{ .target = hdr, .load = if (under != null) .load else .clear, .clear = ctx.output.clear }} }, layer, drawLit);
+        }
     }
     const overlay = try gather(ctx, .overlay, depth);
     if (overlay == null and ctx.output.load != .clear) return;
@@ -388,6 +374,13 @@ fn drawLit(layer: *Layer) !void {
     try draw(layer, .{ .region = .{ .x = 0, .y = 0, .width = region.width, .height = region.height }, .format = renderer_state.hdr_format, .encoding = 0 });
 }
 
+/// Into a scene view's HDR picture where no surface is, which the graph
+/// has begun rendering into.
+fn drawUnder(layer: *Layer) !void {
+    const info = layer.ctx.device.textureInfo(layer.ctx.graph.texture(layer.ctx.graph.slot(.hdr).?));
+    try draw(layer, .{ .region = .{ .x = 0, .y = 0, .width = info.width, .height = info.height }, .format = renderer_state.hdr_format, .encoding = 0 });
+}
+
 /// Into a scene view's picture once it is antialiased, whatever size that
 /// left it at.
 fn drawResolved(layer: *Layer) !void {
@@ -398,7 +391,6 @@ fn drawResolved(layer: *Layer) !void {
     try cmd.beginRendering(.{ .color = &.{.{ .texture = picture, .load = .load }} });
     const outcome = draw(layer, .{ .region = .{ .x = 0, .y = 0, .width = info.width, .height = info.height }, .format = info.format, .encoding = 0 });
     cmd.endRendering();
-    cmd.transition(picture, .shader_read);
     try outcome;
 }
 
@@ -425,13 +417,13 @@ fn draw(layer: *Layer, area: Area) !void {
         .camera_up = .{ 0, 1, 0 },
         .sdf_spread = font_module.sdf_spread,
         .viewport = .{ @floatFromInt(region.width), @floatFromInt(region.height) },
-        .sampler_linear = device.samplerIndex(self.sampler_linear_clamp),
-        .sampler_nearest = device.samplerIndex(self.sampler_nearest_clamp),
+        .sampler_linear = device.samplerIndex(self.internal.sampler_linear_clamp),
+        .sampler_nearest = device.samplerIndex(self.internal.sampler_nearest_clamp),
         .depth_texture = gpu.invalid_id,
         .hdr_paper_white = @max(ctx.settings.output.paper_white, 1),
         .origin = .{ @floatFromInt(region.x), @floatFromInt(region.y) },
         .sharp_text = @intFromBool(ctx.settings.canvas.sharp_text),
-        .time = self.time,
+        .time = self.internal.time,
     };
     const screen_transform = Mat4{
         2 / width, 0,          0, 0,
@@ -474,7 +466,8 @@ fn draw(layer: *Layer, area: Area) !void {
         push.transform = if (range.world) world_transform else screen_transform;
         push.camera_right = if (range.world) camera_right else .{ 0, 0, 0 };
         push.camera_up = if (range.world) camera_up else .{ 0, 0, 0 };
-        push.depth_texture = if (range.world) depth_texture else gpu.invalid_id;
+        push.depth_texture = if (range.world or layer.stage == .under) depth_texture else gpu.invalid_id;
+        push.under = @intFromBool(layer.stage == .under and layer.depth != null);
         if (range.index_count != 0) {
             push.unfold = 0;
             cmd.pushConstants(push);

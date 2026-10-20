@@ -1,5 +1,7 @@
 //! The sun's virtual shadow map (see vsm.slang): per-view pages and atlas, page
 //! requests, allocation and drawing.
+const pipelines_module = @import("../renderer/pipelines.zig");
+const vsm_passes_push = @import("../shaders/push/vsm_passes.zig");
 const geometry_feature = @import("geometry.zig");
 const hair_feature = @import("hair.zig");
 const std = @import("std");
@@ -89,8 +91,8 @@ pub fn declare(ctx: *ViewContext) !void {
     const moved_sun = math.length(math.sub(state.sun, sun_travel)) > 1e-5;
     const scene_handle: ?render.Scene = p.scene_handle;
     const reset = state.frame == 0 or moved_sun or !std.meta.eql(state.origin, scene.origin) or state.extent != extent or
-        state.drawn_frame +% 1 != renderer.frame_index or !std.meta.eql(state.scene, scene_handle);
-    state.drawn_frame = renderer.frame_index;
+        state.drawn_frame +% 1 != renderer.internal.frame_index or !std.meta.eql(state.scene, scene_handle);
+    state.drawn_frame = renderer.internal.frame_index;
     state.scene = scene_handle;
     state.sun = sun_travel;
     state.origin = scene.origin;
@@ -130,8 +132,8 @@ pub fn declare(ctx: *ViewContext) !void {
         .page_views = device.bufferAddress(state.page_views),
         .movers = movers.address,
     };
-    ctx.constants.vsm = params.address;
-    ctx.constants.flags |= gpu.frame_flags.vsm;
+    ctx.constants.shadows.vsm = params.address;
+    ctx.constants.shadows.virtual_maps = 1;
 
     const g = ctx.graph;
     const frame = try ctx.make(Frame);
@@ -157,12 +159,12 @@ fn draw(frame: *Frame) !void {
     const culling = p.culling;
     const state = frame.state;
     const params = frame.params;
-    cmd.bindPipeline(try renderer.pipelines.get(.vsm_mark));
-    cmd.pushConstants(extern struct { frame: u64, vsm: u64, depth: u32, pad: u32 = 0 }{ .frame = ctx.frame_address, .vsm = params, .depth = ctx.index(frame.depth) });
+    cmd.bindPipeline(try renderer.internal.pipelines.of(vsmMarkPipeline));
+    cmd.pushConstants(vsm_passes_push.MarkPush{ .frame = ctx.frame_address, .vsm = params, .depth_texture = ctx.index(frame.depth) });
     cmd.dispatch((p.width + 7) / 8, (p.height + 7) / 8, 1);
     cmd.sync(.compute_to_all);
-    cmd.bindPipeline(try renderer.pipelines.get(.vsm_allocate));
-    cmd.pushConstants(extern struct { frame: u64, vsm: u64, views: u64, first_page_view: u32, pad: u32 = 0 }{
+    cmd.bindPipeline(try renderer.internal.pipelines.of(vsmAllocatePipeline));
+    cmd.pushConstants(vsm_passes_push.AllocatePush{
         .frame = ctx.frame_address,
         .vsm = params,
         .views = culling.views,
@@ -180,11 +182,11 @@ fn draw(frame: *Frame) !void {
     }
 
     try cmd.beginRendering(.{ .depth = .{ .texture = state.atlas, .load = if (state.fresh) .clear else .load, .clear = 1 } });
-    cmd.bindPipeline(try renderer.pipelines.get(.vsm_clear));
-    cmd.pushConstants(extern struct { page_views: u64 }{ .page_views = device.bufferAddress(state.page_views) });
+    cmd.bindPipeline(try renderer.internal.pipelines.of(vsmClearPipeline));
+    cmd.pushConstants(vsm_passes_push.ClearPush{ .page_views = device.bufferAddress(state.page_views) });
     cmd.draw(6, gpu.vsm_pages_per_frame, 0, 0);
     if (p.has_geometry) {
-        cmd.bindIndexBuffer(renderer.indices.get(), 0, .uint32);
+        cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
         for (0..gpu.vsm_pages_per_frame) |page| {
             const page_push = DrawPush{
                 .frame = ctx.frame_address,
@@ -192,9 +194,9 @@ fn draw(frame: *Frame) !void {
                 .view_proj = math.identity,
                 .page = device.bufferAddress(state.page_views) + page * @sizeOf(gpu.VsmPageView),
             };
-            cmd.bindPipeline(try renderer.pipelines.get(.shadow));
+            cmd.bindPipeline(try renderer.internal.pipelines.of(pipelines_module.shadowPipeline));
             geometry_feature.drawMeshlets(renderer, cmd, page_push, render.vsm_view_base + page, 0, p.scene.ref_count);
-            cmd.bindPipeline(try renderer.pipelines.get(.shadow_masked));
+            cmd.bindPipeline(try renderer.internal.pipelines.of(pipelines_module.shadowMaskedPipeline));
             geometry_feature.drawMeshlets(renderer, cmd, page_push, render.vsm_view_base + page, 1, p.scene.ref_count);
         }
     }
@@ -203,4 +205,21 @@ fn draw(frame: *Frame) !void {
         try hair_feature.drawHairShadows(renderer, p, math.identity, finest_texel, device.bufferAddress(state.page_views) + page * @sizeOf(gpu.VsmPageView));
     }
     cmd.endRendering();
+}
+
+fn vsmMarkPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "virtual shadow requests", .shader = pipelines_module.shaderCode("vsm_mark.comp.spv") } };
+}
+
+fn vsmAllocatePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "virtual shadow pages", .shader = pipelines_module.shaderCode("vsm_allocate.comp.spv") } };
+}
+
+fn vsmClearPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .graphics = .{
+        .name = "virtual shadow clear",
+        .vertex = pipelines_module.shaderCode("vsm_clear.vert.spv"),
+        .depth = .{ .compare = .always },
+        .cull = .none,
+    } };
 }

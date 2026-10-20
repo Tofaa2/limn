@@ -13,10 +13,7 @@ Output fullscreenMain(uint vertex : SV_VulkanVertexID) {
     return result;
 }
 
-struct CopyPush {
-    FrameConstants frame;
-    uint source_texture;
-};
+#include "fullscreen.CopyPush.slang"
 
 [[vk::push_constant]] CopyPush copy_push;
 
