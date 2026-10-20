@@ -17,6 +17,10 @@ fn sameShape(a: rhi.TextureDesc, b: rhi.TextureDesc) bool {
 pub const History = struct {
     current: rhi.Texture,
     previous: ?rhi.Texture,
+    /// The other picture of the pair, whatever it holds: last frame's when
+    /// `previous` is set, an older one or nothing drawn otherwise. For
+    /// shaders that read a history even when told to ignore it.
+    last: rhi.Texture,
 };
 
 /// One view's targets that are kept between frames, found by name. Asking
@@ -42,6 +46,17 @@ pub const Kept = struct {
         self.entries.deinit(gpa);
     }
 
+    fn make(device: *rhi.Device, cmd: ?*rhi.CommandEncoder, desc: rhi.TextureDesc) !rhi.Texture {
+        const made = try device.createTexture(desc);
+        errdefer device.destroyTexture(made);
+        if (cmd) |encoder| {
+            std.debug.assert(desc.usage.color_attachment);
+            try encoder.beginRendering(.{ .color = &.{.{ .texture = made, .load = .clear }} });
+            encoder.endRendering();
+        }
+        return made;
+    }
+
     fn release(device: *rhi.Device, entry: Entry) void {
         for (entry.textures) |texture| if (texture) |made| device.destroyTexture(made);
     }
@@ -63,8 +78,15 @@ pub const Kept = struct {
     /// The target named `desc.name`, made on first use and again when its
     /// shape changes. Its contents stay from frame to frame.
     pub fn single(self: *Kept, gpa: std.mem.Allocator, device: *rhi.Device, desc: rhi.TextureDesc, frame: u64) !rhi.Texture {
+        return self.singleCleared(gpa, device, null, desc, frame);
+    }
+
+    /// As `single`, cleared with `cmd` when it is made, so that it never
+    /// holds what the memory held before. `cmd` must be outside a render
+    /// pass; null leaves it as made. Needs `color_attachment` usage.
+    pub fn singleCleared(self: *Kept, gpa: std.mem.Allocator, device: *rhi.Device, cmd: ?*rhi.CommandEncoder, desc: rhi.TextureDesc, frame: u64) !rhi.Texture {
         const entry = try self.find(gpa, device, desc, frame);
-        if (entry.textures[0] == null) entry.textures[0] = try device.createTexture(desc);
+        if (entry.textures[0] == null) entry.textures[0] = try make(device, cmd, desc);
         return entry.textures[0].?;
     }
 
@@ -72,15 +94,21 @@ pub const Kept = struct {
     /// frame. Call once a frame. `previous` is null on first use, after a
     /// change of shape and after a frame in which it was not asked for.
     pub fn history(self: *Kept, gpa: std.mem.Allocator, device: *rhi.Device, desc: rhi.TextureDesc, frame: u64) !History {
+        return self.historyCleared(gpa, device, null, desc, frame);
+    }
+
+    /// As `history`, with both pictures cleared with `cmd` when they are
+    /// made; see `singleCleared`.
+    pub fn historyCleared(self: *Kept, gpa: std.mem.Allocator, device: *rhi.Device, cmd: ?*rhi.CommandEncoder, desc: rhi.TextureDesc, frame: u64) !History {
         const entry = try self.find(gpa, device, desc, frame);
         for (&entry.textures) |*texture| {
-            if (texture.* == null) texture.* = try device.createTexture(desc);
+            if (texture.* == null) texture.* = try make(device, cmd, desc);
         }
         const continuous = if (entry.drawn) |drawn| drawn +% 1 == frame else false;
         const previous = entry.textures[entry.turn].?;
         entry.turn ^= 1;
         entry.drawn = frame;
-        return .{ .current = entry.textures[entry.turn].?, .previous = if (continuous) previous else null };
+        return .{ .current = entry.textures[entry.turn].?, .previous = if (continuous) previous else null, .last = previous };
     }
 
     /// Whether `history` would hand out a last frame's picture for `name`.

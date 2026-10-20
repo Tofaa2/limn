@@ -98,8 +98,10 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
 
 /// Adds the feature's passes to a view of a scene. A path traced view leaves
 /// out those whose result the tracer replaces.
-/// A view's sun shadow maps, and the cascades they were last drawn for.
+/// A view's sun shadow maps, and the cascades they were last drawn for. The
+/// maps are in the view's kept targets, freed once shadows stop asking.
 pub const View = struct {
+    /// This frame's maps; set by `fitMaps`.
     map: ?rhi.Texture = null,
     /// Tint of sunlight passed by see-through casters, per cascade.
     tint: ?rhi.Texture = null,
@@ -110,54 +112,40 @@ pub const View = struct {
         return .{};
     }
 
-    pub fn deinit(self: *View, device: *rhi.Device) void {
-        if (self.map) |texture| device.destroyTexture(texture);
-        if (self.tint) |texture| device.destroyTexture(texture);
-    }
+    pub fn deinit(_: *View, _: *rhi.Device) void {}
 };
 
-/// Makes the maps a view with these shadows draws into, and frees those it
-/// no longer needs; a change between plain and colored shadows redraws
-/// every cascade.
+/// Finds the maps a view with these shadows draws into in its kept
+/// targets; new maps, and a change between plain and colored shadows,
+/// redraw every cascade.
 pub fn fitMaps(renderer: *Renderer, view_data: *render.ViewData, enabled: bool, colored: bool) !*View {
     const device = renderer.device;
     const own = try features.stateOf(view_data, device, @This());
     const resolution = renderer.options.shadows.resolution;
-    if (!colored) if (own.tint) |tint| {
-        device.destroyTexture(tint);
-        own.tint = null;
-    };
-    if (!enabled) if (own.map) |map| {
-        device.destroyTexture(map);
-        own.map = null;
-        own.cascade_cache.valid = false;
-    };
-    if (colored and own.tint == null) {
-        own.tint = try device.createTexture(.{
-            .name = "shadow tint",
-            .width = @max(resolution / 2, 1),
-            .height = @max(resolution / 2, 1),
-            .format = .rgba8_unorm,
-            .usage = .{ .sampled = true, .color_attachment = true },
-            .layers = gpu.cascade_count,
-            .kind = .@"2d_array",
-        });
-    }
-    if (own.colored != colored) {
-        own.colored = colored;
-        own.cascade_cache.valid = false;
-    }
-    if (enabled and own.map == null) {
-        own.map = try device.createTexture(.{
-            .name = "shadow cascades",
-            .width = resolution,
-            .height = resolution,
-            .format = .depth32_float,
-            .usage = .{ .sampled = true, .depth_attachment = true },
-            .layers = gpu.cascade_count,
-            .kind = .@"2d_array",
-        });
-    }
+    const gpa = renderer.internal.gpa;
+    const frame = renderer.internal.frame_index;
+    const tint: ?rhi.Texture = if (colored) try view_data.kept.single(gpa, device, .{
+        .name = "shadow tint",
+        .width = @max(resolution / 2, 1),
+        .height = @max(resolution / 2, 1),
+        .format = .rgba8_unorm,
+        .usage = .{ .sampled = true, .color_attachment = true },
+        .layers = gpu.cascade_count,
+        .kind = .@"2d_array",
+    }, frame) else null;
+    const map: ?rhi.Texture = if (enabled) try view_data.kept.single(gpa, device, .{
+        .name = "shadow cascades",
+        .width = resolution,
+        .height = resolution,
+        .format = .depth32_float,
+        .usage = .{ .sampled = true, .depth_attachment = true },
+        .layers = gpu.cascade_count,
+        .kind = .@"2d_array",
+    }, frame) else null;
+    if (own.colored != colored or !std.meta.eql(own.map, map) or !std.meta.eql(own.tint, tint)) own.cascade_cache.valid = false;
+    own.colored = colored;
+    own.map = map;
+    own.tint = tint;
     return own;
 }
 
