@@ -35,51 +35,65 @@ float4 marchMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position
     float3 sky_up = float3(0.0);
     float3 sky_down = float3(0.0);
     if (frame.environment != 0u) {
-        sky_up = sampleCubeLod(frame.env_irradiance, linear, float3(0.0, 1.0, 0.0), 0.0).rgb * frame.env_intensity * clouds.ambient;
-        sky_down = sampleCubeLod(frame.env_irradiance, linear, float3(0.0, -1.0, 0.0), 0.0).rgb * frame.env_intensity * clouds.ambient;
+        sky_up = sampleCubeLod(frame.env_irradiance, linear, float3(0.0, 1.0, 0.0), 0.0).rgb * frame.env_intensity;
+        sky_down = sampleCubeLod(frame.env_irradiance, linear, float3(0.0, -1.0, 0.0), 0.0).rgb * frame.env_intensity;
     }
     float3 to_sun = frame.sun_direction;
+    float3 up = float3(0.0, 1.0, 0.0);
     float thickness = clouds.top - clouds.bottom;
+    float diffused = 1.0 - clouds.anisotropy;
 
+    float near_end = min(segment.y, clouds.max_distance);
+    float far_end = min(segment.y, clouds.max_distance * 4.0);
     int steps = clouds.steps;
-    float step_length = (segment.y - segment.x) / float(steps);
+    int far_steps = far_end > near_end ? max(steps / 6, 4) : 0;
     float jitter = interleavedGradientNoise(fragment.xy, frame.frame_index);
     float3 scattered = float3(0.0);
     float transmittance = 1.0;
     float weighted_distance = 0.0;
     float weight_total = 0.0;
-    for (int i = 0; i < steps; i++) {
-        float t = segment.x + (float(i) + jitter) * step_length;
+    for (int i = 0; i < steps + far_steps; i++) {
+        bool far = i >= steps;
+        float start = far ? near_end : segment.x;
+        float step_length = far ? (far_end - near_end) / float(far_steps) : (near_end - segment.x) / float(steps);
+        float t = start + (float(far ? i - steps : i) + jitter) * step_length;
         float3 position = camera + direction * t;
         float altitude = cloudAltitude(clouds, position, camera);
-        float sigma = cloudDensity(clouds, linear, position, altitude, true);
+        float sigma = cloudDensity(clouds, linear, position, altitude, !far);
         if (sigma <= 0.0) continue;
 
-        float optical_depth = 0.0;
+        float sun_depth = 0.0;
         float reach_sun = thickness * 0.04;
         float travelled = 0.0;
-        for (int j = 0; j < clouds.light_steps; j++) {
+        int light_steps = far ? 2 : clouds.light_steps;
+        for (int j = 0; j < light_steps; j++) {
             float3 toward = position + to_sun * (travelled + reach_sun * 0.5);
-            optical_depth += cloudDensity(clouds, linear, toward, cloudAltitude(clouds, toward, camera), false) * reach_sun;
+            sun_depth += cloudDensity(clouds, linear, toward, cloudAltitude(clouds, toward, camera), false) * reach_sun;
             travelled += reach_sun;
             reach_sun *= 1.7;
         }
+        float above = sigma * (clouds.top - altitude) * 0.5;
+        float below = sigma * (altitude - clouds.bottom) * 0.5;
+        if (!far) {
+            float3 higher = position + up * (thickness * 0.15);
+            float3 lower = position - up * (thickness * 0.08);
+            above = cloudDensity(clouds, linear, higher, altitude + thickness * 0.15, false) * thickness * 0.3;
+            below = cloudDensity(clouds, linear, lower, altitude - thickness * 0.08, false) * thickness * 0.16;
+        }
         float sun = 0.0;
-        float reach_scale = 1.0;
         float share = 1.0;
+        float reach = 1.0;
         float forward = 1.0;
-        for (int scattering_order = 0; scattering_order < 4; scattering_order++) {
+        for (int order = 0; order < 2; order++) {
             float phase = lerp(henyeyGreenstein(cos_sun, clouds.anisotropy * forward), henyeyGreenstein(cos_sun, -0.3 * forward), 0.25);
-            sun += share * exp(-optical_depth * reach_scale) * phase;
-            reach_scale *= 0.35;
-            share *= 0.6;
+            sun += share * exp(-sun_depth * reach) * phase;
+            share *= 0.5;
+            reach *= 0.5;
             forward *= 0.5;
         }
-        float gathered_here = 1.0 - exp(-(optical_depth + sigma * thickness * 0.06) * 2.0);
-        sun *= lerp(1.0, gathered_here, 0.65);
-        float height = clamp((altitude - clouds.bottom) / thickness, 0.0, 1.0);
-        float3 sunlight = lerp(frame.sun_radiance, float3(luminance(frame.sun_radiance)), 0.6);
-        float3 light = sunlight * sun * 3.2 + sky_up * (0.5 + 0.5 * height) * exp(-optical_depth * 0.08) * 1.6 + sky_down * (1.0 - height) * 0.6;
+        sun += 1.0 / (PI * (1.0 + 0.75 * sun_depth * diffused));
+        float3 ambient = 0.5 * (sky_up / (1.0 + 0.75 * above * diffused) + sky_down / (1.0 + 0.75 * below * diffused)) * clouds.ambient;
+        float3 light = frame.sun_radiance * sun + ambient;
         if (clouds.flash.w > 0.0) {
             float away = distance(position, clouds.flash.xyz) / 700.0;
             light += float3(0.75, 0.82, 1.0) * (clouds.flash.w / (1.0 + away * away * away));
@@ -96,26 +110,31 @@ float4 marchMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position
             break;
         }
     }
-    float visible = 1.0 - smoothstep(0.6, 1.0, (weight_total > 0.0 ? weighted_distance / weight_total : segment.x) / clouds.max_distance);
-    scattered *= visible;
-    transmittance = lerp(1.0, transmittance, visible);
+    float distance_seen = weight_total > 0.0 ? weighted_distance / weight_total : segment.x;
     if (clouds.cirrus > 0.0 && transmittance > 0.01) {
         float bend = (1.0 - direction.y * direction.y) / (2.0 * clouds.planet_radius);
         float cirrus_reach = cloudCrossings(camera.y, direction.y, bend, clouds.top + 5000.0).x;
-        if (cirrus_reach > 0.0 && cirrus_reach < clouds.max_distance * 1.5 && cirrus_reach < limit) {
+        if (cirrus_reach > 0.0 && cirrus_reach < far_end * 1.5 && cirrus_reach < limit) {
             float3 there = camera + direction * cirrus_reach + clouds.offset * 1.6;
             float4 noise = sampleVolumeRepeat(clouds.noise_texture, linear, float3(there.x / (clouds.period * 6.0), there.z / (clouds.period * 1.5), 0.4), CLOUD_NOISE_SIZE, CLOUD_NOISE_TILES);
             float streaks = cloudRemap(noise.r * (0.5 + 0.5 * noise.g), 1.0 - clouds.cirrus * 0.7, 1.0);
-            float veil = streaks * 0.55 * (1.0 - smoothstep(0.5, 1.4, cirrus_reach / clouds.max_distance));
-            float3 lit = frame.sun_radiance * (0.25 / PI) + sky_up;
+            float veil = streaks * 0.55;
+            float3 lit = frame.sun_radiance * henyeyGreenstein(cos_sun, 0.6) + 0.5 * (sky_up + sky_down) * clouds.ambient;
             scattered += transmittance * veil * lit * clouds.albedo;
+            if (weight_total <= 0.0) distance_seen = cirrus_reach;
             transmittance *= 1.0 - veil;
         }
     }
+    float3 through_air;
+    float3 air;
+    cloudAir(frame, 0.5 * (sky_up + sky_down), camera, direction, distance_seen, clouds.planet_radius, through_air, air);
+    scattered = scattered * through_air + air * (1.0 - transmittance);
+    float visible = 1.0 - smoothstep(0.75, 1.0, distance_seen / (clouds.max_distance * 4.0));
+    scattered *= visible;
+    transmittance = lerp(1.0, transmittance, visible);
     float4 result = float4(scattered, transmittance);
 
     if (clouds.history_texture != INVALID_ID) {
-        float distance_seen = weight_total > 0.0 ? weighted_distance / weight_total : segment.x;
         float4 previous = mul(frame.prev_view_proj_unjittered, float4(camera + direction * distance_seen, 1.0));
         float2 previous_uv = previous.xy / previous.w * 0.5 + 0.5;
         if (previous.w > 0.0 && all(previous_uv > 0.0) && all(previous_uv < 1.0)) {
@@ -223,4 +242,30 @@ float4 compositeMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Posi
     float4 result = sampleTextureLod(composite_push.cloud_texture, frame.sampler_linear_clamp, in_uv, 0.0);
     result.a = min(result.a, 1.0);
     return float4(result.rgb, 1.0 - result.a);
+}
+
+#include "cloud_passes.WeatherPush.slang"
+
+[[vk::push_constant]] WeatherPush weather_push;
+
+float swirlPotential(float2 uv) {
+    return gradient(float3(uv, 0.81), 4) * 0.7 + gradient(float3(uv, 0.29), 8) * 0.3;
+}
+
+/// Repeating weather: red is cover, green the kind of cloud, blue and alpha a
+/// swirl that bends the shapes, from the curl of a noise.
+[shader("fragment")]
+float4 weatherMain(float4 fragment : SV_Position) : SV_Target {
+    float texel = 1.0 / float(weather_push.size);
+    float2 uv = fragment.xy * texel;
+    float banks = perlinFbm(float3(uv, 0.21), 3);
+    float cells = worleyFbm(float3(uv, 0.63), 4);
+    float cover = clamp(remap(banks, 0.0, 1.0, cells * 0.6, 1.0) * 1.25 - 0.2, 0.0, 1.0);
+    float kind = perlinFbm(float3(uv, 0.47), 2);
+    float right = swirlPotential(uv + float2(texel, 0.0));
+    float left = swirlPotential(uv - float2(texel, 0.0));
+    float ahead = swirlPotential(uv + float2(0.0, texel));
+    float behind = swirlPotential(uv - float2(0.0, texel));
+    float2 curl = float2(ahead - behind, left - right) / (2.0 * texel * 12.0);
+    return float4(cover, kind, clamp(curl * 0.5 + 0.5, 0.0, 1.0));
 }

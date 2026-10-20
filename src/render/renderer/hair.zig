@@ -69,6 +69,11 @@ pub const Hairs = struct {
         };
         const middle = math.scale(math.add(low, high), 0.5);
         state.bounds = .{ middle[0], middle[1], middle[2], math.length(math.sub(high, middle)) };
+        var length: f64 = 0;
+        for (desc.points[1..], desc.points[0 .. desc.points.len - 1], 1..) |point, before, index| {
+            if (index % desc.points_per_strand != 0) length += math.length(math.sub(point, before));
+        }
+        state.segment = @floatCast(length / @as(f64, @floatFromInt(state.stretches)));
         setHairMotion(state, desc.simulation);
         return hair;
     }
@@ -153,6 +158,10 @@ fn setHairMotion(state: *HairState, simulation: ?HairSimulation) void {
 
 pub fn freeHair(self: *Renderer, state: HairState) void {
     self.device.destroyBuffer(state.points);
+    if (state.shade) |shade| {
+        self.device.destroyBuffer(shade.counts);
+        self.device.destroyBuffer(shade.light);
+    }
     if (state.moving) |moving| {
         for (moving.points) |buffer| self.device.destroyBuffer(buffer);
         for (moving.density) |buffer| self.device.destroyBuffer(buffer);

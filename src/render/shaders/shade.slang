@@ -142,7 +142,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
         float4 previous = mul(frame.prev_view_proj_unjittered, float4(direction, 0.0));
         float3 sky = float3(0.0);
         if (frame.environment != 0u)
-            sky = sampleCubeLod(frame.env_sky, frame.sampler_linear_clamp, direction, 0.0).rgb * frame.env_intensity;
+            sky = sampleCubeLod(frame.env_sky, frame.sampler_linear_clamp, skyFromHeight(direction, eyePoint(frame, far_point).y), 0.0).rgb * frame.env_intensity;
         result.color = float4(sky, 1.0);
 #ifndef PLAIN
         result.reflection = float4(0.0);

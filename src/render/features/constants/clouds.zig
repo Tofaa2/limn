@@ -41,7 +41,14 @@ pub const Clouds = extern struct {
     shadow_strength: f32 = 0,
     cirrus: f32 = 0,
     anvil: f32 = 0,
-    cloud_pad: [2]f32 = .{ 0, 0 },
+    /// Red is cover, green the kind of cloud; stretched over `weather_size`.
+    weather: u32 = invalid_id,
+    weather_size: f32 = 1,
     /// A lightning flash inside the layer: position and brightness.
     flash: [4]f32 = .{ 0, 0, 0, 0 },
+    /// The built-in weather, whose blue and alpha swirl the shapes.
+    pattern: u32 = invalid_id,
+    repeat_sampler: u32 = 0,
+    curl: f32 = 0,
+    kind: f32 = 0.5,
 };

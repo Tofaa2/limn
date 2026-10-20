@@ -8,7 +8,7 @@
 //!   C           clouds on or off
 //!   F           temporal filter on or off (off shows the raw march)
 //!
-//! `--altitude N`, `--sun N`, `--night 1`, `--clear 1`, `--storm 1`, `--frames N`,
+//! `--altitude N`, `--sun N`, `--kind N`, `--night 1`, `--clear 1`, `--storm 1`, `--frames N`,
 //! `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");
@@ -114,6 +114,7 @@ pub fn main(init: std.process.Init) !void {
     while (arguments.next()) |argument| {
         if (std.mem.eql(u8, argument, "--altitude")) altitude = try std.fmt.parseFloat(f32, arguments.next() orelse "30");
         if (std.mem.eql(u8, argument, "--sun")) sun_height = try std.fmt.parseFloat(f32, arguments.next() orelse "0.75");
+        if (std.mem.eql(u8, argument, "--kind")) clouds.kind = try std.fmt.parseFloat(f32, arguments.next() orelse "0.5");
         if (std.mem.eql(u8, argument, "--pane")) {
             const corners = [_][3]f32{ .{ -30, 0, -20 }, .{ 30, 0, -20 }, .{ 30, 0, 20 }, .{ -30, 0, 20 } };
             const pane = try renderer.models.create(&.{.{

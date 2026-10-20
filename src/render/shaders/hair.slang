@@ -14,6 +14,7 @@ HairPoint hairPoint(float3 position, float along) {
     return point;
 }
 
+#include "hair.HairLook.slang"
 #include "hair.HairPush.slang"
 
 float3 hairCopyOffset(uint strand, uint copy) {
@@ -196,14 +197,37 @@ struct StrandVaryings {
     float4 screen : SV_Position;
 };
 
-float3 strandWorldPoint(uint index) {
-    return mul(strand_push.transform, float4(strand_push.points[index].position, 1.0)).xyz;
+float hairRandom(uint seed) {
+    seed = seed * 747796405u + 2891336453u;
+    uint word = ((seed >> ((seed >> 28u) + 4u)) ^ seed) * 277803737u;
+    return float((word >> 22u) ^ word) / 4294967295.0;
 }
 
-float strandShade(uint strand) {
-    strand = strand * 747796405u + 2891336453u;
-    uint word = ((strand >> ((strand >> 28u) + 4u)) ^ strand) * 277803737u;
-    return lerp(0.62, 1.18, float((word >> 22u) ^ word) / 4294967295.0);
+/// Where a drawn copy of a strand sits beside the strand at `along`, in world
+/// units: copies spread out toward the tip and gather back into locks, curl
+/// round the strand and kink.
+float3 hairGroom(HairLook* look, uint strand, uint copy, uint point, float along, float3 tangent) {
+    float3 offset = float3(0.0);
+    if (copy != 0u) {
+        float gather = 1.0 - look.clump * smoothstep(0.35, 1.0, along);
+        offset = hairCopyOffset(strand, copy) * look.spread * lerp(0.3, 1.0, along) * gather;
+    }
+    if (look.curl > 0.0) {
+        float3 side = cross(tangent, float3(0.36, 0.48, 0.8));
+        float side_length = length(side);
+        side = side_length > 1e-4 ? side / side_length : normalize(cross(tangent, float3(0.8, 0.0, 0.6)));
+        float3 other = cross(tangent, side);
+        float turn = along * look.curl_turns * 2.0 * PI + hairRandom(strand * 13u + copy) * 2.0 * PI;
+        float radius = look.curl * lerp(0.6, 1.4, hairRandom(strand * 29u + copy * 7u + 3u)) * smoothstep(0.0, 0.15, along);
+        offset += (side * cos(turn) + other * sin(turn)) * radius;
+    }
+    if (look.frizz > 0.0)
+        offset += hairCopyOffset(strand * 131u + point, copy + 17u) * look.frizz * along * along * step(0.7, hairRandom(strand * 5u + copy));
+    return offset;
+}
+
+float3 strandWorldPoint(uint index) {
+    return mul(strand_push.transform, float4(strand_push.points[index].position, 1.0)).xyz;
 }
 
 /// Each stretch of a strand as a ribbon turned to face the camera, at least
@@ -211,28 +235,29 @@ float strandShade(uint strand) {
 [shader("vertex")]
 StrandVaryings strandMain(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInstanceID) {
     FrameConstants frame = strand_push.frame;
+    HairLook* look = strand_push.look;
     uint stretch = vertex / 6u;
     uint corner = vertex % 6u;
-    uint stretches = strand_push.points_per_strand - 1u;
+    uint stretches = look.points_per_strand - 1u;
     uint strand = stretch / stretches;
     uint within = stretch % stretches;
     bool far_end = corner == 2u || corner == 3u || corner == 5u;
     float side = corner == 1u || corner == 4u || corner == 5u ? 1.0 : -1.0;
-    uint first = strand * strand_push.points_per_strand;
+    uint first = strand * look.points_per_strand;
     uint here = first + within + (far_end ? 1u : 0u);
     uint before = max(here, first + 1u) - 1u;
     uint after = min(here + 1u, first + stretches);
     float along = strand_push.points[here].along;
-    float3 beside = hairCopyOffset(strand, instance) * strand_push.spread * lerp(0.3, 1.0, along);
-    float3 position = strandWorldPoint(here) + beside;
     float3 tangent = normalize(strandWorldPoint(after) - strandWorldPoint(before));
+    float3 beside = hairGroom(look, strand, instance, here - first, along, tangent);
+    float3 position = strandWorldPoint(here) + beside;
     float3 toward = eyePoint(frame, position) - position;
     float distance_to = max(length(toward), 1e-4);
     float3 across = cross(tangent, toward / distance_to);
     float across_length = length(across);
     across = across_length > 1e-4 ? across / across_length : float3(0.0);
 
-    float width = lerp(strand_push.root_width, strand_push.tip_width, along) * length(matrixColumn(strand_push.transform, 0));
+    float width = lerp(look.root_width, look.tip_width, along) * length(matrixColumn(strand_push.transform, 0));
     float pixel = 2.0 * (frame.parallel != 0.0 ? 1.0 : distance_to) / (abs(frame.proj[1][1]) * frame.resolution.y);
     float coverage = clamp(width / pixel, 0.0, 1.0);
     float3 offset = across * side * 0.5 * max(width, pixel);
@@ -246,7 +271,7 @@ StrandVaryings strandMain(uint vertex : SV_VulkanVertexID, uint instance : SV_Vu
     result.screen = mul(frame.view_proj, float4(position, 1.0));
     result.clip = mul(frame.view_proj_unjittered, float4(position, 1.0));
     result.previous_clip = mul(frame.prev_view_proj_unjittered, float4(previous, 1.0));
-    result.shade = strandShade(strand * 31u + instance);
+    result.shade = hairRandom(strand * 31u + instance);
     return result;
 }
 
@@ -255,6 +280,8 @@ StrandVaryings strandMain(uint vertex : SV_VulkanVertexID, uint instance : SV_Vu
 [[vk::push_constant]] ShadowPush shadow_push;
 
 struct ShadowVaryings {
+    [[vk::location(0)]] float coverage;
+    [[vk::location(1)]] nointerpolation uint seed;
     float4 position : SV_Position;
     float clip[4] : SV_ClipDistance;
 };
@@ -265,25 +292,29 @@ float3 shadowWorldPoint(uint index) {
 
 [shader("vertex")]
 ShadowVaryings shadowMain(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInstanceID) {
+    HairLook* look = shadow_push.look;
     uint stretch = vertex / 6u;
     uint corner = vertex % 6u;
-    uint stretches = shadow_push.points_per_strand - 1u;
+    uint stretches = look.points_per_strand - 1u;
     uint strand = stretch / stretches;
     uint within = stretch % stretches;
     bool far_end = corner == 2u || corner == 3u || corner == 5u;
     float side = corner == 1u || corner == 4u || corner == 5u ? 1.0 : -1.0;
-    uint first = strand * shadow_push.points_per_strand;
+    uint first = strand * look.points_per_strand;
     uint here = first + within + (far_end ? 1u : 0u);
     uint before = max(here, first + 1u) - 1u;
     uint after = min(here + 1u, first + stretches);
-    float3 position = shadowWorldPoint(here) + hairCopyOffset(strand, instance) * shadow_push.spread * lerp(0.3, 1.0, shadow_push.points[here].along);
+    float along = shadow_push.points[here].along;
     float3 tangent = normalize(shadowWorldPoint(after) - shadowWorldPoint(before));
+    float3 position = shadowWorldPoint(here) + hairGroom(look, strand, instance, here - first, along, tangent);
     float3 across = cross(tangent, shadow_push.light);
     float across_length = length(across);
     across = across_length > 1e-4 ? across / across_length : float3(0.0);
-    float width = lerp(shadow_push.root_width, shadow_push.tip_width, shadow_push.points[here].along);
+    float width = lerp(look.root_width, look.tip_width, along) * length(matrixColumn(shadow_push.transform, 0));
     position += across * side * 0.5 * max(width, shadow_push.least_width);
     ShadowVaryings result;
+    result.coverage = clamp(width / max(shadow_push.least_width, 1e-9), 0.0, 1.0);
+    result.seed = strand * 7u + instance;
     result.position = mul(shadow_push.view_proj, float4(position, 1.0));
     float4 inside = float4(1.0);
     if (shadow_push.paged != 0u) {
@@ -298,12 +329,93 @@ ShadowVaryings shadowMain(uint vertex : SV_VulkanVertexID, uint instance : SV_Vu
     return result;
 }
 
+/// A strand thinner than a shadow texel covers only part of it: it casts
+/// there with that chance, so light comes through thin hair.
+[shader("fragment")]
+void shadowFragmentMain(ShadowVaryings input) {
+    uint2 texel = uint2(input.position.xy);
+    if (hairRandom(texel.x * 1973u + texel.y * 9277u + input.seed * 26699u) >= input.coverage) discard;
+}
+
+#include "hair.CountPush.slang"
+
+[[vk::push_constant]] CountPush count_push;
+
+uint gridIndex(int3 cell, uint size) {
+    return uint(cell.x) + (uint(cell.y) + uint(cell.z) * size) * size;
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void countMain(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= count_push.point_count) return;
+    float3 place = mul(count_push.transform, float4(count_push.points[id.x].position, 1.0)).xyz;
+    int3 cell = int3(floor((place - count_push.grid_low) / count_push.grid_cell));
+    int size = int(count_push.grid_size);
+    if (all(cell >= int3(0)) && all(cell < int3(size))) InterlockedAdd(count_push.counts[gridIndex(cell, count_push.grid_size)], 1u);
+}
+
+#include "hair.LightPush.slang"
+
+[[vk::push_constant]] LightPush light_push;
+
+/// Fibres crossed walking from the middle of a cell, `start`, along `way`
+/// once out of that cell, and the distance walked; with `to_gap` it stops on
+/// leaving the hair it started in.
+float2 fibresToward(float3 start, float3 way, bool to_gap) {
+    int size = int(light_push.grid_size);
+    float crossed = 0.0;
+    float walked = 0.0;
+    int empty = 0;
+    int3 own = int3(floor(start));
+    for (int i = 1; i <= size * 2; i++) {
+        int3 cell = int3(floor(start + way * (float(i) * 0.5)));
+        if (all(cell == own)) continue;
+        if (any(cell < int3(0)) || any(cell >= int3(size))) break;
+        uint count = light_push.counts[gridIndex(cell, light_push.grid_size)];
+        empty = count == 0u ? empty + 1 : 0;
+        if (to_gap && empty >= 2) break;
+        crossed += float(count) * light_push.fibre * light_push.grid_cell * 0.5;
+        walked = float(i) * 0.5 * light_push.grid_cell;
+    }
+    return float2(crossed, walked);
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void lightMain(uint3 id : SV_DispatchThreadID) {
+    uint size = light_push.grid_size;
+    if (id.x >= size * size * size) return;
+    float3 start = float3(id.x % size, (id.x / size) % size, id.x / (size * size)) + 0.5;
+    float2 sun = fibresToward(start, light_push.to_sun, true);
+    const float3 open_ways[5] = { float3(0.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), float3(-1.0, 0.0, 0.0), float3(0.0, 0.0, 1.0), float3(0.0, 0.0, -1.0) };
+    float open = 0.0;
+    for (int way = 0; way < 5; way++) open += exp(-fibresToward(start, open_ways[way], true).x) / 5.0;
+    light_push.light[id.x] = float4(sun, open, 0.0);
+}
+
 [[vk::push_constant]] HairPush shade_push;
 
 struct Output {
     float4 color : SV_Target0;
     float4 motion : SV_Target1;
 };
+
+/// The light grid at `position`, blended between cells.
+float4 hairLightAt(HairLook* look, float3 position) {
+    float3 cells = (position - look.grid_low) / look.grid_cell - 0.5;
+    int size = int(look.grid_size);
+    int3 base = int3(floor(cells));
+    float3 f = cells - float3(base);
+    float4 total = float4(0.0);
+    for (int corner = 0; corner < 8; corner++) {
+        int3 offset = int3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+        int3 cell = clamp(base + offset, int3(0), int3(size - 1));
+        float3 weights = lerp(1.0 - f, f, float3(offset));
+        total += look.light[gridIndex(cell, look.grid_size)] * (weights.x * weights.y * weights.z);
+    }
+    return total;
+}
 
 [shader("fragment")]
 Output shadeMain(
@@ -316,34 +428,57 @@ Output shadeMain(
     float4 fragment : SV_Position) {
     Output result;
     FrameConstants frame = shade_push.frame;
+    HairLook* look = shade_push.look;
     float3 tangent = normalize(in_tangent);
     float3 view = normalize(eyePoint(frame, in_position) - in_position);
     float3 facing = view - tangent * dot(view, tangent);
     float facing_length = length(facing);
     float3 normal = facing_length > 1e-4 ? facing / facing_length : view;
-    float3 color = lerp(shade_push.root_color, shade_push.tip_color, in_along.x) * in_shade;
+    float pigment = lerp(1.0 - 0.35 * look.variation, 1.0 + 0.5 * look.variation, in_shade);
+    float3 color = pow(clamp(lerp(look.root_color, look.tip_color, in_along.x), float3(1e-4), float3(1.0)), float3(pigment));
+    float roughness = clamp(look.roughness, 0.05, 1.0);
+    float view_depth = -(mul(frame.view, float4(in_position, 1.0))).z;
+    float noise = interleavedGradientNoise(fragment.xy, frame.frame_index);
+    float4 inside = hairLightAt(look, in_position);
+    float3 per_fibre = sqrt(color) * 0.9;
+
+    float3 lit = float3(0.0);
+    float3 l = frame.sun_direction;
+    if (dot(frame.sun_radiance, float3(1.0)) > 0.0) {
+        float shadow = sunShadow(frame, in_position + l * inside.y, l, 1.0, view_depth, noise);
+        float3 radiance = frame.sun_radiance * sunTint(frame, in_position, view_depth) * shadow;
+        lit += radiance * (hairFibre(tangent, view, l, color, roughness) * exp(-inside.x) + hairScatter(tangent, view, l, color, pow(per_fibre, float3(inside.x))));
+    }
 
     Surface surface;
     surface.position = in_position;
     surface.normal = normal;
     surface.view = view;
     surface.diffuse_color = color;
-    surface.f0 = float3(0.046);
-    surface.roughness = clamp(shade_push.roughness, 0.045, 1.0);
-    surface.ao = 1.0;
+    surface.f0 = float3(0.0);
+    surface.roughness = roughness;
+    surface.ao = inside.z;
     surface.bounce = float3(0.0);
-    surface.view_depth = -(mul(frame.view, float4(in_position, 1.0))).z;
+    surface.view_depth = view_depth;
     surface.clearcoat = 0.0;
     surface.clearcoat_roughness = 0.0;
     surface.coat_normal = normal;
     surface.sheen_color = float3(0.0);
     surface.sheen_roughness = 0.5;
     surface.subsurface = 0.0;
-    surface.anisotropy = 0.9;
+    surface.anisotropy = -1.0;
     surface.grain = tangent;
+    lit += localLights(frame, surface, fragment.xy, noise);
+    lit += ambientLight(frame, surface, float4(0.0));
+    if (frame.environment != 0u) {
+        float sin_v = dot(tangent, view);
+        float3 up_across = float3(0.0, 1.0, 0.0) - tangent * tangent.y;
+        float up_length = length(up_across);
+        float3 sky_way = up_length > 1e-3 ? -sin_v * tangent + sqrt(max(1.0 - sin_v * sin_v, 0.0)) * up_across / up_length : float3(0.0, 1.0, 0.0);
+        float3 sky = sampleCubeLod(frame.env_specular, frame.sampler_linear_clamp, sky_way, roughness * (frame.env_specular_mips - 1.0)).rgb * frame.env_intensity;
+        lit += sky * hairFresnel(sqrt(clamp(0.5 + 0.5 * dot(view, sky_way), 0.0, 1.0))) * inside.z;
+    }
 
-    float noise = interleavedGradientNoise(fragment.xy, frame.frame_index);
-    float3 lit = shadeSurface(frame, surface, fragment.xy, noise, float4(0.0));
     float coverage = in_along.y;
     result.color = float4(lit * coverage, coverage);
     result.motion = float4((in_clip.xy / in_clip.w - in_previous_clip.xy / in_previous_clip.w) * 0.5, 0.0, coverage);

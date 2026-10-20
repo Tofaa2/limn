@@ -4,7 +4,7 @@
 //!   A / D    orbit
 //!   Space    start over
 //!
-//! `--frames N`, `--screenshot file.png`.
+//! `--orbit N` sets the camera angle; `--frames N`, `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");
 const glfw = @import("glfw");
@@ -60,6 +60,11 @@ pub fn main(init: std.process.Init) !void {
     defer list.deinit();
     const font = renderer.fonts.default();
     var orbit: f32 = 0.5;
+    var arguments = try init.minimal.args.iterateAllocator(init.gpa);
+    defer arguments.deinit();
+    while (arguments.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--orbit")) orbit = try std.fmt.parseFloat(f32, arguments.next() orelse "0.5");
+    }
     var hud_buffer: [200]u8 = undefined;
 
     while (stage.begin()) |tick| {

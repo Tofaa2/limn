@@ -4,22 +4,23 @@
 pub const SimPush = extern struct {
     liquid: u64,
     particles: u64,
+    shapes: u64,
     counts: u64,
     cells: u64,
     mode: u32,
     flip: u32,
 
-    pub const references = .{ .liquid = "LiquidData*", .particles = "LiquidParticle*", .counts = "uint*", .cells = "uint*" };
+    pub const references = .{ .liquid = "LiquidData*", .particles = "LiquidParticle*", .shapes = "float4*", .counts = "uint*", .cells = "uint*" };
 };
 
 pub const SpherePush = extern struct {
     frame: u64,
     liquid: u64,
-    particles: u64,
+    shapes: u64,
     depth_texture: u32,
-    swell: f32,
+    pad: u32 = 0,
 
-    pub const references = .{ .frame = "FrameConstants", .liquid = "LiquidData*", .particles = "LiquidParticle*" };
+    pub const references = .{ .frame = "FrameConstants", .liquid = "LiquidData*", .shapes = "float4*" };
 };
 
 pub const ShadowPush = extern struct {

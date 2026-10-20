@@ -119,6 +119,8 @@ fn createLiquidAlone(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
     inline for (0..3) |axis| block[axis] = @intFromFloat(@max(@floor(std.math.clamp(desc.fill[axis], 0, 1) * box.extent[axis] / (radius * 2) - 1), 0));
     const particles = try device.createBuffer(.{ .name = "liquid particles", .size = @as(u64, capacity) * @sizeOf(gpu.LiquidParticle), .usage = .{ .storage = true } });
     errdefer device.destroyBuffer(particles);
+    const shapes = try device.createBuffer(.{ .name = "liquid shapes", .size = @as(u64, capacity) * 64, .usage = .{ .storage = true } });
+    errdefer device.destroyBuffer(shapes);
     const counts = try device.createBuffer(.{ .name = "liquid grid counts", .size = cell_count * @sizeOf(u32), .usage = .{ .storage = true } });
     errdefer device.destroyBuffer(counts);
     const cells = try device.createBuffer(.{ .name = "liquid grid", .size = cell_count * liquid_cell_slots * @sizeOf(u32), .usage = .{ .storage = true } });
@@ -130,6 +132,7 @@ fn createLiquidAlone(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
         .desc = desc,
         .capacity = capacity,
         .particles = particles,
+        .shapes = shapes,
         .counts = counts,
         .cells = cells,
         .params_buffer = params_buffer,

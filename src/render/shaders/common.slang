@@ -343,8 +343,13 @@ struct CloudData {
     float shadow_strength;
     float cirrus;
     float anvil;
-    float2 cloud_pad;
+    uint weather_texture;
+    float weather_size;
     float4 flash;
+    uint pattern_texture;
+    uint repeat_sampler;
+    float curl;
+    float kind;
 };
 
 struct Vertices { Vertex* data; };
@@ -516,6 +521,16 @@ float3 matrixColumn(float4x4 m, int column) {
 float3 eyePoint(FrameConstants frame, float3 position) {
     if (frame.parallel == 0.0) return frame.camera_position;
     return position - frame.eye_axis * dot(position - frame.camera_position, frame.eye_axis);
+}
+
+/// Where to look up a sky baked near the ground for a view from `height`:
+/// higher up the horizon sinks below level, so the sky reaches below it.
+float3 skyFromHeight(float3 direction, float height) {
+    float dip = sqrt(2.0 * max(height - 500.0, 0.0) / 6360e3);
+    if (dip <= 0.0) return direction;
+    float level = length(direction.xz);
+    float rise = direction.y > -dip ? (direction.y + dip) / (1.0 + dip) : (direction.y + dip) / (1.0 - dip);
+    return normalize(float3(direction.xz.x, 0.0, direction.xz.y) / max(level, 1e-6) * sqrt(max(1.0 - rise * rise, 0.0)) + float3(0.0, rise, 0.0));
 }
 
 /// Distance along the view of a depth, by `FrameConstants.depth_terms`.

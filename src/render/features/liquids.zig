@@ -39,7 +39,7 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
         const copy = try transparency_feature.sceneCopy(renderer, p);
         const targets = LiquidTargets{
             .depth = try p.keepAs(renderer, .{ .name = "liquid depth", .width = p.width, .height = p.height, .format = .depth32_float, .usage = .{ .sampled = true, .depth_attachment = true } }),
-            .thickness = try p.keep(renderer, "liquid thickness", p.width, p.height, .r16_float),
+            .thickness = try p.keep(renderer, "liquid thickness", p.width, p.height, .rg16_float),
             .smooth = .{
                 try p.keep(renderer, "liquid surface", p.width, p.height, .r32_float),
                 try p.keep(renderer, "liquid surface (other)", p.width, p.height, .r32_float),
@@ -55,9 +55,8 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
             const particle_push = ParticlePush{
                 .frame = frame_address,
                 .liquid = state.params,
-                .particles = device.bufferAddress(state.particles),
+                .shapes = device.bufferAddress(state.shapes),
                 .depth_texture = device.textureIndex(view.depth),
-                .swell = 1.7,
             };
             try cmd.beginRendering(.{ .depth = .{ .texture = targets.depth, .clear = 0 } });
             cmd.bindPipeline(try renderer.internal.pipelines.of(liquidDepthPipeline));
@@ -139,7 +138,7 @@ fn liquidThicknessPipeline(_: *rhi.Device) pipelines_module.Desc {
         .name = "liquid thickness",
         .vertex = pipelines_module.shaderCode("liquid.vert.spv"),
         .fragment = pipelines_module.shaderCode("liquid_thickness.frag.spv"),
-        .color_targets = &.{.{ .format = .r16_float, .blend = .additive }},
+        .color_targets = &.{.{ .format = .rg16_float, .blend = .additive }},
         .cull = .none,
     } };
 }

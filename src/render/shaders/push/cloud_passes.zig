@@ -20,3 +20,7 @@ pub const CompositePush = extern struct {
 
     pub const references = .{ .frame = "FrameConstants", .clouds = "CloudRef" };
 };
+
+pub const WeatherPush = extern struct {
+    size: i32,
+};

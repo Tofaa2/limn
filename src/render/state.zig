@@ -1023,6 +1023,8 @@ pub const ReflectionTargets = struct {
 pub const cloud_noise_size = [3]i32{ 128, 128, 64 };
 /// The volume is stored as a sheet of slices, this many to a row.
 pub const cloud_noise_tiles = 8;
+/// Texels across the built-in cloud weather, which repeats.
+pub const cloud_weather_size = 512;
 pub const MaterialPipelines = struct { plain: rhi.Pipeline, reflective: rhi.Pipeline };
 /// The 2x2 matrix (by rows) of a coordinate transform: scale, then rotate.
 pub fn uvMatrix(scale: [2]f32, rotation: f32) [4]f32 {
@@ -1104,6 +1106,9 @@ pub const LiquidState = struct {
     source_count: u32 = 0,
     capacity: u32,
     particles: rhi.Buffer,
+    /// Per particle, the ellipsoid it is drawn as: centre and foam, then its
+    /// three axes, in box space.
+    shapes: rhi.Buffer,
     /// Per grid cell, how many particles it lists, and the lists.
     counts: rhi.Buffer,
     cells: rhi.Buffer,
@@ -1122,6 +1127,7 @@ pub const LiquidState = struct {
 
     pub fn deinit(self: *LiquidState, device: *rhi.Device) void {
         device.destroyBuffer(self.particles);
+        device.destroyBuffer(self.shapes);
         device.destroyBuffer(self.counts);
         device.destroyBuffer(self.cells);
         device.destroyBuffer(self.params_buffer);
@@ -1153,6 +1159,17 @@ pub const HairState = struct {
     colliders: [max_hair_colliders][4]f32 = undefined,
     collider_count: u32 = 0,
     moving: ?HairMotion = null,
+    /// Mean length between neighbouring points, in the hair's own space.
+    segment: f32 = 0,
+    /// Points per cell of a grid round the hair as drawn, and how much light
+    /// each cell lets through; made when it is first drawn.
+    shade: ?HairShade = null,
+};
+
+/// Buffers of `HairState.shade`.
+pub const HairShade = struct {
+    counts: rhi.Buffer,
+    light: rhi.Buffer,
 };
 
 pub const max_hair_colliders = 6;

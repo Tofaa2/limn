@@ -688,7 +688,8 @@ pub const LiquidParticle = extern struct {
     guess_b: [3]f32,
     pad1: f32 = 0,
     velocity: [3]f32,
-    pad2: f32 = 0,
+    /// Whiteness of churned or flung liquid, 0..1; fades when left alone.
+    foam: f32 = 0,
 };
 
 /// `LiquidSource` in liquid.slang: a round mouth at `position` with
@@ -738,7 +739,17 @@ pub const Liquid = extern struct {
     viscosity: f32 = 0,
     /// Steepness of the fine ripples used for shading.
     detail: f32 = 0,
-    pad: [2]f32 = .{ 0, 0 },
+    /// Light scattered inside per world unit, and the share of a drawn
+    /// particle's depth that is liquid.
+    scatter: f32 = 0,
+    fill: f32 = 1,
+    /// How readily churned liquid froths, the share of foam kept over a
+    /// frame, how much larger than a particle its drawn shape is, and the
+    /// frame's time step.
+    foam: f32 = 0,
+    foam_kept: f32 = 1,
+    swell: f32 = 1,
+    frame_dt: f32 = 0,
     /// Distance each source's newest layer has travelled from its mouth.
     source_lead: [4]f32 = @splat(0),
     sources: [4]LiquidSource = @splat(.{}),
@@ -748,5 +759,5 @@ pub const Liquid = extern struct {
 
 comptime {
     std.debug.assert(@sizeOf(LiquidParticle) == 64);
-    std.debug.assert(@sizeOf(Liquid) == 640 and @sizeOf(Liquid) % 16 == 0);
+    std.debug.assert(@sizeOf(Liquid) == 656 and @sizeOf(Liquid) % 16 == 0);
 }
