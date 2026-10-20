@@ -10,7 +10,7 @@
 //!   W A S D  fly, Space/Ctrl up and down, Shift faster
 //!   P        pause the props' animations
 //!
-//! `--night 1`, `--walk 1` (the camera walks ahead), `--view N`, `--at "x y z yaw pitch"` (as shown on screen),
+//! `--night`, `--walk` (the camera walks ahead), `--view N`, `--at "x y z yaw pitch"` (as shown on screen),
 //! `--frames N`, `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");

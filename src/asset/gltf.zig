@@ -447,6 +447,24 @@ pub const Model = struct {
     }
 };
 
+/// What cgltf allocates with: a buffer a file claims is too large to
+/// allocate fails the load instead of the process.
+const parser_memory = gltf.MemoryOptions{ .alloc_func = parserAlloc, .free_func = parserFree };
+const parser_header = 16;
+
+fn parserAlloc(_: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
+    const total = std.math.add(usize, size, parser_header) catch return null;
+    const bytes = std.heap.smp_allocator.alignedAlloc(u8, .@"16", total) catch return null;
+    std.mem.writeInt(usize, bytes[0..@sizeOf(usize)], total, .native);
+    return bytes.ptr + parser_header;
+}
+
+fn parserFree(_: ?*anyopaque, pointer: ?*anyopaque) callconv(.c) void {
+    const start: [*]align(16) u8 = @alignCast(@as([*]u8, @ptrCast(pointer orelse return)) - parser_header);
+    const total = std.mem.readInt(usize, start[0..@sizeOf(usize)], .native);
+    std.heap.smp_allocator.free(start[0..total]);
+}
+
 var library_mutex: std.Io.Mutex = .init;
 var library_references: u32 = 0;
 
@@ -506,10 +524,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: LoadO
 
     const bytes = try readFile(gpa, io, path);
     defer gpa.free(bytes);
-    const parse_options = gltf.Options{ .memory = .{
-        .alloc_func = zmesh.mem.zmeshAllocUser,
-        .free_func = zmesh.mem.zmeshFreeUser,
-    } };
+    const parse_options = gltf.Options{ .memory = parser_memory };
     const data = try gltf.parse(parse_options, bytes);
     defer gltf.free(data);
     const path_z = try gpa.dupeZ(u8, path);
@@ -583,6 +598,23 @@ fn decodeImage(job: *ImageJob) std.Io.Cancelable!void {
     };
 }
 
+extern fn stbi_info_from_memory(buffer: [*]const u8, len: c_int, x: *c_int, y: *c_int, comp: *c_int) c_int;
+
+/// Widest and tallest image a model may carry.
+const max_image_size = 16384;
+
+/// Decodes a model's PNG, JPEG or the like to RGBA8, refusing one larger than
+/// `max_image_size` before allocating for it.
+fn decodeBounded(encoded: []const u8) !zstbi.Image {
+    var width: c_int = 0;
+    var height: c_int = 0;
+    var components: c_int = 0;
+    const length = std.math.cast(c_int, encoded.len) orelse return error.ImageTooLarge;
+    if (stbi_info_from_memory(encoded.ptr, length, &width, &height, &components) == 0) return error.InvalidImage;
+    if (width > max_image_size or height > max_image_size) return error.ImageTooLarge;
+    return zstbi.Image.loadFromMemory(encoded, 4);
+}
+
 fn decodeImageInner(job: *ImageJob) !void {
     if (job.output.uses == 0) return;
     var owned: ?[]u8 = null;
@@ -646,7 +678,7 @@ fn decodeImageInner(job: *ImageJob) !void {
         return;
     }
     if (!job.options.compress_textures and job.options.raw_mips) {
-        var decoded = try zstbi.Image.loadFromMemory(encoded, 4);
+        var decoded = try decodeBounded(encoded);
         defer decoded.deinit();
         job.output.width = decoded.width;
         job.output.height = decoded.height;
@@ -655,7 +687,7 @@ fn decodeImageInner(job: *ImageJob) !void {
         return;
     }
     if (!job.options.compress_textures) {
-        const decoded = try zstbi.Image.loadFromMemory(encoded, 4);
+        const decoded = try decodeBounded(encoded);
         job.output.width = decoded.width;
         job.output.height = decoded.height;
         job.output.decoded = decoded;
@@ -675,7 +707,7 @@ fn decodeImageInner(job: *ImageJob) !void {
         job.output.compressed = data;
         return;
     };
-    var decoded = try zstbi.Image.loadFromMemory(encoded, 4);
+    var decoded = try decodeBounded(encoded);
     defer decoded.deinit();
     job.output.width = decoded.width;
     job.output.height = decoded.height;
@@ -712,10 +744,7 @@ pub const SceneLight = struct {
 pub fn loadLights(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]SceneLight {
     const bytes = try readFile(gpa, io, path);
     defer gpa.free(bytes);
-    const data = try gltf.parse(.{ .memory = .{
-        .alloc_func = zmesh.mem.zmeshAllocUser,
-        .free_func = zmesh.mem.zmeshFreeUser,
-    } }, bytes);
+    const data = try gltf.parse(.{ .memory = parser_memory }, bytes);
     defer gltf.free(data);
     if (build_features.validate_input and gltf.validate(data) != .success) return error.InvalidGltf;
     var lights: std.ArrayList(SceneLight) = .empty;
@@ -823,10 +852,7 @@ fn bufferStamp(gpa: std.mem.Allocator, io: std.Io, path: []const u8) u64 {
     if (!std.ascii.endsWithIgnoreCase(path, ".gltf")) return 0;
     const bytes = readFile(gpa, io, path) catch return 0;
     defer gpa.free(bytes);
-    const data = gltf.parse(.{ .memory = .{
-        .alloc_func = zmesh.mem.zmeshAllocUser,
-        .free_func = zmesh.mem.zmeshFreeUser,
-    } }, bytes) catch return 0;
+    const data = gltf.parse(.{ .memory = parser_memory }, bytes) catch return 0;
     defer gltf.free(data);
     if (data.buffers_count == 0) return 0;
     const directory = std.fs.path.dirname(path) orelse ".";
@@ -1288,9 +1314,9 @@ fn loadMeshes(gpa: std.mem.Allocator, arena: std.mem.Allocator, data: *gltf.Data
     };
     first_mesh[data.meshes_count] = mesh_count;
 
-    const skinned = try gpa.alloc(bool, data.meshes_count);
-    defer gpa.free(skinned);
-    @memset(skinned, false);
+    const joint_limits = try gpa.alloc(?u32, data.meshes_count);
+    defer gpa.free(joint_limits);
+    @memset(joint_limits, null);
     var instances: std.ArrayList(Instance) = .empty;
     var implicit: std.ArrayList(u32) = .empty;
     if (data.nodes_count != 0) for (data.nodes.?[0..data.nodes_count], 0..) |node, node_index| {
@@ -1303,7 +1329,10 @@ fn loadMeshes(gpa: std.mem.Allocator, arena: std.mem.Allocator, data: *gltf.Data
             try implicit.append(arena, @intCast(node_index));
             break;
         };
-        if (skin != null) skinned[mesh_index] = true;
+        if (skin) |index| {
+            const joints: u32 = if (index < data.skins_count) @intCast(data.skins.?[index].joints_count) else 1;
+            joint_limits[mesh_index] = @min(joint_limits[mesh_index] orelse joints, joints);
+        }
         for (first_mesh[mesh_index]..first_mesh[mesh_index + 1]) |primitive| {
             try instances.append(arena, .{ .mesh = @intCast(primitive), .node = @intCast(node_index), .skin = skin });
         }
@@ -1321,7 +1350,7 @@ fn loadMeshes(gpa: std.mem.Allocator, arena: std.mem.Allocator, data: *gltf.Data
                 elementIndex(gltf.Material, data.materials, pointer)
             else
                 @intCast(data.materials_count);
-            const built = buildMesh(gpa, arena, primitive, skinned[mesh_index], material, lods) catch |err| switch (err) {
+            const built = buildMesh(gpa, arena, primitive, joint_limits[mesh_index], material, lods) catch |err| switch (err) {
                 error.EmptyMesh => continue,
                 else => return err,
             };
@@ -1349,10 +1378,12 @@ fn buildMesh(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     primitive: *const gltf.Primitive,
-    skinned: bool,
+    joint_limit: ?u32,
     material: u32,
     lods: LodOptions,
 ) !Mesh {
+    const skinned = joint_limit != null;
+    if (joint_limit == 0) return error.InvalidGltf;
     const position_accessor = findAttribute(primitive, .position) orelse return error.EmptyMesh;
     const vertex_count = position_accessor.count;
     if (vertex_count == 0) return error.EmptyMesh;
@@ -1399,8 +1430,13 @@ fn buildMesh(
         if (joints != null and weights != null) {
             var total: f32 = 0;
             for (0..4) |k| {
-                fat.skin.joints[k] = @intFromFloat(joints.?[index * 4 + k]);
+                const joint = joints.?[index * 4 + k];
                 fat.skin.weights[k] = weights.?[index * 4 + k];
+                if (joint >= 0 and joint < @as(f32, @floatFromInt(joint_limit.?))) {
+                    fat.skin.joints[k] = @intFromFloat(joint);
+                } else if (fat.skin.weights[k] == 0) {
+                    fat.skin.joints[k] = 0;
+                } else return error.InvalidGltf;
                 total += fat.skin.weights[k];
             }
             if (total > 1e-6) {
@@ -2390,4 +2426,58 @@ test "a node that is its own child is refused" {
     }
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
     try std.testing.expectError(error.InvalidGltf, loadLights(std.testing.allocator, io, path));
+}
+
+fn writeTestFile(io: std.Io, path: []const u8, text: []const u8) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [256]u8 = undefined;
+    var writer = file.writerStreaming(io, &buffer);
+    try writer.interface.writeAll(text);
+    try writer.interface.flush();
+}
+
+test "a buffer larger than memory fails the load" {
+    const io = std.testing.io;
+    acquireLibraries(io);
+    defer releaseLibraries(io);
+    const path = ".zig-cache/limn-test-huge.gltf";
+    try writeTestFile(io, path,
+        \\{"asset":{"version":"2.0"},"buffers":[{"byteLength":1000000000000000,"uri":"data:application/octet-stream;base64,AAAA"}]}
+    );
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    if (load(std.testing.allocator, io, path, .{})) |loaded| {
+        var model = loaded;
+        model.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "a weighted joint outside its skin is refused" {
+    const io = std.testing.io;
+    acquireLibraries(io);
+    defer releaseLibraries(io);
+    var bytes: [96]u8 = @splat(0);
+    const positions = [9]f32{ 0, 0, 0, 1, 0, 0, 0, 1, 0 };
+    @memcpy(bytes[0..36], std.mem.sliceAsBytes(&positions));
+    for (0..3) |vertex| {
+        bytes[36 + vertex * 4] = 5;
+        std.mem.writeInt(u32, bytes[48 + vertex * 16 ..][0..4], @bitCast(@as(f32, 1)), .little);
+    }
+    var encoded: [128]u8 = undefined;
+    const data = std.base64.standard.Encoder.encode(&encoded, &bytes);
+    var text: [1024]u8 = undefined;
+    const json = try std.fmt.bufPrint(&text,
+        \\{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0,1]}}],
+        \\"nodes":[{{"mesh":0,"skin":0}},{{}}],"skins":[{{"joints":[1]}}],
+        \\"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0,"JOINTS_0":1,"WEIGHTS_0":2}}}}]}}],
+        \\"accessors":[{{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0]}},
+        \\{{"bufferView":1,"componentType":5121,"count":3,"type":"VEC4"}},{{"bufferView":2,"componentType":5126,"count":3,"type":"VEC4"}}],
+        \\"bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":36}},{{"buffer":0,"byteOffset":36,"byteLength":12}},{{"buffer":0,"byteOffset":48,"byteLength":48}}],
+        \\"buffers":[{{"byteLength":96,"uri":"data:application/octet-stream;base64,{s}"}}]}}
+    , .{data});
+    const path = ".zig-cache/limn-test-joints.gltf";
+    try writeTestFile(io, path, json);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.testing.expectError(error.InvalidGltf, load(std.testing.allocator, io, path, .{}));
 }

@@ -148,9 +148,11 @@ fn readBasis(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     if (width == 0 or width > 16384 or height > 16384 or levels > 15) return error.InvalidKtx2;
     if (levels > std.math.log2_int(u32, @max(width, height)) + 1) return error.InvalidKtx2;
     if ((faces != 1 and faces != 6) or layers > 2048) return error.InvalidKtx2;
+    if (faces == 6 and width != height) return error.InvalidKtx2;
     const format: Format = if (hdr) .bc6h else .bc7;
     var total: usize = 0;
     for (0..levels) |level| total += layers * faces * levelBytes(format, @max(width >> @intCast(level), 1), @max(height >> @intCast(level), 1));
+    if (total > max_bytes) return error.UnsupportedKtx2;
     const data = try gpa.alloc(u8, total);
     errdefer gpa.free(data);
     var cursor: usize = 0;

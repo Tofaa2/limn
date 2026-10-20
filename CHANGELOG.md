@@ -4,7 +4,7 @@
 
 ### Added
 - glTF and font validation (`-Dvalidate_input=false`).
-- NVIDIA DLSS: `Upscaling.dlss`, `Renderer.dlssSupport`.
+- NVIDIA DLSS: `Upscaler.dlss`.
 - DLSS Ray Reconstruction for path tracing.
 - `zig build dlss-sdk`.
 - Path tracing: normal maps.
@@ -81,7 +81,6 @@
 - Breaking: `rhi.Device.endImmediate` takes the encoder.
 - Breaking: shaders read a feature's frame constants from its block (`frame.shadows`, `frame.lights`, `frame.gi`, `frame.shading` and so on), and the `FRAME_*` flags are fields of those blocks.
 - Breaking: `Renderer` fields other than the namespaces, `options` and `device` are in `Renderer.internal`.
-- Breaking: `Renderer.pathTracing` is `Renderer.capabilities().path_tracing`.
 - Breaking: `environments.load` takes an `EnvironmentDesc`.
 - Breaking: `rhi.BlasDesc` holds a list of `rhi.BlasGeometry`; `createTlas` takes a `rhi.TlasDesc`.
 - Pipelines are built on first use, kept by their description; any can compile on a worker thread.

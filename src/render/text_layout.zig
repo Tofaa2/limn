@@ -368,7 +368,7 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
     defer gpa.free(levels);
     const classes = try gpa.alloc(Class, shaped.len);
     defer gpa.free(classes);
-    const runs = try gpa.alloc(u16, shaped.len);
+    const runs = try gpa.alloc(u32, shaped.len);
     defer gpa.free(runs);
 
     var base: u8 = 0;
@@ -390,11 +390,11 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
         }
     }
 
-    const Frame = struct { level: u8, override: ?Class, isolate: bool, run: u16 };
+    const Frame = struct { level: u8, override: ?Class, isolate: bool, run: u32 };
     var stack: [max_embedding + 1]Frame = undefined;
     var depth: usize = 0;
     var ignored: u32 = 0;
-    var run_count: u16 = 1;
+    var run_count: u32 = 1;
     stack[0] = .{ .level = base, .override = null, .isolate = false, .run = 0 };
     for (shaped, 0..) |c, at| {
         const top = stack[depth];
@@ -445,44 +445,55 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
     }
 
     const unresolved = 0xff;
-    var members: std.ArrayList(u32) = .empty;
-    defer members.deinit(gpa);
-    var run: u16 = 0;
+    const starts = try gpa.alloc(u32, run_count + 1);
+    defer gpa.free(starts);
+    @memset(starts, 0);
+    for (runs, classes) |owner, class| {
+        if (class != .control) starts[owner + 1] += 1;
+    }
+    for (1..starts.len) |at| starts[at] += starts[at - 1];
+    const order = try gpa.alloc(u32, starts[run_count]);
+    defer gpa.free(order);
+    const next = try gpa.dupe(u32, starts[0..run_count]);
+    defer gpa.free(next);
+    for (runs, classes, 0..) |owner, class, at| {
+        if (class == .control) continue;
+        order[next[owner]] = @intCast(at);
+        next[owner] += 1;
+    }
+    var run: u32 = 0;
     while (run < run_count) : (run += 1) {
-        members.clearRetainingCapacity();
-        for (runs, classes, 0..) |owner, class, at| {
-            if (owner == run and class != .control) try members.append(gpa, @intCast(at));
-        }
-        if (members.items.len == 0) continue;
-        for (members.items, 0..) |at, index| {
+        const members = order[starts[run]..starts[run + 1]];
+        if (members.len == 0) continue;
+        for (members, 0..) |at, index| {
             const class = classes[at];
             if (class != .separator and class != .common_separator) continue;
-            if (index == 0 or index + 1 == members.items.len) continue;
-            const before = classes[members.items[index - 1]];
-            const after = classes[members.items[index + 1]];
+            if (index == 0 or index + 1 == members.len) continue;
+            const before = classes[members[index - 1]];
+            const after = classes[members[index + 1]];
             if (before == .number and after == .number) classes[at] = .number;
             if (class == .common_separator and before == .arabic_number and after == .arabic_number) classes[at] = .arabic_number;
         }
-        for (members.items, 0..) |at, index| {
+        for (members, 0..) |at, index| {
             if (classes[at] != .terminator) continue;
             var end = index;
-            while (end < members.items.len and classes[members.items[end]] == .terminator) end += 1;
-            const number_before = index > 0 and classes[members.items[index - 1]] == .number;
-            const number_after = end < members.items.len and classes[members.items[end]] == .number;
+            while (end < members.len and classes[members[end]] == .terminator) end += 1;
+            const number_before = index > 0 and classes[members[index - 1]] == .number;
+            const number_after = end < members.len and classes[members[end]] == .number;
             if (number_before or number_after) {
-                for (members.items[index..end]) |sign| classes[sign] = .number;
+                for (members[index..end]) |sign| classes[sign] = .number;
             }
         }
-        for (members.items) |at| switch (classes[at]) {
+        for (members) |at| switch (classes[at]) {
             .separator, .common_separator, .terminator => classes[at] = .neutral,
             else => {},
         };
-        const embedding = levels[members.items[0]];
+        const embedding = levels[members[0]];
         const odd = embedding % 2 == 1;
         const left_level: u8 = if (odd) embedding + 1 else embedding;
         const right_level: u8 = if (odd) embedding else embedding + 1;
         var strong_right = odd;
-        for (members.items) |at| switch (classes[at]) {
+        for (members) |at| switch (classes[at]) {
             .left => {
                 strong_right = false;
                 levels[at] = left_level;
@@ -496,17 +507,17 @@ pub fn shapeLine(gpa: std.mem.Allocator, text: []const u8, coverage: Coverage, o
             .control, .separator, .common_separator, .terminator => unreachable,
         };
         var index: usize = 0;
-        while (index < members.items.len) {
-            if (levels[members.items[index]] != unresolved) {
+        while (index < members.len) {
+            if (levels[members[index]] != unresolved) {
                 index += 1;
                 continue;
             }
             var end = index;
-            while (end < members.items.len and levels[members.items[end]] == unresolved) end += 1;
-            const before: u8 = if (index > 0) levels[members.items[index - 1]] else embedding;
-            const after: u8 = if (end < members.items.len) levels[members.items[end]] else embedding;
+            while (end < members.len and levels[members[end]] == unresolved) end += 1;
+            const before: u8 = if (index > 0) levels[members[index - 1]] else embedding;
+            const after: u8 = if (end < members.len) levels[members[end]] else embedding;
             const fill: u8 = if (before % 2 != after % 2) embedding else if (before % 2 == 1) right_level else left_level;
-            for (members.items[index..end]) |at| levels[at] = fill;
+            for (members[index..end]) |at| levels[at] = fill;
             index = end;
         }
     }
@@ -659,4 +670,16 @@ test "sara am is drawn as a ring under the tone mark and a letter" {
     out.clearRetainingCapacity();
     try shapeLine(gpa, "\u{e01}\u{e33}", .{ .context = undefined, .has = Any.has }, &out);
     try std.testing.expectEqualSlices(u21, &.{ 0xe01, 0xe4d, 0xe32 }, out.items);
+}
+
+test "more embeddings than fit in 16 bits" {
+    const pair = "\u{202a}a\u{202c}";
+    const count = 40_000;
+    const input = try std.testing.allocator.alloc(u8, pair.len * count);
+    defer std.testing.allocator.free(input);
+    for (0..count) |index| @memcpy(input[index * pair.len ..][0..pair.len], pair);
+    const expected = try std.testing.allocator.alloc(u21, count);
+    defer std.testing.allocator.free(expected);
+    @memset(expected, 'a');
+    try expectShaped(input, expected);
 }
