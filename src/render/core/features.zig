@@ -72,6 +72,25 @@ pub fn emptyViewStates() ViewStates {
     return states;
 }
 
+/// Frames a feature's state for a view may go unasked for before it is freed.
+const idle_frames = 8;
+
+/// Frees the state of features that have not asked for theirs lately, so a
+/// feature that is switched off gives its memory back. Once per drawn frame
+/// of the view.
+pub fn collectViewStates(view: *renderer_state.ViewData, device: *rhi.Device) void {
+    inline for (list, 0..) |Feature, index| {
+        if (!@hasDecl(Feature, "View")) continue;
+        if (view.features[index]) |*state| {
+            view.feature_idle[index] += 1;
+            if (view.feature_idle[index] > idle_frames) {
+                state.deinit(device);
+                view.features[index] = null;
+            }
+        }
+    }
+}
+
 pub fn deinitViewStates(states: *ViewStates, device: *rhi.Device) void {
     inline for (list, 0..) |Feature, index| {
         if (!@hasDecl(Feature, "View")) continue;
@@ -160,19 +179,20 @@ pub fn declare(ctx: *ViewContext) !void {
     inline for (list) |Feature| try Feature.declare(ctx);
 }
 
-/// One view of one frame, as features see it while they add their passes
-/// and while those run.
 /// `Feature`'s state for `view`, made by `Feature.View.init` on first use.
 pub fn stateOf(view: *renderer_state.ViewData, device: *rhi.Device, comptime Feature: type) !*Feature.View {
     inline for (list, 0..) |Listed, at| {
         if (Listed != Feature) continue;
         const slot = &view.features[at];
         if (slot.* == null) slot.* = try Feature.View.init(device);
+        view.feature_idle[at] = 0;
         return &slot.*.?;
     }
     @compileError("not a listed feature");
 }
 
+/// One view of one frame, as features see it while they add their passes
+/// and while those run.
 pub const ViewContext = struct {
     renderer: *render.Renderer,
     device: *rhi.Device,

@@ -116,12 +116,22 @@ pub const View = struct {
     }
 };
 
-/// Makes the maps a view with these shadows draws into; a change between
-/// plain and colored shadows redraws every cascade.
+/// Makes the maps a view with these shadows draws into, and frees those it
+/// no longer needs; a change between plain and colored shadows redraws
+/// every cascade.
 pub fn fitMaps(renderer: *Renderer, view_data: *render.ViewData, enabled: bool, colored: bool) !*View {
     const device = renderer.device;
     const own = try features.stateOf(view_data, device, @This());
     const resolution = renderer.options.shadows.resolution;
+    if (!colored) if (own.tint) |tint| {
+        device.destroyTexture(tint);
+        own.tint = null;
+    };
+    if (!enabled) if (own.map) |map| {
+        device.destroyTexture(map);
+        own.map = null;
+        own.cascade_cache.valid = false;
+    };
     if (colored and own.tint == null) {
         own.tint = try device.createTexture(.{
             .name = "shadow tint",

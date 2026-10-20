@@ -63,6 +63,9 @@ pub const Nrd = struct {
 pub const View = struct {
     /// The view was path traced last frame.
     traced: bool = false,
+    /// Frame the view was last path traced in; history from before a gap
+    /// is not gathered.
+    traced_frame: u64 = std.math.maxInt(u64),
     /// What the tracer found this frame, before anything is gathered: the
     /// textures behind `Signals`.
     raw_color: ?rhi.Texture = null,
@@ -201,6 +204,10 @@ pub fn declare(ctx: *ViewContext) !void {
 
 fn trace(ctx: *ViewContext) !void {
     const p = ctx.scene.?;
+    if (p.settings.path_tracing == null or p.debugging) {
+        p.shared.path_traced = false;
+        return;
+    }
     p.shared.path_traced = try pathTrace(ctx.renderer, p, try ctx.state(@This()));
 }
 
@@ -681,6 +688,11 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass, state: *View) !bool {
         if (state.accum == null or state.size[0] != width or state.size[1] != height) {
             try makeTargets(device, cmd, state, width, height);
         }
+        if (state.traced_frame +% 1 != renderer.internal.frame_index or p.desc.cut) {
+            state.gathered = 0;
+            state.reusable = false;
+        }
+        state.traced_frame = renderer.internal.frame_index;
         // What moves without changing the lighting much: the things in the scene
         // and the sun. Treated like a moving camera, which keeps more history
         // than a change of lamps does.

@@ -36,6 +36,7 @@
 - `Settings.global_illumination.probes.idle_interval`: probes are re-traced less often while the scene and its lights are still.
 - `Pass` runs on views without a scene; `PassContext` has the camera, its matrices and the resolved settings.
 - The `isometric` example.
+- `ViewDesc.cut`: temporal history starts over after a camera jump.
 - `rhi.TextureKind.@"3d"`; storage images can be read, used in any shader stage and bound per layer.
 
 ### Changed
@@ -97,6 +98,8 @@
 
 
 ### Fixed
+- Features switched off on a view give their memory back.
+- Path tracing restarts its history after frames it did not trace.
 - Impostor textures and reflection probes are freed with the renderer.
 - Particle trails are freed with the renderer.
 - Tint, params and flags on skinned entities.

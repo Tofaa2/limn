@@ -191,6 +191,7 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
         const internal_height: u32 = @max(@as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(region.height)) * render_scale))), 1);
         try renderScene(self, &ctx, frame, scene_handle, scene, view, color, internal_width, internal_height, region.width, region.height, delta_time);
         view.kept.collect(device, self.internal.frame_index);
+        features.collectViewStates(view, device);
     } else {
         const picture = try graph.import(target);
         graph.publish(.picture, picture);
@@ -222,6 +223,7 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
             frame_constants.items[0] = constants;
             try graph.execute(self.internal.gpa, device, cmd, &self.internal.target_pool, self.internal.frame_index);
             view.kept.collect(device, self.internal.frame_index);
+            features.collectViewStates(view, device);
         } else {
             if (desc.passes.len != 0 and ctx.output.load == .clear) {
                 try graph.add(.{ .name = "clear", .stage = .prepare, .color = &.{.{ .target = picture, .load = .clear, .clear = ctx.output.clear }}, .always = true, .scope = false }, &ctx, cleared);
@@ -291,10 +293,12 @@ fn renderScene(
     const view = &view_data.state.?;
     std.mem.swap(rhi.Texture, &view.depth, &view.previous_depth);
     std.mem.swap(rhi.Texture, &view.motion, &view.previous_motion);
-    if (view_data.last_frame +% 1 != self.internal.frame_index) {
+    if (view_data.last_frame +% 1 != self.internal.frame_index or desc.cut) {
         view_data.camera_known = false;
         view.history_valid = false;
+        view_data.kept.invalidate();
     }
+    if (desc.cut) view_data.exposure_reset = true;
 
     const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
     const view_matrix = math.lookTo(desc.camera.position, desc.camera.forward, desc.camera.up);
@@ -464,13 +468,13 @@ fn renderScene(
         .resolved = &resolved,
     };
     pass.shared = &shared;
-    const tracer = try features.stateOf(view_data, device, path_tracing_feature);
-    pass.tracing = settings.path_tracing != null and !debugging and tracer.traced;
+    const tracer = features.viewState(view_data, path_tracing_feature);
+    pass.tracing = settings.path_tracing != null and !debugging and tracer != null and tracer.?.traced;
     try features.prepare(ctx);
     try features.declare(ctx);
     constants.items[0] = ctx.constants.*;
     try g.execute(self.internal.gpa, device, cmd, &self.internal.target_pool, self.internal.frame_index);
-    tracer.traced = shared.path_traced;
+    if (features.viewState(view_data, path_tracing_feature)) |state| state.traced = shared.path_traced;
 
     view_data.previous_view_proj = view_proj_unjittered;
     view_data.previous_jitter = jitter;

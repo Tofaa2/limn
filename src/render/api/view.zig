@@ -158,6 +158,9 @@ pub const ViewDesc = struct {
     region: ?Region = null,
     passes: []const Pass = &.{},
     settings: Settings = .{},
+    /// The camera jumped since the last frame: temporal history starts over
+    /// and exposure adapts at once.
+    cut: bool = false,
 };
 
 /// Everything `Renderer.render` draws in one frame.

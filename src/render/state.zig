@@ -948,6 +948,8 @@ pub const ViewData = struct {
     kept: target_store.Kept = .{},
     /// Each feature's own state for this view.
     features: features.ViewStates = features.emptyViewStates(),
+    /// Frames since each feature last asked for its state.
+    feature_idle: [features.list.len]u32 = @splat(0),
 
     pub fn deinit(self: *ViewData, gpa: std.mem.Allocator, device: *rhi.Device) void {
         self.kept.deinit(gpa, device);
