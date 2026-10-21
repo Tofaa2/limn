@@ -100,6 +100,20 @@ pub fn steadyStep(owed: *f32, elapsed: f32) f32 {
     return step;
 }
 
+/// Most water steps taken in one frame; time beyond them is dropped.
+const max_water_steps = 8;
+
+/// How many steps of exactly `step` seconds to take for `elapsed`, carrying
+/// the remainder in `owed`. The water's wave solver gains energy when its
+/// step changes from one step to the next, so it never takes a ragged one.
+fn fixedSteps(owed: *f32, elapsed: f32, step: f32) u32 {
+    if (!(elapsed > 0)) return 0;
+    owed.* = @min(owed.* + elapsed, step * max_water_steps);
+    const steps: u32 = @intFromFloat(@floor(owed.* / step));
+    owed.* -= @as(f32, @floatFromInt(steps)) * step;
+    return steps;
+}
+
 /// Splash emitter of a water surface; emits only when something hits it.
 pub fn splashDesc(desc: WaterDesc) EmitterDesc {
     const t = desc.transform;
@@ -329,10 +343,13 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             }
             state.cleared = true;
         }
-        const dt = steadyStep(&state.time_owed, delta_time * desc.time_scale);
         const t = desc.transform;
         const width = @max(math.length(.{ t[0], t[1], t[2] }), 1e-6);
         const up = @max(math.length(.{ t[4], t[5], t[6] }), 1e-6);
+        const cells_a_second = @max(desc.wave_speed, 0) * @as(f32, @floatFromInt(state.size[0])) / width;
+        const step = @min(1.0 / 60.0, 0.65 / @max(cells_a_second, 1e-6));
+        const steps = fixedSteps(&state.time_owed, delta_time * desc.time_scale, step);
+        const dt = step * @as(f32, @floatFromInt(steps));
         state.rain_pending += @max(desc.rain, 0) * dt;
         var random = std.Random.DefaultPrng.init(renderer.internal.frame_index *% 0x9e3779b97f4a7c15 +% 7);
         const rng = random.random();
@@ -394,9 +411,9 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             .size = .{ @intCast(state.size[0]), @intCast(state.size[1]) },
             .state = device.textureIndex(state.state[state.current]),
             .sampler_linear = device.samplerIndex(renderer.internal.sampler_linear_clamp),
-            .dt = dt,
-            .speed = @max(desc.wave_speed, 0) * @as(f32, @floatFromInt(state.size[0])) / width,
-            .keep = @exp(-@max(desc.damping, 0) * dt),
+            .dt = step,
+            .speed = cells_a_second,
+            .keep = @exp(-@max(desc.damping, 0) * step),
             .ripple_count = state.ripple_count,
             .color = desc.color,
             .murk = @max(desc.murk, 0),
@@ -410,21 +427,22 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             .mask = if (desc.mask) |image| image.index else gpu.invalid_id,
             .ripples = state.ripples,
         };
-        state.ripple_count = 0;
-        const params = try arena.alloc(device, gpu.Water, 2);
-        params.items[0] = record;
-        if (dt > 0) {
+        if (steps > 0) state.ripple_count = 0;
+        const params = try arena.alloc(device, gpu.Water, steps + 1);
+        for (0..steps) |index| {
+            params.items[index] = record;
             const new = 1 - state.current;
             try cmd.beginRendering(.{ .color = &.{.{ .texture = state.state[new], .load = .discard }} });
             cmd.bindPipeline(try renderer.internal.pipelines.of(waterSimPipeline));
-            cmd.pushConstants(water_passes_push.SimPush{ .water = params.address });
+            cmd.pushConstants(water_passes_push.SimPush{ .water = params.address + index * @sizeOf(gpu.Water) });
             cmd.drawFullscreen();
             cmd.endRendering();
             state.current = new;
             record.state = device.textureIndex(state.state[new]);
+            record.ripple_count = 0;
         }
-        params.items[1] = record;
-        state.params = params.address + @sizeOf(gpu.Water);
+        params.items[steps] = record;
+        state.params = params.address + steps * @sizeOf(gpu.Water);
         state.params_frame = renderer.internal.frame_index;
     }
 }
