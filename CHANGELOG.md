@@ -124,6 +124,7 @@
 - Stale model cache entries.
 - A leak when a streamed model runs out of memory.
 - Example flags that take no value.
+- Water blowing up at uneven frame rates.
 
 ## 0.1.3
 
