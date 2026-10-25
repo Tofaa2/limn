@@ -998,6 +998,9 @@ pub const GiVolume = struct {
     irradiance_fast: rhi.Texture,
     visibility: rhi.Texture,
     rays: rhi.Buffer,
+    /// Per probe, whether last trace found it buried, decided before a
+    /// trace overwrites the rays it was decided from.
+    buried: rhi.Buffer,
     /// Per-probe relocation offsets, in two ping-ponged textures.
     offsets: [2]rhi.Texture,
     offset_turn: u32 = 0,
@@ -1014,6 +1017,7 @@ pub const GiVolume = struct {
         device.destroyTexture(self.irradiance_fast);
         device.destroyTexture(self.visibility);
         device.destroyBuffer(self.rays);
+        device.destroyBuffer(self.buried);
         for (self.offsets) |texture| device.destroyTexture(texture);
     }
 };

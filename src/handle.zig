@@ -42,6 +42,8 @@ pub fn HandleTable(comptime T: type, comptime Tag: type) type {
         allocator: std.mem.Allocator,
         slots: std.ArrayList(Slot) = .empty,
         free_head: u24 = none,
+        /// No live value sits below this slot; where `popAny` starts.
+        pop_from: u24 = 0,
 
         /// Allocates nothing until the first `insert`.
         pub fn init(allocator: std.mem.Allocator) Self {
@@ -61,6 +63,7 @@ pub fn HandleTable(comptime T: type, comptime Tag: type) type {
                 const index = self.free_head;
                 const slot = &self.slots.items[index];
                 self.free_head = slot.next_free;
+                self.pop_from = @min(self.pop_from, index);
                 slot.next_free = none;
                 slot.value = value;
                 return .{ .index = index, .generation = slot.generation };
@@ -95,14 +98,14 @@ pub fn HandleTable(comptime T: type, comptime Tag: type) type {
         }
 
         /// Removes and returns the live value in the lowest slot, or null
-        /// when empty. Scans from the first slot on every call.
+        /// when empty. Emptying a table this way visits each slot once.
         pub fn popAny(self: *Self) ?T {
-            for (self.slots.items, 0..) |slot, index| {
-                if (slot.value != null) return self.remove(.{
-                    .index = @intCast(index),
-                    .generation = slot.generation,
-                });
+            for (self.slots.items[self.pop_from..], self.pop_from..) |slot, index| {
+                if (slot.value == null) continue;
+                self.pop_from = @intCast(index);
+                return self.remove(.{ .index = @intCast(index), .generation = slot.generation });
             }
+            self.pop_from = @intCast(self.slots.items.len);
             return null;
         }
 
@@ -165,4 +168,17 @@ test "popAny invalidates every returned slot" {
     try std.testing.expect(table.popAny() == null);
     try std.testing.expect(table.get(first) == null);
     try std.testing.expect(table.get(second) == null);
+}
+
+test "popAny finds values inserted below where it left off" {
+    const Tag = enum { resource };
+    var table = HandleTable(u8, Tag).init(std.testing.allocator);
+    defer table.deinit();
+    _ = try table.insert(1);
+    _ = try table.insert(2);
+    try std.testing.expectEqual(@as(?u8, 1), table.popAny());
+    _ = try table.insert(3);
+    try std.testing.expectEqual(@as(?u8, 3), table.popAny());
+    try std.testing.expectEqual(@as(?u8, 2), table.popAny());
+    try std.testing.expectEqual(@as(?u8, null), table.popAny());
 }

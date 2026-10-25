@@ -6,6 +6,23 @@
 
 [[vk::push_constant]] TracePush trace_push;
 
+/// Marks the probes due this frame that the last trace found mostly facing
+/// back faces, except on one turn in eight, before `traceMain` overwrites the
+/// rays this is decided from.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void buriedMain(uint3 id : SV_DispatchThreadID) {
+    uint probe = id.x * trace_push.probe_stride + trace_push.probe_phase;
+    if (probe >= trace_push.probe_count) return;
+    FrameConstants frame = trace_push.frame;
+    uint backs = 0u;
+    if ((frame.frame_index / max(trace_push.probe_stride, 1u) + probe) % 8u != 0u) {
+        uint spread = max(trace_push.rays_per_probe / 8u, 1u);
+        for (uint k = 0u; k < 8u; k++) backs += uint(loadAligned<16>(trace_push.rays + probe * trace_push.rays_per_probe + min(k * spread, trace_push.rays_per_probe - 1u)).w < 0.0);
+    }
+    trace_push.buried[probe] = backs >= 6u ? 1u : 0u;
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void traceMain(uint3 id : SV_DispatchThreadID) {
@@ -15,12 +32,7 @@ void traceMain(uint3 id : SV_DispatchThreadID) {
     FrameConstants frame = trace_push.frame;
     uint ray = index % trace_push.rays_per_probe;
     uint slot = probe * trace_push.rays_per_probe + ray;
-    if (trace_push.skip_buried != 0u && (frame.frame_index / max(trace_push.probe_stride, 1u) + probe) % 8u != 0u) {
-        uint backs = 0u;
-        uint spread = max(trace_push.rays_per_probe / 8u, 1u);
-        for (uint k = 0u; k < 8u; k++) backs += uint(loadAligned<16>(trace_push.rays + probe * trace_push.rays_per_probe + min(k * spread, trace_push.rays_per_probe - 1u)).w < 0.0);
-        if (backs >= 6u) return;
-    }
+    if (trace_push.skip_buried != 0u && trace_push.buried[probe] != 0u) return;
     GiGrid grid = giGrid(frame, trace_push.grid);
     float3 origin = giProbePosition(grid, giGridCoord(grid, giProbeCoord(int(probe), grid.counts)));
     if (!giProbeDue(frame, origin, probe, trace_push.turn, trace_push.far_distance)) return;

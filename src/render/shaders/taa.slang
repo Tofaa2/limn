@@ -122,7 +122,7 @@ float4 fragmentMain([[vk::location(0)]] float2 in_uv) : SV_Target {
         current_ycocg = lerp(current_ycocg, narrow / max(narrow_weight, 1e-6), confidence);
     }
     float speed = length(motion * frame.resolution);
-    float gamma = lerp(1.75, 1.0, clamp(speed * 0.5, 0.0, 1.0));
+    float gamma = lerp(1.75, 1.0, clamp(max(speed, speedBefore(frame, history_uv)) * 0.5, 0.0, 1.0));
     float3 box_min = mean - gamma * deviation;
     float3 box_max = mean + gamma * deviation;
     float3 box_center = 0.5 * (box_max + box_min);
@@ -130,8 +130,7 @@ float4 fragmentMain([[vk::location(0)]] float2 in_uv) : SV_Target {
     float3 offset = history - box_center;
     float3 unit = abs(offset / box_extent);
     float max_unit = max(unit.x, max(unit.y, unit.z));
-    float stale = clamp(max(speed, speedBefore(frame, history_uv)) * 4.0, 0.1, 1.0);
-    if (max_unit > 1.0) history = lerp(history, box_center + offset / max_unit, stale);
+    if (max_unit > 1.0) history = box_center + offset / max_unit;
 
     float blend = (upscaling ? lerp(0.05, 0.2, clamp(speed / 24.0, 0.0, 1.0)) : lerp(0.05, moving_blend, clamp(speed / moving_speed, 0.0, 1.0))) * max(confidence, 0.15);
     float flicker = abs(current_ycocg.x - history.x) / max(max(current_ycocg.x, history.x), 1e-3);

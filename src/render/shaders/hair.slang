@@ -468,8 +468,9 @@ Output shadeMain(
     surface.subsurface = 0.0;
     surface.anisotropy = -1.0;
     surface.grain = tangent;
+    surface.energy = 0.0;
     lit += localLights(frame, surface, fragment.xy, noise);
-    lit += ambientLight(frame, surface, float4(0.0));
+    lit += ambientLight(frame, surface, float4(0.0), brdfTable(frame, surface));
     if (frame.environment != 0u) {
         float sin_v = dot(tangent, view);
         float3 up_across = float3(0.0, 1.0, 0.0) - tangent * tangent.y;

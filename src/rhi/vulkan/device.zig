@@ -324,6 +324,10 @@ pub const Device = struct {
     frame_number: u64 = 0,
     /// True between `startFrame` and `submitFrame`.
     in_frame: bool = false,
+    /// Frame waits left before `failDevice` makes the device report lost.
+    lose_after: ?u32 = null,
+    /// Set by `failDevice`: every frame wait fails with `error.DeviceLost`.
+    faked_lost: bool = false,
     /// Meaningful while `in_frame`.
     encoder: CommandEncoder = undefined,
     /// Destroyed objects waiting out the frames in flight.
@@ -626,13 +630,14 @@ pub const Device = struct {
         self.samplers = .init(gpa);
         self.pipelines = .init(gpa);
         self.accelerations = .init(gpa);
-        self.texture_slots = try SlotAllocator.init(gpa, texture_capacity);
+        const capacities = descriptorCapacities(self.instance, self.physical);
+        self.texture_slots = try SlotAllocator.init(gpa, capacities.textures);
         errdefer self.texture_slots.deinit(gpa);
-        self.storage_slots = try SlotAllocator.init(gpa, storage_capacity);
+        self.storage_slots = try SlotAllocator.init(gpa, capacities.storage);
         errdefer self.storage_slots.deinit(gpa);
-        self.storage_volume_slots = try SlotAllocator.init(gpa, storage_volume_capacity);
+        self.storage_volume_slots = try SlotAllocator.init(gpa, capacities.storage_volume);
         errdefer self.storage_volume_slots.deinit(gpa);
-        self.sampler_slots = try SlotAllocator.init(gpa, sampler_capacity);
+        self.sampler_slots = try SlotAllocator.init(gpa, capacities.samplers);
         errdefer self.sampler_slots.deinit(gpa);
 
         try self.createDescriptorTable();
@@ -843,6 +848,12 @@ pub const Device = struct {
         self.allocator.fail_after = after;
     }
 
+    /// For tests: after `after` more frame waits, every frame wait fails with
+    /// `error.DeviceLost`, as on a lost device, though the GPU still works.
+    pub fn failDevice(self: *Device, after: u32) void {
+        self.lose_after = after;
+    }
+
     /// A `failGpuAllocation` failure is still to come.
     pub fn gpuAllocationFailurePending(self: *const Device) bool {
         return self.allocator.fail_after != null;
@@ -890,10 +901,10 @@ pub const Device = struct {
 
     fn createDescriptorTable(self: *Device) !void {
         const all_bindings = [_]vk.DescriptorSetLayoutBinding{
-            .{ .binding = 0, .descriptor_type = .sampled_image, .descriptor_count = texture_capacity, .stage_flags = pipelines_module.shaderStages(self) },
-            .{ .binding = 1, .descriptor_type = .sampler, .descriptor_count = sampler_capacity, .stage_flags = pipelines_module.shaderStages(self) },
-            .{ .binding = 2, .descriptor_type = .storage_image, .descriptor_count = storage_capacity, .stage_flags = pipelines_module.shaderStages(self) },
-            .{ .binding = 3, .descriptor_type = .storage_image, .descriptor_count = storage_volume_capacity, .stage_flags = pipelines_module.shaderStages(self) },
+            .{ .binding = 0, .descriptor_type = .sampled_image, .descriptor_count = self.texture_slots.capacity, .stage_flags = pipelines_module.shaderStages(self) },
+            .{ .binding = 1, .descriptor_type = .sampler, .descriptor_count = self.sampler_slots.capacity, .stage_flags = pipelines_module.shaderStages(self) },
+            .{ .binding = 2, .descriptor_type = .storage_image, .descriptor_count = self.storage_slots.capacity, .stage_flags = pipelines_module.shaderStages(self) },
+            .{ .binding = 3, .descriptor_type = .storage_image, .descriptor_count = self.storage_volume_slots.capacity, .stage_flags = pipelines_module.shaderStages(self) },
         };
         const count: u32 = if (self.caps.storage_images) all_bindings.len else all_bindings.len - 2;
         const binding_flags: [all_bindings.len]vk.DescriptorBindingFlags = @splat(.{
@@ -912,9 +923,9 @@ pub const Device = struct {
             .p_bindings = &all_bindings,
         }, null);
         const sizes = [_]vk.DescriptorPoolSize{
-            .{ .type = .sampled_image, .descriptor_count = texture_capacity },
-            .{ .type = .sampler, .descriptor_count = sampler_capacity },
-            .{ .type = .storage_image, .descriptor_count = storage_capacity + storage_volume_capacity },
+            .{ .type = .sampled_image, .descriptor_count = self.texture_slots.capacity },
+            .{ .type = .sampler, .descriptor_count = self.sampler_slots.capacity },
+            .{ .type = .storage_image, .descriptor_count = self.storage_slots.capacity + self.storage_volume_slots.capacity },
         };
         self.descriptor_pool = try self.vkd.createDescriptorPool(&.{
             .flags = .{ .update_after_bind_bit = true },
@@ -929,6 +940,32 @@ pub const Device = struct {
         }, @ptrCast(&self.descriptor_set));
     }
 };
+
+const DescriptorCapacities = struct { textures: u32, samplers: u32, storage: u32, storage_volume: u32 };
+
+/// The bindless table's sizes, cut down to the device's update-after-bind
+/// limits where they are lower; logs what it cut.
+fn descriptorCapacities(instance: dispatch.Instance, physical: vk.PhysicalDevice) DescriptorCapacities {
+    var indexing = std.mem.zeroInit(vk.PhysicalDeviceDescriptorIndexingProperties, .{});
+    var properties = vk.PhysicalDeviceProperties2{ .p_next = &indexing, .properties = undefined };
+    instance.getPhysicalDeviceProperties2(physical, &properties);
+    const sampled_limit = @min(indexing.max_descriptor_set_update_after_bind_sampled_images, indexing.max_per_stage_descriptor_update_after_bind_sampled_images);
+    const sampler_limit = @min(indexing.max_descriptor_set_update_after_bind_samplers, indexing.max_per_stage_descriptor_update_after_bind_samplers);
+    const storage_limit = @min(indexing.max_descriptor_set_update_after_bind_storage_images, indexing.max_per_stage_descriptor_update_after_bind_storage_images);
+    const samplers = @min(sampler_capacity, sampler_limit);
+    const storage_volume = @min(storage_volume_capacity, storage_limit / 65);
+    const storage = @min(storage_capacity, storage_limit -| storage_volume);
+    const room = indexing.max_per_stage_update_after_bind_resources -| (samplers + storage + storage_volume);
+    const capacities = DescriptorCapacities{
+        .textures = @min(texture_capacity, sampled_limit, room),
+        .samplers = samplers,
+        .storage = storage,
+        .storage_volume = storage_volume,
+    };
+    if (capacities.textures < texture_capacity or samplers < sampler_capacity or storage < storage_capacity or storage_volume < storage_volume_capacity)
+        std.log.warn("bindless table cut to the device's limits: {} textures, {} samplers, {} storage images, {} storage volumes", .{ capacities.textures, samplers, storage, storage_volume });
+    return capacities;
+}
 
 /// Fixed-capacity index allocator for bindless descriptor slots.
 const SlotAllocator = struct {
