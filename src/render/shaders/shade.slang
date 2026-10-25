@@ -427,6 +427,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     soft_history_depth_texture = push.shadow_depth;
     soft_history_depth = linearDepth(previous_clip.z / previous_clip.w, frame.depth_terms);
     soft_history_slack = 0.05 * soft_history_depth + 2.0 * fwidth(soft_history_depth);
+    soft_history_speed = length(result.motion * frame.resolution);
     if (instance.lightmap != INVALID_ID) gathered = float4(sampleTextureLod(instance.lightmap, frame.sampler_linear_clamp, raw1, 0.0).rgb, 1.0);
     float3 lit = (material.flags & MATERIAL_UNLIT) != 0u ? emissive : emissive + shadeSurface(frame, surface, fragment.xy, noise, gathered);
     if ((SHADE_FEATURES & FEATURE_AERIAL) != 0u && frame.shading.aerial != 0.0 && frame.environment != 0u) {

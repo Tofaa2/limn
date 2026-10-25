@@ -826,6 +826,8 @@ fn stateInfo(state: types.TextureState, mesh_shaders: bool) StateInfo {
     };
 }
 
+/// A swapchain image leaving `undefined` waits in `all_commands`, the stage
+/// its acquire semaphore is waited in, so the layout change follows it.
 fn imageBarrier(
     mesh_shaders: bool,
     resource: *const device_module.TextureResource,
@@ -836,8 +838,9 @@ fn imageBarrier(
 ) vk.ImageMemoryBarrier2 {
     const source = stateInfo(from, mesh_shaders);
     const destination = stateInfo(to, mesh_shaders);
+    const swapchain_image = resource.allocation == null;
     return .{
-        .src_stage_mask = source.stage,
+        .src_stage_mask = if (from == .undefined and swapchain_image) .{ .all_commands_bit = true } else source.stage,
         .src_access_mask = source.access,
         .dst_stage_mask = destination.stage,
         .dst_access_mask = destination.access,

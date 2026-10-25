@@ -40,8 +40,16 @@ pub fn endFrame(self: *Device) !void {
 }
 
 /// Blocks until the GPU has finished the frame whose slot is reused next.
-/// Touches no shared device state.
+/// Touches no shared device state but `failDevice`'s test counter.
 pub fn waitForFrame(self: *Device) !void {
+    if (self.faked_lost) return error.DeviceLost;
+    if (self.lose_after) |*left| {
+        if (left.* == 0) {
+            self.faked_lost = true;
+            return error.DeviceLost;
+        }
+        left.* -= 1;
+    }
     const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
     _ = self.vkd.waitForFences(&.{frame.fence}, .true, std.math.maxInt(u64)) catch |err| {
         if (err == error.DeviceLost) reportFault(self);

@@ -141,7 +141,7 @@ pub const Settings = struct {
     path_tracing: ?PathTracing = null,
     /// How see-through surfaces are drawn.
     transparency: Transparency = .{},
-    /// Height fog lit by the sun and local lights. Null for none.
+    /// Height fog lit by the sun and the sky. Null for none.
     fog: ?Fog = null,
     /// Volumetric clouds of a scene that has them. Null for none.
     clouds: ?Clouds = .{},

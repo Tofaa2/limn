@@ -6,6 +6,7 @@ pub const TracePush = extern struct {
     rays: u64,
     tlas: u64,
     directions: u64,
+    buried: u64,
     rays_per_probe: u32,
     probe_count: u32,
     multibounce: u32,
@@ -17,7 +18,7 @@ pub const TracePush = extern struct {
     far_distance: f32,
     turn: u32,
 
-    pub const references = .{ .frame = "FrameConstants", .rays = "float4*", .directions = "float4*" };
+    pub const references = .{ .frame = "FrameConstants", .rays = "float4*", .directions = "float4*", .buried = "uint*" };
 };
 
 pub const RelocatePush = extern struct {

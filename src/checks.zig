@@ -978,6 +978,7 @@ pub fn main(init: std.process.Init) !void {
     try renderer.device.waitIdle();
     if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
     try withoutFeatures(init.gpa, init.io);
+    try lostDevice(init.gpa, init.io);
 }
 
 /// A second renderer with ray tracing, mesh shaders and shading variants
@@ -1012,4 +1013,32 @@ fn withoutFeatures(gpa: std.mem.Allocator, io: std.Io) !void {
     try renderer.device.waitIdle();
     if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
     std.log.info("without features: {d} settings turned down and reported, and it drew", .{downgraded.len});
+}
+
+/// A renderer whose device reports itself lost mid-stream: every frame from
+/// then on fails with `error.DeviceLost`, and it still shuts down cleanly.
+fn lostDevice(gpa: std.mem.Allocator, io: std.Io) !void {
+    const renderer = try gfx.Renderer.init(gpa, io, .{ .application_name = "limn checks, lost device", .validation = true });
+    defer renderer.deinit();
+    const target = try renderer.views.createTarget(width, height);
+    defer renderer.views.destroyTarget(target);
+    const scene = try renderer.scenes.create();
+    renderer.scenes.setSun(scene, .{ .direction = .{ -0.5, -0.7, -0.4 }, .color = .{ 1, 1, 1 }, .intensity = 3 });
+    const triangle = [_][3]f32{ .{ -1, 0, 0 }, .{ 1, 0, 0 }, .{ 0, 1, 0 } };
+    const model = try renderer.models.create(&.{.{ .positions = &triangle, .indices = &.{ 0, 1, 2 } }});
+    _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.identity });
+    const frame = gfx.FrameDesc{ .views = &.{.{ .scene = scene, .camera = gfx.Camera.lookAt(.{ 0, 0.5, 3 }, .{ 0, 0.5, 0 }), .target = .{ .texture = target } }}, .delta_time = 1.0 / 60.0 };
+    renderer.device.failDevice(3);
+    var drawn: usize = 0;
+    while (drawn < 8) : (drawn += 1) {
+        _ = renderer.render(frame) catch |err| {
+            if (err != error.DeviceLost) return err;
+            break;
+        };
+    } else return error.NoFailureInjected;
+    for (0..3) |_| {
+        if (renderer.render(frame)) |_| return error.LostDeviceDrew else |err| if (err != error.DeviceLost) return err;
+    }
+    if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
+    std.log.info("lost device: drew {d} frames, then every frame reported the loss", .{drawn});
 }

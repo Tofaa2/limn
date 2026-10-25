@@ -30,6 +30,9 @@ struct Surface {
     float anisotropy;
     float3 grain;
     float subsurface;
+    /// Specular gain giving back the energy single-scattering GGX loses on
+    /// rough surfaces is `1 + f0 * energy`; set by `shadeSurface`.
+    float energy;
 };
 
 static const float2 vogel_disk[16] = { float2(0.1768, 0.0000), float2(-0.2257, 0.2068), float2(0.0345, -0.3938), float2(0.2845, 0.3703), float2(-0.5265, -0.0696), float2(0.4594, -0.3632), float2(-0.1158, 0.6272), float2(-0.4117, -0.5510), float2(0.7123, 0.1728), float2(-0.6434, 0.4302), float2(0.2334, -0.7767), float2(0.4298, 0.7324), float2(-0.8291, -0.2950), float2(0.8183, -0.4133), float2(-0.3632, 0.8715), float2(-0.3838, -0.9010) };
@@ -151,7 +154,7 @@ float contactShadow(FrameConstants frame, float3 position, float noise) {
     return 1.0;
 }
 
-float3 directLight(float3 n, float3 v, float3 l, float3 radiance, float3 diffuse_color, float3 f0, float roughness) {
+float3 directLight(float3 n, float3 v, float3 l, float3 radiance, float3 diffuse_color, float3 f0, float roughness, float energy = 0.0) {
     float n_dot_l = clamp(dot(n, l), 0.0, 1.0);
     if (n_dot_l <= 0.0) return float3(0.0);
     float3 h = normalize(v + l);
@@ -159,7 +162,7 @@ float3 directLight(float3 n, float3 v, float3 l, float3 radiance, float3 diffuse
     float n_dot_h = clamp(dot(n, h), 0.0, 1.0);
     float alpha = roughness * roughness;
     float3 fresnel = fresnelSchlick(clamp(dot(v, h), 0.0, 1.0), f0);
-    float3 specular = fresnel * (distributionGgx(n_dot_h, alpha) * visibilitySmithGgx(n_dot_l, n_dot_v, alpha));
+    float3 specular = fresnel * (1.0 + f0 * energy) * (distributionGgx(n_dot_h, alpha) * visibilitySmithGgx(n_dot_l, n_dot_v, alpha));
     float3 diffuse = diffuse_color * (1.0 - fresnel) / PI;
     return (diffuse + specular) * radiance * n_dot_l;
 }
@@ -181,7 +184,7 @@ float3 grainLight(Surface surface, float3 l, float3 radiance) {
         n_dot_v * length(float3(along * dot(t, l), across * dot(b, l), n_dot_l)), 1e-5);
     float3 fresnel = fresnelSchlick(clamp(dot(v, h), 0.0, 1.0), surface.f0);
     float3 diffuse = surface.diffuse_color * (1.0 - fresnel) / PI;
-    return (diffuse + fresnel * min(distribution * visibility, 1e4)) * radiance * n_dot_l;
+    return (diffuse + fresnel * (1.0 + surface.f0 * surface.energy) * min(distribution * visibility, 1e4)) * radiance * n_dot_l;
 }
 
 /// Fresnel reflectance of a hair's cuticle, of index 1.55.
@@ -244,7 +247,7 @@ float3 surfaceLight(Surface surface, float3 l, float3 radiance) {
     if (surface.anisotropy < 0.0) return (hairFibre(surface.grain, surface.view, l, surface.diffuse_color, surface.roughness) + hairScatter(surface.grain, surface.view, l, surface.diffuse_color, float3(1.0))) * radiance;
     float3 base;
     if (surface.anisotropy > 0.0) base = grainLight(surface, l, radiance);
-    else base = directLight(surface.normal, surface.view, l, radiance, surface.diffuse_color, surface.f0, surface.roughness);
+    else base = directLight(surface.normal, surface.view, l, radiance, surface.diffuse_color, surface.f0, surface.roughness, surface.energy);
     float sheen_strength = max(surface.sheen_color.r, max(surface.sheen_color.g, surface.sheen_color.b));
     if (surface.clearcoat <= 0.0 && sheen_strength <= 0.0) return base;
     float n_dot_l = clamp(dot(surface.normal, l), 0.0, 1.0);
@@ -321,6 +324,8 @@ float tracedShadow(FrameConstants frame, Light light, float3 position, float3 no
         uint rays = max(frame.shadows.light_rays, 1u);
         float base = noise;
         float lit = 0.0;
+        float3 across = normalize(cross(abs(l.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0), l));
+        float3 across_up = cross(l, across);
         for (uint ray = 0u; ray < rays; ray++) {
             float2 pick = frac(float2(base + float(ray) * 0.61803399, base * 7.31 + 0.37 + float(ray) * 0.75487767)) - 0.5;
             float3 target = light.position;
@@ -330,8 +335,9 @@ float tracedShadow(FrameConstants frame, Light light, float3 position, float3 no
                 target += right * (pick.x * light.source_length) + cross(facing, right) * (pick.y * light.source_height);
             } else {
                 if ((light.flags & LIGHT_SPOT) == 0u) target += light.direction * (pick.x * light.source_length);
-                float angle = pick.y * 6.2831853;
-                target += float3(cos(angle), sin(angle * 1.7), sin(angle)) * (light.source_radius * frac(base * 3.17 + 0.11 + float(ray) * 0.37));
+                float angle = (pick.y + 0.5) * 6.2831853;
+                float out_from_center = light.source_radius * sqrt(frac(base * 3.17 + 0.11 + float(ray) * 0.56984029));
+                target += (across * cos(angle) + across_up * sin(angle)) * out_from_center;
             }
             float3 toward = target - origin;
             float distance_there = length(toward);
@@ -446,6 +452,8 @@ static float2 soft_history_uv = float2(0.0);
 static uint soft_history_depth_texture = INVALID_ID;
 static float soft_history_depth = 0.0;
 static float soft_history_slack = 0.0;
+/// How far the pixel moved since the history was made, in pixels.
+static float soft_history_speed = 0.0;
 
 float softShadowHistory(FrameConstants frame) {
     if (soft_history_texture == INVALID_ID) return -1.0;
@@ -481,6 +489,7 @@ float3 localLights(FrameConstants frame, Surface surface, float2 pixel, float no
     if ((SHADE_FEATURES & FEATURE_LOCAL_LIGHTS) == 0u || frame.lights.light_count == 0u) return float3(0.0);
     float3 color = float3(0.0);
     float3 soft_light = float3(0.0);
+    float3 soft_shadowed = float3(0.0);
     float soft_weight = 0.0;
     float soft_lit = 0.0;
     uint cluster = clusterIndex(frame, pixel, surface.view_depth);
@@ -495,6 +504,7 @@ float3 localLights(FrameConstants frame, Surface surface, float2 pixel, float no
                 if ((light.flags & LIGHT_TRACED_SHADOW) != 0u && light.source_radius > 0.0) {
                     float brightness = dot(lit, float3(0.2126, 0.7152, 0.0722));
                     soft_light += lit;
+                    soft_shadowed += lit * traced;
                     soft_weight += brightness;
                     soft_lit += brightness * traced;
                 } else {
@@ -566,6 +576,7 @@ float3 localLights(FrameConstants frame, Surface surface, float2 pixel, float no
         if (soft) {
             float brightness = dot(lit, float3(0.2126, 0.7152, 0.0722));
             soft_light += lit;
+            soft_shadowed += lit * traced;
             soft_weight += brightness;
             soft_lit += brightness * traced;
         } else {
@@ -575,8 +586,10 @@ float3 localLights(FrameConstants frame, Surface surface, float2 pixel, float no
     if (soft_weight > 0.0) {
         float now = soft_lit / soft_weight;
         float before = softShadowHistory(frame);
-        soft_shadow_visibility = before >= 0.0 ? lerp(before, now, 0.12) : now;
-        color += soft_light * soft_shadow_visibility;
+        float fresh = lerp(0.12, 1.0, clamp(soft_history_speed * 0.5, 0.0, 1.0));
+        soft_shadow_visibility = before >= 0.0 ? lerp(before, now, fresh) : now;
+        float3 apart = soft_shadowed * (soft_shadow_visibility / max(now, 1e-4));
+        color += lerp(soft_light * soft_shadow_visibility, apart, smoothstep(0.0, 0.1, now));
     }
     return color;
 }
@@ -648,7 +661,8 @@ float3 ambientReflection(FrameConstants frame, float3 position, float3 view, flo
 static float4 deferred_reflection = float4(0.0);
 #endif
 
-float3 ambientLight(FrameConstants frame, Surface surface, float4 gathered) {
+/// `dfg` is `brdfTable` at the surface.
+float3 ambientLight(FrameConstants frame, Surface surface, float4 gathered, float2 dfg) {
     bool has_environment = frame.environment != 0u;
     bool has_gi = frame.gi.enabled != 0u;
     uint s = frame.sampler_linear_clamp;
@@ -669,7 +683,6 @@ float3 ambientLight(FrameConstants frame, Surface surface, float4 gathered) {
         }
     }
 
-    float2 dfg = sampleTextureLod(frame.brdf_lut, s, float2(n_dot_v, surface.roughness), 0.0).rg;
     float3 specular_weight = surface.f0 * dfg.x + dfg.y;
     float3 color = irradiance * surface.diffuse_color * (1.0 - specular_weight) * multiBounceAo(surface.ao, surface.diffuse_color);
     color += surface.bounce * surface.diffuse_color * (1.0 - specular_weight);
@@ -702,7 +715,17 @@ float3 ambientLight(FrameConstants frame, Surface surface, float4 gathered) {
     return color;
 }
 
+/// Scale and bias of the split-sum specular integral at the surface.
+float2 brdfTable(FrameConstants frame, Surface surface) {
+    float n_dot_v = max(dot(surface.normal, surface.view), 1e-4);
+    return sampleTextureLod(frame.brdf_lut, frame.sampler_linear_clamp, float2(n_dot_v, surface.roughness), 0.0).rg;
+}
+
+/// Light leaving `surface`. Diffuse light is linear in `diffuse_color`, so a
+/// caller can scale it apart from reflections by scaling `diffuse_color`.
 float3 shadeSurface(FrameConstants frame, Surface surface, float2 pixel, float noise, float4 gathered_gi) {
+    float2 dfg = brdfTable(frame, surface);
+    surface.energy = 1.0 / max(dfg.x + dfg.y, 1e-4) - 1.0;
     float3 color = float3(0.0);
     float3 l = frame.sun_direction;
     float n_dot_l = clamp(dot(surface.normal, l), 0.0, 1.0);
@@ -719,7 +742,7 @@ float3 shadeSurface(FrameConstants frame, Surface surface, float2 pixel, float n
         color += surface.diffuse_color * frame.sun_radiance * ((max(wrap * wrap - n_dot_l, 0.0) * 0.7 + through * 0.25) / PI) * lit_behind;
     }
     color += localLights(frame, surface, pixel, noise);
-    color += ambientLight(frame, surface, gathered_gi);
+    color += ambientLight(frame, surface, gathered_gi, dfg);
     return color;
 }
 

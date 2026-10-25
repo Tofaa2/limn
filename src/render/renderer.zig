@@ -788,6 +788,8 @@ pub const Renderer = struct {
     /// Renders one frame; false when skipped because the window has no
     /// drawable surface. Call from one thread at a time; the lock is held
     /// only while recording, not while waiting for the GPU or display.
+    /// `error.DeviceLost` is final: every later frame fails the same way, and
+    /// the application deinits this renderer and creates a new one.
     pub fn render(self: *Renderer, desc: FrameDesc) !bool {
         const device = self.device;
         if (!std.math.isFinite(desc.delta_time) or desc.delta_time < 0) return error.InvalidDeltaTime;

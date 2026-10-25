@@ -41,6 +41,17 @@ float3 agxEotf(float3 color) {
     return pow(max(color, float3(0.0)), float3(2.2));
 }
 
+/// Stretches the highlights of a picture tone mapped for SDR up to `peak`,
+/// in units of paper white, leaving everything below the knee as in SDR.
+float3 expandHighlights(float3 color, float peak) {
+    const float knee = 0.6;
+    float lightness = luminance(color);
+    if (lightness <= knee || peak <= 1.0) return color;
+    float above = (lightness - knee) / (1.0 - knee);
+    float expanded = knee + (1.0 - knee) * above + (peak - 1.0) * above * above * above;
+    return color * (min(expanded, peak) / lightness);
+}
+
 float3 colorAt(int2 pixel) {
     return fetchTexel(push.color_texture, pixel).rgb;
 }
@@ -104,12 +115,9 @@ float4 fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Posit
     }
     color *= exposure * push.color_filter;
 
-    if (push.curve != 0u && push.encode_srgb == 2u) {
-        float peak = max(push.hdr_peak / max(push.hdr_paper_white, 1.0), 1.0);
-        color = color * (1.0 + color / (peak * peak)) / (1.0 + color);
-        color *= min(peak, 2.0) * 0.5 + 0.5;
-    } else if (push.curve != 0u) {
+    if (push.curve != 0u) {
         color = agxEotf(agxLook(agx(color)));
+        if (push.encode_srgb == 2u) color = expandHighlights(color, max(push.hdr_peak / max(push.hdr_paper_white, 1.0), 1.0));
     }
 
     color = lerp(float3(luminance(color)), color, push.saturation);

@@ -1,4 +1,4 @@
-//! Height fog lit by the sun and local lights.
+//! Height fog lit by the sun and the sky.
 const rhi = @import("../../rhi/rhi.zig");
 const pipelines_module = @import("../renderer/pipelines.zig");
 const fog_push = @import("../shaders/push/fog.zig");

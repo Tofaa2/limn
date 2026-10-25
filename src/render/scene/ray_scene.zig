@@ -166,8 +166,6 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
             continue;
         };
         if (frame_now < carried + rhi.frames_in_flight) continue;
-        // A pool that has just moved holds nothing yet for the second queue
-        // to read. Its contents may be copied a frame after the move is seen.
         if (self.internal.geometry_replaced) |replaced| if (frame_now <= replaced + rhi.frames_in_flight) continue;
         var encoder = (try device.beginDetached()).?;
         try geometry_feature.buildMeshBlases(self, &encoder, entry.meshes, buildingBlas);

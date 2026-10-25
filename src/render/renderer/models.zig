@@ -103,12 +103,12 @@ pub const Models = struct {
         defer self.unlock();
         const material_images: []MaterialTextures = if (textured) try self.internal.gpa.alloc(MaterialTextures, meshes.len) else &.{};
         errdefer self.internal.gpa.free(material_images);
-        for (material_images, meshes) |*into, mesh| {
+        if (textured) for (material_images, meshes) |*into, mesh| {
             inline for (@typeInfo(MaterialTextures).@"struct".fields) |field| {
                 if (field.type == ?api.Image) if (@field(mesh.textures, field.name)) |image| if (!self.images.valid(image)) return error.InvalidImage;
             }
             into.* = mesh.textures;
-        }
+        };
         const model = try self.models.internal.table.insert(.{ .source = source, .material_images = material_images });
         self.internal.loading_count += 1;
         return model;

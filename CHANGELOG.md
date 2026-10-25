@@ -3,6 +3,7 @@
 ## 0.1.4 
 
 ### Added
+- `rhi.Device.failDevice`: a device that reports itself lost, for tests.
 - glTF and font validation (`-Dvalidate_input=false`).
 - NVIDIA DLSS: `Upscaler.dlss`.
 - DLSS Ray Reconstruction for path tracing.
@@ -148,6 +149,17 @@
 
 
 ### Fixed
+- The first layout change of a swapchain image did not wait for its acquire.
+- The bindless table asked for more descriptors than some devices allow.
+- Device teardown took quadratic time in the number of live resources.
+- A model without textures panicked in safe builds.
+- Soft traced shadows of differently colored lights took on each other's color, and trailed in motion.
+- Transparent surfaces were shaded twice.
+- Rough metals lost energy under direct light.
+- Traced sphere light shadows sampled the light unevenly.
+- TAA ghosting when lighting changed on still surfaces.
+- HDR10 output used a different tone curve from SDR.
+- Buried GI probes were picked by threads racing their own trace.
 - Two uploads to the same buffer range or texture level in one frame raced each other.
 - Features switched off on a view give their memory back.
 - Path tracing restarts its history after frames it did not trace.

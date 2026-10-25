@@ -33,6 +33,7 @@ pub const renderer: []const Shader = &.{
     .{ .src = dir ++ "/forward.slang", .name = "forward_peel.frag.spv", .defines = &.{"PEEL"}, .entry = "fragmentMain", .stage = "fragment" },
     .{ .src = dir ++ "/hiz.slang", .name = "hiz.frag.spv", .entry = "rasterMain", .stage = "fragment" },
     .{ .src = dir ++ "/gi_passes.slang", .name = "gi_trace.comp.spv", .entry = "traceMain", .stage = "compute" },
+    .{ .src = dir ++ "/gi_passes.slang", .name = "gi_buried.comp.spv", .entry = "buriedMain", .stage = "compute" },
     .{ .src = dir ++ "/gi_passes.slang", .name = "gi_relocate.frag.spv", .entry = "relocateMain", .stage = "fragment" },
     .{ .src = dir ++ "/gi_passes.slang", .name = "gi_gather.frag.spv", .entry = "gatherMain", .stage = "fragment" },
     .{ .src = dir ++ "/gi_passes.slang", .name = "gi_clamp.frag.spv", .entry = "clampMain", .stage = "fragment" },

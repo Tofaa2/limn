@@ -239,6 +239,8 @@ pub fn ensureGiVolume(renderer: *Renderer, slot: *?GiVolume, scene_origin: [3]f6
     const probe_count = counts[0] * counts[1] * counts[2];
     var made = render.MadeTextures{ .device = device };
     errdefer made.destroy();
+    const buried = try device.createBuffer(.{ .name = "gi buried probes", .size = @as(u64, probe_count) * @sizeOf(u32), .usage = .{ .storage = true } });
+    errdefer device.destroyBuffer(buried);
     slot.* = .{
         .origin = origin,
         .cell = cell,
@@ -275,6 +277,7 @@ pub fn ensureGiVolume(renderer: *Renderer, slot: *?GiVolume, scene_origin: [3]f6
             .size = @as(u64, probe_count) * rays_per_probe * @sizeOf([4]f32),
             .usage = .{ .storage = true },
         }),
+        .buried = buried,
     };
     return &slot.*.?;
 }
@@ -435,12 +438,12 @@ pub fn updateGi(
     const update_turn: u32 = @truncate(renderer.internal.frame_index / stride);
 
     cmd.beginScope("gi trace");
-    cmd.bindPipeline(try renderer.internal.pipelines.of(giTracePipeline));
-    cmd.pushConstants(gi_passes_push.TracePush{
+    const trace_push = gi_passes_push.TracePush{
         .frame = frame_address,
         .rays = device.bufferAddress(volume.rays),
         .tlas = device.accelerationAddress(tlas),
         .directions = directions.address,
+        .buried = device.bufferAddress(volume.buried),
         .rays_per_probe = volume.rays_per_probe,
         .probe_count = probe_count,
         .multibounce = @intFromBool(volume.frames != 0 and everyCascadeLit(scene)),
@@ -451,8 +454,17 @@ pub fn updateGi(
         .far_distance = far_distance,
         .turn = update_turn,
         .max_distance = 1000,
-    });
-    cmd.dispatch((((probe_count + stride - 1) / stride) * volume.rays_per_probe + 63) / 64, 1, 1);
+    };
+    const due_probes = (probe_count + stride - 1) / stride;
+    if (trace_push.skip_buried != 0) {
+        cmd.bindPipeline(try renderer.internal.pipelines.of(giBuriedPipeline));
+        cmd.pushConstants(trace_push);
+        cmd.dispatch((due_probes + 63) / 64, 1, 1);
+        cmd.sync(.compute_to_all);
+    }
+    cmd.bindPipeline(try renderer.internal.pipelines.of(giTracePipeline));
+    cmd.pushConstants(trace_push);
+    cmd.dispatch((due_probes * volume.rays_per_probe + 63) / 64, 1, 1);
     cmd.sync(.compute_to_all);
     cmd.endScope();
 
@@ -545,6 +557,10 @@ fn giGatherPipeline(_: *rhi.Device) pipelines_module.Desc {
 
 fn giTracePipeline(_: *rhi.Device) pipelines_module.Desc {
     return .{ .compute = .{ .name = "gi trace", .shader = pipelines_module.shaderCode("gi_trace.comp.spv") } };
+}
+
+fn giBuriedPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "gi buried probes", .shader = pipelines_module.shaderCode("gi_buried.comp.spv") } };
 }
 
 fn giIrradiancePipeline(_: *rhi.Device) pipelines_module.Desc {

@@ -172,17 +172,14 @@ Output fragmentMain(
         surface.anisotropy = material.anisotropy;
     }
 
-    Surface specular_only = surface;
-    specular_only.diffuse_color = float3(0.0);
     float noise = interleavedGradientNoise(fragment.xy, frame.frame_index);
-    float3 specular = shadeSurface(frame, specular_only, fragment.xy, noise, float4(0.0));
-    float3 total = shadeSurface(frame, surface, fragment.xy, noise, float4(0.0));
-    float3 diffuse = max(total - specular, float3(0.0));
     float alpha = base_color.a * (1.0 - material.transmission);
     float fresnel = max(surface.f0.r, max(surface.f0.g, surface.f0.b));
     fresnel += (1.0 - fresnel) * pow(1.0 - clamp(dot(surface.normal, surface.view), 0.0, 1.0), 5.0);
     float coverage = clamp(alpha + (1.0 - alpha) * fresnel * (1.0 - surface.roughness), 0.0, 1.0);
-    float3 color = (diffuse + emissive) * alpha + specular;
+    Surface covered = surface;
+    covered.diffuse_color *= alpha;
+    float3 color = shadeSurface(frame, covered, fragment.xy, noise, float4(0.0)) + emissive * alpha;
     if ((material.flags & MATERIAL_UNLIT) != 0u) {
         color = base_color.rgb * alpha;
         coverage = alpha;
