@@ -40,7 +40,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
     defer cmd.endScope();
     cmd.bindPipeline(try renderer.internal.pipelines.of(particleSimPipeline));
     for (scene.emitters.items) |handle_value| {
-        const emitter = renderer.emitters.table.get(handle_value) orelse continue;
+        const emitter = renderer.emitters.internal.table.get(handle_value) orelse continue;
         const desc = emitter.desc;
         const steps: u32 = if (emitter.warmed or desc.prewarm <= 0 or delta_time <= 0) 1 else @as(u32, @intFromFloat(@min(desc.prewarm / delta_time, 599))) + 1;
         emitter.warmed = true;
@@ -49,7 +49,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
             emitter.pending += @max(desc.rate, 0) * delta_time;
             const births: u32 = @min(@as(u32, @intFromFloat(@min(emitter.pending, 1e9))), emitter.capacity);
             emitter.pending -= @floatFromInt(births);
-            const carrier: u64 = if (desc.fluid) |fluid| (if (renderer.fluids.table.get(fluid)) |state| (if (state.params_frame == renderer.internal.frame_index) state.params else 0) else 0) else 0;
+            const carrier: u64 = if (desc.fluid) |fluid| (if (renderer.fluids.internal.table.get(fluid)) |state| (if (state.params_frame == renderer.internal.frame_index) state.params else 0) else 0) else 0;
             var trail_record = false;
             const trail_interval = @max(desc.trail_seconds, 1e-3) / @as(f32, @floatFromInt(@max(emitter.trail_points, 1)));
             if (emitter.trail_points != 0) {
@@ -78,7 +78,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
                 .capacity = emitter.capacity,
                 .flags = (if (desc.blend == .additive) gpu.emitter_additive else 0) | (if (desc.lit) gpu.emitter_lit else 0) |
                     (if (carrier != 0) gpu.emitter_fluid else 0) | (if (desc.collide and collision_depth != null) gpu.emitter_collide else 0) | (if (emitter.order != null) gpu.emitter_sorted else 0),
-                .image = if (desc.image) |image| image.index else gpu.invalid_id,
+                .image = renderer.images.indexOf(desc.image),
                 .softness = desc.softness,
                 .seed = @truncate(renderer.internal.frame_index *% 0x9e3779b97f4a7c15 >> 16),
                 .shift = emitter.shift,
@@ -119,7 +119,7 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
 /// The mesh an emitter's particles are drawn as, once loaded; null for sprites.
 pub fn emitterMesh(renderer: *Renderer, emitter: *const EmitterData) ?ModelMesh {
     const model = emitter.desc.mesh orelse return null;
-    const entry = renderer.models.table.get(model) orelse return null;
+    const entry = renderer.models.internal.table.get(model) orelse return null;
     if (entry.state != .ready or entry.meshes.len == 0) return null;
     entry.geometry_pinned = true;
     if (!entry.geometry_resident) return null;
@@ -135,7 +135,7 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     cmd.beginScope("particles");
     defer cmd.endScope();
     for (scene.emitters.items) |handle_value| {
-        const emitter = renderer.emitters.table.get(handle_value) orelse continue;
+        const emitter = renderer.emitters.internal.table.get(handle_value) orelse continue;
         const order = emitter.order orelse continue;
         if (emitter.frame_params == 0) continue;
         const count = emitter.order_count;
@@ -171,7 +171,7 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         camera: Vec3,
 
         fn distance(context: @This(), handle_value: Emitter) f32 {
-            const emitter = context.renderer.emitters.table.get(handle_value) orelse return 0;
+            const emitter = context.renderer.emitters.internal.table.get(handle_value) orelse return 0;
             const delta = math.sub(emitter.desc.position, context.camera);
             return math.dot(delta, delta);
         }
@@ -184,7 +184,7 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     var mesh_total: u32 = 0;
     var mesh_pass = false;
     for (scene.emitters.items) |handle_value| {
-        const emitter = renderer.emitters.table.get(handle_value) orelse continue;
+        const emitter = renderer.emitters.internal.table.get(handle_value) orelse continue;
         if (emitter.frame_params == 0) continue;
         const mesh = emitterMesh(renderer, emitter) orelse continue;
         if (!mesh_pass) {
@@ -213,7 +213,7 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     cmd.bindPipeline(try renderer.internal.pipelines.of(particlesPipeline));
     var total: u32 = 0;
     for (ordered) |handle_value| {
-        const emitter = renderer.emitters.table.get(handle_value) orelse continue;
+        const emitter = renderer.emitters.internal.table.get(handle_value) orelse continue;
         if (emitter.frame_params == 0) continue;
         if (emitter.trail) |trail| {
             cmd.bindPipeline(try renderer.internal.pipelines.of(particleTrailsPipeline));

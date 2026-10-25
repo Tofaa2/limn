@@ -25,6 +25,9 @@ pub fn createTexture(self: *Device, desc: types.TextureDesc) !types.Texture {
     if (volume and (desc.depth == 0 or desc.layers != 1 or desc.mip_levels != 1)) return error.InvalidTextureDesc;
     if (!volume and desc.depth != 1) return error.InvalidTextureDesc;
     const layers: u32 = if (desc.kind == .cube) 6 else desc.layers;
+    const largest = if (volume) self.caps.max_volume_size else self.caps.max_texture_size;
+    if (desc.width > largest or desc.height > largest or (volume and desc.depth > largest) or layers == 0 or layers > self.caps.max_texture_layers)
+        return error.InvalidTextureDesc;
     const format = vkFormat(desc.format);
     const image = try self.vkd.createImage(&.{
         .flags = .{ .cube_compatible_bit = desc.kind == .cube },
@@ -60,6 +63,7 @@ pub fn createTexture(self: *Device, desc: types.TextureDesc) !types.Texture {
         .layers = layers,
         .kind = desc.kind,
         .depth = desc.depth,
+        .usage = desc.usage,
     }, desc.usage.sampled);
 }
 
@@ -454,6 +458,7 @@ pub fn createSharedTexture(self: *Device, desc: types.TextureDesc) !types.Textur
         .mip_levels = 1,
         .layers = 1,
         .kind = .@"2d",
+        .usage = desc.usage,
     }, desc.usage.sampled);
 }
 

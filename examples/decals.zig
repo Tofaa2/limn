@@ -65,15 +65,15 @@ pub fn main(init: std.process.Init) !void {
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
     const asphalt = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.13, 0.13, 0.14, 1 }, .metallic = 0, .roughness = 0.85 } }});
     const plaster = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.75, 0.72, 0.66, 1 }, .metallic = 0, .roughness = 0.8 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = asphalt, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 24, 0.5, 16 })) });
-    _ = try renderer.entities.spawn(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ 0, 2, -5 }), math.scaling(.{ 24, 4, 0.5 })) });
+    _ = try renderer.entities.create(scene, .{ .model = asphalt, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 24, 0.5, 16 })) });
+    _ = try renderer.entities.create(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ 0, 2, -5 }), math.scaling(.{ 24, 4, 0.5 })) });
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(1.2, &sphere_positions, &sphere_normals, &sphere_indices);
     const ball = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0.8, 0.8, 0.8, 1 }, .metallic = 0, .roughness = 0.5 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.translation(.{ 3.5, 1.2, -1.5 }) });
-    _ = try renderer.entities.spawn(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ -3.2, 0.6, 0.4 }), math.scaling(.{ 1.2, 1.2, 1.2 })), .receive_decals = false, .tint = .{ 0.9, 0.5, 0.3 } });
+    _ = try renderer.entities.create(scene, .{ .model = ball, .transform = math.translation(.{ 3.5, 1.2, -1.5 }) });
+    _ = try renderer.entities.create(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ -3.2, 0.6, 0.4 }), math.scaling(.{ 1.2, 1.2, 1.2 })), .receive_decals = false, .tint = .{ 0.9, 0.5, 0.3 } });
 
     const arrow_image = try drawImage(renderer, arrow);
     const ring_image = try drawImage(renderer, ring);

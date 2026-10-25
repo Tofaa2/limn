@@ -60,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
         .indices = &indices[0],
         .material = .{ .base_color = .{ 0.16, 0.22, 0.12, 1 }, .metallic = 0, .roughness = 0.9 },
     }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.1, 0 }) });
+    _ = try renderer.entities.create(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.1, 0 }) });
     const tree = try renderer.models.create(&.{
         .{ .positions = &positions[1], .indices = &indices[1], .material = .{ .base_color = .{ 0.27, 0.17, 0.09, 1 }, .metallic = 0, .roughness = 0.9 } },
         .{ .positions = &positions[2], .indices = &indices[2], .material = .{ .base_color = .{ 0.12, 0.42, 0.14, 1 }, .metallic = 0, .roughness = 0.8 } },
@@ -121,7 +121,7 @@ pub fn main(init: std.process.Init) !void {
                 const lean = if (sway) @sin(tick.time * 1.6 + item.position[0] * 0.25 + item.position[2] * 0.18) * 0.12 else 0;
                 out.* = item.transform(lean);
             }
-            try renderer.instances.set(forest, transforms[0..count]);
+            try renderer.instances.setTransforms(forest, transforms[0..count]);
             if (changed) picked = null;
         }
 

@@ -7,6 +7,7 @@ const Options = api.Options;
 const Scene = api.Scene;
 const Settings = api.Settings;
 const Upscaler = api.Upscaler;
+const rhi = @import("../../rhi/rhi.zig");
 
 /// How path tracing follows rays on this device; see `Capabilities`.
 pub const PathTracingSupport = enum {
@@ -80,7 +81,7 @@ pub const Downgrade = struct {
 
 pub const max_downgrades = 16;
 
-/// Counters describing the last frame; see `Renderer.getStats`.
+/// Counters describing the last frame; see `Renderer.stats`.
 pub const Stats = struct {
     /// What the views of the last frame asked for and did not get.
     pub fn downgraded(self: *const Stats) []const Downgrade {
@@ -132,6 +133,11 @@ pub const Stats = struct {
     draw_list_triangles: u32 = 0,
     /// Indirect draws for scene geometry, camera and shadow maps together.
     indirect_draws: u32 = 0,
+    /// Every command the last frame recorded.
+    commands: rhi.Work = .{},
+    /// Bytes the CPU wrote for the GPU to read during the last frame, in
+    /// the per-frame arena; staged uploads are `commands.staged_bytes`.
+    frame_data_bytes: u64 = 0,
     /// Frames accumulated in the last path-traced view (0 when none), and
     /// whether it used hardware ray tracing.
     path_traced_frames: u32 = 0,

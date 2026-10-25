@@ -16,7 +16,8 @@ const ViewContext = features.ViewContext;
 pub const name = "fog";
 
 pub const Settings = struct {
-    /// Extinction of the volumetric fog per world unit; 0 disables it.
+    /// Extinction of the volumetric fog per world unit. 0 shows none but
+    /// still runs it; `Settings.fog = null` turns it off.
     density: f32 = 0.02,
     /// How quickly the fog thins with height.
     height_falloff: f32 = 0.08,

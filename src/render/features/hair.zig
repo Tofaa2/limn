@@ -82,7 +82,7 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
     if (dt <= 0) return;
     var any = false;
     for (p.scene.hairs.items) |handle| {
-        const hair = renderer.hairs.table.get(handle) orelse continue;
+        const hair = renderer.hairs.internal.table.get(handle) orelse continue;
         if (hair.simulation == null) continue;
         if (hair.moving == null) {
             var made: [4]?rhi.Buffer = @splat(null);
@@ -103,7 +103,7 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
     cmd.beginScope("hair simulation");
     cmd.bindPipeline(try renderer.internal.pipelines.of(hairSimulationPipeline));
     for (p.scene.hairs.items) |handle| {
-        const hair = renderer.hairs.table.get(handle) orelse continue;
+        const hair = renderer.hairs.internal.table.get(handle) orelse continue;
         const simulation = hair.simulation orelse continue;
         const moving = &hair.moving.?;
         const next = 1 - moving.current;
@@ -112,7 +112,7 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
         const half = hair.bounds[3] * scale * 1.5;
         const density_low = [3]f32{ middle[0] - half, middle[1] - half, middle[2] - half };
         const density_cell = 2 * half / @as(f32, density_size);
-        const field: ?*render.CollisionFieldState = if (simulation.field) |field_handle| renderer.hairs.fields.get(field_handle) else null;
+        const field: ?*render.CollisionFieldState = if (simulation.field) |field_handle| renderer.hairs.internal.fields.get(field_handle) else null;
         const params = try p.arena.alloc(device, SimulationParams, 1);
         params.items[0] = .{
             .rest = device.bufferAddress(hair.points),
@@ -215,7 +215,7 @@ pub fn drawHairShadows(renderer: *Renderer, p: *const ScenePass, view_proj: [16]
     if (p.scene.hairs.items.len == 0) return;
     cmd.bindPipeline(try renderer.internal.pipelines.of(hairShadowPipeline));
     for (p.scene.hairs.items) |handle| {
-        const hair = renderer.hairs.table.get(handle) orelse continue;
+        const hair = renderer.hairs.internal.table.get(handle) orelse continue;
         const drawn = drawnPoints(hair);
         cmd.pushConstants(hair_push.ShadowPush{
             .frame = p.frame_address,
@@ -242,7 +242,7 @@ fn lightHair(renderer: *Renderer, p: *const ScenePass) !void {
     const cmd = p.cmd;
     cmd.sync(.all_to_transfer);
     for (p.scene.hairs.items) |handle| {
-        const hair = renderer.hairs.table.get(handle) orelse continue;
+        const hair = renderer.hairs.internal.table.get(handle) orelse continue;
         if (hair.shade == null) {
             const counts = try device.createBuffer(.{ .name = "hair counts", .size = grid_bytes, .usage = .{ .storage = true, .copy_dst = true } });
             errdefer device.destroyBuffer(counts);
@@ -254,7 +254,7 @@ fn lightHair(renderer: *Renderer, p: *const ScenePass) !void {
     cmd.sync(.transfer_to_all);
     cmd.bindPipeline(try renderer.internal.pipelines.of(hairCountPipeline));
     for (p.scene.hairs.items) |handle| {
-        const hair = renderer.hairs.table.get(handle) orelse continue;
+        const hair = renderer.hairs.internal.table.get(handle) orelse continue;
         const drawn = drawnPoints(hair);
         const grid = gridOf(hair);
         const point_count = hair.strands * hair.desc.points_per_strand;
@@ -272,7 +272,7 @@ fn lightHair(renderer: *Renderer, p: *const ScenePass) !void {
     cmd.sync(.compute_to_all);
     cmd.bindPipeline(try renderer.internal.pipelines.of(hairLightPipeline));
     for (p.scene.hairs.items) |handle| {
-        const hair = renderer.hairs.table.get(handle) orelse continue;
+        const hair = renderer.hairs.internal.table.get(handle) orelse continue;
         const grid = gridOf(hair);
         const scale = math.maxScale(hair.desc.transform);
         const width = hair.desc.width * (1 + std.math.clamp(hair.desc.taper, 0, 1)) * 0.5 * scale;
@@ -304,7 +304,7 @@ pub fn drawHair(renderer: *Renderer, p: *const ScenePass) !void {
     });
     cmd.bindPipeline(try renderer.internal.pipelines.of(hairPipeline));
     for (p.scene.hairs.items) |handle| {
-        const hair = renderer.hairs.table.get(handle) orelse continue;
+        const hair = renderer.hairs.internal.table.get(handle) orelse continue;
         const drawn = drawnPoints(hair);
         cmd.pushConstants(HairPush{
             .frame = p.frame_address,

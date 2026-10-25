@@ -110,7 +110,7 @@ pub fn draw(list: *gfx.DrawList, font: *const gfx.Font, assets: Assets, size: [2
     try list.popClip();
 
     {
-        var path = gfx.Path.init(list.gpa);
+        var path = gfx.Path.init(list.allocator());
         defer path.deinit();
         const cx = card.x + 70;
         const cy = card.y + 150;
@@ -133,7 +133,7 @@ pub fn draw(list: *gfx.DrawList, font: *const gfx.Font, assets: Assets, size: [2
         try list.polyline(&star, 2, Color.hex(0x8a6a00), true);
     }
     {
-        var path = gfx.Path.init(list.gpa);
+        var path = gfx.Path.init(list.allocator());
         defer path.deinit();
         try path.arc(.{ card.x + 250, card.y + 156 }, 30, std.math.pi * 0.75, std.math.pi * (0.75 + 1.5 * level));
         try list.strokePath(&path, 6, Color.hex(0x3ddc97));

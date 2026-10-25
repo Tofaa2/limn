@@ -152,7 +152,9 @@ void meshletMain(uint3 id : SV_DispatchThreadID) {
 
     if (visible && meshlet_push.view.receiver_culling != 0u && shadowUnseen(center, radius)) visible = false;
 
-    bool two_sided = (material.flags & MATERIAL_DOUBLE_SIDED) != 0u;
+    float3 axis_x = matrixColumn(instance.transform, 0);
+    bool mirrored = dot(axis_x, cross(matrixColumn(instance.transform, 1), matrixColumn(instance.transform, 2))) < 0.0;
+    bool two_sided = (material.flags & MATERIAL_DOUBLE_SIDED) != 0u || mirrored;
     if (visible && meshlet_push.view.cone_culling != 0u && !skinned && !two_sided && meshlet.cone_cutoff < 1.0) {
         float3 axis = normalize(mul((float3x3)instance.transform, meshlet.cone_axis));
         float3 to_center = center - meshlet_push.view.camera_position;
@@ -168,7 +170,7 @@ void meshletMain(uint3 id : SV_DispatchThreadID) {
     if (!visible) return;
     if (meshlet_push.phase == PHASE_SINGLE) markSeen(ref.instance);
 
-    uint bucket = fading || (material.flags & (MATERIAL_ALPHA_TEST | MATERIAL_DOUBLE_SIDED | MATERIAL_BLEND)) != 0u ? 1u : 0u;
+    uint bucket = fading || mirrored || (material.flags & (MATERIAL_ALPHA_TEST | MATERIAL_DOUBLE_SIDED | MATERIAL_BLEND)) != 0u ? 1u : 0u;
     uint slot;
     InterlockedAdd(meshlet_push.counts[bucket], 1u, slot);
     if (slot >= (bucket == 0u ? meshlet_push.bucket_capacity : meshlet_push.masked_capacity)) return;

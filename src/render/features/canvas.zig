@@ -44,13 +44,20 @@ const max_shaders = 8;
 /// `Renderer.canvas`: custom draw list shaders, and what the renderer keeps
 /// to draw lists with.
 pub const Canvas = struct {
-    shaders: [max_shaders]?[]u32 = @splat(null),
-    pipelines: std.ArrayList(Pipeline) = .empty,
-    /// This frame's uploaded batches and what to draw of them, for every view.
-    uploads: std.ArrayList(Upload) = .empty,
-    ranges: std.ArrayList(Range) = .empty,
-    /// GPU copies of batches that have been drawn unchanged for a while.
-    retained: std.ArrayList(Retained) = .empty,
+    internal: Internal = .{},
+
+    /// Not part of the API.
+    pub const Internal = struct {
+        shaders: [max_shaders]?[]u32 = @splat(null),
+        /// Raised each time a slot's shader is destroyed.
+        generations: [max_shaders]u32 = @splat(0),
+        pipelines: std.ArrayList(Pipeline) = .empty,
+        /// This frame's uploaded batches and what to draw of them, for every view.
+        uploads: std.ArrayList(Upload) = .empty,
+        ranges: std.ArrayList(Range) = .empty,
+        /// GPU copies of batches that have been drawn unchanged for a while.
+        retained: std.ArrayList(Retained) = .empty,
+    };
 
     const Pipeline = struct { format: rhi.Format, blend: draw_list.Blend, shader: ?draw_list.CanvasShader, pipeline: rhi.Pipeline };
 
@@ -66,76 +73,51 @@ pub const Canvas = struct {
         self.lock();
         defer self.unlock();
         if (spirv.len == 0 or spirv.len % 4 != 0) return error.InvalidShader;
-        for (&canvas.shaders, 0..) |*slot, index| {
+        for (&canvas.internal.shaders, 0..) |*slot, index| {
             if (slot.* != null) continue;
             const words = try self.internal.gpa.alloc(u32, spirv.len / 4);
             @memcpy(std.mem.sliceAsBytes(words), spirv);
             slot.* = words;
-            return .{ .slot = @intCast(index) };
+            return .{ .slot = @intCast(index), .generation = canvas.internal.generations[index] };
         }
         return error.TooManyCanvasShaders;
     }
 
-    /// Lists must not be drawn with the shader afterwards.
+    /// False once `shader` is destroyed.
+    pub fn valid(canvas: *const Canvas, shader: draw_list.CanvasShader) bool {
+        return shader.slot < max_shaders and canvas.internal.shaders[shader.slot] != null and canvas.internal.generations[shader.slot] == shader.generation;
+    }
+
+    /// `Renderer.render` refuses lists drawn with the shader afterwards
+    /// (`error.InvalidShader`).
     pub fn destroyShader(canvas: *Canvas, shader: draw_list.CanvasShader) void {
         const self = canvas.renderer();
         self.lock();
         defer self.unlock();
-        const words = canvas.shaders[shader.slot] orelse return;
+        if (!canvas.valid(shader)) return;
+        const words = canvas.internal.shaders[shader.slot].?;
         self.device.waitIdle() catch {};
         var index: usize = 0;
-        while (index < canvas.pipelines.items.len) {
-            const entry = canvas.pipelines.items[index];
+        while (index < canvas.internal.pipelines.items.len) {
+            const entry = canvas.internal.pipelines.items[index];
             if (!std.meta.eql(entry.shader, @as(?draw_list.CanvasShader, shader))) {
                 index += 1;
                 continue;
             }
             self.device.destroyPipeline(entry.pipeline);
-            _ = canvas.pipelines.swapRemove(index);
+            _ = canvas.internal.pipelines.swapRemove(index);
         }
         self.internal.gpa.free(words);
-        canvas.shaders[shader.slot] = null;
-    }
-
-    /// Destroys the pipelines, which are made again when next needed.
-    pub fn resetPipelines(canvas: *Canvas, device: *rhi.Device) void {
-        for (canvas.pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
-        canvas.pipelines.clearRetainingCapacity();
-    }
-
-    pub fn deinit(canvas: *Canvas, gpa: std.mem.Allocator, device: *rhi.Device) void {
-        canvas.resetPipelines(device);
-        canvas.pipelines.deinit(gpa);
-        for (canvas.shaders) |slot| if (slot) |words| gpa.free(words);
-        for (canvas.retained.items) |entry| if (entry.buffer) |buffer| device.destroyBuffer(buffer);
-        canvas.retained.deinit(gpa);
-        canvas.uploads.deinit(gpa);
-        canvas.ranges.deinit(gpa);
-    }
-
-    /// Forgets last frame's uploads and drops the GPU copies of lists that
-    /// are no longer drawn.
-    pub fn beginFrame(canvas: *Canvas, device: *rhi.Device, frame: u64) void {
-        canvas.uploads.clearRetainingCapacity();
-        canvas.ranges.clearRetainingCapacity();
-        var index: usize = 0;
-        while (index < canvas.retained.items.len) {
-            const entry = canvas.retained.items[index];
-            if (frame -% entry.used <= retained_idle_frames) {
-                index += 1;
-                continue;
-            }
-            if (entry.buffer) |buffer| device.destroyBuffer(buffer);
-            _ = canvas.retained.swapRemove(index);
-        }
+        canvas.internal.shaders[shader.slot] = null;
+        canvas.internal.generations[shader.slot] +%= 1;
     }
 
     fn pipeline(canvas: *Canvas, format: rhi.Format, blend: draw_list.Blend, shader: ?draw_list.CanvasShader) !rhi.Pipeline {
         const self = canvas.renderer();
-        for (canvas.pipelines.items) |entry| {
+        for (canvas.internal.pipelines.items) |entry| {
             if (entry.format == format and entry.blend == blend and std.meta.eql(entry.shader, shader)) return entry.pipeline;
         }
-        const custom: ?[]const u32 = if (shader) |custom_shader| canvas.shaders[custom_shader.slot] else null;
+        const custom: ?[]const u32 = if (shader) |custom_shader| canvas.internal.shaders[custom_shader.slot] else null;
         const made = try self.device.createGraphicsPipeline(.{
             .name = "draw list",
             .vertex = render.shaderCode("draw.vert.spv"),
@@ -148,10 +130,54 @@ pub const Canvas = struct {
             } }},
             .cull = .none,
         });
-        try canvas.pipelines.append(self.internal.gpa, .{ .format = format, .blend = blend, .shader = shader, .pipeline = made });
+        try canvas.internal.pipelines.append(self.internal.gpa, .{ .format = format, .blend = blend, .shader = shader, .pipeline = made });
         return made;
     }
 };
+
+/// Fails with `error.InvalidImage`, `error.InvalidFont` or
+/// `error.InvalidShader` when `list` draws with one destroyed since.
+pub fn check(canvas: *Canvas, list: *const draw_list.DrawList) !void {
+    const self = canvas.renderer();
+    for (list.internal.images.keys()) |image| if (!self.images.valid(image)) return error.InvalidImage;
+    for (list.internal.fonts.keys()) |font| if (!self.fonts.valid(font)) return error.InvalidFont;
+    for ([_]*const draw_list.Batch{ &list.internal.screen, &list.internal.world }) |batch| {
+        for (batch.states.items) |state| if (state.shader) |shader| if (!canvas.valid(shader)) return error.InvalidShader;
+    }
+}
+
+/// Destroys the pipelines, which are made again when next needed.
+pub fn resetPipelines(canvas: *Canvas, device: *rhi.Device) void {
+    for (canvas.internal.pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
+    canvas.internal.pipelines.clearRetainingCapacity();
+}
+
+pub fn deinit(canvas: *Canvas, gpa: std.mem.Allocator, device: *rhi.Device) void {
+    resetPipelines(canvas, device);
+    canvas.internal.pipelines.deinit(gpa);
+    for (canvas.internal.shaders) |slot| if (slot) |words| gpa.free(words);
+    for (canvas.internal.retained.items) |entry| if (entry.buffer) |buffer| device.destroyBuffer(buffer);
+    canvas.internal.retained.deinit(gpa);
+    canvas.internal.uploads.deinit(gpa);
+    canvas.internal.ranges.deinit(gpa);
+}
+
+/// Forgets last frame's uploads and drops the GPU copies of lists that
+/// are no longer drawn.
+pub fn beginFrame(canvas: *Canvas, device: *rhi.Device, frame: u64) void {
+    canvas.internal.uploads.clearRetainingCapacity();
+    canvas.internal.ranges.clearRetainingCapacity();
+    var index: usize = 0;
+    while (index < canvas.internal.retained.items.len) {
+        const entry = canvas.internal.retained.items[index];
+        if (frame -% entry.used <= retained_idle_frames) {
+            index += 1;
+            continue;
+        }
+        if (entry.buffer) |buffer| device.destroyBuffer(buffer);
+        _ = canvas.internal.retained.swapRemove(index);
+    }
+}
 
 /// Frames a batch is drawn unchanged before it gets a GPU copy of its own,
 /// and frames that copy outlives the batch's last use.
@@ -207,17 +233,17 @@ fn upload(ctx: *ViewContext, list: *const draw_list.DrawList, batch: *const draw
     const canvas = &self.canvas;
     const device = ctx.device;
     const frame = self.internal.frame_index;
-    const key = [4]u64{ list.generation, batch.vertices.items.len, batch.indices.items.len, batch.quads.items.len };
+    const key = [4]u64{ list.internal.generation, batch.vertices.items.len, batch.indices.items.len, batch.quads.items.len };
     const sizes = [3]u64{
         std.mem.alignForward(u64, batch.vertices.items.len * @sizeOf(draw_list.Vertex), 16),
         std.mem.alignForward(u64, batch.indices.items.len * @sizeOf(u32), 16),
         batch.quads.items.len * @sizeOf(draw_list.Quad),
     };
-    const entry: *Retained = for (canvas.retained.items) |*seen| {
-        if (seen.list == list.id and seen.world == world) break seen;
+    const entry: *Retained = for (canvas.internal.retained.items) |*seen| {
+        if (seen.list == list.internal.id and seen.world == world) break seen;
     } else blk: {
-        try canvas.retained.append(self.internal.gpa, .{ .list = list.id, .world = world, .key = key, .used = frame });
-        break :blk &canvas.retained.items[canvas.retained.items.len - 1];
+        try canvas.internal.retained.append(self.internal.gpa, .{ .list = list.internal.id, .world = world, .key = key, .used = frame });
+        break :blk &canvas.internal.retained.items[canvas.internal.retained.items.len - 1];
     };
     if (!std.meta.eql(entry.key, key)) {
         if (entry.buffer) |buffer| device.destroyBuffer(buffer);
@@ -249,9 +275,9 @@ fn upload(ctx: *ViewContext, list: *const draw_list.DrawList, batch: *const draw
         @memcpy(quads.items, batch.quads.items);
         result = .{ .vertices = vertices.address, .indices = indices.address, .quads = quads.address };
     }
-    try canvas.uploads.append(self.internal.gpa, result);
+    try canvas.internal.uploads.append(self.internal.gpa, result);
     self.internal.stats.draw_list_triangles += @intCast(batch.indices.items.len / 3 + batch.quads.items.len * 2);
-    return @intCast(canvas.uploads.items.len - 1);
+    return @intCast(canvas.internal.uploads.items.len - 1);
 }
 
 /// Uploads the batches of `stage` and lists what to draw of them, lowest
@@ -260,12 +286,12 @@ fn upload(ctx: *ViewContext, list: *const draw_list.DrawList, batch: *const draw
 fn gather(ctx: *ViewContext, stage: api.DrawStage, depth: ?features.Target) !?*Layer {
     const self = ctx.renderer;
     const canvas = &self.canvas;
-    const first: u32 = @intCast(canvas.ranges.items.len);
+    const first: u32 = @intCast(canvas.internal.ranges.items.len);
     var any_world = false;
     for ([_]bool{ true, false }) |world| {
         for (ctx.desc.draw_lists) |entry| {
             if (entry.stage != stage) continue;
-            const batch = if (world) &entry.list.world else &entry.list.screen;
+            const batch = if (world) &entry.list.internal.world else &entry.list.internal.screen;
             if (batch.isEmpty()) continue;
             any_world = any_world or world;
             const uploaded = try upload(ctx, entry.list, batch, world);
@@ -275,7 +301,7 @@ fn gather(ctx: *ViewContext, stage: api.DrawStage, depth: ?features.Target) !?*L
             for (0..batch.states.items.len + 1) |next| {
                 const until_index = if (next < batch.states.items.len) batch.states.items[next].first_index else index_total;
                 const until_quad = if (next < batch.states.items.len) batch.states.items[next].first_quad else quad_total;
-                if (until_index > state.first_index or until_quad > state.first_quad) try canvas.ranges.append(self.internal.gpa, .{
+                if (until_index > state.first_index or until_quad > state.first_quad) try canvas.internal.ranges.append(self.internal.gpa, .{
                     .upload = uploaded,
                     .world = world,
                     .first_index = state.first_index,
@@ -291,7 +317,7 @@ fn gather(ctx: *ViewContext, stage: api.DrawStage, depth: ?features.Target) !?*L
             }
         }
     }
-    const made = canvas.ranges.items[first..];
+    const made = canvas.internal.ranges.items[first..];
     if (made.len == 0) return null;
     std.sort.block(Range, made, {}, struct {
         fn before(_: void, a: Range, b: Range) bool {
@@ -420,7 +446,7 @@ fn draw(layer: *Layer, area: Area) !void {
         .sampler_linear = device.samplerIndex(self.internal.sampler_linear_clamp),
         .sampler_nearest = device.samplerIndex(self.internal.sampler_nearest_clamp),
         .depth_texture = gpu.invalid_id,
-        .hdr_paper_white = @max(ctx.settings.output.paper_white, 1),
+        .hdr_paper_white = @max(ctx.settings.output.paper_white_nits, 1),
         .origin = .{ @floatFromInt(region.x), @floatFromInt(region.y) },
         .sharp_text = @intFromBool(ctx.settings.canvas.sharp_text),
         .time = self.internal.time,
@@ -446,7 +472,7 @@ fn draw(layer: *Layer, area: Area) !void {
     cmd.setViewport(region.x, region.y, region.width, region.height);
     var bound: ?rhi.Pipeline = null;
     var clipped = false;
-    for (canvas.ranges.items[layer.first_range..][0..layer.range_count]) |range| {
+    for (canvas.internal.ranges.items[layer.first_range..][0..layer.range_count]) |range| {
         const pipeline = try canvas.pipeline(area.format, range.blend, range.shader);
         if (bound == null or !std.meta.eql(bound.?, pipeline)) {
             cmd.bindPipeline(pipeline);
@@ -459,7 +485,7 @@ fn draw(layer: *Layer, area: Area) !void {
             cmd.setScissor(region.x, region.y, region.width, region.height);
             clipped = false;
         }
-        const uploaded = canvas.uploads.items[range.upload];
+        const uploaded = canvas.internal.uploads.items[range.upload];
         push.vertices = uploaded.vertices;
         push.indices = uploaded.indices;
         push.quads = uploaded.quads;

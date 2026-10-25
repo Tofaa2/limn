@@ -33,9 +33,11 @@ pub const RayTracingOptions = struct {
 
 /// Shadow map sizes; see `Options.shadows`.
 pub const ShadowOptions = struct {
-    /// Size of each of the four sun shadow cascades, in texels per side.
+    /// Size of each of the four sun shadow cascades, in texels per side; not
+    /// 0, or `Renderer.init` fails with `error.InvalidOptions`.
     resolution: u32 = 2048,
-    /// Size per side of the spot and point light shadow atlas, in texels.
+    /// Size per side of the spot and point light shadow atlas, in texels; at
+    /// least `local_tiles_per_side`.
     local_resolution: u32 = 2048,
     /// Tiles per side of the local-light shadow atlas, 1..4. A spot light uses
     /// one tile, a point light six.
@@ -88,10 +90,11 @@ pub const GeometryOptions = struct {
 pub const CacheOptions = struct {
     /// File for the driver's pipeline cache. Null keeps none.
     pipelines: ?[]const u8 = null,
-    /// Directory for processed assets; null caches nothing.
+    /// Directory for processed assets; null caches nothing, so textures are
+    /// compressed again (`TextureOptions.compression`) on every run.
     assets: ?[]const u8 = null,
     /// Size the asset cache is trimmed to at startup, oldest files first; 0
-    /// never trims. See `trimAssetCache`.
+    /// never trims. See `Renderer.trimAssetCache`.
     assets_max_bytes: u64 = 0,
 };
 

@@ -70,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
         .indices = ball_indices,
         .material = .{ .base_color = .{ 0.75, 0.2, 0.15, 1 }, .metallic = 0, .roughness = 0.4 },
     }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.5, -avenue_length * 0.5 }), math.scaling(.{ 60, 1, avenue_length + 40 })) });
+    _ = try renderer.entities.create(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.5, -avenue_length * 0.5 }), math.scaling(.{ 60, 1, avenue_length + 40 })) });
 
     var bars: std.ArrayList(math.Mat4) = .empty;
     defer bars.deinit(gpa);
@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     _ = try renderer.instances.create(scene, wood, bars.items);
-    const roller = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.translation(.{ 0, 0.6, -6 }) });
+    const roller = try renderer.entities.create(scene, .{ .model = ball, .transform = math.translation(.{ 0, 0.6, -6 }) });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(gpa);
@@ -118,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
         }
         list.clear();
         try list.rect(.{ .x = 12, .y = 12, .width = 520, .height = 112 }, gfx.Color.rgba(8, 10, 18, 190));
-        try list.text(font, if (virtual) "Sun shadows: virtual shadow map" else "Sun shadows: cascades", .{ 24, 20 }, .{ .size = 20 });
+        try list.text(font, if (virtual) "SunDesc shadows: virtual shadow map" else "SunDesc shadows: cascades", .{ 24, 20 }, .{ .size = 20 });
         try list.text(font, try std.fmt.bufPrint(&text, "cascades {d:.2} ms · virtual pages {d:.2} ms · frame {d:.1} ms GPU\n{d:.0} fps", .{
             cascades_ms, if (virtual) virtual_ms else 0, stage.gpu_ms, stage.fps,
         }), .{ 24, 50 }, .{ .size = 15 });

@@ -183,6 +183,10 @@ Output fragmentMain(
     fresnel += (1.0 - fresnel) * pow(1.0 - clamp(dot(surface.normal, surface.view), 0.0, 1.0), 5.0);
     float coverage = clamp(alpha + (1.0 - alpha) * fresnel * (1.0 - surface.roughness), 0.0, 1.0);
     float3 color = (diffuse + emissive) * alpha + specular;
+    if ((material.flags & MATERIAL_UNLIT) != 0u) {
+        color = base_color.rgb * alpha;
+        coverage = alpha;
+    }
     if (material.transmission > 0.0 && fragment_push.scene_texture != INVALID_ID) {
         float3 bent = refract(-surface.view, surface.normal, 1.0 / max(material.ior, 1.0));
         float4 exit = mul(frame.view_proj, float4(in_position + bent * material.thickness, 1.0));

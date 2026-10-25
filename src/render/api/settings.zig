@@ -5,7 +5,7 @@ const features = @import("../core/features.zig");
 
 const api = @import("../api.zig");
 const Material = api.Material;
-const Sun = api.Sun;
+const SunDesc = api.SunDesc;
 const ViewDesc = api.ViewDesc;
 
 /// See `Settings.transparency.mode`.
@@ -75,7 +75,7 @@ pub const GlobalIllumination = @import("../features/global_illumination.zig").Se
 pub const PathTracing = @import("../features/path_tracing.zig").Settings;
 /// `Settings.path_tracing.nrd`.
 pub const NrdSettings = @import("../features/path_tracing.zig").Nrd;
-/// `Settings.transparency.mode`.
+/// `Settings.transparency`.
 pub const Transparency = @import("../features/transparency.zig").Settings;
 /// `Settings.fog`.
 pub const Fog = @import("../features/fog.zig").Settings;
@@ -109,6 +109,21 @@ pub const Settings = struct {
         features.preset(&settings, quality);
         return settings;
     }
+
+    /// Every optional feature off. What remains: GPU culling, direct sun,
+    /// sky and lamp light, and tone mapping at a fixed exposure. A start for
+    /// simple 3D and for views where 2D is drawn over a scene; turn on what a
+    /// view needs.
+    pub const lightweight = Settings{
+        .shadows = null,
+        .ambient_occlusion = null,
+        .reflections = null,
+        .global_illumination = null,
+        .clouds = null,
+        .fluids = null,
+        .post = .{ .bloom = 0, .automatic_exposure = false },
+        .resolution = .{ .temporal_antialiasing = false },
+    };
 
     /// Which of a scene's geometry a view draws, and at what detail.
     geometry: Geometry = .{},

@@ -330,11 +330,11 @@ pub fn prepareGi(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame
         var cell: [3]i32 = undefined;
         var counts: [3]u32 = undefined;
         inline for (0..3) |axis| {
-            const first: i32 = @intFromFloat(@floor((bounds[0][axis] + scene.origin[axis]) / spacing));
+            const first = gridIndex(@floor((bounds[0][axis] + scene.origin[axis]) / spacing));
             const needed: f32 = @floatCast(@ceil((bounds[1][axis] + scene.origin[axis]) / spacing) - @as(f64, @floatFromInt(first)) + 1);
-            counts[axis] = std.math.clamp(@as(u32, @intFromFloat(@max(needed, 2))), 2, gi_max_counts[axis]);
+            counts[axis] = @intFromFloat(std.math.clamp(needed, 2, @as(f32, @floatFromInt(gi_max_counts[axis]))));
             cell[axis] = if (follows and needed > @as(f32, @floatFromInt(gi_max_counts[axis])))
-                @as(i32, @intFromFloat(@floor((camera_position[axis] + scene.origin[axis]) / spacing))) - @as(i32, @intCast(counts[axis] / 2))
+                gridIndex(@floor((camera_position[axis] + scene.origin[axis]) / spacing)) - @as(i32, @intCast(counts[axis] / 2))
             else
                 first;
         }
@@ -595,4 +595,10 @@ fn giVisibilityPipeline(_: *rhi.Device) pipelines_module.Desc {
         .color_targets = &.{.{ .format = .rg16_float, .blend = .alpha }},
         .cull = .none,
     } };
+}
+
+/// A probe grid cell index along one axis, held within reach of `i32` so a
+/// far-off scene origin or volume cannot overflow it.
+fn gridIndex(cell: f64) i32 {
+    return @intFromFloat(std.math.clamp(cell, -(1 << 30), 1 << 30));
 }

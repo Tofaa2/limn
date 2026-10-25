@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
         .indices = &indices,
         .material = .{ .base_color = .{ 0.22, 0.23, 0.26, 1 }, .metallic = 0, .roughness = 0.7 },
     }});
-    _ = try renderer.entities.spawn(scene, .{ .model = floor, .transform = math.translation(.{ 0, -0.1, 0 }) });
+    _ = try renderer.entities.create(scene, .{ .model = floor, .transform = math.translation(.{ 0, -0.1, 0 }) });
 
     const robot = try renderer.models.load("examples/assets/world/RobotExpressive.glb");
     const environment = try renderer.environments.load(.{ .path = "examples/assets/world/venice_sunset_1k.hdr", .max_radiance = 24 });
@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
     var robots: [4]gfx.Entity = undefined;
     for (&robots, 0..) |*entity, index| {
         const x = (@as(f32, @floatFromInt(index)) - 1.5) * 3.2;
-        entity.* = try renderer.entities.spawn(scene, .{
+        entity.* = try renderer.entities.create(scene, .{
             .model = robot,
             .transform = math.mul(math.translation(.{ x, 0, 0 }), math.uniformScaling(0.5)),
         });

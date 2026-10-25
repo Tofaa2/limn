@@ -119,7 +119,7 @@ pub fn reflectionProbeList(renderer: *Renderer, p: *const ScenePass) !ProbeList 
     if (scene.probes.items.len != 0) {
         const list = try arena.alloc(device, gpu.ReflectionProbe, scene.probes.items.len);
         for (scene.probes.items) |probe_handle| {
-            const probe = renderer.probes.table.get(probe_handle) orelse continue;
+            const probe = renderer.reflection_probes.internal.table.get(probe_handle) orelse continue;
             if (!probe.captured or probe.capturing) continue;
             list.items[probe_count] = .{
                 .center = probe.desc.position,
@@ -145,11 +145,11 @@ pub fn writeDecals(renderer: *Renderer, p: *const ScenePass) !u64 {
     for (scene.decals.items, decals.items) |decal, *out| out.* = .{
         .world_to_decal = math.inverse(decal.transform),
         .color = decal.color,
-        .image = if (decal.image) |image| image.index else gpu.invalid_id,
+        .image = renderer.images.indexOf(decal.image),
         .angle_fade = decal.angle_fade,
         .emissive = decal.emissive,
         .roughness = decal.roughness orelse -1,
-        .normal_image = if (decal.normal_image) |image| image.index else gpu.invalid_id,
+        .normal_image = renderer.images.indexOf(decal.normal_image),
         .normal_strength = decal.normal_strength,
         .bounds = .{ decal.transform[12], decal.transform[13], decal.transform[14], 0.5 * @sqrt(math.dot(decal.transform[0..3].*, decal.transform[0..3].*) + math.dot(decal.transform[4..7].*, decal.transform[4..7].*) + math.dot(decal.transform[8..11].*, decal.transform[8..11].*)) },
     };
@@ -258,7 +258,7 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
             gpu.invalid_id,
     };
     if (shade_push.shadow_history != gpu.invalid_id) shade_push.shadow_depth = device.textureIndex(view.previous_depth);
-    for (renderer.materials.shaders, renderer.materials.shader_users, 0..) |shader, users, slot| {
+    for (renderer.materials.internal.shaders, renderer.materials.internal.shader_users, 0..) |shader, users, slot| {
         if (shader != null and users != 0) shade_push.material_shader |= @as(u32, 1) << @intCast(slot);
     }
     const custom_shaders = shade_push.material_shader;
@@ -281,7 +281,7 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
     cmd.bindPipeline(try shadePipeline(renderer, reflections != null, shade_features));
     cmd.pushConstants(shade_push);
     cmd.drawFullscreen();
-    for (renderer.materials.shaders, 0..) |shader, slot| {
+    for (renderer.materials.internal.shaders, 0..) |shader, slot| {
         if ((custom_shaders >> @intCast(slot)) & 1 == 0) continue;
         shade_push.material_shader = @intCast(slot);
         cmd.bindPipeline(if (reflections != null) shader.?.reflective else shader.?.plain);

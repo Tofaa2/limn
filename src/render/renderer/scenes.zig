@@ -1,5 +1,6 @@
 //! Scenes and the entities in them. Internal to the renderer.
 const std = @import("std");
+const releaseModel = @import("models.zig").releaseModel;
 const handle = @import("../../handle.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
@@ -8,6 +9,15 @@ const gpu = @import("../gpu.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
 const render = @import("../renderer.zig");
+const restyleEntity = render.restyleEntity;
+const transformOf = render.transformOf;
+const moveEntity = render.moveEntity;
+const queueEdit = render.queueEdit;
+const queueEdits = render.queueEdits;
+const tryLock = render.tryLock;
+const markEntity = render.markEntity;
+const markOf = render.markOf;
+const followParent = render.followParent;
 
 const Renderer = render.Renderer;
 const Mat4 = math.Mat4;
@@ -19,9 +29,10 @@ const LightmapDesc = api.LightmapDesc;
 const Pose = api.Pose;
 const CloudDesc = api.CloudDesc;
 const CloudFlash = api.CloudFlash;
-const Sun = api.Sun;
-const Light = api.Light;
+const SunDesc = api.SunDesc;
+const LightDesc = api.LightDesc;
 const EntityDesc = api.EntityDesc;
+const EntityInfo = api.EntityInfo;
 const DecalDesc = api.DecalDesc;
 const max_decals = api.max_decals;
 const hdr_format = renderer_state.hdr_format;
@@ -37,12 +48,17 @@ const freeProbe = @import("probes.zig").freeProbe;
 
 /// Worlds of entities, lights and effects.
 pub const Scenes = struct {
-    table: handle.HandleTable(renderer_state.SceneData, api.SceneTag),
+    internal: Internal,
 
-    /// Frees what one of them holds, as when the renderer is destroyed.
-    pub fn free(owner: *Renderer, entry: *renderer_state.SceneData) void {
-        freeScene(owner, entry);
-    }
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.SceneData, api.SceneTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.SceneData) void {
+            freeScene(owner, entry);
+        }
+    };
 
     fn renderer(scenes: *Scenes) *Renderer {
         return @alignCast(@fieldParentPtr("scenes", scenes));
@@ -54,7 +70,7 @@ pub const Scenes = struct {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return;
+        const data = self.scenes.internal.table.get(scene) orelse return;
         data.clouds = clouds;
     }
 
@@ -64,7 +80,7 @@ pub const Scenes = struct {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return null;
+        const data = self.scenes.internal.table.get(scene) orelse return null;
         if (data.flash_brightness <= 0) return null;
         return .{
             .position = .{
@@ -77,14 +93,14 @@ pub const Scenes = struct {
     }
 
     /// Replaces the scene's decals. They apply to opaque surfaces before
-    /// lighting.
+    /// lighting. Handles from `Renderer.decals` for this scene stop resolving.
     pub fn setDecals(scenes: *Scenes, scene: Scene, decals: []const DecalDesc) !void {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return;
+        const data = self.scenes.internal.table.get(scene) orelse return;
         if (decals.len > max_decals) return error.TooManyDecals;
-        self.decals.forget(data);
+        self.decals.internal.forget(data);
         data.decals.clearRetainingCapacity();
         try data.decals.appendSlice(self.internal.gpa, decals);
     }
@@ -95,7 +111,7 @@ pub const Scenes = struct {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        return self.scenes.table.insert(.{});
+        return self.scenes.internal.table.insert(.{});
     }
 
     /// Destroys the scene and every entity in it.
@@ -103,22 +119,22 @@ pub const Scenes = struct {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        var removed = self.scenes.table.remove(scene) orelse return;
+        var removed = self.scenes.internal.table.remove(scene) orelse return;
         for (removed.entities.items) |entity| {
-            const data = self.entities.table.remove(entity) orelse continue;
+            const data = self.entities.internal.table.remove(entity) orelse continue;
             self.internal.entity_marks.items[entity.index] = .{};
-            if (self.models.table.get(data.model)) |model| model.references -= 1;
+            releaseModel(self, data.model);
             freeEntityStorage(self, data);
         }
         freeScene(self, &removed);
     }
 
     /// Replaces the scene's sun. `intensity` 0 turns it and its shadows off.
-    pub fn setSun(scenes: *Scenes, scene: Scene, sun: Sun) void {
+    pub fn setSun(scenes: *Scenes, scene: Scene, sun: SunDesc) void {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return;
+        const data = self.scenes.internal.table.get(scene) orelse return;
         // Probes forget slowly, and light bounced between bright surfaces
         // more slowly still, so a sun that jumps starts them over.
         const change = @abs(sun.intensity - data.sun.intensity);
@@ -137,19 +153,21 @@ pub const Scenes = struct {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        if (self.scenes.table.get(scene)) |data| {
+        if (self.scenes.internal.table.get(scene)) |data| {
             data.environment = desc.environment;
             data.environment_intensity = desc.intensity;
         }
     }
 
-    /// Replaces the scene's point and spot lights.
-    pub fn setLights(scenes: *Scenes, scene: Scene, lights: []const Light) !void {
+    /// Replaces the scene's lights. Handles from `Renderer.lights` for this
+    /// scene stop resolving. Each cell of the view's light grid holds at most
+    /// 127; where more reach one cell, the rest do not light it.
+    pub fn setLights(scenes: *Scenes, scene: Scene, lights: []const LightDesc) !void {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return;
-        self.lights.forget(data);
+        const data = self.scenes.internal.table.get(scene) orelse return;
+        self.lights.internal.forget(data);
         data.lights.clearRetainingCapacity();
         try data.lights.appendSlice(self.internal.gpa, lights);
         data.lights_version += 1;
@@ -162,10 +180,13 @@ pub const Scenes = struct {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return;
+        const data = self.scenes.internal.table.get(scene) orelse return;
         inline for (0..3) |axis| data.origin[axis] -= offset[axis];
         for (data.entities.items) |item| {
-            if (self.markOf(item) == null) continue;
+            const mark = markOf(self, item) orelse continue;
+            if (mark.related) if (self.entities.internal.table.get(item)) |entity| if (entity.parent == null) {
+                inline for (0..3) |axis| entity.local[12 + axis] += offset[axis];
+            };
             inline for (0..3) |axis| {
                 self.internal.entity_transforms.items[item.index][12 + axis] += offset[axis];
                 self.internal.entity_previous.items[item.index][12 + axis] += offset[axis];
@@ -173,7 +194,7 @@ pub const Scenes = struct {
         }
         data.records_valid = false;
         for (data.groups.items) |item| {
-            const group = self.instances.table.get(item) orelse continue;
+            const group = self.instances.internal.table.get(item) orelse continue;
             for (group.transforms) |*transform| {
                 inline for (0..3) |axis| transform[12 + axis] += offset[axis];
             }
@@ -185,16 +206,16 @@ pub const Scenes = struct {
             inline for (0..3) |axis| decal.transform[12 + axis] += offset[axis];
         }
         for (data.emitters.items) |item| {
-            const emitter = self.emitters.table.get(item) orelse continue;
+            const emitter = self.emitters.internal.table.get(item) orelse continue;
             emitter.desc.position = math.add(emitter.desc.position, offset);
             emitter.shift = math.add(emitter.shift, offset);
         }
         for (data.fluids.items) |item| {
-            const fluid = self.fluids.table.get(item) orelse continue;
+            const fluid = self.fluids.internal.table.get(item) orelse continue;
             inline for (0..3) |axis| fluid.desc.transform[12 + axis] += offset[axis];
         }
         for (data.waters.items) |item| {
-            const water = self.waters.table.get(item) orelse continue;
+            const water = self.waters.internal.table.get(item) orelse continue;
             inline for (0..3) |axis| water.desc.transform[12 + axis] += offset[axis];
         }
         if (data.gi_bounds) |*bounds| {
@@ -212,7 +233,7 @@ pub const Scenes = struct {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        return if (self.scenes.table.get(scene)) |data| data.origin else .{ 0, 0, 0 };
+        return if (self.scenes.internal.table.get(scene)) |data| data.origin else .{ 0, 0, 0 };
     }
 
     /// Pins the irradiance probe volume to a world-space box; null derives it
@@ -221,50 +242,50 @@ pub const Scenes = struct {
         const self = scenes.renderer();
         self.lock();
         defer self.unlock();
-        if (self.scenes.table.get(scene)) |data| data.gi_bounds = bounds;
+        if (self.scenes.internal.table.get(scene)) |data| data.gi_bounds = bounds;
     }
 };
 
 pub fn freeScene(self: *Renderer, scene: *SceneData) void {
     scene.entities.deinit(self.internal.gpa);
-    self.lights.forget(scene);
+    self.lights.internal.forget(scene);
     scene.lights.deinit(self.internal.gpa);
     scene.light_handles.deinit(self.internal.gpa);
     scene.shadow_grants.deinit(self.internal.gpa);
-    for (scene.emitters.items) |emitter| if (self.emitters.table.remove(emitter)) |removed| {
+    for (scene.emitters.items) |emitter| if (self.emitters.internal.table.remove(emitter)) |removed| {
         self.device.destroyBuffer(removed.buffer);
         if (removed.order) |order| self.device.destroyBuffer(order);
         if (removed.trail) |trail| self.device.destroyBuffer(trail);
     };
     scene.emitters.deinit(self.internal.gpa);
-    for (scene.probes.items) |probe| if (self.probes.table.remove(probe)) |removed_probe| {
+    for (scene.probes.items) |probe| if (self.reflection_probes.internal.table.remove(probe)) |removed_probe| {
         var removed = removed_probe;
         freeProbe(self, &removed);
     };
     scene.probes.deinit(self.internal.gpa);
-    for (scene.fluids.items) |fluid| if (self.fluids.table.remove(fluid)) |removed| {
+    for (scene.fluids.items) |fluid| if (self.fluids.internal.table.remove(fluid)) |removed| {
         var state = removed;
         destroyFluidTextures(self, &state);
     };
     scene.fluids.deinit(self.internal.gpa);
-    for (scene.waters.items) |water| if (self.waters.table.remove(water)) |removed| {
+    for (scene.waters.items) |water| if (self.waters.internal.table.remove(water)) |removed| {
         for (removed.state) |texture| self.device.destroyTexture(texture);
     };
     scene.waters.deinit(self.internal.gpa);
-    for (scene.hairs.items) |hair| if (self.hairs.table.remove(hair)) |removed| freeHair(self, removed);
+    for (scene.hairs.items) |hair| if (self.hairs.internal.table.remove(hair)) |removed| freeHair(self, removed);
     scene.hairs.deinit(self.internal.gpa);
-    for (scene.liquids.items) |liquid| if (self.liquids.table.remove(liquid)) |removed_liquid| {
+    for (scene.liquids.items) |liquid| if (self.liquids.internal.table.remove(liquid)) |removed_liquid| {
         var removed = removed_liquid;
         removed.deinit(self.device);
     };
     scene.liquids.deinit(self.internal.gpa);
     if (scene.trace_nodes) |buffer| self.device.destroyBuffer(buffer);
     if (scene.trace_instances) |buffer| self.device.destroyBuffer(buffer);
-    self.decals.forget(scene);
+    self.decals.internal.forget(scene);
     scene.decals.deinit(self.internal.gpa);
     scene.decal_handles.deinit(self.internal.gpa);
     scene.movers.deinit(self.internal.gpa);
-    for (scene.groups.items) |group| if (self.instances.table.remove(group)) |removed| {
+    for (scene.groups.items) |group| if (self.instances.internal.table.remove(group)) |removed| {
         if (removed.impostor) |impostor| {
             self.device.destroyTexture(impostor.color);
             self.device.destroyTexture(impostor.normal);
@@ -272,7 +293,7 @@ pub fn freeScene(self: *Renderer, scene: *SceneData) void {
         self.internal.gpa.free(removed.transforms);
         self.internal.gpa.free(removed.tints);
         self.internal.gpa.free(removed.params);
-        if (self.models.table.get(removed.model)) |model| model.references -= 1;
+        releaseModel(self, removed.model);
     };
     scene.groups.deinit(self.internal.gpa);
     scene.static_tlas.deinit(self.internal.gpa);
@@ -308,27 +329,33 @@ pub fn freeScene(self: *Renderer, scene: *SceneData) void {
 
 /// Placements of models in scenes.
 pub const Entities = struct {
-    table: handle.HandleTable(renderer_state.EntityData, api.EntityTag),
+    internal: Internal,
 
-    /// Frees what one of them holds, as when the renderer is destroyed.
-    pub fn free(owner: *Renderer, entry: *renderer_state.EntityData) void {
-        freeEntityStorage(owner, entry.*);
-    }
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.EntityData, api.EntityTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.EntityData) void {
+            freeEntityStorage(owner, entry.*);
+        }
+    };
 
     fn renderer(entities: *Entities) *Renderer {
         return @alignCast(@fieldParentPtr("entities", entities));
     }
 
     /// Adds an entity; the model may still be loading. The entity holds a
-    /// reference to the model until `despawn` or `scenes.destroy`. Fails with
+    /// reference to the model until `destroy` or `scenes.destroy`. Fails with
     /// `error.InvalidScene` or `error.InvalidModel` for a stale handle.
-    pub fn spawn(entities: *Entities, scene: Scene, desc: EntityDesc) !Entity {
+    pub fn create(entities: *Entities, scene: Scene, desc: EntityDesc) !Entity {
         const self = entities.renderer();
         self.lock();
         defer self.unlock();
-        const scene_data = self.scenes.table.get(scene) orelse return error.InvalidScene;
-        const model = self.models.table.get(desc.model) orelse return error.InvalidModel;
-        const entity = try self.entities.table.insert(.{
+        const scene_data = self.scenes.internal.table.get(scene) orelse return error.InvalidScene;
+        const model = self.models.internal.table.get(desc.model) orelse return error.InvalidModel;
+        if (model.orphaned) return error.InvalidModel;
+        const entity = try self.entities.internal.table.insert(.{
             .scene = scene,
             .model = desc.model,
             .visible = desc.visible,
@@ -336,8 +363,8 @@ pub const Entities = struct {
             .params = desc.params,
             .receive_decals = desc.receive_decals,
         });
-        errdefer _ = self.entities.table.remove(entity);
-        try self.markEntity(entity, scene, desc.transform);
+        errdefer _ = self.entities.internal.table.remove(entity);
+        try markEntity(self, entity, scene, desc.transform);
         errdefer self.internal.entity_marks.items[entity.index] = .{};
         try scene_data.entities.append(self.internal.gpa, entity);
         model.references += 1;
@@ -347,68 +374,72 @@ pub const Entities = struct {
 
     /// Removes an entity and releases its model reference. A stale handle is
     /// ignored.
-    pub fn despawn(entities: *Entities, entity: Entity) void {
+    pub fn destroy(entities: *Entities, entity: Entity) void {
         const self = entities.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.entities.table.remove(entity) orelse return;
+        unlinkEntity(self, entity);
+        const data = self.entities.internal.table.remove(entity) orelse return;
         self.internal.entity_marks.items[entity.index] = .{};
-        if (self.scenes.table.get(data.scene)) |scene| {
+        if (self.scenes.internal.table.get(data.scene)) |scene| {
             for (scene.entities.items, 0..) |candidate, index| if (std.meta.eql(candidate, entity)) {
                 _ = scene.entities.orderedRemove(index);
                 break;
             };
             scene.layout_dirty = true;
         }
-        if (self.models.table.get(data.model)) |model| model.references -= 1;
+        releaseModel(self, data.model);
         freeEntityStorage(self, data);
     }
 
-    /// Sets the model-to-world transform. The change from last frame counts
+    /// Sets the model-to-world transform, or to its parent's space once it has
+    /// one (`setParent`). The change from last frame counts
     /// as motion; use `teleport` for a jump that should not.
     pub fn setTransform(entities: *Entities, entity: Entity, transform: Mat4) void {
         const self = entities.renderer();
-        if (!self.tryLock()) return self.queueEdit(entity, .{ .transform = transform });
+        if (!tryLock(self)) return queueEdit(self, entity, .{ .transform = transform });
         defer self.unlock();
-        self.moveEntity(entity, transform, false);
+        moveEntity(self, entity, transform, false);
     }
 
-    /// `setTransform` for many entities at once; the slices pair up.
+    /// `setTransform` for many entities at once; the slices pair up, and the
+    /// longer one's extra items are ignored.
     pub fn setTransforms(entities: *Entities, handles: []const Entity, transforms: []const Mat4) void {
         const self = entities.renderer();
-        if (!self.tryLock()) return queueTransforms(self, handles, transforms);
+        const count = @min(handles.len, transforms.len);
+        if (!tryLock(self)) return queueTransforms(self, handles[0..count], transforms[0..count]);
         defer self.unlock();
-        for (handles, transforms) |entity, transform| self.moveEntity(entity, transform, false);
+        for (handles[0..count], transforms[0..count]) |entity, transform| moveEntity(self, entity, transform, false);
     }
 
     /// Like `setTransform`, but resets motion history.
     pub fn teleport(entities: *Entities, entity: Entity, transform: Mat4) void {
         const self = entities.renderer();
-        if (!self.tryLock()) return self.queueEdit(entity, .{ .teleport = transform });
+        if (!tryLock(self)) return queueEdit(self, entity, .{ .teleport = transform });
         defer self.unlock();
-        self.moveEntity(entity, transform, true);
+        moveEntity(self, entity, transform, true);
     }
 
     /// Changes the color an entity's materials are multiplied by.
     pub fn setTint(entities: *Entities, entity: Entity, tint: [3]f32) void {
         const self = entities.renderer();
-        if (!self.tryLock()) return self.queueEdit(entity, .{ .tint = packTint(tint) });
+        if (!tryLock(self)) return queueEdit(self, entity, .{ .tint = packTint(tint) });
         defer self.unlock();
-        const data = self.entities.table.get(entity) orelse return;
+        const data = self.entities.internal.table.get(entity) orelse return;
         if (data.tint == packTint(tint)) return;
         data.tint = packTint(tint);
-        self.restyleEntity(entity);
+        restyleEntity(self, entity);
     }
 
     /// Sets the entity's `MaterialContext.instance_params`.
     pub fn setParams(entities: *Entities, entity: Entity, params: [4]f32) void {
         const self = entities.renderer();
-        if (!self.tryLock()) return self.queueEdit(entity, .{ .params = params });
+        if (!tryLock(self)) return queueEdit(self, entity, .{ .params = params });
         defer self.unlock();
-        const data = self.entities.table.get(entity) orelse return;
+        const data = self.entities.internal.table.get(entity) orelse return;
         if (std.mem.eql(f32, &data.params, &params)) return;
         data.params = params;
-        self.restyleEntity(entity);
+        restyleEntity(self, entity);
     }
 
     /// Overrides morph target weights (up to 64, in model order) on every
@@ -418,7 +449,7 @@ pub const Entities = struct {
         const self = entities.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.entities.table.get(entity) orelse return;
+        const data = self.entities.internal.table.get(entity) orelse return;
         if (weights) |values| {
             var stored: [gltf.max_morph_targets]f32 = @splat(0);
             for (values[0..@min(values.len, stored.len)], 0..) |value, index| stored[index] = value;
@@ -434,8 +465,8 @@ pub const Entities = struct {
         const self = entities.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.entities.table.get(entity) orelse return;
-        const scene = self.scenes.table.get(data.scene) orelse return;
+        const data = self.entities.internal.table.get(entity) orelse return;
+        const scene = self.scenes.internal.table.get(data.scene) orelse return;
         if (data.lightmap) |old| {
             for (old.gathered) |texture| self.device.destroyTexture(texture);
             self.device.destroyTexture(old.shown);
@@ -462,7 +493,7 @@ pub const Entities = struct {
         const self = entities.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.entities.table.get(entity) orelse return null;
+        const data = self.entities.internal.table.get(entity) orelse return null;
         const lightmap = data.lightmap orelse return null;
         return @as(f32, @floatFromInt(@min(lightmap.rounds, lightmap.wanted))) / @as(f32, @floatFromInt(lightmap.wanted));
     }
@@ -473,21 +504,106 @@ pub const Entities = struct {
         const self = entities.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.entities.table.get(entity) orelse return;
+        const data = self.entities.internal.table.get(entity) orelse return;
         if (data.visible == visible) return;
         data.visible = visible;
         data.history_frames = 0;
-        if (self.scenes.table.get(data.scene)) |scene| scene.layout_dirty = true;
+        if (self.scenes.internal.table.get(data.scene)) |scene| scene.layout_dirty = true;
     }
 
     /// Sets the animation pose. Null returns the model to its rest pose.
     pub fn setPose(entities: *Entities, entity: Entity, pose: ?Pose) void {
         const self = entities.renderer();
-        if (!self.tryLock()) return self.queueEdit(entity, .{ .pose = pose });
+        if (!tryLock(self)) return queueEdit(self, entity, .{ .pose = pose });
         defer self.unlock();
-        if (self.entities.table.get(entity)) |data| data.pose = pose;
+        if (self.entities.internal.table.get(entity)) |data| data.pose = pose;
+    }
+
+    /// Makes `entity` move with `parent`, which must be in the same scene
+    /// and not follow `entity` itself (`error.InvalidParent`); null lets it
+    /// go. From here on `setTransform` and the transform it was last given
+    /// place it relative to the parent; the jump this makes is not motion.
+    /// When the parent is destroyed its children stay where they are.
+    pub fn setParent(entities: *Entities, entity: Entity, parent: ?Entity) !void {
+        const self = entities.renderer();
+        self.lock();
+        defer self.unlock();
+        const data = self.entities.internal.table.get(entity) orelse return error.InvalidEntity;
+        if (parent) |new_parent| {
+            const parent_data = self.entities.internal.table.get(new_parent) orelse return error.InvalidParent;
+            if (!std.meta.eql(parent_data.scene, data.scene)) return error.InvalidParent;
+            var above: ?Entity = new_parent;
+            while (above) |ancestor| : (above = self.entities.internal.table.get(ancestor).?.parent) {
+                if (std.meta.eql(ancestor, entity)) return error.InvalidParent;
+            }
+            if (data.parent) |old| if (std.meta.eql(old, new_parent)) return;
+            try parent_data.children.ensureUnusedCapacity(self.internal.gpa, 1);
+        } else if (data.parent == null) return;
+        if (!markOf(self, entity).?.related) data.local = transformOf(self, entity);
+        detachEntity(self, entity, data);
+        data.parent = parent;
+        if (parent) |new_parent| {
+            const parent_data = self.entities.internal.table.get(new_parent).?;
+            parent_data.children.appendAssumeCapacity(entity);
+            const parent_mark = markOf(self, new_parent).?;
+            if (!parent_mark.related) parent_data.local = transformOf(self, new_parent);
+            parent_mark.related = true;
+        }
+        markOf(self, entity).?.related = data.parent != null or data.children.items.len != 0;
+        followParent(self, entity, data, true);
+    }
+
+    /// What an entity is and where; null for a stale handle.
+    pub fn info(entities: *Entities, entity: Entity) ?EntityInfo {
+        const self = entities.renderer();
+        self.lock();
+        defer self.unlock();
+        const data = self.entities.internal.table.get(entity) orelse return null;
+        const mark = markOf(self, entity) orelse return null;
+        var tint: [3]f32 = undefined;
+        inline for (0..3) |channel| tint[channel] = @as(f32, @floatFromInt(data.tint >> (channel * 8) & 0xff)) / 255;
+        return .{
+            .scene = data.scene,
+            .model = data.model,
+            .transform = if (mark.related) data.local else transformOf(self, entity),
+            .world_transform = transformOf(self, entity),
+            .parent = data.parent,
+            .visible = data.visible,
+            .tint = tint,
+            .params = data.params,
+            .receive_decals = data.receive_decals,
+            .pose = data.pose,
+        };
     }
 };
+
+/// Takes an entity off its parent's list of children.
+fn detachEntity(self: *Renderer, entity: Entity, data: *EntityData) void {
+    const old = data.parent orelse return;
+    data.parent = null;
+    const parent_data = self.entities.internal.table.get(old) orelse return;
+    for (parent_data.children.items, 0..) |child, index| if (std.meta.eql(child, entity)) {
+        _ = parent_data.children.swapRemove(index);
+        break;
+    };
+    if (markOf(self, old)) |mark| mark.related = parent_data.parent != null or parent_data.children.items.len != 0;
+}
+
+/// Before an entity is destroyed: off its parent, and its children left
+/// where they are.
+fn unlinkEntity(self: *Renderer, entity: Entity) void {
+    const data = self.entities.internal.table.get(entity) orelse return;
+    const mark = markOf(self, entity) orelse return;
+    if (!mark.related) return;
+    detachEntity(self, entity, data);
+    for (data.children.items) |child| if (self.entities.internal.table.get(child)) |child_data| {
+        child_data.parent = null;
+        child_data.local = transformOf(self, child);
+        if (markOf(self, child)) |child_mark| child_mark.related = child_data.children.items.len != 0;
+    };
+    data.children.clearRetainingCapacity();
+    mark.related = false;
+}
 
 /// Queues transforms a chunk at a time, so that the queue is not held long.
 fn queueTransforms(self: *Renderer, handles: []const Entity, transforms: []const Mat4) void {
@@ -498,7 +614,7 @@ fn queueTransforms(self: *Renderer, handles: []const Entity, transforms: []const
         for (edits[0..count], handles[done..][0..count], transforms[done..][0..count]) |*edit, entity, transform| {
             edit.* = .{ .entity = entity, .change = .{ .transform = transform } };
         }
-        self.queueEdits(edits[0..count]);
+        queueEdits(self, edits[0..count]);
         done += count;
     }
 }
@@ -508,12 +624,14 @@ pub fn freeEntityStorage(self: *Renderer, entity: EntityData) void {
         for (lightmap.gathered) |texture| self.device.destroyTexture(texture);
         self.device.destroyTexture(lightmap.shown);
     }
-    if (self.models.table.get(entity.model)) |model| {
+    if (self.models.internal.table.get(entity.model)) |model| {
         if (model.source) |source| for (entity.skin_offsets, 0..) |offset, index| {
             if (offset == no_skin) continue;
             self.internal.vertices.free(self, offset, model.meshes[source.instances[index].mesh].vertex_count * 2);
         };
     }
+    var children = entity.children;
+    children.deinit(self.internal.gpa);
     self.internal.gpa.free(entity.skin_offsets);
     for (entity.skin_blas) |blas| if (blas) |value| self.device.destroyAcceleration(value);
     self.internal.gpa.free(entity.skin_blas);
@@ -548,7 +666,7 @@ pub fn resolveEntity(self: *Renderer, entity: *EntityData, model: *ModelEntry) !
 
 /// The entity whose pose a group's copies take, if posed this frame.
 pub fn groupDriver(self: *Renderer, group: *const InstanceGroupData, model_instances: usize) ?*EntityData {
-    const entity = self.entities.table.get(group.driver orelse return null) orelse return null;
+    const entity = self.entities.internal.table.get(group.driver orelse return null) orelse return null;
     if (!entity.visible or !entity.resolved) return null;
     if (!std.meta.eql(entity.model, group.model) or !std.meta.eql(entity.scene, group.scene)) return null;
     if (entity.skin_offsets.len != model_instances) return null;

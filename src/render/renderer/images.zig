@@ -6,42 +6,70 @@ const gltf = @import("../../asset/gltf.zig");
 const ktx2 = @import("../../asset/ktx2.zig");
 const texture_codec = @import("texture_codec");
 const png = @import("../../png.zig");
+const gpu = @import("../gpu.zig");
 const api = @import("../api.zig");
 const render = @import("../renderer.zig");
+const materials_module = @import("materials.zig");
 
 const Renderer = render.Renderer;
 const Image = api.Image;
+const MaterialTextures = renderer_state.MaterialTextures;
 
 /// Textures usable by draw lists and materials.
 pub const Images = struct {
-    list: std.ArrayList(renderer_state.ImageEntry) = .empty,
-    next_id: u32 = 1,
+    internal: Internal = .{},
+
+    /// Not part of the API.
+    pub const Internal = struct {
+        list: std.ArrayList(renderer_state.ImageEntry) = .empty,
+        /// The id of the image at each bindless texture index, 0 where there is none.
+        live: std.ArrayList(u32) = .empty,
+        /// View targets lent out by `views.targetImage`, so each keeps one id.
+        targets: std.ArrayList(Target) = .empty,
+        next_id: u32 = 1,
+
+        const Target = struct { texture: rhi.Texture, id: u32 };
+
+        pub fn deinit(internal: *Internal, gpa: std.mem.Allocator, device: *rhi.Device) void {
+            for (internal.list.items) |entry| device.destroyTexture(entry.texture);
+            internal.list.deinit(gpa);
+            internal.live.deinit(gpa);
+            internal.targets.deinit(gpa);
+        }
+    };
 
     fn renderer(images: *Images) *Renderer {
         return @alignCast(@fieldParentPtr("images", images));
     }
 
-    /// As `images.create`, but stored as BC7 with a full mip chain. Falls back
-    /// to `images.create` on a device without block compression.
-    pub fn createCompressed(images: *Images, width: u32, height: u32, pixels: []const u8, srgb: bool) !Image {
-        const self = images.renderer();
-        if (!self.device.caps.bc_textures) return self.images.create(.{ .width = width, .height = height, .pixels = pixels, .srgb = srgb });
-        if (pixels.len != @as(usize, width) * height * 4) return error.InvalidTextureData;
-        const chain = try texture_codec.encodeBc7Chain(self.internal.gpa, pixels, width, height, srgb);
-        defer self.internal.gpa.free(chain);
-        return createImageFromLevels(self, .{
-            .width = width,
-            .height = height,
-            .format = .bc7,
-            .srgb = srgb,
-            .levels = texture_codec.mipCount(width, height),
-            .data = chain,
-        });
+    /// False once `image` is destroyed, for a view target's image once the
+    /// target is, and for an image of another renderer.
+    pub fn valid(images: *const Images, image: Image) bool {
+        return image.id != 0 and image.index < images.internal.live.items.len and images.internal.live.items[image.index] == image.id;
     }
 
-    /// Creates an image for draw lists.
+    /// The texture index the GPU samples `image` by; `gpu.invalid_id`, which
+    /// samples nothing, for null and for an image that is no longer valid.
+    pub fn indexOf(images: *const Images, image: ?Image) u32 {
+        const value = image orelse return gpu.invalid_id;
+        return if (images.valid(value)) value.index else gpu.invalid_id;
+    }
+
+    /// Creates an image for draw lists and materials.
     pub fn create(images: *Images, desc: api.ImageDesc) !Image {
-        return images.createLimited(desc.width, desc.height, desc.pixels, desc.srgb, desc.mip_levels);
+        const self = images.renderer();
+        if (!desc.compressed or !self.device.caps.bc_textures) return images.createLimited(desc.width, desc.height, desc.pixels, desc.srgb, desc.mip_levels);
+        if (desc.pixels.len != @as(usize, desc.width) * desc.height * 4) return error.InvalidTextureData;
+        const chain = try texture_codec.encodeBc7Chain(self.internal.gpa, desc.pixels, desc.width, desc.height, desc.srgb);
+        defer self.internal.gpa.free(chain);
+        return createImageFromLevels(self, .{
+            .width = desc.width,
+            .height = desc.height,
+            .format = .bc7,
+            .srgb = desc.srgb,
+            .levels = texture_codec.mipCount(desc.width, desc.height),
+            .data = chain,
+        });
     }
 
     /// Like `create`, with at most `levels` mips; 0 means the full chain. An
@@ -94,9 +122,13 @@ pub const Images = struct {
 
     /// Compresses an RGBA8 picture to BC7 with full mips and writes it as a
     /// KTX2 file.
-    pub fn writeKtx2(images: *Images, path: []const u8, width: u32, height: u32, pixels: []const u8, srgb: bool) !void {
+    pub fn writeKtx2(images: *Images, path: []const u8, desc: api.ImageDesc) !void {
         const self = images.renderer();
-        const chain = try texture_codec.encodeBc7Chain(self.internal.gpa, pixels, width, height, srgb);
+        const width = desc.width;
+        const height = desc.height;
+        const srgb = desc.srgb;
+        if (desc.pixels.len != @as(usize, width) * height * 4) return error.InvalidTextureData;
+        const chain = try texture_codec.encodeBc7Chain(self.internal.gpa, desc.pixels, width, height, srgb);
         defer self.internal.gpa.free(chain);
         const file = try ktx2.write(self.internal.gpa, .{
             .width = width,
@@ -144,28 +176,35 @@ pub const Images = struct {
     }
 
     /// Replaces a rectangle of an image made by `create` with tightly packed
-    /// RGBA8 pixels. `region` is X, Y, width and height from the top-left
-    /// corner. The smaller mip levels keep what they hold.
-    pub fn update(images: *Images, image: Image, region: [4]u32, pixels: []const u8) !void {
+    /// RGBA8 pixels, `region` from the top-left corner. The smaller mip
+    /// levels keep what they hold.
+    pub fn update(images: *Images, image: Image, region: api.Region, pixels: []const u8) !void {
         const self = images.renderer();
         self.lock();
         defer self.unlock();
-        for (self.images.list.items) |owned| {
-            if (owned.id == image.id and owned.index == image.index) return self.device.uploadTextureRegion(owned.texture, 0, 0, region, pixels);
+        if (!self.images.valid(image)) return error.InvalidImage;
+        for (self.images.internal.list.items) |owned| {
+            if (owned.id == image.id) return self.device.uploadTextureRegion(owned.texture, 0, 0, .{ region.x, region.y, region.width, region.height }, pixels);
         }
         return error.InvalidImage;
     }
 
-    /// Frees an image. It must not be used in any later frame. Images the
-    /// renderer does not own (such as a `views.targetImage`) are ignored.
+    /// Frees an image. Materials given it by `materials.setTextures` go back
+    /// to their own textures; lights, decals, particles, water, clouds and
+    /// color grading using it sample nothing; `Renderer.render` refuses draw
+    /// lists that draw it with `error.InvalidImage`. Images the renderer does
+    /// not own (such as a `views.targetImage`) are ignored.
     pub fn destroy(images: *Images, image: Image) void {
         const self = images.renderer();
         self.lock();
         defer self.unlock();
-        for (self.images.list.items, 0..) |entry, index| {
-            if (entry.index != image.index or entry.id != image.id) continue;
+        if (!self.images.valid(image)) return;
+        for (self.images.internal.list.items, 0..) |entry, index| {
+            if (entry.id != image.id) continue;
             self.device.destroyTexture(entry.texture);
-            _ = self.images.list.swapRemove(index);
+            _ = self.images.internal.list.swapRemove(index);
+            self.images.internal.live.items[image.index] = 0;
+            forgetMaterialImage(self, image);
             return;
         }
     }
@@ -173,11 +212,65 @@ pub const Images = struct {
 
 /// Lists `texture` as an image of the renderer's own.
 fn own(self: *Renderer, texture: rhi.Texture, index: u32, width: u32, height: u32) !Image {
-    const id = self.images.next_id;
-    try self.images.list.append(self.internal.gpa, .{ .texture = texture, .index = index, .id = id });
-    self.images.next_id +%= 1;
-    if (self.images.next_id == 0) self.images.next_id = 1;
+    try self.images.internal.list.ensureUnusedCapacity(self.internal.gpa, 1);
+    const id = try lend(self, index);
+    self.images.internal.list.appendAssumeCapacity(.{ .texture = texture, .index = index, .id = id });
     return .{ .index = index, .width = width, .height = height, .id = id };
+}
+
+/// Marks texture index `index` as an image under a new id.
+fn lend(self: *Renderer, index: u32) !u32 {
+    const live = &self.images.internal.live;
+    if (index >= live.items.len) try live.appendNTimes(self.internal.gpa, 0, index + 1 - live.items.len);
+    const id = self.images.internal.next_id;
+    self.images.internal.next_id +%= 1;
+    if (self.images.internal.next_id == 0) self.images.internal.next_id = 1;
+    live.items[index] = id;
+    return id;
+}
+
+/// The image `views.targetImage` gives for `target`: the same one until the
+/// target is destroyed.
+pub fn targetImage(self: *Renderer, target: rhi.Texture, index: u32, width: u32, height: u32) !Image {
+    for (self.images.internal.targets.items) |lent| if (std.meta.eql(lent.texture, target))
+        return .{ .index = index, .width = width, .height = height, .id = lent.id };
+    try self.images.internal.targets.ensureUnusedCapacity(self.internal.gpa, 1);
+    const id = try lend(self, index);
+    self.images.internal.targets.appendAssumeCapacity(.{ .texture = target, .id = id });
+    return .{ .index = index, .width = width, .height = height, .id = id };
+}
+
+/// Ends the image lent out for `target`, before it is destroyed.
+pub fn forgetTarget(self: *Renderer, target: rhi.Texture) void {
+    for (self.images.internal.targets.items, 0..) |lent, index| {
+        if (!std.meta.eql(lent.texture, target)) continue;
+        for (self.images.internal.live.items) |*id| if (id.* == lent.id) {
+            id.* = 0;
+        };
+        _ = self.images.internal.targets.swapRemove(index);
+        return;
+    }
+}
+
+/// Gives materials set to `image` their own textures back.
+fn forgetMaterialImage(self: *Renderer, image: Image) void {
+    for (self.models.internal.table.slots.items) |*slot| {
+        const entry = if (slot.value) |*value| value else continue;
+        for (entry.material_images, 0..) |*textures, index| {
+            var used = false;
+            inline for (@typeInfo(MaterialTextures).@"struct".fields) |field| {
+                if (field.type == ?Image) if (@field(textures, field.name)) |set| if (set.id == image.id) {
+                    @field(textures, field.name) = null;
+                    used = true;
+                };
+            }
+            if (!used or entry.state != .ready) continue;
+            const source = entry.source orelse continue;
+            self.internal.asset_generation += 1;
+            const encoded = materials_module.encodeMaterial(self, entry, source.materials[index], index) catch continue;
+            self.materials.internal.pool.write(self.device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded)) catch continue;
+        }
+    }
 }
 
 /// Makes an image from mip levels already in a GPU format.
@@ -221,10 +314,11 @@ fn parseIes(gpa: std.mem.Allocator, bytes: []const u8) ![]f32 {
     var tokens = std.mem.tokenizeAny(u8, bytes[after_tilt..], " \t\r\n,");
     while (tokens.next()) |token| try numbers.append(gpa, std.fmt.parseFloat(f32, token) catch return error.InvalidIes);
     if (numbers.items.len < 13) return error.InvalidIes;
+    for (numbers.items) |number| if (!std.math.isFinite(number)) return error.InvalidIes;
     const multiplier = numbers.items[2];
+    if (!(numbers.items[3] >= 2 and numbers.items[3] <= 4096 and numbers.items[4] >= 1 and numbers.items[4] <= 4096)) return error.InvalidIes;
     const vertical: usize = @intFromFloat(numbers.items[3]);
     const horizontal: usize = @intFromFloat(numbers.items[4]);
-    if (vertical < 2 or horizontal < 1) return error.InvalidIes;
     if (numbers.items.len < 13 + vertical + horizontal + vertical * horizontal) return error.InvalidIes;
     const angles = numbers.items[13..][0..vertical];
     const candela = numbers.items[13 + vertical + horizontal ..][0 .. vertical * horizontal];

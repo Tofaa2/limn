@@ -24,14 +24,14 @@ pub const InstanceGroupTag = opaque {};
 pub const LightTag = opaque {};
 pub const DecalTag = opaque {};
 /// Geometry, materials and animations shared by entities; see
-/// `Renderer.models.load`. Handles are 32-bit copyable values; calls given a
+/// `Renderer.models.load`. Handles are 64-bit copyable values; calls given a
 /// stale handle do nothing or return an error.
 pub const Model = handle.Handle(ModelTag);
 /// A sky and its image-based lighting; see `Renderer.environments.load`.
 pub const Environment = handle.Handle(EnvironmentTag);
 /// A world of entities, lights and effects; see `Renderer.scenes.create`.
 pub const Scene = handle.Handle(SceneTag);
-/// One placement of a model in a scene; see `Renderer.entities.spawn`.
+/// One placement of a model in a scene; see `Renderer.entities.create`.
 pub const Entity = handle.Handle(EntityTag);
 /// Per-camera state that persists between frames.
 pub const View = handle.Handle(ViewTag);
@@ -40,9 +40,9 @@ pub const Emitter = handle.Handle(EmitterTag);
 /// A local reflection probe in a scene.
 pub const ReflectionProbe = handle.Handle(ReflectionProbeTag);
 /// One light of a scene; see `Renderer.lights`.
-pub const LightHandle = handle.Handle(LightTag);
+pub const Light = handle.Handle(LightTag);
 /// One decal of a scene; see `Renderer.decals`.
-pub const DecalHandle = handle.Handle(DecalTag);
+pub const Decal = handle.Handle(DecalTag);
 /// A box of simulated smoke and fire in a scene; see `Renderer.fluids.create`.
 pub const Fluid = handle.Handle(FluidTag);
 /// A shape that hair is kept out of; see `Renderer.hairs.createCollisionField`.
@@ -58,7 +58,6 @@ pub const InstanceGroup = handle.Handle(InstanceGroupTag);
 /// Animation clips an entity plays; see `Renderer.entities.setPose`.
 pub const Pose = animation.Pose;
 /// Application-supplied geometry for `Renderer.models.create`.
-pub const MeshDesc = gltf.MeshDesc;
 /// Surface description of a mesh.
 pub const Material = gltf.Material;
 /// 2D shapes, images and text drawn over a view.

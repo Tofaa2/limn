@@ -19,13 +19,18 @@ const HairState = renderer_state.HairState;
 
 /// Strands of hair, fur or grass, and the shapes they are kept out of.
 pub const Hairs = struct {
-    table: handle.HandleTable(renderer_state.HairState, api.HairTag),
-    fields: handle.HandleTable(renderer_state.CollisionFieldState, api.CollisionFieldTag),
+    internal: Internal,
 
-    /// Frees what one of them holds, as when the renderer is destroyed.
-    pub fn free(owner: *Renderer, entry: *renderer_state.HairState) void {
-        freeHair(owner, entry.*);
-    }
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.HairState, api.HairTag),
+        fields: handle.HandleTable(renderer_state.CollisionFieldState, api.CollisionFieldTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.HairState) void {
+            freeHair(owner, entry.*);
+        }
+    };
 
     fn renderer(hairs: *Hairs) *Renderer {
         return @alignCast(@fieldParentPtr("hairs", hairs));
@@ -36,7 +41,7 @@ pub const Hairs = struct {
         const self = hairs.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+        const data = self.scenes.internal.table.get(scene) orelse return error.InvalidScene;
         if (desc.points_per_strand < 2 or desc.points.len < desc.points_per_strand or desc.points.len % desc.points_per_strand != 0) return error.InvalidHair;
         if (desc.simulation != null and desc.points_per_strand > 64) return error.TooManyPointsPerStrand;
         const Point = extern struct { position: [3]f32, along: f32 };
@@ -57,10 +62,10 @@ pub const Hairs = struct {
         kept.points = &.{};
         kept.simulation = null;
         const strands: u32 = @intCast(desc.points.len / desc.points_per_strand);
-        const hair = try self.hairs.table.insert(.{ .scene = scene, .desc = kept, .points = points, .stretches = strands * (desc.points_per_strand - 1), .strands = strands });
-        errdefer _ = self.hairs.table.remove(hair);
+        const hair = try self.hairs.internal.table.insert(.{ .scene = scene, .desc = kept, .points = points, .stretches = strands * (desc.points_per_strand - 1), .strands = strands });
+        errdefer _ = self.hairs.internal.table.remove(hair);
         try data.hairs.append(self.internal.gpa, hair);
-        const state = self.hairs.table.get(hair).?;
+        const state = self.hairs.internal.table.get(hair).?;
         var low: Vec3 = desc.points[0];
         var high: Vec3 = desc.points[0];
         for (desc.points) |position| inline for (0..3) |axis| {
@@ -102,7 +107,7 @@ pub const Hairs = struct {
         errdefer self.device.destroyTexture(texture);
         const per_layer = @as(usize, field.size) * field.size;
         for (0..field.size) |layer| try self.device.uploadTexture(texture, 0, @intCast(layer), std.mem.sliceAsBytes(halves[layer * per_layer ..][0..per_layer]));
-        return self.hairs.fields.insert(.{ .texture = texture, .low = field.low, .cell = field.cell, .size = field.size });
+        return self.hairs.internal.fields.insert(.{ .texture = texture, .low = field.low, .cell = field.cell, .size = field.size });
     }
 
     /// A stale handle is ignored.
@@ -110,7 +115,7 @@ pub const Hairs = struct {
         const self = hairs.renderer();
         self.lock();
         defer self.unlock();
-        const removed = self.hairs.fields.remove(field) orelse return;
+        const removed = self.hairs.internal.fields.remove(field) orelse return;
         self.device.destroyTexture(removed.texture);
     }
 
@@ -120,7 +125,7 @@ pub const Hairs = struct {
         const self = hairs.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.hairs.table.get(hair) orelse return;
+        const state = self.hairs.internal.table.get(hair) orelse return;
         setHairMotion(state, simulation);
         if (simulation == null) if (state.moving) |moving| {
             for (moving.points) |buffer| self.device.destroyBuffer(buffer);
@@ -134,7 +139,7 @@ pub const Hairs = struct {
         const self = hairs.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.hairs.table.get(hair) orelse return;
+        const state = self.hairs.internal.table.get(hair) orelse return;
         state.desc.transform = transform;
     }
 

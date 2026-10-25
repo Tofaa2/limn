@@ -17,6 +17,8 @@ const Mat4 = math.Mat4;
 const Vec3 = math.Vec3;
 const Model = api.Model;
 const MeshDesc = api.MeshDesc;
+const MaterialTextures = api.MaterialTextures;
+const primitives = @import("../primitives.zig");
 const blockFormat = renderer_state.blockFormat;
 const TextureStream = renderer_state.TextureStream;
 const AssetState = api.AssetState;
@@ -30,6 +32,7 @@ const SceneData = renderer_state.SceneData;
 const uvMatrix = renderer_state.uvMatrix;
 const createStreamTexture = @import("streaming.zig").createStreamTexture;
 const encodeMaterial = @import("materials.zig").encodeMaterial;
+const shaderSlot = @import("materials.zig").shaderSlot;
 const freeMeshGeometry = @import("streaming.zig").freeMeshGeometry;
 
 fn lodOptions(self: *const Renderer) gltf.LodOptions {
@@ -38,12 +41,17 @@ fn lodOptions(self: *const Renderer) gltf.LodOptions {
 
 /// Shared geometry, materials and animations.
 pub const Models = struct {
-    table: handle.HandleTable(renderer_state.ModelEntry, api.ModelTag),
+    internal: Internal,
 
-    /// Frees what one of them holds, as when the renderer is destroyed.
-    pub fn free(owner: *Renderer, entry: *renderer_state.ModelEntry) void {
-        freeModel(owner, entry);
-    }
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.ModelEntry, api.ModelTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.ModelEntry) void {
+            freeModel(owner, entry);
+        }
+    };
 
     fn renderer(models: *Models) *Renderer {
         return @alignCast(@fieldParentPtr("models", models));
@@ -70,23 +78,50 @@ pub const Models = struct {
             },
         };
         errdefer self.internal.gpa.free(job.path);
-        const model = try self.models.table.insert(.{ .job = job });
+        const model = try self.models.internal.table.insert(.{ .job = job });
         job.group.concurrent(self.internal.io, runModelJob, .{job}) catch job.group.async(self.internal.io, runModelJob, .{job});
         self.internal.loading_count += 1;
         return model;
     }
 
-    /// Creates a model from geometry in memory. Ready on the next frame or
-    /// `waitUntilLoaded`.
+    /// Creates a model from geometry in memory, one material per mesh.
+    /// Ready on the next frame or `waitUntilLoaded`. A destroyed image in
+    /// `MeshDesc.textures` is `error.InvalidImage`.
     pub fn create(models: *Models, meshes: []const MeshDesc) !Model {
         const self = models.renderer();
-        var source = try gltf.fromMeshes(self.options.job_allocator orelse std.heap.smp_allocator, meshes, lodOptions(self));
+        const gpa = self.options.job_allocator orelse std.heap.smp_allocator;
+        const geometry = try gpa.alloc(gltf.MeshDesc, meshes.len);
+        defer gpa.free(geometry);
+        var textured = false;
+        for (meshes, geometry) |mesh, *into| {
+            into.* = mesh.geometry();
+            if (!std.meta.eql(mesh.textures, MaterialTextures{})) textured = true;
+        }
+        var source = try gltf.fromMeshes(gpa, geometry, lodOptions(self));
         errdefer source.deinit();
         self.lock();
         defer self.unlock();
-        const model = try self.models.table.insert(.{ .source = source });
+        const material_images: []MaterialTextures = if (textured) try self.internal.gpa.alloc(MaterialTextures, meshes.len) else &.{};
+        errdefer self.internal.gpa.free(material_images);
+        for (material_images, meshes) |*into, mesh| {
+            inline for (@typeInfo(MaterialTextures).@"struct".fields) |field| {
+                if (field.type == ?api.Image) if (@field(mesh.textures, field.name)) |image| if (!self.images.valid(image)) return error.InvalidImage;
+            }
+            into.* = mesh.textures;
+        }
+        const model = try self.models.internal.table.insert(.{ .source = source, .material_images = material_images });
         self.internal.loading_count += 1;
         return model;
+    }
+
+    /// A model of one simple shape; see `primitives`.
+    pub fn createPrimitive(models: *Models, desc: api.PrimitiveDesc) !Model {
+        const self = models.renderer();
+        const mesh = try primitives.build(self.internal.gpa, desc.shape);
+        defer mesh.deinit(self.internal.gpa);
+        var shape = mesh.desc(desc.material);
+        shape.textures = desc.textures;
+        return models.create(&.{shape});
     }
 
     /// A handle that names no model reports `.failed`. Safe from any thread.
@@ -94,7 +129,7 @@ pub const Models = struct {
         const self = models.renderer();
         self.lock();
         defer self.unlock();
-        return (self.models.table.get(model) orelse return .failed).state;
+        return (self.models.internal.table.get(model) orelse return .failed).state;
     }
 
     /// The error a failed load ended with, if any.
@@ -102,7 +137,7 @@ pub const Models = struct {
         const self = models.renderer();
         self.lock();
         defer self.unlock();
-        return (self.models.table.get(model) orelse return error.InvalidModel).failure;
+        return (self.models.internal.table.get(model) orelse return error.InvalidModel).failure;
     }
 
     /// Null until the model is ready.
@@ -110,7 +145,7 @@ pub const Models = struct {
         const self = models.renderer();
         self.lock();
         defer self.unlock();
-        const entry = self.models.table.get(model) orelse return null;
+        const entry = self.models.internal.table.get(model) orelse return null;
         return if (entry.state == .ready) entry.info else null;
     }
 
@@ -119,7 +154,7 @@ pub const Models = struct {
         const self = models.renderer();
         self.lock();
         defer self.unlock();
-        const entry = self.models.table.get(model) orelse return 0;
+        const entry = self.models.internal.table.get(model) orelse return 0;
         if (entry.state != .ready) return 0;
         return @intCast(entry.source.?.animations.len);
     }
@@ -130,7 +165,7 @@ pub const Models = struct {
         const self = models.renderer();
         self.lock();
         defer self.unlock();
-        const entry = self.models.table.get(model) orelse return null;
+        const entry = self.models.internal.table.get(model) orelse return null;
         if (entry.state != .ready or index >= entry.source.?.animations.len) return null;
         const clip = entry.source.?.animations[index];
         return .{ .name = clip.name, .duration = clip.duration };
@@ -142,7 +177,7 @@ pub const Models = struct {
         const self = models.renderer();
         self.lock();
         defer self.unlock();
-        const entry = self.models.table.get(model) orelse return null;
+        const entry = self.models.internal.table.get(model) orelse return null;
         if (entry.state != .ready) return null;
         for (entry.source.?.nodes, 0..) |node, index| {
             if (std.mem.eql(u8, node.name, name)) return @intCast(index);
@@ -156,7 +191,7 @@ pub const Models = struct {
         const self = models.renderer();
         self.lock();
         defer self.unlock();
-        const entry = self.models.table.get(model) orelse return error.InvalidModel;
+        const entry = self.models.internal.table.get(model) orelse return error.InvalidModel;
         if (entry.state != .ready) return error.ModelNotReady;
         const source = &entry.source.?;
         if (node >= source.nodes.len) return error.InvalidNode;
@@ -171,7 +206,7 @@ pub const Models = struct {
         const self = models.renderer();
         self.lock();
         defer self.unlock();
-        const entry = self.models.table.get(model) orelse return null;
+        const entry = self.models.internal.table.get(model) orelse return null;
         if (entry.state != .ready) return null;
         for (entry.source.?.animations, 0..) |clip, index| {
             if (std.mem.eql(u8, clip.name, name)) return @intCast(index);
@@ -179,19 +214,66 @@ pub const Models = struct {
         return null;
     }
 
-    /// Fails with `error.ModelInUse` while any entity still references it.
-    pub fn destroy(models: *Models, model: Model) !void {
+    /// The lights of a glTF file (`KHR_lights_punctual`), ready for
+    /// `scenes.setLights`; the caller frees the slice with `gpa`. glTF
+    /// intensities are candela and lux; they are multiplied by
+    /// `intensity_scale` into the renderer's units. A light of unlimited
+    /// range gets the distance where it falls to 1/256 of its intensity.
+    /// Reads only the file's JSON.
+    pub fn loadLights(models: *Models, gpa: std.mem.Allocator, path: []const u8, intensity_scale: f32) ![]api.LightDesc {
+        const self = models.renderer();
+        const found = try gltf.loadLights(gpa, self.internal.io, path);
+        defer gpa.free(found);
+        const lights = try gpa.alloc(api.LightDesc, found.len);
+        for (found, lights) |light, *out| {
+            const intensity = light.intensity * intensity_scale;
+            out.* = .{
+                .kind = switch (light.kind) {
+                    .directional => .directional,
+                    .point => .point,
+                    .spot => .spot,
+                },
+                .position = light.position,
+                .direction = light.direction,
+                .color = light.color,
+                .intensity = intensity,
+                .range = if (light.range > 0) light.range else @sqrt(@max(intensity, 0) * 256),
+                .inner_angle = light.inner_angle,
+                .outer_angle = light.outer_angle,
+            };
+        }
+        return lights;
+    }
+
+    /// Frees the model now, or, while entities or instance groups still use
+    /// it, once the last of them goes; until then it can make nothing new.
+    pub fn destroy(models: *Models, model: Model) void {
         const self = models.renderer();
         self.lock();
         defer self.unlock();
-        const entry = self.models.table.get(model) orelse return;
-        if (entry.references != 0) return error.ModelInUse;
-        var removed = self.models.table.remove(model).?;
-        if (removed.state == .loading) self.internal.loading_count -= 1;
-        freeModel(self, &removed);
-        self.internal.asset_generation += 1;
+        const entry = self.models.internal.table.get(model) orelse return;
+        if (entry.references != 0) {
+            entry.orphaned = true;
+            return;
+        }
+        removeModel(self, model);
     }
 };
+
+fn removeModel(self: *Renderer, model: Model) void {
+    var removed = self.models.internal.table.remove(model).?;
+    if (removed.state == .loading) self.internal.loading_count -= 1;
+    freeModel(self, &removed);
+    self.internal.asset_generation += 1;
+}
+
+/// Drops one use of `model` by an entity or instance group, freeing it if
+/// `models.destroy` was asked for while it was in use. Under the lock.
+pub fn releaseModel(self: *Renderer, model: Model) void {
+    const entry = self.models.internal.table.get(model) orelse return;
+    entry.references -= 1;
+    if (entry.references == 0 and entry.orphaned) removeModel(self, model);
+}
 
 pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
     const device = self.device;
@@ -279,13 +361,13 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
         budget.* -|= pixels.len;
     }
 
-    entry.material_base = try self.materials.pool.alloc(self, @intCast(source.materials.len));
+    entry.material_base = try self.materials.internal.pool.alloc(self, @intCast(source.materials.len));
     var transform_count: u32 = 0;
     for (source.materials) |material| {
         if (material.hasOwnTransforms()) transform_count += 1;
     }
     if (transform_count != 0) {
-        entry.transform_base = try self.materials.pool.alloc(self, transform_count * gpu.texture_transform_slots);
+        entry.transform_base = try self.materials.internal.pool.alloc(self, transform_count * gpu.texture_transform_slots);
         entry.transform_count = transform_count;
         self.internal.texture_transform_users += 1;
         var slot = entry.transform_base;
@@ -296,7 +378,7 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
                 const transform = if (maybe) |ref| ref.transform else material.sharedTransform();
                 out.* = .{ .matrix = uvMatrix(transform.scale, transform.rotation), .offset = transform.offset };
             }
-            try self.materials.pool.write(device, slot, std.mem.sliceAsBytes(&block));
+            try self.materials.internal.pool.write(device, slot, std.mem.sliceAsBytes(&block));
             slot += gpu.texture_transform_slots;
         }
     }
@@ -304,9 +386,9 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
     defer gpa.free(materials);
     for (source.materials, materials, 0..) |material, *out, index| {
         out.* = try encodeMaterial(self, entry, material, index);
-        self.materials.shader_users[out.shader] += 1;
+        self.materials.internal.shader_users[out.shader] += 1;
     }
-    try self.materials.pool.write(device, entry.material_base, std.mem.sliceAsBytes(materials));
+    try self.materials.internal.pool.write(device, entry.material_base, std.mem.sliceAsBytes(materials));
 
     entry.mesh_base = try self.internal.meshes.alloc(self, @intCast(source.meshes.len));
     entry.meshes = try gpa.alloc(ModelMesh, source.meshes.len);
@@ -476,9 +558,9 @@ pub fn buildSceneTree(self: *Renderer, scene: *SceneData, entities: []const gpu.
     }
     var record: u32 = @intCast(entities.len);
     for (scene.groups.items) |group_handle| {
-        const group = self.instances.table.get(group_handle) orelse continue;
+        const group = self.instances.internal.table.get(group_handle) orelse continue;
         if (group.per_copy == 0) continue;
-        const model = self.models.table.get(group.model) orelse continue;
+        const model = self.models.internal.table.get(group.model) orelse continue;
         const source = &model.source.?;
         for (group.transforms) |placement| {
             for (source.instances) |instance| {
@@ -631,14 +713,14 @@ pub fn freeModel(self: *Renderer, entry: *ModelEntry) void {
     }
     if (entry.source) |*source| {
         if (entry.transform_count != 0) {
-            self.materials.pool.free(self, entry.transform_base, entry.transform_count * gpu.texture_transform_slots);
+            self.materials.internal.pool.free(self, entry.transform_base, entry.transform_count * gpu.texture_transform_slots);
             self.internal.texture_transform_users -= 1;
             entry.transform_count = 0;
         }
         if (entry.meshes.len != 0) self.internal.meshes.free(self, entry.mesh_base, @intCast(source.meshes.len));
         if (entry.state == .ready) {
-            for (source.materials) |material| self.materials.shader_users[if (material.shader < self.materials.shaders.len) material.shader else 0] -= 1;
-            self.materials.pool.free(self, entry.material_base, @intCast(source.materials.len));
+            for (source.materials) |material| self.materials.internal.shader_users[shaderSlot(self, material)] -= 1;
+            self.materials.internal.pool.free(self, entry.material_base, @intCast(source.materials.len));
         }
         source.deinit();
         entry.source = null;

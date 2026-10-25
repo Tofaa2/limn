@@ -217,7 +217,7 @@ pub fn main(init: std.process.Init) !void {
             .material = .{ .base_color = .{ 0.62, 0.45, 0.30, 1 }, .metallic = 0, .roughness = 0.85 },
         }});
     };
-    _ = try renderer.entities.spawn(scene, .{ .model = planet, .transform = math.identity });
+    _ = try renderer.entities.create(scene, .{ .model = planet, .transform = math.identity });
     try renderer.waitUntilLoaded();
 
     const transforms = try gpa.alloc(math.Mat4, max_count);
@@ -231,7 +231,7 @@ pub fn main(init: std.process.Init) !void {
         placed += share;
     }
 
-    if (impostors) for (groups) |group| try renderer.instances.setImpostor(group, .{ .pixels = impostor_pixels });
+    if (impostors) for (groups) |group| try renderer.instances.setImpostor(group, .{ .max_pixels = impostor_pixels });
 
     var list = gfx.DrawList.init(gpa);
     defer list.deinit();
@@ -262,7 +262,7 @@ pub fn main(init: std.process.Init) !void {
             for (kinds, groups, 0..) |kind, group, index| {
                 const share = shareOf(kind, count);
                 scatter(transforms[0..share], kind, 100 + index);
-                try renderer.instances.set(group, transforms[0..share]);
+                try renderer.instances.setTransforms(group, transforms[0..share]);
                 placed += share;
             }
         }
@@ -271,7 +271,7 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_S)) shadows = !shadows;
         if (stage.keyPressed(glfw.GLFW_KEY_I)) {
             impostors = !impostors;
-            for (groups) |group| try renderer.instances.setImpostor(group, if (impostors) .{ .pixels = impostor_pixels } else null);
+            for (groups) |group| try renderer.instances.setImpostor(group, if (impostors) .{ .max_pixels = impostor_pixels } else null);
         }
         if (stage.keyPressed(glfw.GLFW_KEY_TAB)) meshlet_view = !meshlet_view;
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE)) flying = !flying;

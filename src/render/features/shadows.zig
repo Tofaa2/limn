@@ -6,6 +6,7 @@ const ray_scene = @import("../scene/ray_scene.zig");
 const scene_pass = @import("../scene_pass.zig");
 const geometry_feature = @import("geometry.zig");
 const hair_feature = @import("hair.zig");
+const hooks = @import("hooks.zig");
 const gpu = @import("../gpu.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const filled = @import("../api.zig").filled;
@@ -168,6 +169,7 @@ pub fn prepare(ctx: *ViewContext) !void {
     const tlas: u64 = if (traced) device.accelerationAddress(p.scene.tlas.?) else 0;
     const local = try ctx.make(LocalShadows);
     local.* = planLocalShadows(renderer, p, p.shared.lighting);
+    if (local.draw) try fitLocalAtlas(renderer, local, p.shared.lighting.tile_count);
     p.shared.sun = sun;
     p.shared.local_shadows = local;
     p.shared.shadow_tlas = tlas;
@@ -203,13 +205,20 @@ pub fn declare(ctx: *ViewContext) !void {
 fn sunShadows(ctx: *ViewContext) !void {
     const p = ctx.scene.?;
     const c = p.shared;
-    if (c.shadows_enabled) try drawSunShadows(ctx.renderer, p, c.sun);
+    if (!c.shadows_enabled) return;
+    try drawSunShadows(ctx.renderer, p, c.sun);
+    try hooks.sunShadows(ctx, c.sun.map, &c.sun.cascades.view_proj, &c.sun.update);
 }
 
 fn localShadows(ctx: *ViewContext) !void {
     const p = ctx.scene.?;
     const c = p.shared;
-    if (c.local_shadows.draw) try drawLocalShadows(ctx.renderer, p, c.lighting, c.local_shadows);
+    if (!c.local_shadows.draw) return;
+    try drawLocalShadows(ctx.renderer, p, c.lighting, c.local_shadows);
+    const options = ctx.renderer.options.shadows;
+    const per_side = std.math.clamp(options.local_tiles_per_side, 1, local_shadow_tiles_per_side);
+    const count = c.lighting.tile_count;
+    try hooks.lightShadows(ctx, ctx.renderer.internal.local_shadow_map, c.lighting.tile_view_proj[0..count], c.local_shadows.tile_dirty[0..count], options.local_resolution / per_side, per_side);
 }
 
 /// Whether anything that moved this frame casts into a cascade's bounding
@@ -249,7 +258,7 @@ pub fn updateCascades(renderer: *Renderer, p: *const ScenePass, shadows_enabled:
             const due = !filled(settings.shadows).cascade_stagger or view_data.frames % interval == interval / 2;
             const uncovered = math.length(math.sub(ideal.centers[cascade], cache.cascades.centers[cascade])) + ideal.tight_radii[cascade] >
                 cache.cascades.radii[cascade];
-            const caster_moved = moverCastsInto(p.scene, cache.cascades.centers[cascade], cache.cascades.radii[cascade], sun_travel);
+            const caster_moved = hooks.movingCasters(&p.desc, .sun_shadow) or moverCastsInto(p.scene, cache.cascades.centers[cascade], cache.cascades.radii[cascade], sun_travel);
             if (!shadows_enabled or !(stale or due or uncovered or caster_moved)) continue;
             cascade_update[cascade] = true;
             cache.cascades.view_proj[cascade] = ideal.view_proj[cascade];
@@ -293,7 +302,7 @@ pub fn drawSunShadows(renderer: *Renderer, p: *const ScenePass, sun: *const SunS
         geometry_feature.drawMeshlets(renderer, cmd, cascade_push, 1 + cascade, 1, scene.ref_count);
         try hair_feature.drawHairShadows(renderer, p, cascades.view_proj[cascade], cascades.texel_size[cascade], 0);
         for (scene.liquids.items) |item| {
-            const state = renderer.liquids.table.get(item) orelse continue;
+            const state = renderer.liquids.internal.table.get(item) orelse continue;
             if (state.params_frame != renderer.internal.frame_index or state.live == 0 or state.desc.shadow <= 0) continue;
             cmd.bindPipeline(try renderer.internal.pipelines.of(liquidShadowPipeline));
             cmd.pushConstants(liquid_push.ShadowPush{
@@ -324,6 +333,25 @@ pub fn drawSunShadows(renderer: *Renderer, p: *const ScenePass, sun: *const SunS
     cmd.endScope();
 }
 
+/// Makes the local shadow atlas full size the first time a light draws into
+/// it; until then it is a single texel. A new atlas is drawn whole.
+fn fitLocalAtlas(renderer: *Renderer, local: *LocalShadows, tile_count: u32) !void {
+    const device = renderer.device;
+    const size = renderer.options.shadows.local_resolution;
+    if (device.textureInfo(renderer.internal.local_shadow_map).width == size) return;
+    const atlas = try device.createTexture(.{
+        .name = "local shadow atlas",
+        .width = size,
+        .height = size,
+        .format = .depth32_float,
+        .usage = .{ .sampled = true, .depth_attachment = true },
+    });
+    device.destroyTexture(renderer.internal.local_shadow_map);
+    renderer.internal.local_shadow_map = atlas;
+    local.same_atlas = false;
+    @memset(local.tile_dirty[0..tile_count], true);
+}
+
 /// Picks the local shadow atlas tiles to redraw for this view.
 pub fn planLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *const Lighting) LocalShadows {
     const scene_handle = p.scene_handle;
@@ -343,7 +371,7 @@ pub fn planLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *con
     if (same_atlas and !local_shadows_current) {
         any_tile_dirty = false;
         for (0..lighting.tile_count) |tile| {
-            var reached = scene.movers_overflow;
+            var reached = scene.movers_overflow or hooks.movingCasters(&p.desc, .light_shadow);
             if (!reached) for (scene.movers.items) |mover| {
                 const cull = lighting.tile_views[tile];
                 var inside = true;

@@ -63,7 +63,7 @@ pub fn wanted(renderer: *Renderer, scene: *const SceneData, rays: bool) bool {
     if (rays) return true;
     if (scene.lightmaps_baking != 0) return true;
     for (scene.fluids.items) |handle| {
-        const fluid = renderer.fluids.table.get(handle) orelse continue;
+        const fluid = renderer.fluids.internal.table.get(handle) orelse continue;
         if (fluid.desc.scene_obstacles) return true;
     }
     return false;
@@ -126,7 +126,7 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
     const device = self.device;
     var still_pending: u32 = 0;
     var finished = false;
-    for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
+    for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
         if (!entry.blas_pending) continue;
         const frame_now = frame_index orelse {
             if (entry.blas_job) |job| {
@@ -195,7 +195,7 @@ fn compactBuiltBlas(self: *Renderer, cmd: *rhi.CommandEncoder) !void {
     const device = self.device;
     var budget: u32 = compactions_per_frame;
     var replaced = false;
-    for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
+    for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
         if (!entry.blas_compacting or entry.blas_pending) continue;
         var waiting = false;
         for (entry.meshes) |*mesh| {

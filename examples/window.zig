@@ -147,6 +147,11 @@ pub fn frameLimit(init: std.process.Init) !?u64 {
 ///   --validation         turn the Vulkan validation layers on
 ///   --names              name GPU objects and label passes for debuggers
 ///                        such as RenderDoc; always on in a debug build
+///   --uneven-frames      without a window, step time by an uneven, repeating
+///                        run of frame lengths instead of 1/60 s, as a
+///                        window does; finds what depends on the frame rate
+///   --memory N           print GPU memory and resident memory every N
+///                        frames, to find what grows in long runs
 pub const Stage = struct {
     init: std.process.Init,
     window: ?Window,
@@ -167,6 +172,8 @@ pub const Stage = struct {
     meter_time: f32 = 0,
     meter_frames: u32 = 0,
     timings: bool = false,
+    uneven: bool = false,
+    memory_every: u64 = 0,
     timed_frames: u32 = 0,
     timed_cpu: f64 = 0,
     /// GPU time of the slowest frame once the scene has settled.
@@ -179,6 +186,10 @@ pub const Stage = struct {
     const timing_warmup = 60;
     /// Frames left out of the slowest frame, while lighting is first gathered.
     const timing_settle = 300;
+
+    /// Frame lengths `--uneven-frames` cycles through: vsync jitter at
+    /// several refresh rates, and the odd hitch.
+    pub const uneven_frames = [_]f32{ 1.0 / 144.0, 1.0 / 98.0, 1.0 / 144.0, 1.0 / 60.0, 1.0 / 240.0, 1.0 / 75.0, 1.0 / 30.0, 1.0 / 120.0, 1.0 / 11.0, 1.0 / 165.0 };
 
     pub const width = 1280;
     pub const height = 720;
@@ -197,6 +208,8 @@ pub const Stage = struct {
         var debug_names = builtin.mode == .Debug;
         var validation = false;
         var timings = false;
+        var uneven = false;
+        var memory_every: u64 = 0;
         var args = try init.minimal.args.iterateAllocator(init.gpa);
         defer args.deinit();
         _ = args.skip();
@@ -215,6 +228,10 @@ pub const Stage = struct {
                 validation = true;
             } else if (std.mem.eql(u8, arg, "--timings")) {
                 timings = true;
+            } else if (std.mem.eql(u8, arg, "--uneven-frames")) {
+                uneven = true;
+            } else if (std.mem.eql(u8, arg, "--memory")) {
+                memory_every = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArgument, 10);
             } else if (std.mem.startsWith(u8, arg, "--")) {
                 own_value = true;
             } else return error.InvalidArgument;
@@ -242,6 +259,8 @@ pub const Stage = struct {
             .offscreen = if (headless) try renderer.views.createTarget(width, height) else null,
             .screenshot = screenshot,
             .timings = timings,
+            .uneven = uneven,
+            .memory_every = memory_every,
             .frame_limit = frame_limit,
             .last = if (window) |value| value.time() else 0,
         };
@@ -250,7 +269,7 @@ pub const Stage = struct {
     /// Starts a frame. Null when the example should end.
     pub fn begin(self: *Stage) ?Tick {
         if (self.frame_limit) |limit| if (self.frames >= limit) return null;
-        var tick = Tick{ .dt = 1.0 / 60.0, .time = 0, .size = .{ width, height } };
+        var tick = Tick{ .dt = if (self.uneven) uneven_frames[self.frames % uneven_frames.len] else 1.0 / 60.0, .time = 0, .size = .{ width, height } };
         if (self.window) |window| {
             if (window.shouldClose() or window.keyDown(glfw.GLFW_KEY_ESCAPE)) return null;
             window.pollEvents();
@@ -284,7 +303,7 @@ pub const Stage = struct {
     /// The renderer's counters, with CPU time left at 0 in a `--screenshot`
     /// run, so that its picture comes out the same every time.
     pub fn stats(self: *const Stage) gfx.Stats {
-        var counted = self.renderer.getStats();
+        var counted = self.renderer.stats();
         if (self.screenshot != null) counted.cpu_ms = 0;
         return counted;
     }
@@ -303,6 +322,7 @@ pub const Stage = struct {
         self.meter_frames += 1;
         if (self.timings and self.frames == timing_warmup) zones.totals = @splat(0);
         if (self.timings and self.frames > timing_warmup) self.noteTimings();
+        if (self.memory_every != 0 and self.frames % self.memory_every == 0) self.logMemory();
         if (self.time - self.meter_time >= 0.5) {
             self.fps = @as(f32, @floatFromInt(self.meter_frames)) / (self.time - self.meter_time);
             const images = self.renderer.device.presented.load(.monotonic);
@@ -317,9 +337,22 @@ pub const Stage = struct {
         }
     }
 
+    fn logMemory(self: *Stage) void {
+        const frame_stats = self.renderer.stats();
+        const peak = std.posix.getrusage(std.posix.rusage.SELF).maxrss;
+        var statm: [128]u8 = undefined;
+        const resident: u64 = if (std.Io.Dir.cwd().readFile(self.init.io, "/proc/self/statm", &statm)) |text| blk: {
+            var fields = std.mem.tokenizeScalar(u8, text, ' ');
+            _ = fields.next();
+            const pages = std.fmt.parseInt(u64, fields.next() orelse "0", 10) catch 0;
+            break :blk pages * 4;
+        } else |_| 0;
+        std.log.info("memory: frame {d} · gpu {d} KiB · resident {d} KiB (peak {d}) · {d} pipelines", .{ self.frames, frame_stats.gpu_memory_bytes / 1024, resident, peak, frame_stats.pipelines });
+    }
+
     fn noteTimings(self: *Stage) void {
         self.timed_frames += 1;
-        self.timed_cpu += self.renderer.getStats().cpu_ms;
+        self.timed_cpu += self.renderer.stats().cpu_ms;
         var frame_gpu: f64 = 0;
         for (self.renderer.device.passTimings()) |timing| {
             if (timing.depth == 0) frame_gpu += timing.milliseconds;
@@ -346,7 +379,7 @@ pub const Stage = struct {
             std.debug.print("{d:8.3} ms  {s}{s}\n", .{ entry.total / frames, "        "[0..@min(entry.depth * 2, 8)], entry.name });
         }
         std.debug.print("{d:8.3} ms  GPU\n{d:8.3} ms  GPU slowest frame\n{d:8.3} ms  CPU\n", .{ gpu / frames, self.timed_worst, self.timed_cpu / frames });
-        const counted = self.renderer.getStats();
+        const counted = self.renderer.stats();
         std.debug.print("{d:8.1} MiB GPU memory\n{d:8} pipelines\n", .{ @as(f64, @floatFromInt(counted.gpu_memory_bytes)) / (1024 * 1024), counted.pipelines });
         for (counted.downgraded()) |downgrade| {
             std.debug.print("{s}: asked for {s}, got {s} ({s})\n", .{ downgrade.feature, downgrade.requested, downgrade.used, @tagName(downgrade.reason) });

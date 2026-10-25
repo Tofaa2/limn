@@ -38,7 +38,7 @@ const FluidObstacle = render.FluidObstacle;
 const FluidSource = render.FluidSource;
 const Image = render.Image;
 const InstanceGroup = render.InstanceGroup;
-const Light = render.Light;
+const LightDesc = render.LightDesc;
 const Liquid = render.Liquid;
 const LiquidDesc = render.LiquidDesc;
 const LiquidSource = render.LiquidSource;
@@ -53,7 +53,7 @@ const Renderer = render.Renderer;
 const Scene = render.Scene;
 const SceneFrame = render.SceneFrame;
 const SkyDesc = render.SkyDesc;
-const Sun = render.Sun;
+const SunDesc = render.SunDesc;
 const Vec3 = render.Vec3;
 const View = render.View;
 const Water = render.Water;
@@ -245,6 +245,8 @@ pub const FrameArena = struct {
     buffer: rhi.Buffer,
     capacity: u64,
     cursor: u64 = 0,
+    /// Bytes handed out since `reset`, over every buffer.
+    used: u64 = 0,
     /// Buffers outgrown this frame, kept until `reset`.
     outgrown: [16]?rhi.Buffer = @splat(null),
 
@@ -267,6 +269,7 @@ pub const FrameArena = struct {
 
     pub fn reset(self: *FrameArena, device: *rhi.Device) void {
         self.cursor = 0;
+        self.used = 0;
         for (&self.outgrown) |*slot| {
             if (slot.*) |buffer| device.destroyBuffer(buffer);
             slot.* = null;
@@ -298,6 +301,7 @@ pub const FrameArena = struct {
             offset = 0;
         }
         self.cursor = offset + size;
+        self.used += size;
         const bytes = device.mapped(self.buffer)[@intCast(offset)..][0..size];
         return .{
             .address = device.bufferAddress(self.buffer) + offset,
@@ -484,6 +488,9 @@ pub const ModelEntry = struct {
     node_world: []Mat4 = &.{},
     info: ModelInfo = std.mem.zeroes(ModelInfo),
     references: u32 = 0,
+    /// `models.destroy` was asked while entities still used it; freed when
+    /// the last one goes.
+    orphaned: bool = false,
     blas_pending: bool = false,
     /// Frame the geometry was uploaded in; structures are built after it.
     blas_frame: ?u64 = null,
@@ -565,6 +572,8 @@ pub const EntityMark = struct {
     /// Distance moved in the last prepared frame.
     travelled: f32 = 0,
     bits: u32 = 0,
+    /// Has a parent or children, so moving it means more than its own slot.
+    related: bool = false,
 
     /// In its scene's `edited` list.
     pub const listed: u32 = 1;
@@ -610,12 +619,12 @@ pub const SceneData = struct {
     movers: std.ArrayList([4]f32) = .empty,
     movers_overflow: bool = false,
     entities: std.ArrayList(Entity) = .empty,
-    sun: Sun = .{},
+    sun: SunDesc = .{ .intensity = 0 },
     environment: ?Environment = null,
     environment_intensity: f32 = 1,
-    lights: std.ArrayList(Light) = .empty,
+    lights: std.ArrayList(LightDesc) = .empty,
     /// The handle of each light, where it has one; see `placed.zig`.
-    light_handles: std.ArrayList(?api.LightHandle) = .empty,
+    light_handles: std.ArrayList(?api.Light) = .empty,
     /// Bumped whenever the lights are replaced or moved.
     lights_version: u64 = 0,
     emitters: std.ArrayList(Emitter) = .empty,
@@ -651,7 +660,7 @@ pub const SceneData = struct {
     instance_slots: [rhi.frames_in_flight]InstanceSlot = @splat(.{}),
     decals: std.ArrayList(DecalDesc) = .empty,
     /// The handle of each decal, where it has one.
-    decal_handles: std.ArrayList(?api.DecalHandle) = .empty,
+    decal_handles: std.ArrayList(?api.Decal) = .empty,
     transmissive: bool = false,
     /// GPU instance indices of blended geometry, drawn in the forward pass.
     transparent: std.ArrayList(TransparentDraw) = .empty,
@@ -791,6 +800,11 @@ pub const LightmapState = struct {
 pub const EntityData = struct {
     lightmap: ?LightmapState = null,
     scene: Scene,
+    /// The entity it moves with, and its transform relative to that entity.
+    parent: ?Entity = null,
+    local: Mat4 = math.identity,
+    /// Entities whose `parent` this is.
+    children: std.ArrayList(Entity) = .empty,
     /// In the ray-tracing structure with an instance record, but never drawn.
     rays_only: bool = false,
     model: Model,
@@ -1133,9 +1147,18 @@ pub const LiquidState = struct {
         device.destroyBuffer(self.params_buffer);
     }
 
+    /// Keeps the sources whose numbers are all finite.
     pub fn setSources(self: *LiquidState, sources: []const LiquidSource) void {
-        self.source_count = @intCast(@min(sources.len, self.sources.len));
-        @memcpy(self.sources[0..self.source_count], sources[0..self.source_count]);
+        self.source_count = 0;
+        for (sources) |source| {
+            if (self.source_count == self.sources.len) break;
+            const numbers = source.position ++ source.velocity ++ [2]f32{ source.radius, source.rate };
+            if (!for (numbers) |number| {
+                if (!std.math.isFinite(number)) break false;
+            } else true) continue;
+            self.sources[self.source_count] = source;
+            self.source_count += 1;
+        }
         self.desc.sources = &.{};
     }
 };
@@ -1287,7 +1310,7 @@ pub const InstanceGroupData = struct {
     tints: []u32 = &.{},
     /// One set of shader parameters per copy, or empty for zeros.
     params: [][4]f32 = &.{},
-    /// The entity whose pose every copy takes; see `instances.setPose`.
+    /// The entity whose pose every copy takes; see `instances.followPose`.
     driver: ?Entity = null,
     /// First GPU instance index, and GPU instances per copy; set when the
     /// layout is rebuilt.

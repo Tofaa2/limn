@@ -41,6 +41,12 @@ MaterialInputs materialInputs<T : IMaterialTexels>(Material material, T texels, 
     inputs.emissive = material.emissive;
     if (material.emissive_texture != INVALID_ID && dot(inputs.emissive, float3(1.0)) > 0.0)
         inputs.emissive *= texels.texel(material.emissive_texture, 4u, true).rgb;
+    if ((material.flags & MATERIAL_UNLIT) != 0u) {
+        inputs.emissive = inputs.base_color.rgb;
+        inputs.base_color.rgb = float3(0.0);
+        inputs.metallic = 1.0;
+        inputs.roughness = 1.0;
+    }
     return inputs;
 }
 

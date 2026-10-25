@@ -14,9 +14,9 @@ pub const Settings = struct {
     /// an HDR surface.
     encoding: api.OutputEncoding = .auto,
     /// HDR10 only: brightness of white, in nits.
-    paper_white: f32 = 200,
+    paper_white_nits: f32 = 200,
     /// HDR10 only: peak brightness of the display, in nits.
-    peak: f32 = 1000,
+    peak_nits: f32 = 1000,
 };
 
 pub fn preset(quality: api.Quality) Settings {

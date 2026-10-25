@@ -59,10 +59,10 @@ pub fn main(init: std.process.Init) !void {
     };
     for (walls) |wall| {
         const model = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = wall.color, .metallic = 0, .roughness = wall.roughness } }});
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.mul(math.translation(wall.at), math.scaling(wall.size)) });
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.mul(math.translation(wall.at), math.scaling(wall.size)) });
     }
     const bar = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0, 0, 0, 1 }, .emissive = .{ 9, 6.5, 3.5 }, .metallic = 0, .roughness = 0.5 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = bar, .transform = math.mul(math.translation(.{ 2.6, 3.0, -1.2 }), math.scaling(.{ 2.4, 0.08, 0.3 })) });
+    _ = try renderer.entities.create(scene, .{ .model = bar, .transform = math.mul(math.translation(.{ 2.6, 3.0, -1.2 }), math.scaling(.{ 2.4, 0.08, 0.3 })) });
 
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
@@ -76,10 +76,10 @@ pub fn main(init: std.process.Init) !void {
     };
     for (balls) |ball| {
         const model = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = ball.material }});
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(ball.at) });
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.translation(ball.at) });
     }
     const helmet = try renderer.models.load("examples/assets/DamagedHelmet.glb");
-    _ = try renderer.entities.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ -3.0, 1.0, 1.8 }), math.mul(math.rotationY(0.9), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.8)))) });
+    _ = try renderer.entities.create(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ -3.0, 1.0, 1.8 }), math.mul(math.rotationY(0.9), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.8)))) });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(init.gpa);
@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
         if (orbiting) orbit += tick.dt * 0.35;
 
         list.clear();
-        const stats = renderer.getStats();
+        const stats = renderer.stats();
         try list.rect(.{ .x = 12, .y = 12, .width = 560, .height = 58 }, gfx.Color.rgba(10, 12, 20, 180));
         const line = if (traced)
             try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · path traced by {s} · {d} bounces · {d} frames gathered", .{ stage.fps, stage.gpu_ms, switch (tracer) {

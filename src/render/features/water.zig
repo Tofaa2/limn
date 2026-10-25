@@ -43,7 +43,7 @@ pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
         try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
         cmd.bindPipeline(try renderer.internal.pipelines.of(waterPipeline));
         for (scene.waters.items) |item| {
-            const state = renderer.waters.table.get(item) orelse continue;
+            const state = renderer.waters.internal.table.get(item) orelse continue;
             if (state.params_frame != renderer.internal.frame_index) continue;
             cmd.pushConstants(water_passes_push.ShadePush{
                 .frame = frame_address,
@@ -57,14 +57,14 @@ pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
         cmd.endRendering();
         var any_depth = false;
         for (scene.waters.items) |item| {
-            const state = renderer.waters.table.get(item) orelse continue;
+            const state = renderer.waters.internal.table.get(item) orelse continue;
             if (state.params_frame == renderer.internal.frame_index and state.desc.write_depth) any_depth = true;
         }
         if (any_depth) {
             try cmd.beginRendering(.{ .depth = .{ .texture = view.depth, .load = .load } });
             cmd.bindPipeline(try renderer.internal.pipelines.of(waterDepthPipeline));
             for (scene.waters.items) |item| {
-                const state = renderer.waters.table.get(item) orelse continue;
+                const state = renderer.waters.internal.table.get(item) orelse continue;
                 if (state.params_frame != renderer.internal.frame_index or !state.desc.write_depth) continue;
                 cmd.pushConstants(water_passes_push.SurfacePush{
                     .frame = frame_address,
@@ -78,7 +78,7 @@ pub fn drawWater(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.endRendering();
         }
         for (scene.waters.items) |item| {
-            const state = renderer.waters.table.get(item) orelse continue;
+            const state = renderer.waters.internal.table.get(item) orelse continue;
             if (state.params_frame != renderer.internal.frame_index or !state.desc.underwater) continue;
             const local = math.transformPoint(math.inverse(state.desc.transform), desc.camera.position);
             if (local[1] >= 0 or @abs(local[0]) > 0.5 or @abs(local[2]) > 0.5) continue;

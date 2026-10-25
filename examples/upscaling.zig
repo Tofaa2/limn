@@ -122,7 +122,7 @@ pub fn main(init: std.process.Init) !void {
     for (bars.items) |_| try bar_colors.append(gpa, .{ 0.2, 0.13, 0.08 });
     try renderer.instances.setColors(try renderer.instances.create(scene, block, bars.items), bar_colors.items);
     _ = try renderer.instances.create(scene, ball, balls.items);
-    _ = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.mul(math.translation(.{ 0, 1.2, 0 }), math.uniformScaling(2.4)) });
+    _ = try renderer.entities.create(scene, .{ .model = ball, .transform = math.mul(math.translation(.{ 0, 1.2, 0 }), math.uniformScaling(2.4)) });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(gpa);

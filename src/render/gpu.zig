@@ -89,6 +89,8 @@ pub const material_blend: u32 = 4;
 pub const material_specular_glossiness: u32 = 8;
 /// See `gltf.Material.sway_weights`.
 pub const material_sway_weights: u32 = 16;
+/// Drawn in its base color, unlit; traced light sees it as glowing that color.
+pub const material_unlit: u32 = 32;
 
 /// Cascades of the sun's shadow map. Shaders hard-code 4.
 pub const cascade_count = frame_constants.cascade_count;

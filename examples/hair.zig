@@ -221,7 +221,7 @@ pub fn main(init: std.process.Init) !void {
         .indices = &ground_indices,
         .material = .{ .base_color = .{ 0.35, 0.36, 0.38, 1 }, .metallic = 0, .roughness = 0.8 },
     }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.05, 0 }) });
+    _ = try renderer.entities.create(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.05, 0 }) });
 
     var from_file = true;
     const points = loadHair(gpa, init.io, hair_path) catch |failure| made: {
@@ -252,7 +252,7 @@ pub fn main(init: std.process.Init) !void {
 
     const upright = math.mul(math.rotationX(-std.math.pi * 0.5), math.uniformScaling(scale));
     var placement = math.mul(math.translation(.{ 0, head_height, 0 }), upright);
-    const head_entity = try renderer.entities.spawn(scene, .{ .model = head, .transform = placement });
+    const head_entity = try renderer.entities.create(scene, .{ .model = head, .transform = placement });
     var simulation = gfx.HairSimulation{};
     const hair = try renderer.hairs.create(scene, .{
         .points = points,

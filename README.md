@@ -38,7 +38,7 @@ defer renderer.deinit();
 
 const scene = try renderer.scenes.create();
 const model = try renderer.models.load("helmet.glb");
-_ = try renderer.entities.spawn(scene, .{ .model = model });
+_ = try renderer.entities.create(scene, .{ .model = model });
 renderer.scenes.setSun(scene, .{ .direction = .{ -0.4, -1.0, -0.3 }, .intensity = 5 });
 
 while (running) {
@@ -48,6 +48,19 @@ while (running) {
     });
 }
 ```
+
+## Where to start
+
+| Need | Start from | Example |
+|---|---|---|
+| 2D only (UI, tools, games) | a `View` with draw lists and no scene | `canvas`, `text` |
+| 2D over 3D | draw lists on a scene view | `views`, `post` |
+| Simple 3D at the least cost | `Settings.lightweight` | `lightweight` |
+| Photoreal 3D | `Settings{}` or `Settings.preset` | `bistro`, `meadow`, `rtx`, `pathtrace` |
+| Your own GPU work in a frame | `ViewDesc.passes`, `materials.createShader` | `passes`, `shader` |
+| No renderer, just the device layer | `rhi.Device` | `triangle` |
+
+`zig build costs` prints what frames record as each kind of scene grows.
 
 ## Build
 
