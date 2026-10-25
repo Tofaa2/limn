@@ -47,9 +47,9 @@ pub const Slot = enum {
     /// The HDR picture as it stands.
     hdr,
     ambient_occlusion,
-    /// Light bounced off nearby surfaces, found with the occlusion.
+    /// LightDesc bounced off nearby surfaces, found with the occlusion.
     occluder_light,
-    /// Light from the irradiance probes gathered at a reduced resolution,
+    /// LightDesc from the irradiance probes gathered at a reduced resolution,
     /// which shading upsamples; absent when shading reads the probes itself.
     diffuse_gi,
     /// What shading writes for the reflection technique: each surface's

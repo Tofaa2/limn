@@ -22,6 +22,7 @@ static const uint MATERIAL_DOUBLE_SIDED = 2u;
 static const uint MATERIAL_BLEND = 4u;
 static const uint MATERIAL_SPECULAR_GLOSSINESS = 8u;
 static const uint MATERIAL_SWAY_WEIGHTS = 16u;
+static const uint MATERIAL_UNLIT = 32u;
 static const uint INSTANCE_SKINNED = 1u;
 static const uint INSTANCE_MOVING = 2u;
 static const uint INSTANCE_NO_DECALS = 4u;

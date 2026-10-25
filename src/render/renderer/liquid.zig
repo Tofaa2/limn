@@ -13,17 +13,23 @@ const Entity = api.Entity;
 const Liquid = api.Liquid;
 const LiquidDesc = api.LiquidDesc;
 const max_liquids = renderer_state.max_liquids;
+const max_liquid_sources = @typeInfo(@FieldType(renderer_state.LiquidState, "sources")).array.len;
 const liquid_cell_slots = renderer_state.liquid_cell_slots;
 const LiquidState = renderer_state.LiquidState;
 
 /// Volumes of particle-simulated liquid.
 pub const Liquids = struct {
-    table: handle.HandleTable(renderer_state.LiquidState, api.LiquidTag),
+    internal: Internal,
 
-    /// Frees what one of them holds, as when the renderer is destroyed.
-    pub fn free(owner: *Renderer, entry: *renderer_state.LiquidState) void {
-        entry.deinit(owner.device);
-    }
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.LiquidState, api.LiquidTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.LiquidState) void {
+            entry.deinit(owner.device);
+        }
+    };
 
     fn renderer(liquids: *Liquids) *Renderer {
         return @alignCast(@fieldParentPtr("liquids", liquids));
@@ -42,7 +48,8 @@ pub const Liquids = struct {
         const self = liquids.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.liquids.table.get(liquid) orelse return;
+        if (desc.sources.len > max_liquid_sources) return error.TooManyLiquidSources;
+        const state = self.liquids.internal.table.get(liquid) orelse return;
         const radius = state.desc.particle_radius;
         state.desc = desc;
         state.desc.particle_radius = radius;
@@ -50,11 +57,11 @@ pub const Liquids = struct {
     }
 
     /// Particles of a liquid currently in use.
-    pub fn particles(liquids: *Liquids, liquid: Liquid) u32 {
+    pub fn particleCount(liquids: *Liquids, liquid: Liquid) u32 {
         const self = liquids.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.liquids.table.get(liquid) orelse return 0;
+        const state = self.liquids.internal.table.get(liquid) orelse return 0;
         return state.live;
     }
 
@@ -62,13 +69,13 @@ pub const Liquids = struct {
     pub fn destroy(liquids: *Liquids, liquid: Liquid) void {
         const self = liquids.renderer();
         var proxy: ?Entity = null;
-        defer if (proxy) |entity| self.entities.despawn(entity);
+        defer if (proxy) |entity| self.entities.destroy(entity);
         self.lock();
         defer self.unlock();
-        var removed = self.liquids.table.remove(liquid) orelse return;
+        var removed = self.liquids.internal.table.remove(liquid) orelse return;
         proxy = removed.proxy;
         removed.deinit(self.device);
-        const scene = self.scenes.table.get(removed.scene) orelse return;
+        const scene = self.scenes.internal.table.get(removed.scene) orelse return;
         for (scene.liquids.items, 0..) |item, index| if (std.meta.eql(item, liquid)) {
             _ = scene.liquids.orderedRemove(index);
             break;
@@ -88,21 +95,27 @@ fn attachLiquidProxy(self: *Renderer, scene: Scene, liquid: Liquid, desc: Liquid
         if (self.internal.liquid_proxy_model == null) self.internal.liquid_proxy_model = created;
         break :made self.internal.liquid_proxy_model.?;
     };
-    const entity = try self.entities.spawn(scene, .{ .model = model, .transform = desc.transform, .visible = false, .tint = desc.color });
-    self.lock();
-    defer self.unlock();
-    const data = self.entities.table.get(entity) orelse return;
-    data.rays_only = true;
-    data.visible = true;
-    if (self.liquids.table.get(liquid)) |state| state.proxy = entity;
-    if (self.scenes.table.get(scene)) |scene_data| scene_data.layout_dirty = true;
+    const entity = try self.entities.create(scene, .{ .model = model, .transform = desc.transform, .visible = false, .tint = desc.color });
+    const attached = attach: {
+        self.lock();
+        defer self.unlock();
+        const data = self.entities.internal.table.get(entity) orelse return;
+        const state = self.liquids.internal.table.get(liquid) orelse break :attach false;
+        data.rays_only = true;
+        data.visible = true;
+        state.proxy = entity;
+        if (self.scenes.internal.table.get(scene)) |scene_data| scene_data.layout_dirty = true;
+        break :attach true;
+    };
+    if (!attached) self.entities.destroy(entity);
 }
 
 fn createLiquidAlone(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
     self.lock();
     defer self.unlock();
-    const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+    const data = self.scenes.internal.table.get(scene) orelse return error.InvalidScene;
     if (data.liquids.items.len == max_liquids) return error.TooManyLiquids;
+    if (desc.sources.len > max_liquid_sources) return error.TooManyLiquidSources;
     const device = self.device;
     const radius = std.math.clamp(desc.particle_radius, 0.002, 10);
     const reach = radius * 4;
@@ -110,13 +123,15 @@ fn createLiquidAlone(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
     var grid: [3]i32 = undefined;
     var cell_count: u64 = 1;
     inline for (0..3) |axis| {
-        grid[axis] = @intFromFloat(@max(@ceil(box.extent[axis] / reach), 1));
+        const cells = @ceil(box.extent[axis] / reach);
+        if (!(cells <= 1 << 21)) return error.LiquidTooFine;
+        grid[axis] = @intFromFloat(@max(cells, 1));
         cell_count *= @intCast(grid[axis]);
     }
     if (cell_count > 2 * 1024 * 1024) return error.LiquidTooFine;
     const capacity = std.math.clamp(desc.capacity, 64, 1 << 20);
     var block: [3]u32 = undefined;
-    inline for (0..3) |axis| block[axis] = @intFromFloat(@max(@floor(std.math.clamp(desc.fill[axis], 0, 1) * box.extent[axis] / (radius * 2) - 1), 0));
+    inline for (0..3) |axis| block[axis] = @intFromFloat(std.math.clamp(@floor(std.math.clamp(desc.fill[axis], 0, 1) * box.extent[axis] / (radius * 2) - 1), 0, 1 << 21));
     const particles = try device.createBuffer(.{ .name = "liquid particles", .size = @as(u64, capacity) * @sizeOf(gpu.LiquidParticle), .usage = .{ .storage = true } });
     errdefer device.destroyBuffer(particles);
     const shapes = try device.createBuffer(.{ .name = "liquid shapes", .size = @as(u64, capacity) * 64, .usage = .{ .storage = true } });
@@ -142,8 +157,8 @@ fn createLiquidAlone(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
     };
     state.desc.particle_radius = radius;
     state.setSources(desc.sources);
-    const liquid = try self.liquids.table.insert(state);
-    errdefer _ = self.liquids.table.remove(liquid);
+    const liquid = try self.liquids.internal.table.insert(state);
+    errdefer _ = self.liquids.internal.table.remove(liquid);
     try data.liquids.append(self.internal.gpa, liquid);
     return liquid;
 }

@@ -4,6 +4,9 @@ const liquid_push = @import("../shaders/push/liquid.zig");
 const water_passes_push = @import("../shaders/push/water_passes.zig");
 const fluid_passes_push = @import("../shaders/push/fluid_passes.zig");
 const render = @import("../renderer.zig");
+const restyleEntity = render.restyleEntity;
+const moveEntity = render.moveEntity;
+const transformOf = render.transformOf;
 const hair_feature = @import("hair.zig");
 const particles_feature = @import("particles.zig");
 const fluids_feature = @import("fluids.zig");
@@ -103,12 +106,14 @@ pub fn steadyStep(owed: *f32, elapsed: f32) f32 {
 /// Most water steps taken in one frame; time beyond them is dropped.
 const max_water_steps = 8;
 
-/// How many steps of exactly `step` seconds to take for `elapsed`, carrying
-/// the remainder in `owed`. The water's wave solver gains energy when its
-/// step changes from one step to the next, so it never takes a ragged one.
-fn fixedSteps(owed: *f32, elapsed: f32, step: f32) u32 {
-    if (!(elapsed > 0)) return 0;
-    owed.* = @min(owed.* + elapsed, step * max_water_steps);
+/// How many steps of exactly `step` seconds to take for `elapsed`, at most
+/// `most`, carrying the remainder in `owed` and dropping time beyond `most`.
+/// Solvers that keep velocity as a difference of positions, or step waves
+/// near their stability limit, gain energy when the step changes from one
+/// step to the next, so they never take a ragged one.
+fn fixedSteps(owed: *f32, elapsed: f32, step: f32, most: u32) u32 {
+    if (!(elapsed > 0) or !(step > 0)) return 0;
+    owed.* = @min(owed.* + elapsed, step * @as(f32, @floatFromInt(most)));
     const steps: u32 = @intFromFloat(@floor(owed.* / step));
     owed.* -= @as(f32, @floatFromInt(steps)) * step;
     return steps;
@@ -145,14 +150,15 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
     defer cmd.endScope();
     const Push = liquid_push.SimPush;
     for (scene.liquids.items) |item| {
-        const state = renderer.liquids.table.get(item) orelse continue;
+        const state = renderer.liquids.internal.table.get(item) orelse continue;
         const desc = state.desc;
         const box = liquidBox(desc.transform);
         const radius = desc.particle_radius;
         const spacing = radius * 2;
-        const frame_dt = steadyStep(&state.time_owed, delta_time * desc.time_scale);
         const substeps = std.math.clamp(desc.substeps, 1, 8);
-        const dt = frame_dt / @as(f32, @floatFromInt(substeps));
+        const dt = 1.0 / (60.0 * @as(f32, @floatFromInt(substeps)));
+        const steps = fixedSteps(&state.time_owed, delta_time * desc.time_scale, dt, substeps * 2);
+        const frame_dt = dt * @as(f32, @floatFromInt(steps));
         var record = gpu.Liquid{
             .from_box = .{
                 box.axes[0][0], box.axes[0][1], box.axes[0][2], 0,
@@ -201,12 +207,12 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
         }
         if (desc.obstacles) for (scene.entities.items) |entity_handle| {
             if (record.sphere_count == record.spheres.len) break;
-            const entity = renderer.entities.table.get(entity_handle) orelse continue;
+            const entity = renderer.entities.internal.table.get(entity_handle) orelse continue;
             if (!entity.visible) continue;
-            const model = renderer.models.table.get(entity.model) orelse continue;
+            const model = renderer.models.internal.table.get(entity.model) orelse continue;
             if (model.state != .ready) continue;
-            const center = math.sub(math.transformPoint(renderer.transformOf(entity_handle), model.info.bounds_center), box.corner);
-            const reach = model.info.bounds_radius * math.maxScale(renderer.transformOf(entity_handle));
+            const center = math.sub(math.transformPoint(transformOf(renderer, entity_handle), model.info.bounds_center), box.corner);
+            const reach = model.info.bounds_radius * math.maxScale(transformOf(renderer, entity_handle));
             const local = Vec3{ math.dot(center, box.axes[0]), math.dot(center, box.axes[1]), math.dot(center, box.axes[2]) };
             var inside = true;
             inline for (0..3) |axis| {
@@ -227,7 +233,6 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             .mode = 0,
             .flip = 0,
         };
-        const steps: u32 = if (frame_dt > 0) substeps else 0;
         const records = try arena.alloc(device, gpu.Liquid, @max(steps, 1));
         records.items[0] = record;
         for (0..steps) |step| {
@@ -239,11 +244,11 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             for (state.sources[0..state.source_count], 0..) |source, index| {
                 const speed = math.length(source.velocity);
                 const mouth = @max(source.radius, radius);
-                const per_layer = @max(@round(std.math.pi * mouth * mouth / (spacing * spacing)), 1);
+                const per_layer = std.math.clamp(@round(std.math.pi * mouth * mouth / (spacing * spacing)), 1, @as(f32, @floatFromInt(state.capacity)));
                 const layers_a_second = if (source.rate > 0) source.rate / per_layer else speed / spacing;
                 state.owed[index] += layers_a_second * dt;
                 const room: u32 = (state.capacity - state.live) / @as(u32, @intFromFloat(per_layer));
-                const layers: u32 = @min(@as(u32, @intFromFloat(@floor(state.owed[index]))), room);
+                const layers: u32 = @intFromFloat(@min(@floor(state.owed[index]), @as(f32, @floatFromInt(room))));
                 state.owed[index] -= @floor(state.owed[index]);
                 const born: u32 = layers * @as(u32, @intFromFloat(per_layer));
                 record.sources[index].layer = per_layer;
@@ -315,13 +320,13 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
         }
         state.params = params_address + (records.items.len - 1) * stride;
         state.params_frame = renderer.internal.frame_index;
-        if (state.proxy) |stand_in| if (renderer.entities.table.get(stand_in)) |proxy| {
+        if (state.proxy) |stand_in| if (renderer.entities.internal.table.get(stand_in)) |proxy| {
             const volume = @as(f32, @floatFromInt(state.live)) * spacing * spacing * spacing;
             const filled = std.math.clamp(volume / (box.extent[0] * box.extent[1] * box.extent[2]), 0.002, 1);
-            renderer.moveEntity(stand_in, math.mul(desc.transform, math.mul(math.translation(.{ 0, -0.5 + filled * 0.5, 0 }), math.scaling(.{ 1, filled, 1 }))), false);
+            moveEntity(renderer, stand_in, math.mul(desc.transform, math.mul(math.translation(.{ 0, -0.5 + filled * 0.5, 0 }), math.scaling(.{ 1, filled, 1 }))), false);
             if (proxy.tint != packTint(desc.color)) {
                 proxy.tint = packTint(desc.color);
-                renderer.restyleEntity(stand_in);
+                restyleEntity(renderer, stand_in);
             }
         };
     }
@@ -334,7 +339,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     cmd.beginScope("water simulation");
     defer cmd.endScope();
     for (scene.waters.items) |item| {
-        const state = renderer.waters.table.get(item) orelse continue;
+        const state = renderer.waters.internal.table.get(item) orelse continue;
         const desc = state.desc;
         if (!state.cleared) {
             for (state.state) |texture| {
@@ -347,8 +352,8 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         const width = @max(math.length(.{ t[0], t[1], t[2] }), 1e-6);
         const up = @max(math.length(.{ t[4], t[5], t[6] }), 1e-6);
         const cells_a_second = @max(desc.wave_speed, 0) * @as(f32, @floatFromInt(state.size[0])) / width;
-        const step = @min(1.0 / 60.0, 0.65 / @max(cells_a_second, 1e-6));
-        const steps = fixedSteps(&state.time_owed, delta_time * desc.time_scale, step);
+        const step = std.math.clamp(0.65 / @max(cells_a_second, 1e-6), 1e-5, 1.0 / 60.0);
+        const steps = fixedSteps(&state.time_owed, delta_time * desc.time_scale, step, max_water_steps);
         const dt = step * @as(f32, @floatFromInt(steps));
         state.rain_pending += @max(desc.rain, 0) * dt;
         var random = std.Random.DefaultPrng.init(renderer.internal.frame_index *% 0x9e3779b97f4a7c15 +% 7);
@@ -371,12 +376,12 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             const to_sheet = math.inverse(t);
             for (scene.entities.items) |entity_handle| {
                 if (state.ripple_count == state.ripples.len) break;
-                const entity = renderer.entities.table.get(entity_handle) orelse continue;
+                const entity = renderer.entities.internal.table.get(entity_handle) orelse continue;
                 if (!entity.visible or renderer.internal.entity_marks.items[entity_handle.index].travelled < 1e-4) continue;
-                const model = renderer.models.table.get(entity.model) orelse continue;
+                const model = renderer.models.internal.table.get(entity.model) orelse continue;
                 if (model.state != .ready) continue;
-                const center = math.transformPoint(renderer.transformOf(entity_handle), model.info.bounds_center);
-                const radius = model.info.bounds_radius * math.maxScale(renderer.transformOf(entity_handle));
+                const center = math.transformPoint(transformOf(renderer, entity_handle), model.info.bounds_center);
+                const radius = model.info.bounds_radius * math.maxScale(transformOf(renderer, entity_handle));
                 const local = math.transformPoint(to_sheet, center);
                 const above = local[1] * up;
                 if (@abs(above) >= radius or @abs(local[0]) > 0.5 or @abs(local[2]) > 0.5) continue;
@@ -396,7 +401,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
                 state.ripple_count += 1;
             }
         }
-        if (state.splash) |spraying| if (renderer.emitters.table.get(spraying)) |emitter| {
+        if (state.splash) |spraying| if (renderer.emitters.internal.table.get(spraying)) |emitter| {
             var spray = splashDesc(desc);
             if (splash_strength > 0.15) {
                 spray.position = splash_at;
@@ -424,7 +429,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             .foam = std.math.clamp(desc.foam, 0, 1),
             .caustics = std.math.clamp(desc.caustics, 0, 1),
             .detail = std.math.clamp(desc.ripple_detail, 0, 2),
-            .mask = if (desc.mask) |image| image.index else gpu.invalid_id,
+            .mask = renderer.images.indexOf(desc.mask),
             .ripples = state.ripples,
         };
         if (steps > 0) state.ripple_count = 0;
@@ -454,7 +459,7 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
     cmd.beginScope("fluid simulation");
     defer cmd.endScope();
     for (scene.fluids.items) |item| {
-        const state = renderer.fluids.table.get(item) orelse continue;
+        const state = renderer.fluids.internal.table.get(item) orelse continue;
         const desc = state.desc;
         if (!state.cleared) {
             for (state.textures()) |texture| {

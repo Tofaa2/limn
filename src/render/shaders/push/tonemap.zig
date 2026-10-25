@@ -24,7 +24,8 @@ pub const Push = extern struct {
     lut_texture: u32 = 0xffff_ffff,
     lut_strength: f32 = 1,
     flare: f32 = 0,
-    flare_pad: u32 = 0,
+    /// 0 skips the tone curve: colors are only exposed, graded and encoded.
+    curve: u32 = 1,
 
     pub const references = .{ .frame = "FrameConstants" };
 };

@@ -19,13 +19,18 @@ const destroyEmitterLocked = @import("emitters.zig").destroyEmitterLocked;
 
 /// Sheets of simulated water.
 pub const Waters = struct {
-    table: handle.HandleTable(renderer_state.WaterState, api.WaterTag),
+    internal: Internal,
 
-    /// Frees what one of them holds, as when the renderer is destroyed.
-    pub fn free(owner: *Renderer, entry: *renderer_state.WaterState) void {
-        if (entry.splash) |emitter| destroyEmitterLocked(owner, emitter);
-        for (entry.state) |texture| owner.device.destroyTexture(texture);
-    }
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.WaterState, api.WaterTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.WaterState) void {
+            if (entry.splash) |emitter| destroyEmitterLocked(owner, emitter);
+            for (entry.state) |texture| owner.device.destroyTexture(texture);
+        }
+    };
 
     fn renderer(waters: *Waters) *Renderer {
         return @alignCast(@fieldParentPtr("waters", waters));
@@ -36,15 +41,15 @@ pub const Waters = struct {
         const self = waters.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+        const data = self.scenes.internal.table.get(scene) orelse return error.InvalidScene;
         if (data.waters.items.len == max_waters) return error.TooManyWaters;
         var state = WaterState{ .scene = scene, .desc = desc };
         if (desc.splashes > 0) state.splash = try createEmitterLocked(self, scene, simulation_feature.splashDesc(desc));
         errdefer if (state.splash) |emitter| destroyEmitterLocked(self, emitter);
         try createWaterTextures(self, &state);
         errdefer for (state.state) |texture| self.device.destroyTexture(texture);
-        const water = try self.waters.table.insert(state);
-        errdefer _ = self.waters.table.remove(water);
+        const water = try self.waters.internal.table.insert(state);
+        errdefer _ = self.waters.internal.table.remove(water);
         try data.waters.append(self.internal.gpa, water);
         return water;
     }
@@ -55,18 +60,21 @@ pub const Waters = struct {
         const self = waters.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.waters.table.get(water) orelse return;
+        const state = self.waters.internal.table.get(water) orelse return;
         const resized = !std.mem.eql(u32, &desc.resolution, &state.desc.resolution);
         if (desc.splashes > 0 and state.splash == null) state.splash = try createEmitterLocked(self, state.scene, simulation_feature.splashDesc(desc));
         if (desc.splashes <= 0) if (state.splash) |emitter| {
             destroyEmitterLocked(self, emitter);
             state.splash = null;
         };
-        state.desc = desc;
         if (resized) {
+            var fresh = state.*;
+            fresh.desc = desc;
+            try createWaterTextures(self, &fresh);
             for (state.state) |texture| self.device.destroyTexture(texture);
-            try createWaterTextures(self, state);
+            state.* = fresh;
         }
+        state.desc = desc;
     }
 
     /// Dents the water at a world position; `radius` and `depth` in world
@@ -75,7 +83,7 @@ pub const Waters = struct {
         const self = waters.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.waters.table.get(water) orelse return;
+        const state = self.waters.internal.table.get(water) orelse return;
         if (state.ripple_count == state.ripples.len) return;
         const t = state.desc.transform;
         const local = math.transformPoint(math.inverse(t), position);

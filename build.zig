@@ -127,6 +127,28 @@ const examples: []const Example = &.{
         .windowed = true,
     },
     .{
+        .name = "lightweight",
+        .root = "examples/lightweight.zig",
+        .description = "Simple 3D at its smallest cost, with a HUD of what each frame records",
+        .windowed = true,
+    },
+    .{
+        .name = "passes",
+        .root = "examples/passes.zig",
+        .description = "The application's own compute, geometry, tone curve and ink lines inside a lit scene",
+        .windowed = true,
+        .shaders = &.{
+            .{ .src = "examples/shaders/passes.slang", .name = "passes_move.comp.spv", .entry = "moveMain", .stage = "compute" },
+            .{ .src = "examples/shaders/passes.slang", .name = "passes_fullscreen.vert.spv", .entry = "fullscreenMain", .stage = "vertex" },
+            .{ .src = "examples/shaders/passes.slang", .name = "passes_blob.frag.spv", .entry = "orbsMain", .stage = "fragment" },
+            .{ .src = "examples/shaders/passes.slang", .name = "passes_copy.frag.spv", .entry = "copyMain", .stage = "fragment" },
+            .{ .src = "examples/shaders/passes.slang", .name = "passes_curve.frag.spv", .entry = "curveMain", .stage = "fragment" },
+            .{ .src = "examples/shaders/passes.slang", .name = "passes_outline.frag.spv", .entry = "outlineMain", .stage = "fragment" },
+            .{ .src = "examples/shaders/passes.slang", .name = "passes_shadow.frag.spv", .entry = "shadowMain", .stage = "fragment" },
+            .{ .src = "examples/shaders/passes.slang", .name = "passes_light_shadow.frag.spv", .entry = "lightShadowMain", .stage = "fragment" },
+        },
+    },
+    .{
         .name = "reflections",
         .root = "examples/reflections.zig",
         .description = "Polished floor, spheres from mirror to rough, metals and lacquer, with reflections",
@@ -490,6 +512,18 @@ pub fn build(b: *std.Build) void {
     run_checks.has_side_effects = true;
     b.step("checks", "Check picking, shader reloading, streaming and running out of memory, without a window").dependOn(&run_checks.step);
     verify_step.dependOn(&run_checks.step);
+    const costs_module = b.createModule(.{
+        .root_source_file = b.path("src/costs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    costs_module.addImport("limn", renderer);
+    const costs = b.addExecutable(.{ .name = "costs", .root_module = costs_module, .use_llvm = true });
+    check_step.dependOn(&costs.step);
+    const run_costs = b.addRunArtifact(costs);
+    run_costs.has_side_effects = true;
+    if (b.args) |args| run_costs.addArgs(args);
+    b.step("costs", "Print what frames record as 2D and 3D scenes grow, without a window").dependOn(&run_costs.step);
     const verify_particles = b.addRunArtifact(particles_example.?);
     verify_particles.has_side_effects = true;
     verify_particles.addArgs(&.{ "--frames", "90", "--screenshot" });

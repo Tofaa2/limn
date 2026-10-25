@@ -155,7 +155,9 @@ pub const TextureRef = struct {
     uv_set: u8 = 0,
 };
 
-/// glTF metallic-roughness material plus the extensions noted on the fields.
+/// glTF metallic-roughness material plus the extensions noted on the fields,
+/// with the same defaults for loaded files and `MeshDesc` except where a file
+/// leaves a factor out (`file_defaults`).
 /// Colors are linear. Texture references index a loaded model's images and
 /// are ignored for `MeshDesc.material`.
 pub const Material = struct {
@@ -164,9 +166,9 @@ pub const Material = struct {
     /// Linear RGB, with `KHR_materials_emissive_strength` multiplied in.
     emissive: [3]f32 = .{ 0, 0, 0 },
     /// 0..1, multiplied with the blue (metallic) and green (roughness) channels
-    /// of `metallic_roughness_texture`.
-    metallic: f32 = 1,
-    roughness: f32 = 1,
+    /// of `metallic_roughness_texture`. Loaded files start from glTF's 1 and 1.
+    metallic: f32 = 0,
+    roughness: f32 = 0.6,
     /// Scales the normal map's X and Y.
     normal_scale: f32 = 1,
     /// 0 ignores the occlusion map, 1 applies it fully.
@@ -219,6 +221,10 @@ pub const Material = struct {
     anisotropy_rotation: f32 = 0,
     /// Subsurface scattering approximation, 0..1. Applied to the sun only.
     subsurface: f32 = 0,
+    /// Drawn in its base color with vertex colors and tint, untouched by light
+    /// and shadow; fog still covers it (`KHR_materials_unlit`). Reflections,
+    /// path tracing and probes see it as glowing that color.
+    unlit: bool = false,
     /// Scale, rotation (radians), then offset, applied to texture coordinates.
     /// Textures with their own `TextureRef.transform` use that instead.
     uv_scale: [2]f32 = .{ 1, 1 },
@@ -1111,12 +1117,15 @@ fn addressMode(mode: gltf.WrapMode) SamplerData.AddressMode {
     };
 }
 
+/// What glTF assumes where a file leaves a factor out.
+const file_defaults = Material{ .metallic = 1, .roughness = 1 };
+
 fn loadMaterials(arena: std.mem.Allocator, data: *gltf.Data, model: *Model) !void {
     model.materials = try arena.alloc(Material, data.materials_count + 1);
-    for (model.materials) |*material| material.* = .{};
+    for (model.materials) |*material| material.* = file_defaults;
     if (data.materials_count == 0) return;
     for (data.materials.?[0..data.materials_count], 0..) |source, index| {
-        var material: Material = .{};
+        var material = file_defaults;
         if (source.has_pbr_metallic_roughness != 0) {
             const pbr = source.pbr_metallic_roughness;
             material.base_color = pbr.base_color_factor;
@@ -1146,6 +1155,7 @@ fn loadMaterials(arena: std.mem.Allocator, data: *gltf.Data, model: *Model) !voi
         if (source.has_transmission != 0) material.transmission = source.transmission.transmission_factor;
         if (source.has_ior != 0) material.ior = source.ior.ior;
         if (source.has_volume != 0 and source.volume.thickness_factor > 0) material.thickness = source.volume.thickness_factor;
+        material.unlit = source.unlit != 0;
         if (source.has_anisotropy != 0) {
             material.anisotropy = source.anisotropy.anisotropy_strength;
             material.anisotropy_rotation = source.anisotropy.anisotropy_rotation;
@@ -2191,7 +2201,9 @@ pub const MeshDesc = struct {
     uvs1: ?[]const [2]f32 = null,
     /// Triangle list, counter-clockwise front faces.
     indices: []const u32,
-    material: Material = .{ .metallic = 0, .roughness = 0.6 },
+    /// Its texture fields are ignored; give textures with
+    /// `Renderer.materials.setTextures` once the model is ready.
+    material: Material = .{},
 };
 
 /// Builds a model from in-memory meshes, one instance each at the model
@@ -2210,6 +2222,8 @@ pub fn fromMeshes(gpa: std.mem.Allocator, descs: []const MeshDesc, lods: LodOpti
         if (desc.positions.len == 0 or desc.indices.len < 3) return error.EmptyMesh;
         if (desc.normals) |normals| if (normals.len != desc.positions.len) return error.InvalidMesh;
         if (desc.uvs) |uvs| if (uvs.len != desc.positions.len) return error.InvalidMesh;
+        if (desc.uvs1) |uvs1| if (uvs1.len != desc.positions.len) return error.InvalidMesh;
+        if (desc.colors) |colors| if (colors.len != desc.positions.len) return error.InvalidMesh;
         for (desc.indices) |value| if (value >= desc.positions.len) return error.InvalidMesh;
         const source = try gpa.alloc(FatVertex, desc.positions.len);
         defer gpa.free(source);

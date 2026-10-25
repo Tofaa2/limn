@@ -37,7 +37,8 @@ pub const Settings = struct {
     /// after a rough bounce, where the GPU traces rays. Much less noise; false
     /// follows every bounce, for a still picture left to gather.
     probes: bool = true,
-    /// How lamp and glow light is sampled at each surface.
+    /// How lamp and glow light is sampled at each surface. At most 1024
+    /// glowing instances are sampled directly; others are found by rays only.
     direct: api.DirectSampling = .ris,
     /// What removes the noise; null only gathers over frames. `.builtin`
     /// averages indirect light over neighbouring pixels of the same surface
@@ -59,7 +60,7 @@ pub const Nrd = struct {
     /// gathered; 0 for none. It hides noise where history is short, as
     /// behind something that moves, and softens contact shadows and color
     /// bleeding with it.
-    blur_radius: f32 = 0,
+    blur_radius_pixels: f32 = 0,
 };
 
 /// What a view keeps for path tracing from frame to frame, besides its
@@ -330,7 +331,7 @@ fn denoiseWithNrd(renderer: *Renderer, p: *const ScenePass, keep: Keep, state: *
         .frame_index = state.nrd_frame,
         .reset = reset or first,
         .history_frames = filled(p.settings.path_tracing).nrd.history_frames,
-        .blur_radius = filled(p.settings.path_tracing).nrd.blur_radius,
+        .blur_radius = filled(p.settings.path_tracing).nrd.blur_radius_pixels,
     }) catch {
         state.denoiser.refuse();
         std.log.warn("NRD failed; the built-in denoiser stands in", .{});
@@ -441,7 +442,7 @@ fn denoiseReflections(renderer: *Renderer, p: *const ScenePass, keep: Keep, glos
 /// render size, with nothing carried over from earlier frames. Depth and
 /// motion vectors come with the view.
 pub const Signals = struct {
-    /// Light that needs no filtering, as it reaches the eye. Alpha is 1
+    /// LightDesc that needs no filtering, as it reaches the eye. Alpha is 1
     /// where the first surface is a mirror.
     direct: rhi.Texture,
     /// Color of the surface seen, through mirrors, with how far its
@@ -461,7 +462,7 @@ pub const Signals = struct {
 
 /// `Signals` gathered over frames by the built-in denoiser.
 const Gathered = struct {
-    /// Light that needs no filtering, with the frames gathered in alpha.
+    /// LightDesc that needs no filtering, with the frames gathered in alpha.
     steady: rhi.Texture,
     /// Bounced light, still grainy, with its squared brightness in alpha.
     noisy: rhi.Texture,

@@ -3,6 +3,8 @@ const rhi = @import("../../rhi/rhi.zig");
 const pipelines_module = @import("../renderer/pipelines.zig");
 const lightmap_push = @import("../shaders/push/lightmap.zig");
 const render = @import("../renderer.zig");
+const restyleEntity = render.restyleEntity;
+const transformOf = render.transformOf;
 const scene_pass = @import("../scene_pass.zig");
 const math = @import("../../math.zig");
 const features = @import("../core/features.zig");
@@ -36,11 +38,11 @@ pub fn bakeLightmaps(renderer: *Renderer, p: *const ScenePass) !void {
     if (scene.tlas_hash == 0 or scene.tlas_hash != p.scene_frame.tlas_hash) return;
     var baking: u32 = 0;
     for (scene.entities.items) |handle| {
-        const entity = renderer.entities.table.get(handle) orelse continue;
+        const entity = renderer.entities.internal.table.get(handle) orelse continue;
         const lightmap = if (entity.lightmap) |*state| state else continue;
         if (lightmap.rounds >= lightmap.wanted) continue;
         baking += 1;
-        const model = renderer.models.table.get(entity.model) orelse continue;
+        const model = renderer.models.internal.table.get(entity.model) orelse continue;
         if (model.state != .ready or !model.geometry_resident) continue;
         const source = &model.source.?;
         const from = lightmap.gathered[lightmap.rounds & 1];
@@ -55,7 +57,7 @@ pub fn bakeLightmaps(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.pushConstants(lightmap_push.BakePush{
                 .frame = p.frame_address,
                 .tlas = device.accelerationAddress(tlas),
-                .transform = math.mul(renderer.transformOf(handle), model.node_world[instance.node]),
+                .transform = math.mul(transformOf(renderer, handle), model.node_world[instance.node]),
                 .vertex_offset = mesh.vertex_offset,
                 .gathered_texture = device.textureIndex(from),
                 .rounds = lightmap.rounds,
@@ -72,7 +74,7 @@ pub fn bakeLightmaps(renderer: *Renderer, p: *const ScenePass) !void {
         cmd.endRendering();
         cmd.endScope();
         lightmap.rounds += 1;
-        if (lightmap.rounds == 1) renderer.restyleEntity(handle);
+        if (lightmap.rounds == 1) restyleEntity(renderer, handle);
     }
     scene.lightmaps_baking = baking;
 }

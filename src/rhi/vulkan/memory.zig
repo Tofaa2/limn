@@ -24,7 +24,8 @@ pub const Allocation = struct {
     offset: u64,
     /// Requested size in bytes.
     size: u64,
-    /// Start of the range for host-visible classes; null for `gpu`.
+    /// Start of the range for host-visible classes, and for `gpu` buffers on
+    /// unified memory; null otherwise.
     mapped: ?[*]u8,
     /// Null when the allocation has a memory object of its own.
     block_index: ?u32,
@@ -70,6 +71,9 @@ pub const Allocator = struct {
     allocator: std.mem.Allocator,
     device: Device,
     properties: vk.PhysicalDeviceMemoryProperties,
+    /// The GPU shares the CPU's memory: `.gpu` buffers go in memory both
+    /// sides reach and come back mapped, so their uploads need no staging.
+    unified: bool = false,
     blocks: std.ArrayList(Block) = .empty,
     dedicated_allocations: usize = 0,
     dedicated_bytes: u64 = 0,
@@ -78,8 +82,15 @@ pub const Allocator = struct {
     fail_after: ?u32 = null,
 
     /// No device memory is reserved until the first `allocate`.
-    pub fn init(allocator: std.mem.Allocator, device: Device, properties: vk.PhysicalDeviceMemoryProperties) Allocator {
-        return .{ .allocator = allocator, .device = device, .properties = properties };
+    /// `shared` says the GPU uses the CPU's memory (integrated or software);
+    /// with a memory type that is device-local and host-visible, `unified` is set.
+    pub fn init(allocator: std.mem.Allocator, device: Device, properties: vk.PhysicalDeviceMemoryProperties, shared: bool) Allocator {
+        var result = Allocator{ .allocator = allocator, .device = device, .properties = properties };
+        const both = vk.MemoryPropertyFlags{ .device_local_bit = true, .host_visible_bit = true, .host_coherent_bit = true };
+        for (properties.memory_types[0..properties.memory_type_count]) |memory_type| {
+            if (shared and memory_type.property_flags.contains(both)) result.unified = true;
+        }
+        return result;
     }
 
     /// Frees every block. Dedicated allocations must already be freed.
@@ -105,9 +116,11 @@ pub const Allocator = struct {
             }
             remaining.* -= 1;
         }
-        const memory_type = self.findMemoryType(requirements.memory_type_bits, class) orelse
+        const shared_buffer = class == .gpu and kind == .buffer and self.unified;
+        const memory_type = (if (shared_buffer) self.findShared(requirements.memory_type_bits) else null) orelse
+            self.findMemoryType(requirements.memory_type_bits, class) orelse
             return error.MemoryTypeUnavailable;
-        const mapped = class != .gpu;
+        const mapped = class != .gpu or (shared_buffer and self.properties.memory_types[memory_type].property_flags.host_visible_bit);
         const block_size: u64 = if (class == .gpu) block_size_gpu else block_size_host;
         self.used_bytes += requirements.size;
         errdefer self.used_bytes -= requirements.size;
@@ -245,6 +258,15 @@ pub const Allocator = struct {
             .allocation_size = size,
             .memory_type_index = memory_type,
         }, null);
+    }
+
+    fn findShared(self: *const Allocator, allowed_types: u32) ?u32 {
+        const both = vk.MemoryPropertyFlags{ .device_local_bit = true, .host_visible_bit = true, .host_coherent_bit = true };
+        for (0..self.properties.memory_type_count) |index| {
+            if (allowed_types & (@as(u32, 1) << @intCast(index)) == 0) continue;
+            if (self.properties.memory_types[index].property_flags.contains(both)) return @intCast(index);
+        }
+        return null;
     }
 
     fn findMemoryType(self: *const Allocator, allowed_types: u32, class: Class) ?u32 {

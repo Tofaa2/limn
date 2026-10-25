@@ -10,6 +10,7 @@ pub const hdr_format = renderer_state.hdr_format;
 pub const bloom_format = renderer_state.bloom_format;
 const pipeline_cache = @import("../core/pipeline_cache.zig");
 const spirv_readonly = @import("../core/spirv_readonly.zig");
+const canvas_feature = @import("../features/canvas.zig");
 pub const shade_plain_targets = renderer_state.shade_plain_targets;
 pub const shade_reflective_targets = renderer_state.shade_reflective_targets;
 
@@ -97,11 +98,11 @@ pub const Shaders = struct {
             try compiled.append(gpa, code);
         }
 
+        try overrideShaders(shader_sources.names, compiled.items);
         self.internal.shade_variants.clearRetainingCapacity();
-        for (shader_sources.names, compiled.items) |name, code| try overrideShader(name, code);
         try device.waitIdle();
         self.internal.pipelines.reset();
-        self.canvas.resetPipelines(device);
+        canvas_feature.resetPipelines(&self.canvas, device);
         return @intCast(shader_sources.names.len);
     }
 
@@ -161,13 +162,22 @@ pub fn releaseOverrides() void {
     retired_overrides = .empty;
 }
 
-fn overrideShader(name: []const u8, code: []const u8) !void {
-    const copy = try override_allocator.dupe(u8, code);
-    errdefer override_allocator.free(copy);
+/// Replaces the code of every shader in `names` together: on failure none
+/// is replaced, so a reload never mixes old and new shaders.
+fn overrideShaders(names: []const []const u8, codes: []const []u8) !void {
+    const copies = try override_allocator.alloc([]u8, codes.len);
+    defer override_allocator.free(copies);
+    var made: usize = 0;
+    errdefer for (copies[0..made]) |copy| override_allocator.free(copy);
+    for (codes, copies) |code, *copy| {
+        copy.* = try override_allocator.dupe(u8, code);
+        made += 1;
+    }
     lockOverrides();
     defer unlockOverrides();
-    try retired_overrides.ensureUnusedCapacity(override_allocator, 1);
-    if (try shader_overrides.fetchPut(override_allocator, name, copy)) |old| retired_overrides.appendAssumeCapacity(old.value);
+    try shader_overrides.ensureUnusedCapacity(override_allocator, @intCast(names.len));
+    try retired_overrides.ensureUnusedCapacity(override_allocator, names.len);
+    for (names, copies) |name, copy| if (shader_overrides.fetchPutAssumeCapacity(name, copy)) |old| retired_overrides.appendAssumeCapacity(old.value);
     overridden.store(true, .release);
 }
 

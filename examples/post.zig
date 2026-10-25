@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
     const block = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.6, 0.6, 0.62, 1 }, .metallic = 0, .roughness = 0.45 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 60, 0.5, 60 })), .tint = .{ 0.5, 0.5, 0.52 } });
+    _ = try renderer.entities.create(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 60, 0.5, 60 })), .tint = .{ 0.5, 0.5, 0.52 } });
     var posts: [40]math.Mat4 = undefined;
     for (&posts, 0..) |*post, index| {
         const along: f32 = @floatFromInt(index / 2);
@@ -46,10 +46,10 @@ pub fn main(init: std.process.Init) !void {
     helpers.sphereMesh(0.22, &sphere_positions, &sphere_normals, &sphere_indices);
     for (lamp_colors, &lamps) |color, *lamp| {
         const model = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0, 0, 0, 1 }, .emissive = color, .metallic = 0, .roughness = 0.5 } }});
-        lamp.* = try renderer.entities.spawn(scene, .{ .model = model });
+        lamp.* = try renderer.entities.create(scene, .{ .model = model });
     }
     const helmet = try renderer.models.load("examples/assets/DamagedHelmet.glb");
-    _ = try renderer.entities.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 0, 1.3, 0 }), math.mul(math.rotationY(0.5), math.rotationX(std.math.pi * 0.5))) });
+    _ = try renderer.entities.create(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 0, 1.3, 0 }), math.mul(math.rotationY(0.5), math.rotationX(std.math.pi * 0.5))) });
     try renderer.waitUntilLoaded();
 
     const Effect = enum { bloom, dof, motion_blur, vignette, grain, fringes, flare, grade, sharpen, antialiasing, upscale, manual_exposure };

@@ -3,6 +3,7 @@ const std = @import("std");
 const math = @import("../../math.zig");
 const gltf = @import("../../asset/gltf.zig");
 const gpu = @import("../gpu.zig");
+const primitives = @import("../primitives.zig");
 const render = @import("../renderer.zig");
 
 const Mat4 = render.Mat4;
@@ -20,7 +21,7 @@ const Pass = api.Pass;
 const Pick = api.Pick;
 const Reflections = api.Reflections;
 const Settings = api.Settings;
-const Sun = api.Sun;
+const SunDesc = api.SunDesc;
 
 /// Where liquid pours into a `LiquidDesc` volume.
 pub const LiquidSource = struct {
@@ -45,13 +46,13 @@ pub const LiquidDesc = struct {
     particle_radius: f32 = 0.04,
     /// Initial fill from the box's low corner, as a share of each axis.
     fill: [3]f32 = .{ 0, 0, 0 },
-    /// Up to four jets pouring in.
+    /// Up to four jets pouring in; more is `error.TooManyLiquidSources`.
     sources: []const LiquidSource = &.{},
     gravity: Vec3 = .{ 0, -9.8, 0 },
     /// Color taken on with depth, and how quickly; `murk` 0 is clear.
     color: [3]f32 = .{ 0.1, 0.38, 0.5 },
     murk: f32 = 1.5,
-    /// Light scattered inside per world unit, which gives the liquid a lit
+    /// LightDesc scattered inside per world unit, which gives the liquid a lit
     /// body of its own colour; 0 is perfectly clear.
     scatter: f32 = 0.15,
     /// How readily the liquid froths white where it is churned or flung
@@ -64,7 +65,9 @@ pub const LiquidDesc = struct {
     write_depth: bool = true,
     /// How far the slope of the surface shifts what is seen through it.
     refraction: f32 = 0.3,
-    /// Simulation steps per frame, and solver iterations per step.
+    /// Simulation steps per 1/60 s, and solver iterations per step. Steps
+    /// are all the same length; a frame takes as many as its time needs, up
+    /// to twice this, and drops time beyond that.
     substeps: u32 = 2,
     iterations: u32 = 3,
     /// Share of its speed lost per second.
@@ -94,7 +97,7 @@ pub const LightmapDesc = struct {
 /// See `Renderer.instances.setImpostor`.
 pub const ImpostorDesc = struct {
     /// Copies smaller than this many pixels across are drawn as impostor cards.
-    pixels: f32 = 24,
+    max_pixels: f32 = 24,
     /// Pixels per side of each of the 64 captured directions.
     resolution: u32 = 64,
 };
@@ -381,9 +384,11 @@ pub const ImageDesc = struct {
     /// Most mips made; 0 is the full chain. An atlas wants no more than its
     /// smallest cell can be halved.
     mip_levels: u32 = 0,
+    /// Store as BC7 with a full mip chain (`mip_levels` is ignored); plain
+    /// RGBA8 on a device without block compression.
+    compressed: bool = false,
 };
 
-/// See `Renderer.environments.load`.
 /// See `Renderer.environments.load`.
 pub const EnvironmentDesc = struct {
     /// An equirectangular `.hdr`, or a KTX2 cube of half floats or BC6H.
@@ -398,6 +403,35 @@ pub const SceneEnvironment = struct {
     environment: ?Environment,
     /// Multiplies its radiance.
     intensity: f32 = 1,
+};
+
+/// Geometry supplied by the application instead of a file; see
+/// `Renderer.models.create`.
+pub const MeshDesc = struct {
+    positions: []const [3]f32,
+    /// Generated from the triangles when null.
+    normals: ?[]const [3]f32 = null,
+    uvs: ?[]const [2]f32 = null,
+    /// Multiplied with the material's base color.
+    colors: ?[]const [4]f32 = null,
+    uvs1: ?[]const [2]f32 = null,
+    /// Triangle list, counter-clockwise front faces.
+    indices: []const u32,
+    /// Its own texture fields are ignored; `textures` gives them.
+    material: Material = .{},
+    textures: MaterialTextures = .{},
+
+    /// The geometry and material as the model loader takes them.
+    pub fn geometry(self: MeshDesc) gltf.MeshDesc {
+        return .{ .positions = self.positions, .normals = self.normals, .uvs = self.uvs, .colors = self.colors, .uvs1 = self.uvs1, .indices = self.indices, .material = self.material };
+    }
+};
+
+/// One of `primitives.Shape` as a model; see `Renderer.models.createPrimitive`.
+pub const PrimitiveDesc = struct {
+    shape: primitives.Shape,
+    material: Material = .{},
+    textures: MaterialTextures = .{},
 };
 
 /// Application images used as a material's textures (see
@@ -421,8 +455,6 @@ pub const MaterialTextures = struct {
 
 /// See `Renderer.materials.setShader`.
 pub const ShaderAssignment = struct {
-    /// Index of the material; null for every material of the model.
-    material: ?u32 = null,
     /// Null restores the standard shader.
     shader: ?MaterialShader = null,
     params: [4]f32 = .{ 0, 0, 0, 0 },
@@ -432,6 +464,8 @@ pub const ShaderAssignment = struct {
 pub const MaterialShader = struct {
     /// Value for `Material.shader`.
     slot: u32,
+    /// Tells a destroyed shader from the next one made in its slot.
+    generation: u32 = 0,
 };
 
 /// The answer to a `Renderer.requestPick`, returned by `Renderer.takePick`.
@@ -468,7 +502,7 @@ pub const max_decals = gpu.cluster_decal_words * 32;
 
 /// A procedural clear sky; see `Renderer.environments.createSky`.
 pub const SkyDesc = struct {
-    /// Direction the sun's light travels, as in `Sun.direction`.
+    /// Direction the sun's light travels, as in `SunDesc.direction`.
     sun_direction: Vec3 = .{ -0.4, -1.0, -0.3 },
     /// Haze: 1 is very clear air, 10 a hazy day.
     turbidity: f32 = 2.5,
@@ -495,10 +529,10 @@ pub const SkyDesc = struct {
 /// Brightness of the sun above the atmosphere; matches environment.slang.
 pub const sky_sun_strength = 8.0;
 
-/// The `Sun` matching a sky: its direction, and its color and intensity after
+/// The `SunDesc` matching a sky: its direction, and its color and intensity after
 /// crossing the atmosphere (zero below the horizon). Pass it to
 /// `Renderer.scenes.setSun`.
-pub fn skySun(desc: SkyDesc) Sun {
+pub fn skySun(desc: SkyDesc) SunDesc {
     const to_sun = math.normalize(math.scale(desc.sun_direction, -1));
     if (to_sun[1] <= -0.02) return .{ .direction = desc.sun_direction, .intensity = 0 };
     const planet = 6360e3;
@@ -575,7 +609,7 @@ pub const SizeCurve = struct {
 
 /// A local reflection capture, used by surfaces inside its box where neither
 /// the screen nor a ray gives a reflection. See
-/// `Renderer.probes.create`.
+/// `Renderer.reflection_probes.create`.
 pub const ReflectionProbeDesc = struct {
     /// Capture point and center of the box.
     position: Vec3,

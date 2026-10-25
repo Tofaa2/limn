@@ -36,16 +36,16 @@ pub fn main(init: std.process.Init) !void {
         .{ .model = stone, .at = .{ -0.6, 1.0, -1.8 }, .size = .{ 0.3, 2.0, 0.3 } },
         .{ .model = stone, .at = .{ 1.2, 0.5, -2.4 }, .size = .{ 0.3, 1.0, 0.3 } },
     };
-    for (boxes) |box| _ = try renderer.entities.spawn(scene, .{ .model = box.model, .transform = math.mul(math.translation(box.at), math.scaling(box.size)) });
+    for (boxes) |box| _ = try renderer.entities.create(scene, .{ .model = box.model, .transform = math.mul(math.translation(box.at), math.scaling(box.size)) });
     var ball_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(0.3, &ball_positions, &ball_normals, &ball_indices);
     const ball_model = try renderer.models.create(&.{.{ .positions = &ball_positions, .normals = &ball_normals, .indices = &ball_indices, .material = .{ .base_color = .{ 0.9, 0.3, 0.12, 1 }, .metallic = 0, .roughness = 0.4 } }});
-    const ball = try renderer.entities.spawn(scene, .{ .model = ball_model, .transform = math.translation(.{ 0.6, 0.3, 0 }) });
+    const ball = try renderer.entities.create(scene, .{ .model = ball_model, .transform = math.translation(.{ 0.6, 0.3, 0 }) });
     helpers.sphereMesh(0.7, &ball_positions, &ball_normals, &ball_indices);
     const mirror = try renderer.models.create(&.{.{ .positions = &ball_positions, .normals = &ball_normals, .indices = &ball_indices, .material = .{ .base_color = .{ 0.95, 0.95, 0.95, 1 }, .metallic = 1, .roughness = 0.03 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = mirror, .transform = math.translation(.{ 1.2, 1.7, -2.4 }) });
+    _ = try renderer.entities.create(scene, .{ .model = mirror, .transform = math.translation(.{ 1.2, 1.7, -2.4 }) });
     try renderer.waitUntilLoaded();
 
     const desc = gfx.LiquidDesc{
@@ -78,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
 
         list.clear();
         try list.rect(.{ .x = 12, .y = 12, .width = 430, .height = 62 }, gfx.Color.rgba(10, 12, 20, 180));
-        try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · {d} particles", .{ stage.fps, stage.gpu_ms, renderer.liquids.particles(liquid) }), .{ 24, 22 }, .{ .size = 18 });
+        try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · {d} particles", .{ stage.fps, stage.gpu_ms, renderer.liquids.particleCount(liquid) }), .{ 24, 22 }, .{ .size = 18 });
         try list.text(font, "Space start over · A/D orbit", .{ 24, 48 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });
 
         const eye = math.Vec3{ @sin(orbit) * 4.6, 2.1, @cos(orbit) * 4.6 };

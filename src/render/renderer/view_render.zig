@@ -21,6 +21,7 @@ const canvas = @import("../features/canvas.zig");
 const post = @import("../features/post.zig");
 const ray_scene = @import("../scene/ray_scene.zig");
 const render = @import("../renderer.zig");
+const ensureSceneResources = render.ensureSceneResources;
 
 const Renderer = render.Renderer;
 const Vec3 = math.Vec3;
@@ -107,6 +108,9 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
     };
     if (!device.textureExists(target)) return error.InvalidTarget;
     const info = device.textureInfo(target);
+    if (!info.usage.color_attachment or info.format.isDepth() or info.format.isBlockCompressed() or info.kind != .@"2d") return error.InvalidTarget;
+    if (!desc.camera.valid()) return error.InvalidCamera;
+    for (desc.draw_lists) |layer| try canvas.check(&self.canvas, layer.list);
     const region = desc.region orelse Region{ .x = 0, .y = 0, .width = info.width, .height = info.height };
     if (region.width == 0 or region.height == 0 or
         @as(u64, region.x) + region.width > info.width or @as(u64, region.y) + region.height > info.height)
@@ -142,9 +146,9 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
     };
 
     if (desc.scene) |scene_handle| {
-        try self.ensureSceneResources(cmd);
-        const scene = self.scenes.table.get(scene_handle) orelse return error.InvalidScene;
-        const view = self.views.table.get(desc.view orelse self.internal.main_view) orelse return error.InvalidView;
+        try ensureSceneResources(self, cmd);
+        const scene = self.scenes.internal.table.get(scene_handle) orelse return error.InvalidScene;
+        const view = self.views.internal.table.get(desc.view orelse self.internal.main_view) orelse return error.InvalidView;
         if (view.last_frame == self.internal.frame_index) return error.ViewUsedTwice;
         var color = target;
         if (!whole) {
@@ -197,7 +201,7 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
         graph.publish(.picture, picture);
         graph.want(picture);
         if (canvas.lit(&desc)) {
-            const view = self.views.table.get(desc.view orelse self.internal.main_view) orelse return error.InvalidView;
+            const view = self.views.internal.table.get(desc.view orelse self.internal.main_view) orelse return error.InvalidView;
             if (view.last_frame == self.internal.frame_index) return error.ViewUsedTwice;
             if (view.last_frame +% 1 != self.internal.frame_index) view.exposure_reset = true;
             view.last_frame = self.internal.frame_index;
@@ -380,7 +384,7 @@ fn renderScene(
         .resolved = &resolved,
     };
     const environment: ?*EnvironmentEntry = blk: {
-        const entry = self.environments.table.get(scene.environment orelse break :blk null) orelse break :blk null;
+        const entry = self.environments.internal.table.get(scene.environment orelse break :blk null) orelse break :blk null;
         break :blk if (entry.state == .ready) entry else null;
     };
 
@@ -423,7 +427,7 @@ fn renderScene(
         .indices = device.bufferAddress(self.internal.indices.get()),
         .meshlets = device.bufferAddress(self.internal.meshlets.get()),
         .meshes = device.bufferAddress(self.internal.meshes.get()),
-        .materials = device.bufferAddress(self.materials.pool.get()),
+        .materials = device.bufferAddress(self.materials.internal.pool.get()),
         .instances = scene_frame.instances,
         .previous_transforms = scene_frame.previous_transforms,
         .meshlet_refs = if (scene.refs) |buffer| device.bufferAddress(buffer) else 0,

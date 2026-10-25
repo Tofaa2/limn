@@ -4,7 +4,7 @@ const frame_constants = @import("../../core/frame_constants.zig");
 const invalid_id = frame_constants.invalid_id;
 
 pub const LightConstants = extern struct {
-    /// Arrays of `Light`, `Cluster` and `ShadowTile`.
+    /// Arrays of `LightDesc`, `Cluster` and `ShadowTile`.
     lights: u64 = 0,
     clusters: u64 = 0,
     shadow_tiles: u64 = 0,

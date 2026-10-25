@@ -67,6 +67,11 @@ pub const Settings = struct {
     chromatic_aberration: f32 = 0,
     /// Lens flare strength; 0 is none.
     lens_flare: f32 = 0,
+    /// Compress the exposed picture into display range (AgX, or a roll-off
+    /// for HDR10). False leaves the colors as the passes before made them,
+    /// only exposed, graded and encoded: for a curve of the application's
+    /// own in an `after_resolve` pass.
+    tone_curve: bool = true,
     /// Blur what is out of focus; null for none.
     depth_of_field: ?DepthOfField = null,
     /// Blur what moves across the picture; null for none.
@@ -74,7 +79,8 @@ pub const Settings = struct {
 };
 
 pub const DepthOfField = struct {
-    /// Depth of field aperture. 0 is off; 1 blurs distant things by about 24
+    /// Depth of field aperture. 0 blurs nothing (`depth_of_field = null` turns
+    /// it off); 1 blurs distant things by about 24
     /// pixels at 1080p when focused close.
     aperture: f32 = 0.8,
     /// Distance in perfect focus.
@@ -84,7 +90,7 @@ pub const DepthOfField = struct {
     /// Autofocus rate, per second.
     autofocus_speed: f32 = 4,
     /// Largest blur radius, in pixels at 1080p.
-    max_blur: f32 = 16,
+    max_blur_pixels: f32 = 16,
     /// Depth of field samples per pixel, 4..128.
     samples: u32 = 32,
     /// Resolution the blur is gathered at.
@@ -94,7 +100,8 @@ pub const DepthOfField = struct {
 };
 
 pub const MotionBlur = struct {
-    /// Motion blur: fraction of a frame the shutter stays open; 0 is off.
+    /// Motion blur: fraction of a frame the shutter stays open. 0 blurs
+    /// nothing; `motion_blur = null` turns it off.
     strength: f32 = 0.5,
     /// Samples along each pixel's path, 2..64.
     samples: u32 = 10,
@@ -169,14 +176,15 @@ pub fn declareFlat(ctx: *ViewContext, hdr: Target) !void {
         });
     }
     const levels = frame.levels[0..frame.count];
-    try g.add(.{ .name = "bloom", .stage = .exposure, .reads = &.{hdr}, .writes = levels }, frame, reduce);
-    try g.add(.{ .name = "exposure", .stage = .exposure, .reads = levels[frame.count - 1 ..], .always = true }, frame, meter);
+    const chain = bloomChainRead(settings.post);
+    if (chain) try g.add(.{ .name = "bloom", .stage = .exposure, .reads = &.{hdr}, .writes = levels }, frame, reduce);
+    try g.add(.{ .name = "exposure", .stage = .exposure, .reads = if (chain) levels[frame.count - 1 ..] else &.{}, .always = true }, frame, meter);
     if (settings.post.bloom > 0 and frame.count > 1)
         try g.add(.{ .name = "bloom upsample", .stage = .exposure, .reads = levels[1..], .writes = levels[0 .. frame.count - 1] }, frame, spread);
     try g.add(.{
         .name = "tonemap",
         .stage = .tonemap,
-        .reads = &.{ hdr, levels[0] },
+        .reads = if (chain) &.{ hdr, levels[0] } else &.{hdr},
         .color = &.{.{ .target = g.slot(.picture).?, .load = ctx.output.load, .clear = ctx.output.clear }},
     }, frame, tonemap);
     ctx.output.load = .load;
@@ -206,7 +214,7 @@ fn meter(frame: *Frame) !void {
     const cmd = ctx.cmd;
     const settings = ctx.settings;
     const view = ctx.view.?;
-    const smallest = ctx.index(frame.levels[frame.count - 1]);
+    const smallest = ctx.index(if (bloomChainRead(settings.post)) frame.levels[frame.count - 1] else frame.hdr);
     cmd.bindPipeline(try ctx.renderer.internal.pipelines.of(exposurePipeline));
     cmd.pushConstants(exposure_push.Push{
         .frame = ctx.frame_address,
@@ -246,7 +254,7 @@ fn tonemap(frame: *Frame) !void {
     var push = gradingPush(ctx.renderer, ctx.desc.*, ctx.output.format, false);
     push.frame = ctx.frame_address;
     push.color_texture = ctx.index(frame.hdr);
-    push.bloom_texture = ctx.index(frame.levels[0]);
+    push.bloom_texture = ctx.index(if (bloomChainRead(ctx.settings.post)) frame.levels[0] else frame.hdr);
     push.bloom_scale = 1.0 / @as(f32, @floatFromInt(frame.count));
     push.sharpen = 0;
     push.origin = .{ @intCast(region.x), @intCast(region.y) };
@@ -298,7 +306,7 @@ pub fn lensEffects(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textur
             cmd.beginScope("depth of field");
             const focus: f32 = if (filled(settings.post.depth_of_field).autofocus) -1 else @max(filled(settings.post.depth_of_field).focus_distance, desc.camera.near);
             const strength = (if (settings.post.depth_of_field) |on| on.aperture else 0) * 24 * scale;
-            const max_radius = @max(filled(settings.post.depth_of_field).max_blur, 1) * scale;
+            const max_radius = @max(filled(settings.post.depth_of_field).max_blur_pixels, 1) * scale;
             const gather_target = dof_reduced orelse lens[0];
             try cmd.beginRendering(.{ .color = &.{.{ .texture = gather_target, .load = .discard }} });
             cmd.bindPipeline(try renderer.internal.pipelines.of(dofPipeline));
@@ -354,6 +362,12 @@ pub fn lensEffects(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textur
     return resolved;
 }
 
+/// Whether anything reads the bloom chain: bloom itself, automatic exposure
+/// metering its smallest level, or the lens flare.
+fn bloomChainRead(post: Settings) bool {
+    return post.bloom > 0 or post.automatic_exposure or post.lens_flare > 0;
+}
+
 /// Builds the bloom chain and meters exposure from its smallest level. Returns
 /// the level count.
 pub fn bloomAndExposure(renderer: *Renderer, p: *const ScenePass, resolved: rhi.Texture) !usize {
@@ -363,25 +377,27 @@ pub fn bloomAndExposure(renderer: *Renderer, p: *const ScenePass, resolved: rhi.
     const view_data = p.view_data;
     const view = p.view;
     const frame_address = p.frame_address;
-    cmd.beginScope("bloom");
     var source = resolved;
     const bloom_count: usize = std.math.clamp(settings.post.bloom_levels, 1, render.bloom_levels);
-    const bloom_chain = try bloomLevels(renderer, p);
-    for (bloom_chain[0..bloom_count], 0..) |level, index| {
-        const source_info = device.textureInfo(source);
-        try cmd.beginRendering(.{ .color = &.{.{ .texture = level, .load = .discard }} });
-        cmd.bindPipeline(try renderer.internal.pipelines.of(bloomDownPipeline));
-        cmd.pushConstants(BloomPush{
-            .frame = frame_address,
-            .source_texture = device.textureIndex(source),
-            .first_level = @intFromBool(index == 0),
-            .source_texel = .{ 1.0 / @as(f32, @floatFromInt(source_info.width)), 1.0 / @as(f32, @floatFromInt(source_info.height)) },
-        });
-        cmd.drawFullscreen();
-        cmd.endRendering();
-        source = level;
+    const bloom_chain: [render.bloom_levels]rhi.Texture = if (bloomChainRead(settings.post)) try bloomLevels(renderer, p) else @splat(resolved);
+    if (bloomChainRead(settings.post)) {
+        cmd.beginScope("bloom");
+        for (bloom_chain[0..bloom_count], 0..) |level, index| {
+            const source_info = device.textureInfo(source);
+            try cmd.beginRendering(.{ .color = &.{.{ .texture = level, .load = .discard }} });
+            cmd.bindPipeline(try renderer.internal.pipelines.of(bloomDownPipeline));
+            cmd.pushConstants(BloomPush{
+                .frame = frame_address,
+                .source_texture = device.textureIndex(source),
+                .first_level = @intFromBool(index == 0),
+                .source_texel = .{ 1.0 / @as(f32, @floatFromInt(source_info.width)), 1.0 / @as(f32, @floatFromInt(source_info.height)) },
+            });
+            cmd.drawFullscreen();
+            cmd.endRendering();
+            source = level;
+        }
+        cmd.endScope();
     }
-    cmd.endScope();
 
     cmd.beginScope("exposure");
     cmd.bindPipeline(try renderer.internal.pipelines.of(exposurePipeline));
@@ -486,7 +502,7 @@ pub fn tonemapScene(renderer: *Renderer, p: *const ScenePass, picture: rhi.Textu
     var push = gradingPush(renderer, desc, target_format, debugging);
     push.frame = frame_address;
     push.color_texture = device.textureIndex(resolved);
-    push.bloom_texture = device.textureIndex((try bloomLevels(renderer, p))[0]);
+    push.bloom_texture = device.textureIndex(if (bloomChainRead(p.settings.post)) (try bloomLevels(renderer, p))[0] else resolved);
     push.bloom_scale = 1.0 / @as(f32, @floatFromInt(bloom_count));
     cmd.pushConstants(push);
     cmd.drawFullscreen();
@@ -534,8 +550,8 @@ pub fn gradingPush(renderer: *const Renderer, desc: ViewDesc, target_format: rhi
         .bloom_texture = gpu.invalid_id,
         .bloom_strength = settings.post.bloom,
         .encode_srgb = output_feature.outputEncoding(renderer, desc, target_format),
-        .hdr_paper_white = @max(settings.output.paper_white, 1),
-        .hdr_peak = @max(settings.output.peak, settings.output.paper_white),
+        .hdr_paper_white = @max(settings.output.paper_white_nits, 1),
+        .hdr_peak = @max(settings.output.peak_nits, settings.output.paper_white_nits),
         .sharpen = if (settings.resolution.temporal_antialiasing and !debugging) settings.resolution.sharpen else 0,
         .bloom_scale = 1,
         .passthrough = @intFromBool(debugging),
@@ -549,7 +565,8 @@ pub fn gradingPush(renderer: *const Renderer, desc: ViewDesc, target_format: rhi
             settings.post.color_filter[2] * (1 - 0.25 * std.math.clamp(settings.post.temperature, -1, 1)),
         },
         .aberration = if (debugging) 0 else std.math.clamp(settings.post.chromatic_aberration, 0, 1),
-        .lut_texture = if (debugging) gpu.invalid_id else if (settings.post.color_lut) |image| image.index else gpu.invalid_id,
+        .curve = @intFromBool(settings.post.tone_curve or debugging),
+        .lut_texture = if (debugging) gpu.invalid_id else renderer.images.indexOf(settings.post.color_lut),
         .lut_strength = std.math.clamp(settings.post.color_lut_strength, 0, 1),
         .flare = if (debugging) 0 else @max(settings.post.lens_flare, 0),
     };

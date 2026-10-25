@@ -156,8 +156,8 @@ pub fn main(init: std.process.Init) !void {
     const robot = try renderer.models.load("examples/assets/world/RobotExpressive.glb");
     renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 1.0 });
     renderer.scenes.setSun(scene, .{ .direction = .{ -0.42, -1.0, 0.18 }, .color = .{ 1.0, 0.93, 0.82 }, .intensity = 28 });
-    _ = try renderer.entities.spawn(scene, .{ .model = sponza });
-    const player_entity = try renderer.entities.spawn(scene, .{ .model = robot });
+    _ = try renderer.entities.create(scene, .{ .model = sponza });
+    const player_entity = try renderer.entities.create(scene, .{ .model = robot });
 
     var player = Player{};
     var camera = OrbitCamera{};
@@ -381,7 +381,7 @@ pub fn main(init: std.process.Init) !void {
             for (renderer.device.passTimings()) |timing| {
                 if (timing.depth == 0) gpu_ms += timing.milliseconds;
             }
-            const stats = renderer.getStats();
+            const stats = renderer.stats();
             hud_text = try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms\n{d} / {d} meshlets drawn · {d}k triangles{s}{s}{s}", .{
                 @as(f64, @floatFromInt(title_frames)) / (now - title_time),
                 gpu_ms,

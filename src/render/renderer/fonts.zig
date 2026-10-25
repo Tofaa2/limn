@@ -12,17 +12,30 @@ const Font = api.Font;
 
 /// Distance-field fonts for draw lists.
 pub const Fonts = struct {
-    default_font: *Font = undefined,
-    list: std.ArrayList(*Font) = .empty,
-    textures: std.ArrayList(rhi.Texture) = .empty,
+    internal: Internal = .{},
+
+    /// Not part of the API.
+    pub const Internal = struct {
+        default_font: *Font = undefined,
+        list: std.ArrayList(*Font) = .empty,
+        textures: std.ArrayList(rhi.Texture) = .empty,
+        /// Destroyed fonts, kept so lists still holding them read valid memory.
+        destroyed: std.ArrayList(*Font) = .empty,
+    };
 
     fn renderer(fonts: *Fonts) *Renderer {
         return @alignCast(@fieldParentPtr("fonts", fonts));
     }
 
+    /// False once `font` is destroyed, and for a font of another renderer.
+    pub fn valid(fonts: *const Fonts, font: *const Font) bool {
+        for (fonts.internal.list.items) |candidate| if (@as(*const Font, candidate) == font) return true;
+        return false;
+    }
+
     /// The built-in font (DejaVu Sans, printable ASCII and Latin-1).
     pub fn default(fonts: *const Fonts) *const Font {
-        return fonts.default_font;
+        return fonts.internal.default_font;
     }
 
     /// Loads a TrueType font and bakes a distance-field atlas for `ranges`.
@@ -75,10 +88,10 @@ pub const Fonts = struct {
         const self = fonts.renderer();
         self.lock();
         defer self.unlock();
-        const index = for (self.fonts.list.items, 0..) |candidate, index| {
+        const index = for (self.fonts.internal.list.items, 0..) |candidate, index| {
             if (candidate == font) break index;
         } else return error.UnknownFont;
-        const mutable = self.fonts.list.items[index];
+        const mutable = self.fonts.internal.list.items[index];
         var missing: std.ArrayList(u21) = .empty;
         defer missing.deinit(self.internal.gpa);
         var iterator = font_module.Utf8Iterator{ .bytes = text };
@@ -141,23 +154,26 @@ pub const Fonts = struct {
         try device.generateMips(texture);
         next.texture_index = device.textureIndex(texture);
         mutable.adopt(next);
-        device.destroyTexture(self.fonts.textures.items[index]);
-        self.fonts.textures.items[index] = texture;
+        device.destroyTexture(self.fonts.internal.textures.items[index]);
+        self.fonts.internal.textures.items[index] = texture;
     }
 
+    /// Frees the font's atlas. `Renderer.render` refuses lists drawn with it
+    /// afterwards (`error.InvalidFont`); the font itself stays readable
+    /// until the renderer is destroyed, so recording with it is still safe.
     /// The built-in font cannot be destroyed.
     pub fn destroy(fonts: *Fonts, font: *const Font) void {
         const self = fonts.renderer();
         self.lock();
         defer self.unlock();
-        if (font == @as(*const Font, self.fonts.default_font)) return;
-        for (self.fonts.list.items, 0..) |candidate, index| {
+        if (font == @as(*const Font, self.fonts.internal.default_font)) return;
+        for (self.fonts.internal.list.items, 0..) |candidate, index| {
             if (@as(*const Font, candidate) != font) continue;
-            self.device.destroyTexture(self.fonts.textures.items[index]);
-            _ = self.fonts.list.swapRemove(index);
-            _ = self.fonts.textures.swapRemove(index);
-            candidate.deinit();
-            self.internal.gpa.destroy(candidate);
+            self.fonts.internal.destroyed.ensureUnusedCapacity(self.internal.gpa, 1) catch return;
+            self.device.destroyTexture(self.fonts.internal.textures.items[index]);
+            _ = self.fonts.internal.list.swapRemove(index);
+            _ = self.fonts.internal.textures.swapRemove(index);
+            self.fonts.internal.destroyed.appendAssumeCapacity(candidate);
             return;
         }
     }
@@ -181,9 +197,9 @@ pub fn registerFont(self: *Renderer, font: *Font) !void {
     }
     try device.generateMips(texture);
     font.setTexture(device.textureIndex(texture));
-    try self.fonts.list.append(self.internal.gpa, font);
-    errdefer _ = self.fonts.list.pop();
-    try self.fonts.textures.append(self.internal.gpa, texture);
+    try self.fonts.internal.list.append(self.internal.gpa, font);
+    errdefer _ = self.fonts.internal.list.pop();
+    try self.fonts.internal.textures.append(self.internal.gpa, texture);
 }
 
 /// A font atlas as the GPU gets it: the three-channel field in red, green

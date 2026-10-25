@@ -36,6 +36,7 @@ const room = 1.25;
 /// open only downward along z: space under a surface counts as inside.
 pub fn build(gpa: std.mem.Allocator, positions: []const [3]f32, indices: []const u32, resolution: u32) !Field {
     if (positions.len == 0 or indices.len < 3) return error.EmptyMesh;
+    for (indices) |index| if (index >= positions.len) return error.InvalidMesh;
     const size: usize = std.math.clamp(resolution, 8, 128);
     var lowest = positions[0];
     var highest = positions[0];
@@ -45,6 +46,7 @@ pub fn build(gpa: std.mem.Allocator, positions: []const [3]f32, indices: []const
     };
     var widest: f32 = 0;
     inline for (0..3) |axis| widest = @max(widest, highest[axis] - lowest[axis]);
+    if (!std.math.isFinite(widest)) return error.InvalidMesh;
     const side = @max(widest, 1e-6) * room;
     const cell = side / @as(f32, @floatFromInt(size));
     var low: [3]f32 = undefined;

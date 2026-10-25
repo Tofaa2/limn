@@ -10,6 +10,8 @@ pub const rhi = @import("rhi/rhi.zig");
 /// Vectors, quaternions and column-major 4x4 matrices. Right-handed, +Y
 /// up, cameras look down -Z; `mul(a, b)` applies `b` first.
 pub const math = @import("math.zig");
+/// Simple shapes as mesh data; see `Renderer.models.createPrimitive`.
+pub const primitives = @import("render/primitives.zig");
 /// A minimal PNG encoder.
 pub const png = @import("png.zig");
 /// TrueType loading and glyph metrics; see `Renderer.fonts.load`.
@@ -18,9 +20,6 @@ pub const font = @import("font_baker").font;
 pub const ktx2 = @import("asset/ktx2.zig");
 /// DDS texture files with block-compressed data.
 pub const dds = @import("asset/dds.zig");
-/// The `KHR_lights_punctual` lights of a glTF file.
-pub const SceneLight = @import("asset/gltf.zig").SceneLight;
-pub const loadSceneLights = @import("asset/gltf.zig").loadLights;
 
 /// Owns the device, assets, scenes and frame pipeline. Callable from any
 /// thread; `render` from one thread at a time.
@@ -48,16 +47,19 @@ pub const Environment = api.Environment;
 /// Handle to a world of entities, lights and effects; see
 /// `Renderer.scenes.create`.
 pub const Scene = api.Scene;
-/// Handle to one placement of a model in a scene; see `Renderer.entities.spawn`.
+/// Handle to one placement of a model in a scene; see `Renderer.entities.create`.
 pub const Entity = api.Entity;
-/// What `Renderer.entities.spawn` makes an entity from.
+/// What `Renderer.entities.create` makes an entity from.
 pub const EntityDesc = api.EntityDesc;
+pub const EntityInfo = api.EntityInfo;
 /// Load state of a model or environment; see `Renderer.models.state`.
 pub const AssetState = api.AssetState;
 /// GPU storage of material textures; see `Options.textures.compression`.
 pub const TextureCompression = api.TextureCompression;
 /// Distance-based texture residency; see `Options.textures.streaming`.
 pub const TextureStreaming = api.TextureStreaming;
+/// Releasing far models' geometry; see `Options.geometry.streaming`.
+pub const GeometryStreaming = api.GeometryStreaming;
 /// How overlapping transparent surfaces are combined; see
 /// `Settings.transparency.mode`.
 pub const TransparencyMode = api.TransparencyMode;
@@ -71,14 +73,17 @@ pub const AnimationInfo = api.AnimationInfo;
 pub const EnvironmentInfo = api.EnvironmentInfo;
 /// Where a view is seen from; see `ViewDesc.camera`.
 pub const Camera = api.Camera;
+pub const Projected = api.Projected;
+pub const Ray = api.Ray;
 pub const Orthographic = api.Orthographic;
 /// A scene's shadow-casting directional light; see `Renderer.scenes.setSun`.
-pub const Sun = api.Sun;
+pub const SunDesc = api.SunDesc;
 /// A point, spot, directional or rectangle light; see `Renderer.scenes.setLights`.
-pub const Light = api.Light;
+pub const LightDesc = api.LightDesc;
 /// Application-supplied geometry for `Renderer.models.create`; its slices are
 /// only read during that call.
 pub const MeshDesc = api.MeshDesc;
+pub const PrimitiveDesc = api.PrimitiveDesc;
 /// Surface description in glTF's metallic-roughness model.
 pub const Material = api.Material;
 pub const LightKind = api.LightKind;
@@ -93,6 +98,7 @@ pub const Target = api.Target;
 /// Shading input shown instead of the lit picture; see `Settings.debug_view`.
 pub const DebugView = api.DebugView;
 /// How a picture rendered below output size is scaled up; see
+/// `Settings.resolution.upscaler`.
 pub const Upscaler = api.Upscaler;
 pub const FrameGeneration = api.FrameGeneration;
 pub const Denoiser = api.Denoiser;
@@ -203,7 +209,7 @@ pub const LiquidSource = api.LiquidSource;
 pub const InstanceGroup = api.InstanceGroup;
 /// A procedural clear sky; see `Renderer.environments.createSky` and `Renderer.environments.setSky`.
 pub const SkyDesc = api.SkyDesc;
-/// The `Sun` matching a sky, attenuated by the atmosphere; pass it to
+/// The `SunDesc` matching a sky, attenuated by the atmosphere; pass it to
 /// `Renderer.scenes.setSun`.
 pub const skySun = api.skySun;
 /// Handle to a particle emitter in a scene; see `Renderer.emitters.create`.
@@ -212,15 +218,12 @@ pub const Emitter = api.Emitter;
 pub const EmitterDesc = api.EmitterDesc;
 /// A lightning flash in a cloud layer; see `Renderer.scenes.cloudFlash`.
 pub const CloudFlash = api.CloudFlash;
-/// The 64 two-group splits of a BC7 block (bit i set: texel i is in the
-/// second group); for tests of the texture encoder.
-pub const bc7_partitions = @import("texture_codec").partitions;
-/// Handle to a local reflection probe; see `Renderer.probes.create`.
+/// Handle to a local reflection probe; see `Renderer.reflection_probes.create`.
 pub const ReflectionProbe = api.ReflectionProbe;
 /// One light of a scene, set and removed on its own; see `Renderer.lights`.
-pub const LightHandle = api.LightHandle;
+pub const Light = api.Light;
 /// One decal of a scene, set and removed on its own; see `Renderer.decals`.
-pub const DecalHandle = api.DecalHandle;
+pub const Decal = api.Decal;
 /// A local reflection capture, used inside its box where neither the screen nor
 /// a ray gives a reflection.
 pub const ReflectionProbeDesc = api.ReflectionProbeDesc;
@@ -241,11 +244,11 @@ pub const PassRead = api.PassRead;
 pub const PassContext = api.PassContext;
 /// Format of `PassContext.color` before tone mapping (RGBA16F).
 pub const scene_color_format = api.scene_color_format;
-/// How path tracing follows rays on this device; see `Renderer.pathTracing`.
+/// How path tracing follows rays on this device; see `Renderer.capabilities`.
 pub const PathTracingSupport = api.PathTracingSupport;
 pub const Support = api.Support;
 pub const Capabilities = api.Capabilities;
-/// Counters for the last frame; see `Renderer.getStats`.
+/// Counters for the last frame; see `Renderer.stats`.
 pub const Stats = api.Stats;
 
 const draw_list = @import("render/draw_list.zig");
@@ -300,6 +303,8 @@ test {
     _ = @import("render/collision_field.zig");
     _ = @import("render/api.zig");
     _ = @import("render/gpu.zig");
+    _ = @import("render/api/scene.zig");
+    _ = @import("render/primitives.zig");
     _ = @import("render/animation.zig");
     _ = @import("render/draw_list.zig");
     _ = @import("render/bvh.zig");

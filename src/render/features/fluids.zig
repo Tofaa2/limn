@@ -79,7 +79,7 @@ pub fn shadowingFluids(renderer: *Renderer, p: *const ScenePass) gpu.FluidList {
     const scene = p.scene;
     var list = gpu.FluidList{};
     for (scene.fluids.items) |item| {
-        const state = renderer.fluids.table.get(item) orelse continue;
+        const state = renderer.fluids.internal.table.get(item) orelse continue;
         if (state.params_frame != renderer.internal.frame_index or state.desc.shadow <= 0) continue;
         list.fluids[list.count] = state.params;
         list.count += 1;
@@ -99,7 +99,7 @@ pub fn lightFluids(renderer: *Renderer, p: *const ScenePass, lighting: *const Li
         var fluid_slot: u32 = @intCast(scene.lights.items.len);
         var bound = false;
         for (scene.fluids.items) |item| {
-            const state = renderer.fluids.table.get(item) orelse continue;
+            const state = renderer.fluids.internal.table.get(item) orelse continue;
             if (state.desc.light <= 0) continue;
             defer fluid_slot += 1;
             if (state.params_frame != renderer.internal.frame_index) continue;
@@ -134,7 +134,7 @@ pub fn drawFluids(renderer: *Renderer, p: *const ScenePass) !void {
             .fluids = @splat(0),
         };
         for (scene.fluids.items) |item| {
-            const state = renderer.fluids.table.get(item) orelse continue;
+            const state = renderer.fluids.internal.table.get(item) orelse continue;
             if (state.params_frame != renderer.internal.frame_index) continue;
             push.fluids[push.count] = state.params;
             push.count += 1;

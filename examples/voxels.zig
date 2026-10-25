@@ -334,7 +334,7 @@ const World = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.built.append(self.gpa, result) catch {
-            if (result.model) |model| self.renderer.models.destroy(model) catch {};
+            if (result.model) |model| self.renderer.models.destroy(model);
         };
     }
 
@@ -371,8 +371,8 @@ const World = struct {
     }
 
     fn unload(self: *World, chunk: *Chunk) void {
-        if (chunk.entity) |entity| self.renderer.entities.despawn(entity);
-        if (chunk.model) |model| self.renderer.models.destroy(model) catch {};
+        if (chunk.entity) |entity| self.renderer.entities.destroy(entity);
+        if (chunk.model) |model| self.renderer.models.destroy(model);
         chunk.entity = null;
         chunk.model = null;
         chunk.state = .absent;
@@ -402,7 +402,7 @@ const World = struct {
                 continue;
             };
             chunk.model = model;
-            chunk.entity = try self.renderer.entities.spawn(self.scene, .{ .model = model, .transform = math.translation(chunk.origin()) });
+            chunk.entity = try self.renderer.entities.create(self.scene, .{ .model = model, .transform = math.translation(chunk.origin()) });
             chunk.state = .loaded;
             self.loaded += 1;
             self.triangles += result.triangles;

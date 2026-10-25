@@ -18,6 +18,19 @@
 - `rhi.Device.storageArrayIndex`: storage views of every layer.
 - `rhi.CommandEncoder.buildBlases` and `updateTlas`.
 - `Stats.pipelines`.
+- `--uneven-frames` for headless example runs.
+- `Stats.commands`, `Stats.frame_data_bytes` and `PassTiming.work`.
+- `zig build costs`.
+- `Settings.lightweight` and the `lightweight` example.
+- `PassStage.sun_shadow` and `.light_shadow`, `PassContext.layer` and `.origin`, `Pass.moving`.
+- `Settings.post.tone_curve`.
+- The `passes` example.
+- `--memory N` for headless example runs.
+- `GeometryStreaming` exported.
+- `rhi.Capabilities.unified_memory`: integrated and software GPUs write GPU-only buffers without staging.
+- `zig build costs -- --device NAME`.
+- `Camera.valid`, `TextureInfo.usage`, `MaterialShader.generation`.
+- A lost device logs where it faulted, where the driver reports it.
 - The `canvas` example takes `--screenshot` and `--timings`.
 - `DrawStage.scene`: draw lists under bloom, exposure and tone mapping, with or without a scene.
 - `DrawStage.under`: draw lists behind the scene, where no surface is.
@@ -43,8 +56,31 @@
 - `HairDesc.variation`, `clump`, `curl`, `curl_turns` and `frizz`.
 - `LiquidDesc.scatter` and `foam`: lit liquid body and whitewater.
 - The `clouds` example takes `--kind`, `hair` takes `--orbit` and `--blonde`, `liquid` takes `--orbit`.
+- `Camera.project`, `ray` and `viewProjection`.
+- `entities.setParent` and `entities.info`.
+- `Material.unlit`, also from `KHR_materials_unlit`.
+- `primitives` and `models.createPrimitive`.
+- `MeshDesc.textures`.
+- `DrawList.measureText`.
+- `views.saveTarget`.
 
 ### Changed
+- `render` fails with `error.InvalidDeltaTime`, `error.InvalidCamera` or `error.InvalidTarget` for a bad frame, `Renderer.init` with `error.InvalidOptions`.
+- `entities.setTransforms` pairs the slices up to the shorter one.
+- Liquids with more than four sources fail with `error.TooManyLiquidSources`.
+- `decals.create` past the limit fails with `error.TooManyDecals`, as `setDecals` does.
+- `bc7_partitions` is no longer public.
+- `entities.spawn`/`despawn` are `entities.create`/`destroy`.
+- `Light` is `LightDesc`, `LightHandle` is `Light`, `DecalHandle` is `Decal`, `Sun` is `SunDesc`.
+- `instances.set` is `setTransforms`, `instances.setPose` is `followPose`, `probes.update` is `recapture`, `getStats` is `stats`, `liquids.particles` is `particleCount`, `fluids.flipbookFrames` is `flipbookFrameCount`.
+- `Renderer.probes` is `Renderer.reflection_probes`.
+- `models.destroy` cannot fail: a model in use is freed when its last entity or group goes.
+- `materials.setShader` takes the material index as an argument; `ShaderAssignment.material` is gone.
+- `images.createCompressed` is `ImageDesc.compressed`; `writeKtx2` takes an `ImageDesc`; `images.update` takes a `Region`.
+- `max_blur_pixels`, `blur_radius_pixels`, `paper_white_nits`, `peak_nits`, `ImpostorDesc.max_pixels`, `ambient_occlusion.power`.
+- `loadSceneLights` and `SceneLight` are `models.loadLights`, which returns `LightDesc`s.
+- `SunDesc.intensity` and `FrameDesc.delta_time` have no default.
+- Renderer internals (`ensureSceneResources`, `tryLock`, `queueEdit`, `markOf`, `moveEntity` and the like) are no longer methods.
 - Breaking: handles are 64 bits.
 - Breaking: `views.targetImage` can fail with `error.InvalidTarget`.
 - Breaking: `shaders.reload` needs `-Dshader_reload` outside Debug.
@@ -104,10 +140,15 @@
 - Hair is shaded as fibres (Marschner lobes), shadows itself through its density, and lets light through in shadow maps.
 - Liquid particles are drawn as ellipsoids along their neighbours; the liquid reflects the scene.
 - Breaking: `LiquidDesc.murk` defaults to 1.5.
+- Breaking: destroyed images, fonts and canvas shaders are refused (`error.InvalidImage`, `InvalidFont`, `InvalidShader`) or sample nothing; `Image.id` is required, `CanvasShader` has a `generation`.
+- `fonts.destroy` keeps the font readable until the renderer is destroyed.
+- Breaking: namespace state, `DrawList` state and `rhi.Device`'s split frame loop are behind `internal` fields (`device.internal.startFrame`, ...).
+- Breaking: `Material` defaults to metallic 0 and roughness 0.6 for `MeshDesc` too; glTF files still start from 1 and 1.
 
 
 
 ### Fixed
+- Two uploads to the same buffer range or texture level in one frame raced each other.
 - Features switched off on a view give their memory back.
 - Path tracing restarts its history after frames it did not trace.
 - Impostor textures and reflection probes are freed with the renderer.
@@ -124,7 +165,23 @@
 - Stale model cache entries.
 - A leak when a streamed model runs out of memory.
 - Example flags that take no value.
-- Water blowing up at uneven frame rates.
+- Water and liquid gaining energy at uneven frame rates.
+- Bloom drawn with bloom, automatic exposure and lens flare off.
+- 128 KiB of per-frame data reserved for threads that were not used.
+- Heap allocations every frame while preparing lights.
+- GPU memory held for features and geometry a scene does not use.
+- Decal texture derivatives in divergent shader code.
+- Attachments left in the wrong state after a failed `beginRendering`.
+- A data race on the swapchain's out-of-date flag with paced presentation.
+- Shader reloading half applied when it ran out of memory.
+- Unbounded work shaping text with a malicious font.
+- Application task and mesh shaders sampling textures without a barrier.
+- GPU faults drawing custom materials.
+- Mirrored instances drawn inside out.
+- Crashes from bad mesh attribute lengths, collision meshes, sprite sheets, rounded rects, liquid and fluid sizes, IES files and oversized textures.
+- Stale material shader handles selecting another shader.
+- Custom material use counts underflowing with specular-glossiness materials.
+- Fluid and water textures lost when a resize failed.
 
 ## 0.1.3
 

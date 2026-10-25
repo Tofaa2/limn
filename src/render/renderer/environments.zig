@@ -26,12 +26,17 @@ const EnvironmentEntry = renderer_state.EnvironmentEntry;
 
 /// Skies and their image-based lighting.
 pub const Environments = struct {
-    table: handle.HandleTable(renderer_state.EnvironmentEntry, api.EnvironmentTag),
+    internal: Internal,
 
-    /// Frees what one of them holds, as when the renderer is destroyed.
-    pub fn free(owner: *Renderer, entry: *renderer_state.EnvironmentEntry) void {
-        freeEnvironment(owner, entry);
-    }
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.EnvironmentEntry, api.EnvironmentTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.EnvironmentEntry) void {
+            freeEnvironment(owner, entry);
+        }
+    };
 
     fn renderer(environments: *Environments) *Renderer {
         return @alignCast(@fieldParentPtr("environments", environments));
@@ -47,7 +52,7 @@ pub const Environments = struct {
         errdefer self.internal.gpa.destroy(job);
         job.* = .{ .gpa = self.options.job_allocator orelse std.heap.smp_allocator, .io = self.internal.io, .path = try self.internal.gpa.dupe(u8, desc.path) };
         errdefer self.internal.gpa.free(job.path);
-        const environment = try self.environments.table.insert(.{ .job = job, .max_radiance = desc.max_radiance });
+        const environment = try self.environments.internal.table.insert(.{ .job = job, .max_radiance = desc.max_radiance });
         job.group.concurrent(self.internal.io, runEnvironmentJob, .{job}) catch job.group.async(self.internal.io, runEnvironmentJob, .{job});
         self.internal.loading_count += 1;
         return environment;
@@ -58,9 +63,9 @@ pub const Environments = struct {
         const self = environments.renderer();
         self.lock();
         defer self.unlock();
-        const environment = try self.environments.table.insert(.{ .max_radiance = 64, .sky_desc = desc });
-        errdefer _ = self.environments.table.remove(environment);
-        const entry = self.environments.table.get(environment).?;
+        const environment = try self.environments.internal.table.insert(.{ .max_radiance = 64, .sky_desc = desc });
+        errdefer _ = self.environments.internal.table.remove(environment);
+        const entry = self.environments.internal.table.get(environment).?;
         errdefer freeEnvironment(self, entry);
         try ensureEnvironmentTextures(self, entry);
         var cmd = try self.device.beginImmediate();
@@ -76,7 +81,7 @@ pub const Environments = struct {
         const self = environments.renderer();
         self.lock();
         defer self.unlock();
-        const entry = self.environments.table.get(environment) orelse return;
+        const entry = self.environments.internal.table.get(environment) orelse return;
         if (entry.sky_desc == null) return;
         if (std.meta.eql(entry.sky_desc.?, desc)) return;
         entry.sky_desc = desc;
@@ -90,7 +95,7 @@ pub const Environments = struct {
         const self = environments.renderer();
         self.lock();
         defer self.unlock();
-        return (self.environments.table.get(environment) orelse return .failed).state;
+        return (self.environments.internal.table.get(environment) orelse return .failed).state;
     }
 
     /// Null until the environment is ready.
@@ -98,7 +103,7 @@ pub const Environments = struct {
         const self = environments.renderer();
         self.lock();
         defer self.unlock();
-        const entry = self.environments.table.get(environment) orelse return null;
+        const entry = self.environments.internal.table.get(environment) orelse return null;
         return if (entry.state == .ready) .{ .brightest_direction = entry.brightest_direction } else null;
     }
 
@@ -108,7 +113,7 @@ pub const Environments = struct {
         const self = environments.renderer();
         self.lock();
         defer self.unlock();
-        var removed = self.environments.table.remove(environment) orelse return;
+        var removed = self.environments.internal.table.remove(environment) orelse return;
         if (removed.state == .loading) self.internal.loading_count -= 1;
         freeEnvironment(self, &removed);
     }

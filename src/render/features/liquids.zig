@@ -48,7 +48,7 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
         cmd.beginScope("liquid");
         defer cmd.endScope();
         for (scene.liquids.items) |item| {
-            const state = renderer.liquids.table.get(item) orelse continue;
+            const state = renderer.liquids.internal.table.get(item) orelse continue;
             if (state.params_frame != renderer.internal.frame_index or state.live == 0) continue;
             const radius = state.desc.particle_radius;
             const ParticlePush = liquid_push.SpherePush;

@@ -42,13 +42,13 @@ pub fn main(init: std.process.Init) !void {
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
     const ground = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.12, 0.11, 0.1, 1 }, .metallic = 0, .roughness = 0.6 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 30, 0.5, 30 })) });
+    _ = try renderer.entities.create(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 30, 0.5, 30 })) });
 
     const count = 5;
     var balls: [count]gfx.Entity = undefined;
     for (&balls, 0..) |*ball, index| {
         const cooled = @as(f32, @floatFromInt(index)) / (count - 1);
-        ball.* = try renderer.entities.spawn(scene, .{
+        ball.* = try renderer.entities.create(scene, .{
             .model = molten,
             .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - (count - 1) * 0.5) * 2.6, 1.0, 0 }),
             .params = .{ cooled, 0, 0, 0 },
@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
             glow = @max(glow - 1, 0);
             changed = true;
         }
-        if (changed) try renderer.materials.setShader(molten, .{ .shader = lava, .params = .{ 2.5, glow, 0, 0 } });
+        if (changed) try renderer.materials.setShader(molten, null, .{ .shader = lava, .params = .{ 2.5, glow, 0, 0 } });
 
         list.clear();
         try list.text3d(font, "molten", .{ -(count - 1) * 0.5 * 2.6, 2.4, 0 }, .{ .size = 0.2 });

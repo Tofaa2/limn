@@ -25,25 +25,30 @@ const renderView = @import("view_render.zig").renderView;
 
 /// Local reflection probes.
 pub const Probes = struct {
-    table: handle.HandleTable(renderer_state.ProbeData, api.ReflectionProbeTag),
+    internal: Internal,
 
-    /// Frees what one of them holds, as when the renderer is destroyed.
-    pub fn free(owner: *Renderer, entry: *renderer_state.ProbeData) void {
-        freeProbe(owner, entry);
-    }
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.ProbeData, api.ReflectionProbeTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.ProbeData) void {
+            freeProbe(owner, entry);
+        }
+    };
 
     fn renderer(probes: *Probes) *Renderer {
-        return @alignCast(@fieldParentPtr("probes", probes));
+        return @alignCast(@fieldParentPtr("reflection_probes", probes));
     }
 
     /// Adds a local reflection probe. Its six faces are captured one per
-    /// frame from the next frames that draw; call `probes.update`
+    /// frame from the next frames that draw; call `probes.recapture`
     /// after the scene or its lighting changes.
     pub fn create(probes: *Probes, scene: Scene, desc: ReflectionProbeDesc) !ReflectionProbe {
         const self = probes.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+        const data = self.scenes.internal.table.get(scene) orelse return error.InvalidScene;
         if (data.probes.items.len >= max_reflection_probes) return error.TooManyReflectionProbes;
         const size = std.math.clamp(desc.resolution, 16, 1024);
         const target = try self.device.createTexture(.{
@@ -55,22 +60,22 @@ pub const Probes = struct {
         });
         errdefer self.device.destroyTexture(target);
         const view = try insertView(self);
-        errdefer if (self.views.table.remove(view)) |removed_view| {
+        errdefer if (self.views.internal.table.remove(view)) |removed_view| {
             var removed = removed_view;
             removed.deinit(self.device);
         };
-        const probe = try self.probes.table.insert(.{ .scene = scene, .desc = desc, .target = target, .view = view, .cubes = .{ .max_radiance = desc.max_radiance } });
-        errdefer _ = self.probes.table.remove(probe);
+        const probe = try self.reflection_probes.internal.table.insert(.{ .scene = scene, .desc = desc, .target = target, .view = view, .cubes = .{ .max_radiance = desc.max_radiance } });
+        errdefer _ = self.reflection_probes.internal.table.remove(probe);
         try data.probes.append(self.internal.gpa, probe);
         return probe;
     }
 
-    /// A new position takes effect with the next `probes.update`.
+    /// A new position takes effect with the next `probes.recapture`.
     pub fn set(probes: *Probes, probe: ReflectionProbe, desc: ReflectionProbeDesc) void {
         const self = probes.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.probes.table.get(probe) orelse return;
+        const data = self.reflection_probes.internal.table.get(probe) orelse return;
         const resolution = data.desc.resolution;
         data.desc = desc;
         data.desc.resolution = resolution;
@@ -78,11 +83,11 @@ pub const Probes = struct {
     }
 
     /// Asks for a probe to be captured again.
-    pub fn update(probes: *Probes, probe: ReflectionProbe) void {
+    pub fn recapture(probes: *Probes, probe: ReflectionProbe) void {
         const self = probes.renderer();
         self.lock();
         defer self.unlock();
-        if (self.probes.table.get(probe)) |data| data.dirty = true;
+        if (self.reflection_probes.internal.table.get(probe)) |data| data.dirty = true;
     }
 
     /// A stale handle is ignored.
@@ -90,14 +95,14 @@ pub const Probes = struct {
         const self = probes.renderer();
         self.lock();
         defer self.unlock();
-        render.destroyObject(self, "probes", "probes", probe);
+        render.destroyObject(self, "reflection_probes", "probes", probe);
     }
 };
 
 pub fn freeProbe(self: *Renderer, probe: *ProbeData) void {
     freeEnvironment(self, &probe.cubes);
     self.device.destroyTexture(probe.target);
-    if (self.views.table.remove(probe.view)) |removed_view| {
+    if (self.views.internal.table.remove(probe.view)) |removed_view| {
         var removed = removed_view;
         removed.deinit(self.internal.gpa, self.device);
     }
@@ -106,13 +111,13 @@ pub fn freeProbe(self: *Renderer, probe: *ProbeData) void {
 /// Captures the first waiting probe, one face per frame, and filters the
 /// result into its reflection cube.
 pub fn captureProbes(self: *Renderer, frame: rhi.Frame, delta_time: f32, arena: *FrameArena) !void {
-    for (self.probes.table.slots.items) |*slot| if (slot.value) |*probe| {
+    for (self.reflection_probes.internal.table.slots.items) |*slot| if (slot.value) |*probe| {
         if (!probe.dirty and probe.face == 0) continue;
         if (!probe.captured and probe.face == 0 and probe.waited < probe.desc.settle_frames) {
             probe.waited += 1;
             continue;
         }
-        const scene = self.scenes.table.get(probe.scene) orelse continue;
+        const scene = self.scenes.internal.table.get(probe.scene) orelse continue;
         if (scene.layout.items.len == 0 and scene.static_count == 0) continue;
         if (probe.face == 0) probe.dirty = false;
         probe.capturing = true;
@@ -144,7 +149,7 @@ pub fn captureProbes(self: *Renderer, frame: rhi.Frame, delta_time: f32, arena: 
                     .ambient_occlusion = .{ .temporal_filter = false, .bounce = 0 },
                 },
             }, delta_time, arena);
-            const state = &(self.views.table.get(probe.view).?.state orelse return);
+            const state = &(self.views.internal.table.get(probe.view).?.state orelse return);
             cmd.transition(state.hdr, .shader_read);
             const forward = axes[0];
             const right = math.normalize(math.cross(forward, axes[1]));

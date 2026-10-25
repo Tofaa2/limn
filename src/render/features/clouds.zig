@@ -178,7 +178,7 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             .shadow_strength = std.math.clamp(layer.shadow, 0, 1),
             .cirrus = std.math.clamp(layer.cirrus, 0, 1),
             .anvil = std.math.clamp(layer.anvil, 0, 1),
-            .weather = if (layer.weather) |image| image.index else device.textureIndex(renderer.internal.cloud_weather.?),
+            .weather = if (layer.weather) |image| renderer.images.indexOf(image) else device.textureIndex(renderer.internal.cloud_weather.?),
             .weather_size = if (layer.weather_size > 0) layer.weather_size else period * 16,
             .flash = flash,
             .pattern = device.textureIndex(renderer.internal.cloud_weather.?),
@@ -187,7 +187,7 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             .kind = std.math.clamp(layer.kind, 0, 1),
         };
         cloud_address = params.address;
-        if (scene.environment) |handle_value| if (renderer.environments.table.get(handle_value)) |sky_entry| {
+        if (scene.environment) |handle_value| if (renderer.environments.internal.table.get(handle_value)) |sky_entry| {
             if ((sky_entry.sky_desc != null or sky_entry.state == .ready) and layer.environment_interval > 0 and
                 (sky_entry.clouds == null or renderer.internal.time - sky_entry.cloud_bake_time >= layer.environment_interval))
             {
@@ -200,7 +200,7 @@ pub fn prepareClouds(renderer: *Renderer, p: *const ScenePass) !u64 {
             }
         };
     }
-    if (scene.clouds == null) if (scene.environment) |handle_value| if (renderer.environments.table.get(handle_value)) |sky_entry| {
+    if (scene.clouds == null) if (scene.environment) |handle_value| if (renderer.environments.internal.table.get(handle_value)) |sky_entry| {
         if (sky_entry.clouds != null) {
             sky_entry.clouds = null;
             sky_entry.sky_dirty = true;

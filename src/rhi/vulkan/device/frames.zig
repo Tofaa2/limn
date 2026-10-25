@@ -16,6 +16,7 @@ const finishPacedPresent = @import("presentation.zig").finishPacedPresent;
 const frames_in_flight = device_module.frames_in_flight;
 const max_timing_scopes = device_module.max_timing_scopes;
 const recordGeneratedFrame = @import("presentation.zig").recordGeneratedFrame;
+const presentation = @import("presentation.zig");
 
 /// Queues a copy ordered with the pending uploads; `source` is destroyed
 /// once it is recorded.
@@ -26,23 +27,26 @@ pub fn queueBufferCopy(self: *Device, source: types.Buffer, destination: types.B
 /// `waitForFrame` + `prepareSurface` + `acquireImage` + `startFrame`.
 /// Returns null when there is nothing to draw to; try again next time.
 pub fn beginFrame(self: *Device) !?Frame {
-    try self.waitForFrame();
-    if (!try self.prepareSurface()) return null;
-    if (!try self.acquireImage()) return null;
-    return try self.startFrame();
+    try waitForFrame(self);
+    if (!try presentation.prepareSurface(self)) return null;
+    if (!try presentation.acquireImage(self)) return null;
+    return try startFrame(self);
 }
 
 /// Submits the frame and presents the backbuffer if there is one.
 pub fn endFrame(self: *Device) !void {
-    try self.submitFrame();
-    try self.presentFrame();
+    try submitFrame(self);
+    try presentation.presentFrame(self);
 }
 
 /// Blocks until the GPU has finished the frame whose slot is reused next.
 /// Touches no shared device state.
 pub fn waitForFrame(self: *Device) !void {
     const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
-    _ = try self.vkd.waitForFences(&.{frame.fence}, .true, std.math.maxInt(u64));
+    _ = self.vkd.waitForFences(&.{frame.fence}, .true, std.math.maxInt(u64)) catch |err| {
+        if (err == error.DeviceLost) reportFault(self);
+        return err;
+    };
 }
 
 /// Begins recording, after `waitForFrame` and `acquireImage`. On failure
@@ -282,7 +286,38 @@ fn collectTimings(self: *Device, frame: *FrameData) void {
             .name = scope.name,
             .milliseconds = @floatCast(@as(f64, @floatFromInt(ticks)) * period / 1e6),
             .depth = scope.depth,
+            .work = scope.work,
         };
     }
     self.timing_count = frame.scope_count;
+}
+
+/// Logs where a lost device faulted, when the driver says: each address,
+/// what was done there and the buffer it falls in.
+pub fn reportFault(self: *Device) void {
+    if (!self.device_fault) return;
+    var counts = vk.DeviceFaultCountsEXT{};
+    _ = self.vkd.getDeviceFaultInfoEXT(&counts, null) catch return;
+    var addresses: [16]vk.DeviceFaultAddressInfoEXT = undefined;
+    var vendors: [8]vk.DeviceFaultVendorInfoEXT = undefined;
+    counts.address_info_count = @min(counts.address_info_count, addresses.len);
+    counts.vendor_info_count = @min(counts.vendor_info_count, vendors.len);
+    counts.vendor_binary_size = 0;
+    var info = vk.DeviceFaultInfoEXT{ .description = undefined, .p_address_infos = &addresses[0], .p_vendor_infos = &vendors[0] };
+    _ = self.vkd.getDeviceFaultInfoEXT(&counts, &info) catch return;
+    std.log.err("device lost: {s}", .{std.mem.sliceTo(&info.description, 0)});
+    for (addresses[0..counts.address_info_count]) |entry| {
+        var buffer_name: []const u8 = "no buffer";
+        var offset: u64 = 0;
+        var below: ?device_module.BufferResource = null;
+        for (self.buffers.slots.items) |slot| if (slot.value) |resource| {
+            if (resource.address <= entry.reported_address and (below == null or resource.address > below.?.address)) below = resource;
+            if (entry.reported_address < resource.address or entry.reported_address >= resource.address + resource.size) continue;
+            buffer_name = std.mem.sliceTo(&resource.name, 0);
+            offset = entry.reported_address - resource.address;
+        };
+        if (offset == 0) if (below) |nearest| std.log.err("  nearest buffer below: {s}, {d} bytes, ends {d} bytes before", .{ std.mem.sliceTo(&nearest.name, 0), nearest.size, entry.reported_address -| (nearest.address + nearest.size) });
+        std.log.err("  fault type {d} (1 read, 2 write, 3 execute) at 0x{x} (within 0x{x}): {s} + {d}", .{ @intFromEnum(entry.address_type), entry.reported_address, entry.address_precision, buffer_name, offset });
+    }
+    for (vendors[0..counts.vendor_info_count]) |vendor| std.log.err("  {s} (code 0x{x}, data 0x{x})", .{ std.mem.sliceTo(&vendor.description, 0), vendor.vendor_fault_code, vendor.vendor_fault_data });
 }

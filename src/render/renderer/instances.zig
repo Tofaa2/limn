@@ -1,5 +1,6 @@
 //! Instance groups. Internal to the renderer.
 const std = @import("std");
+const releaseModel = @import("models.zig").releaseModel;
 const impostors_feature = @import("../features/impostors.zig");
 const handle = @import("../../handle.zig");
 const math = @import("../../math.zig");
@@ -18,20 +19,25 @@ const packTint = renderer_state.packTint;
 
 /// Groups of many copies of one model.
 pub const Instances = struct {
-    table: handle.HandleTable(renderer_state.InstanceGroupData, api.InstanceGroupTag),
+    internal: Internal,
 
-    /// Frees what one of them holds, as when the renderer is destroyed.
-    pub fn free(owner: *Renderer, entry: *renderer_state.InstanceGroupData) void {
-        if (entry.impostor) |impostor| {
-            owner.device.destroyTexture(impostor.color);
-            owner.device.destroyTexture(impostor.normal);
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.InstanceGroupData, api.InstanceGroupTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.InstanceGroupData) void {
+            if (entry.impostor) |impostor| {
+                owner.device.destroyTexture(impostor.color);
+                owner.device.destroyTexture(impostor.normal);
+            }
+            owner.internal.gpa.free(entry.transforms);
+            owner.internal.gpa.free(entry.tints);
+            owner.internal.gpa.free(entry.params);
+            releaseModel(owner, entry.model);
+            if (owner.scenes.internal.table.get(entry.scene)) |scene| scene.layout_dirty = true;
         }
-        owner.internal.gpa.free(entry.transforms);
-        owner.internal.gpa.free(entry.tints);
-        owner.internal.gpa.free(entry.params);
-        if (owner.models.table.get(entry.model)) |model| model.references -= 1;
-        if (owner.scenes.table.get(entry.scene)) |scene| scene.layout_dirty = true;
-    }
+    };
 
     fn renderer(instances: *Instances) *Renderer {
         return @alignCast(@fieldParentPtr("instances", instances));
@@ -44,12 +50,13 @@ pub const Instances = struct {
         const self = instances.renderer();
         self.lock();
         defer self.unlock();
-        const scene_data = self.scenes.table.get(scene) orelse return error.InvalidScene;
-        const entry = self.models.table.get(model) orelse return error.InvalidModel;
+        const scene_data = self.scenes.internal.table.get(scene) orelse return error.InvalidScene;
+        const entry = self.models.internal.table.get(model) orelse return error.InvalidModel;
+        if (entry.orphaned) return error.InvalidModel;
         const copy = try self.internal.gpa.dupe(Mat4, transforms);
         errdefer self.internal.gpa.free(copy);
-        const group = try self.instances.table.insert(.{ .scene = scene, .model = model, .transforms = copy });
-        errdefer _ = self.instances.table.remove(group);
+        const group = try self.instances.internal.table.insert(.{ .scene = scene, .model = model, .transforms = copy });
+        errdefer _ = self.instances.internal.table.remove(group);
         try scene_data.groups.append(self.internal.gpa, group);
         entry.references += 1;
         scene_data.layout_dirty = true;
@@ -57,12 +64,12 @@ pub const Instances = struct {
     }
 
     /// Replaces the transforms of a group; the count may change.
-    pub fn set(instances: *Instances, group: InstanceGroup, transforms: []const Mat4) !void {
+    pub fn setTransforms(instances: *Instances, group: InstanceGroup, transforms: []const Mat4) !void {
         const self = instances.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.instances.table.get(group) orelse return;
-        const scene = self.scenes.table.get(data.scene) orelse return;
+        const data = self.instances.internal.table.get(group) orelse return;
+        const scene = self.scenes.internal.table.get(data.scene) orelse return;
         if (transforms.len == data.transforms.len) {
             @memcpy(data.transforms, transforms);
             scene.static_version += 1;
@@ -80,8 +87,8 @@ pub const Instances = struct {
         const self = instances.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.instances.table.get(group) orelse return;
-        const scene = self.scenes.table.get(data.scene) orelse return;
+        const data = self.instances.internal.table.get(group) orelse return;
+        const scene = self.scenes.internal.table.get(data.scene) orelse return;
         if (colors.len != 0 and colors.len != data.transforms.len) return error.ColorCountMismatch;
         const tints = try self.internal.gpa.alloc(u32, colors.len);
         for (tints, colors) |*tint, color| tint.* = packTint(color);
@@ -96,8 +103,8 @@ pub const Instances = struct {
         const self = instances.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.instances.table.get(group) orelse return;
-        const scene = self.scenes.table.get(data.scene) orelse return;
+        const data = self.instances.internal.table.get(group) orelse return;
+        const scene = self.scenes.internal.table.get(data.scene) orelse return;
         if (params.len != 0 and params.len != data.transforms.len) return error.ParamCountMismatch;
         const copy = try self.internal.gpa.dupe([4]f32, params);
         self.internal.gpa.free(data.params);
@@ -105,15 +112,15 @@ pub const Instances = struct {
         scene.static_version += 1;
     }
 
-    /// Draws copies smaller on screen than `ImpostorDesc.pixels` as impostor
+    /// Draws copies smaller on screen than `ImpostorDesc.max_pixels` as impostor
     /// cards; null turns that off. Only for single-mesh models; groups that
     /// take an entity's pose are never impostors.
     pub fn setImpostor(instances: *Instances, group: InstanceGroup, desc: ?ImpostorDesc) !void {
         const self = instances.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.instances.table.get(group) orelse return;
-        const scene = self.scenes.table.get(data.scene) orelse return;
+        const data = self.instances.internal.table.get(group) orelse return;
+        const scene = self.scenes.internal.table.get(data.scene) orelse return;
         if (data.impostor) |old| {
             self.device.destroyTexture(old.color);
             self.device.destroyTexture(old.normal);
@@ -126,18 +133,18 @@ pub const Instances = struct {
         const color = try self.device.createTexture(.{ .name = "impostor color", .width = size, .height = size, .format = .rgba8_srgb, .usage = .{ .sampled = true, .color_attachment = true } });
         errdefer self.device.destroyTexture(color);
         const normal = try self.device.createTexture(.{ .name = "impostor normal", .width = size, .height = size, .format = .rgba8_unorm, .usage = .{ .sampled = true, .color_attachment = true } });
-        data.impostor = .{ .color = color, .normal = normal, .pixels = @max(wanted.pixels, 0), .resolution = resolution };
+        data.impostor = .{ .color = color, .normal = normal, .pixels = @max(wanted.max_pixels, 0), .resolution = resolution };
     }
 
     /// Makes every copy take the pose of `entity`, a visible entity of the
     /// same model in the same scene; null gives the rest pose. Posed copies
     /// do not take part in ray tracing.
-    pub fn setPose(instances: *Instances, group: InstanceGroup, entity: ?Entity) void {
+    pub fn followPose(instances: *Instances, group: InstanceGroup, entity: ?Entity) void {
         const self = instances.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.instances.table.get(group) orelse return;
-        const scene = self.scenes.table.get(data.scene) orelse return;
+        const data = self.instances.internal.table.get(group) orelse return;
+        const scene = self.scenes.internal.table.get(data.scene) orelse return;
         data.driver = entity;
         scene.static_version += 1;
     }

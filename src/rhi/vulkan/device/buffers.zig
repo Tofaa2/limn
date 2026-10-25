@@ -40,12 +40,15 @@ pub fn createBuffer(self: *Device, desc: types.BufferDesc) !types.Buffer {
     errdefer self.allocator.free(allocation);
     try self.vkd.bindBufferMemory(handle, allocation.memory, allocation.offset);
     const address = self.vkd.getBufferDeviceAddress(&.{ .buffer = handle });
-    return self.buffers.insert(.{
+    var resource = device_module.BufferResource{
         .handle = handle,
         .allocation = allocation,
         .size = desc.size,
         .address = address,
-    });
+    };
+    const kept = @min(desc.name.len, resource.name.len - 1);
+    @memcpy(resource.name[0..kept], desc.name[0..kept]);
+    return self.buffers.insert(resource);
 }
 
 /// Drops queued uploads that target a resource being destroyed.

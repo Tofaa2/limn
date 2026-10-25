@@ -419,6 +419,34 @@ pub const BufferSync = enum {
 
 pub const IndexType = enum { uint16, uint32 };
 
+/// Commands one encoder recorded, counted as they are recorded.
+pub const Work = struct {
+    render_passes: u32 = 0,
+    /// Draws whose counts the CPU gave.
+    draws: u32 = 0,
+    /// Draws whose counts come from a GPU buffer.
+    indirect_draws: u32 = 0,
+    dispatches: u32 = 0,
+    /// Pipeline barrier commands, and the image layout changes in them.
+    barriers: u32 = 0,
+    image_barriers: u32 = 0,
+    pipeline_binds: u32 = 0,
+    push_constants: u32 = 0,
+    /// Buffer and image copies, buffer fills, mip chains generated.
+    transfers: u32 = 0,
+    /// Acceleration structure builds and updates.
+    builds: u32 = 0,
+    /// Bytes copied from staging buffers into GPU-only memory.
+    staged_bytes: u64 = 0,
+
+    /// What was recorded after `earlier`, a count taken from the same encoder.
+    pub fn since(self: Work, earlier: Work) Work {
+        var result: Work = .{};
+        inline for (std.meta.fields(Work)) |field| @field(result, field.name) = @field(self, field.name) - @field(earlier, field.name);
+        return result;
+    }
+};
+
 /// From `Device.textureInfo`.
 pub const TextureInfo = struct {
     width: u32,
@@ -429,6 +457,8 @@ pub const TextureInfo = struct {
     layers: u32,
     kind: TextureKind,
     depth: u32 = 1,
+    /// What it was made for.
+    usage: TextureUsage = .{},
 };
 
 /// GPU time of one `CommandEncoder.beginScope` region.
@@ -438,6 +468,8 @@ pub const PassTiming = struct {
     milliseconds: f32,
     /// Nesting level; sum only depth 0 for a frame total.
     depth: u8,
+    /// Commands recorded inside the scope, nested scopes included.
+    work: Work = .{},
 };
 
 pub const AdapterKind = enum {
@@ -464,6 +496,9 @@ pub const Capabilities = struct {
     shading_rate_tile: u32 = 0,
     /// `Device.createSharedTexture` works.
     shared_textures: bool = false,
+    /// The GPU shares the CPU's memory; GPU-only buffers are mapped and
+    /// written without staging.
+    unified_memory: bool = false,
     /// The extensions NVIDIA's NGX asks for are enabled; see
     /// `DeviceDesc.nvidia_ngx`.
     nvidia_ngx: bool = false,

@@ -7,6 +7,7 @@ const gpu = @import("../gpu.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
 const render = @import("../renderer.zig");
+const images_module = @import("images.zig");
 
 const Renderer = render.Renderer;
 const Scene = api.Scene;
@@ -20,12 +21,17 @@ const FluidState = renderer_state.FluidState;
 
 /// Boxes of simulated smoke and fire.
 pub const Fluids = struct {
-    table: handle.HandleTable(renderer_state.FluidState, api.FluidTag),
+    internal: Internal,
 
-    /// Frees what one of them holds, as when the renderer is destroyed.
-    pub fn free(owner: *Renderer, entry: *renderer_state.FluidState) void {
-        destroyFluidTextures(owner, entry);
-    }
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.FluidState, api.FluidTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.FluidState) void {
+            destroyFluidTextures(owner, entry);
+        }
+    };
 
     fn renderer(fluids: *Fluids) *Renderer {
         return @alignCast(@fieldParentPtr("fluids", fluids));
@@ -36,7 +42,7 @@ pub const Fluids = struct {
         const self = fluids.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+        const data = self.scenes.internal.table.get(scene) orelse return error.InvalidScene;
         if (data.fluids.items.len == max_fluids) return error.TooManyFluids;
         if (desc.sources.len > gpu.max_fluid_sources) return error.TooManyFluidSources;
         if (desc.obstacles.len > gpu.max_fluid_obstacles) return error.TooManyFluidObstacles;
@@ -44,8 +50,8 @@ pub const Fluids = struct {
         state.setSources(desc.sources);
         try createFluidTextures(self, &state);
         errdefer destroyFluidTextures(self, &state);
-        const fluid = try self.fluids.table.insert(state);
-        errdefer _ = self.fluids.table.remove(fluid);
+        const fluid = try self.fluids.internal.table.insert(state);
+        errdefer _ = self.fluids.internal.table.remove(fluid);
         try data.fluids.append(self.internal.gpa, fluid);
         return fluid;
     }
@@ -56,16 +62,20 @@ pub const Fluids = struct {
         const self = fluids.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.fluids.table.get(fluid) orelse return;
+        const state = self.fluids.internal.table.get(fluid) orelse return;
         if (desc.sources.len > gpu.max_fluid_sources) return error.TooManyFluidSources;
         if (desc.obstacles.len > gpu.max_fluid_obstacles) return error.TooManyFluidObstacles;
-        const resized = !std.mem.eql(u32, &desc.resolution, &state.desc.resolution);
+        if (!std.mem.eql(u32, &desc.resolution, &state.desc.resolution)) {
+            var fresh = state.*;
+            fresh.desc = desc;
+            try createFluidTextures(self, &fresh);
+            destroyFluidTextures(self, state);
+            fresh.picture = null;
+            fresh.flipbook = null;
+            state.* = fresh;
+        }
         state.desc = desc;
         state.setSources(desc.sources);
-        if (resized) {
-            destroyFluidTextures(self, state);
-            try createFluidTextures(self, state);
-        }
     }
 
     /// Empties a fluid: no smoke, no heat, no motion.
@@ -73,17 +83,18 @@ pub const Fluids = struct {
         const self = fluids.renderer();
         self.lock();
         defer self.unlock();
-        if (self.fluids.table.get(fluid)) |state| state.cleared = false;
+        if (self.fluids.internal.table.get(fluid)) |state| state.cleared = false;
     }
 
     /// The fluid seen along its depth (smoke as coverage, fire as glow),
     /// redrawn each frame its scene renders. `resolution` pixels in size;
-    /// lasts as long as the fluid.
+    /// lasts while the fluid keeps its resolution: ask again after `set`
+    /// changes it.
     pub fn image(fluids: *Fluids, fluid: Fluid) !Image {
         const self = fluids.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
+        const state = self.fluids.internal.table.get(fluid) orelse return error.InvalidFluid;
         if (state.picture == null) {
             state.picture = try self.device.createTexture(.{
                 .name = "fluid picture",
@@ -94,7 +105,7 @@ pub const Fluids = struct {
             });
             state.picture_drawn = false;
         }
-        return .{ .index = self.device.textureIndex(state.picture.?), .width = state.size[0], .height = state.size[1] };
+        return images_module.targetImage(self, state.picture.?, self.device.textureIndex(state.picture.?), state.size[0], state.size[1]);
     }
 
     /// Saves the fluid's picture as a PNG with alpha. Waits for the GPU; call
@@ -103,7 +114,7 @@ pub const Fluids = struct {
         const self = fluids.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
+        const state = self.fluids.internal.table.get(fluid) orelse return error.InvalidFluid;
         const picture = state.picture orelse return error.NoFluidImage;
         try saveHdrPicture(self, picture, state.size[0], state.size[1], path);
     }
@@ -116,12 +127,14 @@ pub const Fluids = struct {
         const self = fluids.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
+        const state = self.fluids.internal.table.get(fluid) orelse return error.InvalidFluid;
         if (desc.columns == 0 or desc.rows == 0) return error.InvalidFlipbook;
         const frame = desc.frame_size orelse [2]u32{ state.size[0], state.size[1] };
-        const width = frame[0] * desc.columns;
-        const height = frame[1] * desc.rows;
-        if (frame[0] == 0 or frame[1] == 0 or width > 16384 or height > 16384) return error.InvalidFlipbook;
+        const wide = @as(u64, frame[0]) * desc.columns;
+        const tall = @as(u64, frame[1]) * desc.rows;
+        if (frame[0] == 0 or frame[1] == 0 or wide > 16384 or tall > 16384) return error.InvalidFlipbook;
+        const width: u32 = @intCast(wide);
+        const height: u32 = @intCast(tall);
         const old = state.flipbook_desc;
         if (state.flipbook == null or old.columns != desc.columns or old.rows != desc.rows or !std.meta.eql(state.flipbook_frame, frame)) {
             const sheet = try self.device.createTexture(.{
@@ -131,22 +144,25 @@ pub const Fluids = struct {
                 .format = hdr_format,
                 .usage = .{ .sampled = true, .color_attachment = true, .copy_src = true },
             });
-            if (state.flipbook) |texture| self.device.destroyTexture(texture);
+            if (state.flipbook) |texture| {
+                images_module.forgetTarget(self, texture);
+                self.device.destroyTexture(texture);
+            }
             state.flipbook = sheet;
         }
         state.flipbook_desc = desc;
         state.flipbook_frame = frame;
         state.flipbook_recorded = 0;
         state.flipbook_wait = 0;
-        return .{ .index = self.device.textureIndex(state.flipbook.?), .width = width, .height = height };
+        return images_module.targetImage(self, state.flipbook.?, self.device.textureIndex(state.flipbook.?), width, height);
     }
 
     /// Flipbook frames recorded so far; `columns * rows` when full.
-    pub fn flipbookFrames(fluids: *Fluids, fluid: Fluid) u32 {
+    pub fn flipbookFrameCount(fluids: *Fluids, fluid: Fluid) u32 {
         const self = fluids.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.fluids.table.get(fluid) orelse return 0;
+        const state = self.fluids.internal.table.get(fluid) orelse return 0;
         return state.flipbook_recorded;
     }
 
@@ -156,7 +172,7 @@ pub const Fluids = struct {
         const self = fluids.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.fluids.table.get(fluid) orelse return error.InvalidFluid;
+        const state = self.fluids.internal.table.get(fluid) orelse return error.InvalidFluid;
         const sheet = state.flipbook orelse return error.NoFluidImage;
         if (state.flipbook_recorded == 0) return error.NoFluidImage;
         try saveHdrPicture(self, sheet, state.flipbook_frame[0] * state.flipbook_desc.columns, state.flipbook_frame[1] * state.flipbook_desc.rows, path);
@@ -217,8 +233,14 @@ fn createFluidTextures(self: *Renderer, state: *FluidState) !void {
 
 pub fn destroyFluidTextures(self: *Renderer, state: *FluidState) void {
     for (state.textures()) |texture| self.device.destroyTexture(texture.*);
-    if (state.picture) |texture| self.device.destroyTexture(texture);
-    if (state.flipbook) |texture| self.device.destroyTexture(texture);
+    if (state.picture) |texture| {
+        images_module.forgetTarget(self, texture);
+        self.device.destroyTexture(texture);
+    }
+    if (state.flipbook) |texture| {
+        images_module.forgetTarget(self, texture);
+        self.device.destroyTexture(texture);
+    }
     state.flipbook = null;
     state.picture = null;
 }

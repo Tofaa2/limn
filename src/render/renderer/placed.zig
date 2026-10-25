@@ -10,24 +10,39 @@ const Renderer = render.Renderer;
 const Scene = api.Scene;
 
 /// Lights of scenes, one at a time.
-pub const Lights = Placed(api.Light, api.LightTag, "lights", "light_handles", "lights", null);
+pub const Lights = Placed(api.LightDesc, api.LightTag, "lights", "light_handles", "lights", null);
 /// Decals of scenes, one at a time.
 pub const Decals = Placed(api.DecalDesc, api.DecalTag, "decals", "decal_handles", "decals", api.max_decals);
 
 /// A namespace of `Item`s kept in each scene's list `list`, with the handle
 /// of each in the scene's list `handles`; `field` is its name in `Renderer`.
-/// A scene holds at most `limit`.
+/// A scene holds at most `limit`, past which `create` fails with
+/// `error.TooManyDecals`; only decals have a limit.
 fn Placed(comptime Item: type, comptime Tag: type, comptime list: []const u8, comptime handles: []const u8, comptime field: []const u8, comptime limit: ?usize) type {
     return struct {
         const Self = @This();
         pub const Id = handle.Handle(Tag);
 
-        table: handle.HandleTable(Entry, Tag),
+        internal: Internal,
 
         /// Where one is: its scene, and its place in the scene's list.
         pub const Entry = struct { scene: Scene, index: u32 };
 
-        pub fn free(_: *Renderer, _: *Entry) void {}
+        /// Not part of the API.
+        pub const Internal = struct {
+            table: handle.HandleTable(Entry, Tag),
+
+            pub fn free(_: *Renderer, _: *Entry) void {}
+
+            /// Forgets the handles into `data`'s list before it is replaced or
+            /// freed; they name nothing from here on.
+            pub fn forget(internal: *Internal, data: anytype) void {
+                for (@field(data, handles).items) |maybe| if (maybe) |id| {
+                    _ = internal.table.remove(id);
+                };
+                @field(data, handles).clearRetainingCapacity();
+            }
+        };
 
         fn renderer(self: *Self) *Renderer {
             return @alignCast(@fieldParentPtr(field, self));
@@ -38,14 +53,14 @@ fn Placed(comptime Item: type, comptime Tag: type, comptime list: []const u8, co
             const owner = self.renderer();
             owner.lock();
             defer owner.unlock();
-            const data = owner.scenes.table.get(scene) orelse return error.InvalidScene;
+            const data = owner.scenes.internal.table.get(scene) orelse return error.InvalidScene;
             const items = &@field(data, list);
             const ids = &@field(data, handles);
-            if (limit) |most| if (items.items.len >= most) return error.TooMany;
+            if (limit) |most| if (items.items.len >= most) return error.TooManyDecals;
             try pad(owner, data);
             try items.ensureUnusedCapacity(owner.internal.gpa, 1);
             try ids.ensureUnusedCapacity(owner.internal.gpa, 1);
-            const id = try self.table.insert(.{ .scene = scene, .index = @intCast(items.items.len) });
+            const id = try self.internal.table.insert(.{ .scene = scene, .index = @intCast(items.items.len) });
             items.appendAssumeCapacity(item);
             ids.appendAssumeCapacity(id);
             changed(data);
@@ -57,8 +72,8 @@ fn Placed(comptime Item: type, comptime Tag: type, comptime list: []const u8, co
             const owner = self.renderer();
             owner.lock();
             defer owner.unlock();
-            const entry = self.table.get(id) orelse return;
-            const data = owner.scenes.table.get(entry.scene) orelse return;
+            const entry = self.internal.table.get(id) orelse return;
+            const data = owner.scenes.internal.table.get(entry.scene) orelse return;
             @field(data, list).items[entry.index] = item;
             changed(data);
         }
@@ -68,30 +83,21 @@ fn Placed(comptime Item: type, comptime Tag: type, comptime list: []const u8, co
             const owner = self.renderer();
             owner.lock();
             defer owner.unlock();
-            const entry = (self.table.get(id) orelse return).*;
-            const data = owner.scenes.table.get(entry.scene) orelse {
-                _ = self.table.remove(id);
+            const entry = (self.internal.table.get(id) orelse return).*;
+            const data = owner.scenes.internal.table.get(entry.scene) orelse {
+                _ = self.internal.table.remove(id);
                 return;
             };
             pad(owner, data) catch return;
-            _ = self.table.remove(id);
+            _ = self.internal.table.remove(id);
             const items = &@field(data, list);
             const ids = &@field(data, handles);
             _ = items.swapRemove(entry.index);
             _ = ids.swapRemove(entry.index);
             if (entry.index < ids.items.len) if (ids.items[entry.index]) |moved| {
-                if (self.table.get(moved)) |place| place.index = entry.index;
+                if (self.internal.table.get(moved)) |place| place.index = entry.index;
             };
             changed(data);
-        }
-
-        /// Forgets the handles into `data`'s list before it is replaced or
-        /// freed; they name nothing from here on.
-        pub fn forget(self: *Self, data: anytype) void {
-            for (@field(data, handles).items) |maybe| if (maybe) |id| {
-                _ = self.table.remove(id);
-            };
-            @field(data, handles).clearRetainingCapacity();
         }
 
         /// Gives every item of `data`'s list a place in its list of handles;

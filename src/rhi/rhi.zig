@@ -49,6 +49,7 @@ pub const ColorAttachment = types.ColorAttachment;
 pub const DepthAttachment = types.DepthAttachment;
 pub const LoadOp = types.LoadOp;
 pub const IndexType = types.IndexType;
+pub const Work = types.Work;
 pub const PassTiming = types.PassTiming;
 pub const MemoryStats = types.MemoryStats;
 pub const AdapterInfo = types.AdapterInfo;

@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 6, 0.05, 6 }, &box_positions, &box_indices);
     const floor = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.3, 0.32, 0.36, 1 }, .metallic = 0, .roughness = 0.4 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = floor });
+    _ = try renderer.entities.create(scene, .{ .model = floor });
 
     const font = renderer.fonts.default();
     try renderer.fonts.prepareText(font, hebrew ++ arabic ++ mixed ++ "→·“”");

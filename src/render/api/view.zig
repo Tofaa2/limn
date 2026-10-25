@@ -21,7 +21,8 @@ const View = api.View;
 pub const Target = union(enum) {
     /// The window surface passed in `Options.surface`.
     backbuffer,
-    /// Any color texture created with `.color_attachment` usage.
+    /// A 2D color texture created with `.color_attachment` usage, else
+    /// `error.InvalidTarget`.
     texture: rhi.Texture,
 };
 
@@ -47,6 +48,19 @@ pub const PassStage = enum {
     /// Tone-mapped: `color` is the view's output in display colors. Draw lists
     /// come after.
     after_tonemap,
+    /// Into each sun shadow cascade redrawn this frame, after the scene's own
+    /// casters: `depth` (also given as `color`) is the shadow map, `layer`
+    /// the cascade and `view_projection` its matrix. Unlike the scene's
+    /// depth it is not reversed: cleared to 1 and compared less-or-equal.
+    /// Draw casters depth only, rendering into that layer with `.load`.
+    sun_shadow,
+    /// Into each tile of the spot and point light shadow atlas redrawn this
+    /// frame, after the scene's own casters: `depth` (also given as `color`)
+    /// is the atlas, `origin`, `width` and `height` the tile, which the pass
+    /// sets as its viewport, and `view_projection` the tile's matrix. The
+    /// depth is reversed like the scene's: cleared to 0 and compared
+    /// greater-or-equal.
+    light_shadow,
 };
 
 /// What a `Pass` is given. Textures are in the shader-read state;
@@ -54,6 +68,8 @@ pub const PassStage = enum {
 /// them afterwards.
 pub const PassContext = struct {
     cmd: *rhi.CommandEncoder,
+    /// The renderer's device. What a pass makes with it is the application's
+    /// to destroy, after `Device.waitIdle` and before `Renderer.deinit`.
     device: *rhi.Device,
     stage: PassStage,
     /// GPU address of this view's `FrameConstants` (see `shaders/common.slang`);
@@ -75,6 +91,12 @@ pub const PassContext = struct {
     ambient_occlusion: ?rhi.Texture = null,
     width: u32,
     height: u32,
+    /// Layer of `color` and `depth` to draw into: the cascade for
+    /// `.sun_shadow`, else 0.
+    layer: u32 = 0,
+    /// Top-left corner of the `width` by `height` part of the targets to
+    /// draw: a light's tile of the atlas for `.light_shadow`, else 0, 0.
+    origin: [2]u32 = .{ 0, 0 },
     camera: Camera,
     /// World to view, view to clip with this frame's jitter, and both.
     view: Mat4,
@@ -84,18 +106,22 @@ pub const PassContext = struct {
     settings: *const Settings,
 };
 
+/// A texture of the view a `Pass` can read.
+pub const PassRead = enum { depth, motion, visibility, ambient_occlusion };
+
 /// Application code run at a `PassStage`, while the frame is recorded with the
 /// renderer locked: it must not call back into the `Renderer`. On a view
 /// without a scene the stages before tone mapping run together, after the
 /// draw lists of `DrawStage.scene`.
-/// A texture of the view a `Pass` can read.
-pub const PassRead = enum { depth, motion, visibility, ambient_occlusion };
-
 pub const Pass = struct {
     stage: PassStage,
     /// What the pass samples besides `PassContext.color`: the passes that
     /// make them run first, and they are readable when it runs.
     reads: []const PassRead = &.{},
+    /// For `.sun_shadow` and `.light_shadow`: whether what the pass draws
+    /// moves. While it does, every cascade and atlas tile is redrawn each
+    /// frame, also those that would otherwise be kept.
+    moving: bool = true,
     context: ?*anyopaque = null,
     run: *const fn (context: ?*anyopaque, pass: PassContext) anyerror!void,
 };
@@ -152,11 +178,15 @@ pub const ViewDesc = struct {
     /// Background without a scene, linear RGBA. Only the first view drawn to a
     /// target in a frame clears it.
     clear_color: [4]f32 = .{ 0, 0, 0, 1 },
+    /// See `Camera.valid`.
     camera: Camera = .{},
     target: Target = .backbuffer,
     /// Part of the target to draw into; null covers it all.
     region: ?Region = null,
     passes: []const Pass = &.{},
+    /// Defaults to everything on (`Quality.ultra`); start from
+    /// `Settings.preset(renderer.recommendedQuality())` or
+    /// `Settings.lightweight` to pay less.
     settings: Settings = .{},
     /// The camera jumped since the last frame: temporal history starts over
     /// and exposure adapts at once.
@@ -166,8 +196,12 @@ pub const ViewDesc = struct {
 /// Everything `Renderer.render` draws in one frame.
 pub const FrameDesc = struct {
     /// Drawn in order. A view may draw into a texture a later view shows (see
-    /// `Renderer.views.targetImage`).
+    /// `Renderer.views.targetImage`). At most 16 distinct targets a frame,
+    /// reflection probe captures included, else `error.TooManyTargets`. A
+    /// view that fails (an invalid scene, view, target, region or camera)
+    /// fails the whole frame.
     views: []const ViewDesc,
-    /// Seconds since the previous frame.
-    delta_time: f32 = 1.0 / 60.0,
+    /// Seconds since the previous frame; finite and not negative, or
+    /// `render` fails with `error.InvalidDeltaTime`.
+    delta_time: f32,
 };

@@ -63,28 +63,23 @@ pub fn main(init: std.process.Init) !void {
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
 
-    const lights = try gfx.loadSceneLights(gpa, init.io, scene_path);
+    const lights = try renderer.models.loadLights(gpa, scene_path, 0.02);
     defer gpa.free(lights);
     var sun_direction = math.Vec3{ -0.4, -1.0, -0.3 };
-    var lamps: std.ArrayList(gfx.Light) = .empty;
+    var lamps: std.ArrayList(gfx.LightDesc) = .empty;
     defer lamps.deinit(gpa);
     for (lights) |light| switch (light.kind) {
         .directional => sun_direction = light.direction,
-        else => try lamps.append(gpa, .{
-            .kind = if (light.kind == .spot) .spot else .point,
-            .position = light.position,
-            .direction = light.direction,
-            .color = light.color,
-            .intensity = light.intensity * 0.02,
-            .range = if (light.range > 0) light.range else 8,
-            .inner_angle = light.inner_angle,
-            .outer_angle = light.outer_angle,
-            .source_radius = 0.05,
-        }),
+        else => {
+            var lamp = light;
+            if (lamp.range > 8) lamp.range = 8;
+            lamp.source_radius = 0.05;
+            try lamps.append(gpa, lamp);
+        },
     };
 
     const model = try renderer.models.load(scene_path);
-    const bistro = try renderer.entities.spawn(scene, .{ .model = model });
+    const bistro = try renderer.entities.create(scene, .{ .model = model });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(gpa);
@@ -100,7 +95,7 @@ pub fn main(init: std.process.Init) !void {
         pitch = values[4];
     }
     var applied_night: ?bool = null;
-    var lit: std.ArrayList(gfx.Light) = .empty;
+    var lit: std.ArrayList(gfx.LightDesc) = .empty;
     defer lit.deinit(gpa);
     var animating = true;
     var clock: f32 = 0;
@@ -155,7 +150,7 @@ pub fn main(init: std.process.Init) !void {
             try renderer.scenes.setLights(scene, lit.items);
         }
 
-        const stats = renderer.getStats();
+        const stats = renderer.stats();
         list.clear();
         try list.rect(.{ .x = 12, .y = 12, .width = 700, .height = 96 }, gfx.Color.rgba(8, 10, 18, 190));
         try list.text(font, try std.fmt.bufPrint(&text, "Bistro, {s} · {d:.0} fps rendered, {d:.0} shown · gpu {d:.2} ms", .{ if (night) "night" else "day", stage.fps, stage.shown_fps, stage.gpu_ms }), .{ 24, 20 }, .{ .size = 17 });

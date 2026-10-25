@@ -26,6 +26,13 @@ const max_depth = 6;
 const max_glyphs = 1 << 16;
 /// Most glyphs one rule's input may span.
 const max_input = 32;
+/// Lookup applications one call to `substitute` or `substitutePlanned` may
+/// make per glyph of the run, at least `min_operations`; a font whose rules
+/// would make more leaves the rest of the run as it is.
+const operations_per_glyph = 64;
+const min_operations = 4096;
+/// What the running call may still apply.
+threadlocal var operations_left: usize = 0;
 
 /// Bounds-checked big-endian reads from a font file. `bytes` is borrowed.
 pub const Reader = struct {
@@ -257,6 +264,7 @@ pub const Layout = struct {
     /// Applies a plan's lookups to a glyph run. Returns whether anything
     /// changed.
     pub fn substitutePlanned(self: Layout, gpa: std.mem.Allocator, glyphs: *std.ArrayList(Glyph), planned: Plan) !bool {
+        operations_left = @max(glyphs.items.len * operations_per_glyph, min_operations);
         var changed = false;
         for (planned.lookups, planned.starts, planned.masks) |index, starts, mask| {
             var lookup: ?usize = null;
@@ -311,6 +319,7 @@ pub const Layout = struct {
 
     /// Applies lookups, in the order given, to a glyph run.
     pub fn substitute(self: Layout, gpa: std.mem.Allocator, glyphs: *std.ArrayList(Glyph), lookup_indices: []const u16) !void {
+        operations_left = @max(glyphs.items.len * operations_per_glyph, min_operations);
         for (lookup_indices) |index| {
             const lookup = (try self.lookupAt(index)) orelse continue;
             const flag = try self.flagsOf(lookup);
@@ -387,6 +396,8 @@ pub const Layout = struct {
     /// Tries the lookup's subtables at `at`. Null when none applies, else how
     /// many glyphs to advance by.
     fn applyAt(self: Layout, gpa: std.mem.Allocator, glyphs: *std.ArrayList(Glyph), lookup: usize, at: usize, depth: u32) anyerror!?usize {
+        if (operations_left == 0) return null;
+        operations_left -= 1;
         const reader = self.reader;
         const kind = try reader.u16At(lookup);
         const flag = try self.flagsOf(lookup);

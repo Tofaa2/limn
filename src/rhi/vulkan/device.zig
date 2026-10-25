@@ -64,6 +64,8 @@ pub const BufferResource = struct {
     /// Requested size in bytes.
     size: u64,
     address: u64,
+    /// The start of `BufferDesc.name`, for reports of a lost device.
+    name: [24]u8 = @splat(0),
 };
 
 const SubView = struct { mip: u32, layer: u32, view: vk.ImageView };
@@ -169,7 +171,9 @@ pub const PendingUpload = union(enum) {
     copy: struct { source: types.Buffer, destination: types.Buffer, size: u64 },
 };
 
-const Scope = struct { name: []const u8, depth: u8 };
+/// While open, `work` holds the encoder's count at the start; once closed,
+/// what the scope recorded.
+const Scope = struct { name: []const u8, depth: u8, work: types.Work = .{} };
 
 /// One of the `frames_in_flight` slots of the frame loop.
 pub const FrameData = struct {
@@ -204,8 +208,8 @@ const Swapchain = struct {
     vsync: bool,
     /// Set by `resize`/`setVsync`; may be written under an external lock.
     dirty: bool = true,
-    /// Set by acquire/present; owned by the frame loop.
-    stale: bool = false,
+    /// Set by acquire and present, also from the paced present thread.
+    stale: std.atomic.Value(bool) = .init(false),
     present_pending: bool = false,
     image_index: u32 = 0,
     /// The backbuffer copied for the frame generator and what it writes, in
@@ -250,8 +254,8 @@ const supportsMeshShaders = adapter_module.supportsMeshShaders;
 const supportsRayQueries = adapter_module.supportsRayQueries;
 
 /// Not movable, and not thread-safe except: `compileGraphicsPipeline` and
-/// `validationErrorCount` run on any thread; `waitForFrame`, `acquireImage`
-/// and `presentFrame` may run outside the caller's device lock.
+/// `validationErrorCount` run on any thread; `internal.waitForFrame`, `internal.acquireImage`
+/// and `internal.presentFrame` may run outside the caller's device lock.
 pub const Device = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -260,6 +264,8 @@ pub const Device = struct {
     instance: dispatch.Instance,
     physical: vk.PhysicalDevice,
     device_wrapper: dispatch.DeviceWrapper,
+    /// `VK_EXT_device_fault` is enabled: a lost device says where it faulted.
+    device_fault: bool = false,
     vkd: dispatch.Device,
     /// The only queue; submit under `queue_mutex`.
     queue: vk.Queue,
@@ -336,6 +342,47 @@ pub const Device = struct {
     detached_pool: vk.CommandPool = .null_handle,
     /// Detached jobs submitted and not yet released.
     detached_outstanding: u32 = 0,
+    /// `beginFrame` and `endFrame` in their parts, as `Renderer` paces
+    /// them; not part of the API.
+    internal: FrameLoop = .{},
+
+    pub const FrameLoop = struct {
+        fn device(loop: *FrameLoop) *Device {
+            return @alignCast(@fieldParentPtr("internal", loop));
+        }
+
+        pub fn waitForFrame(loop: *FrameLoop) !void {
+            return frames_module.waitForFrame(loop.device());
+        }
+
+        pub fn prepareSurface(loop: *FrameLoop) !bool {
+            return presentation_module.prepareSurface(loop.device());
+        }
+
+        pub fn acquireImage(loop: *FrameLoop) !bool {
+            return presentation_module.acquireImage(loop.device());
+        }
+
+        pub fn startFrame(loop: *FrameLoop) !Frame {
+            return frames_module.startFrame(loop.device());
+        }
+
+        pub fn closeFailedFrame(loop: *FrameLoop) void {
+            frames_module.closeFailedFrame(loop.device());
+        }
+
+        pub fn submitFrame(loop: *FrameLoop) !void {
+            return frames_module.submitFrame(loop.device());
+        }
+
+        pub fn presentFrame(loop: *FrameLoop) !void {
+            return presentation_module.presentFrame(loop.device());
+        }
+
+        pub fn takeUploads(loop: *FrameLoop) std.ArrayList(PendingUpload) {
+            return frames_module.takeUploads(loop.device());
+        }
+    };
 
     /// Creates a device on the best Vulkan 1.3 adapter. Keeps `gpa` and `io`;
     /// the window must outlive it. Fails with `error.VulkanLoaderUnavailable`,
@@ -477,7 +524,16 @@ pub const Device = struct {
         };
         self.caps.shading_rate_tile = try shadingRateTile(gpa, self.instance, self.physical);
         self.caps.mesh_shaders = desc.mesh_shaders and try supportsMeshShaders(gpa, self.instance, self.physical);
+        self.device_fault = blk: {
+            if (!try deviceExtensionListed(gpa, self.instance, self.physical, vk.extensions.ext_device_fault.name)) break :blk false;
+            var fault = vk.PhysicalDeviceFaultFeaturesEXT{};
+            var supported = vk.PhysicalDeviceFeatures2{ .p_next = &fault, .features = .{} };
+            self.instance.getPhysicalDeviceFeatures2(self.physical, &supported);
+            break :blk fault.device_fault == .true;
+        };
         var chain = FeatureChain{};
+        var fault_features = vk.PhysicalDeviceFaultFeaturesEXT{ .device_fault = .true };
+        if (self.device_fault) chain.add(&fault_features);
         var mesh_shader_features = vk.PhysicalDeviceMeshShaderFeaturesEXT{ .task_shader = .true, .mesh_shader = .true };
         var shading_rate_features = vk.PhysicalDeviceFragmentShadingRateFeaturesKHR{ .pipeline_fragment_shading_rate = .true, .attachment_fragment_shading_rate = .true };
         var ray_query_features = vk.PhysicalDeviceRayQueryFeaturesKHR{ .ray_query = .true };
@@ -536,6 +592,7 @@ pub const Device = struct {
         var extensions = ExtensionList{};
         if (self.caps.shading_rate_tile != 0) extensions.add(&.{vk.extensions.khr_fragment_shading_rate.name});
         if (self.caps.mesh_shaders) extensions.add(&.{vk.extensions.ext_mesh_shader.name});
+        if (self.device_fault) extensions.add(&.{vk.extensions.ext_device_fault.name});
         if (self.surface != .null_handle) extensions.add(&.{vk.extensions.khr_swapchain.name});
         if (self.caps.ray_tracing) extensions.add(&ray_query_extensions);
         if (self.caps.nvidia_ngx) extensions.add(&ngx_extensions);
@@ -559,7 +616,9 @@ pub const Device = struct {
         errdefer self.vkd.destroyDevice(null);
         self.queue = self.vkd.getDeviceQueue(self.queue_family, 0);
         self.detached_queue = if (queue_count > 1) self.vkd.getDeviceQueue(self.queue_family, 1) else null;
-        self.allocator = memory.Allocator.init(gpa, self.vkd, self.instance.getPhysicalDeviceMemoryProperties(self.physical));
+        const shared_memory = self.properties.device_type == .integrated_gpu or self.properties.device_type == .cpu;
+        self.allocator = memory.Allocator.init(gpa, self.vkd, self.instance.getPhysicalDeviceMemoryProperties(self.physical), shared_memory);
+        self.caps.unified_memory = self.allocator.unified;
         errdefer self.allocator.deinit();
 
         self.buffers = .init(gpa);
@@ -819,13 +878,6 @@ pub const Device = struct {
     pub const setFrameGenerator = presentation_module.setFrameGenerator;
     pub const beginFrame = frames_module.beginFrame;
     pub const endFrame = frames_module.endFrame;
-    pub const waitForFrame = frames_module.waitForFrame;
-    pub const prepareSurface = presentation_module.prepareSurface;
-    pub const acquireImage = presentation_module.acquireImage;
-    pub const startFrame = frames_module.startFrame;
-    pub const submitFrame = frames_module.submitFrame;
-    pub const presentFrame = presentation_module.presentFrame;
-    pub const closeFailedFrame = frames_module.closeFailedFrame;
     pub const waitIdle = frames_module.waitIdle;
     pub const flushUploadsBlocking = frames_module.flushUploadsBlocking;
     pub const pendingUploadBytes = frames_module.pendingUploadBytes;
@@ -835,7 +887,6 @@ pub const Device = struct {
     pub const releaseDetached = frames_module.releaseDetached;
     pub const beginImmediate = frames_module.beginImmediate;
     pub const endImmediate = frames_module.endImmediate;
-    pub const takeUploads = frames_module.takeUploads;
 
     fn createDescriptorTable(self: *Device) !void {
         const all_bindings = [_]vk.DescriptorSetLayoutBinding{

@@ -82,8 +82,8 @@ fn evaluatePoses(self: *Renderer, scene: *SceneData) !void {
 /// two batches share an entity.
 fn poseEntities(self: *Renderer, entities: []const Entity, scratch: []animation.Local) void {
     for (entities) |handle_value| {
-        const entity = self.entities.table.get(handle_value).?;
-        const model = self.models.table.get(entity.model).?;
+        const entity = self.entities.internal.table.get(handle_value).?;
+        const model = self.models.internal.table.get(entity.model).?;
         std.mem.swap([]Mat4, &entity.node_world, &entity.previous_node_world);
         animation.evaluate(&model.source.?, model.pose_order, entity.pose, scratch, entity.node_world);
         if (entity.history_frames == 0) @memcpy(entity.previous_node_world, entity.node_world);
@@ -111,12 +111,12 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     scene.triangle_count = 0;
     scene.masked_ref_count = 0;
     for (scene.entities.items) |entity_handle| {
-        const entity = self.entities.table.get(entity_handle) orelse continue;
+        const entity = self.entities.internal.table.get(entity_handle) orelse continue;
         const mark = &self.internal.entity_marks.items[entity_handle.index];
         mark.layout_first = @intCast(scene.layout.items.len);
         mark.layout_count = 0;
         if (!entity.visible) continue;
-        const model = self.models.table.get(entity.model) orelse continue;
+        const model = self.models.internal.table.get(entity.model) orelse continue;
         if (model.state != .ready or !model.geometry_resident) continue;
         try resolveEntity(self, entity, model);
         const source = &model.source.?;
@@ -183,10 +183,10 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     scene.entity_ref_count = @intCast(self.internal.scratch_refs.items.len);
     scene.static_ranges.clearRetainingCapacity();
     for (scene.groups.items) |group_handle| {
-        const group = self.instances.table.get(group_handle) orelse continue;
+        const group = self.instances.internal.table.get(group_handle) orelse continue;
         group.base = @as(u32, @intCast(scene.layout.items.len)) + scene.static_count;
         group.per_copy = 0;
-        const model = self.models.table.get(group.model) orelse continue;
+        const model = self.models.internal.table.get(group.model) orelse continue;
         if (model.state != .ready or !model.geometry_resident) continue;
         const source = &model.source.?;
         group.per_copy = @intCast(source.instances.len);
@@ -317,8 +317,8 @@ const PrepareWhole = struct {
         for (scene.layout.items[start..end], scene.entries.items[start..end], start..) |entry, *info, instance_index| {
             info.bits &= ~EntryInfo.moved;
             if (info.bits & EntryInfo.skinned != 0) continue;
-            const entity = self.entities.table.get(entry.entity).?;
-            const model = self.models.table.get(entity.model).?;
+            const entity = self.entities.internal.table.get(entry.entity).?;
+            const model = self.models.internal.table.get(entity.model).?;
             const instance = model.source.?.instances[entry.model_instance];
             const node_world = if (entity.node_world.len != 0) entity.node_world else model.node_world;
             const previous_node_world = if (entity.node_world.len != 0) entity.previous_node_world else model.node_world;
@@ -423,7 +423,7 @@ const MoveShare = struct {
         for (edited[share.first..share.last]) |slot| {
             const mark = &self.internal.entity_marks.items[slot];
             const bits = @atomicLoad(u32, &mark.bits, .monotonic);
-            if (mark.handle == 0 or bits & EntityMark.listed == 0 or self.scenes.table.get(mark.scene) != scene) continue;
+            if (mark.handle == 0 or bits & EntityMark.listed == 0 or self.scenes.internal.table.get(mark.scene) != scene) continue;
             const count = mark.layout_count;
             var simple = bits & (EntityMark.teleported | EntityMark.restyled) == 0 and count <= most_entries and (count == 0 or entries[mark.layout_first].rest != null);
             if (simple and room < count) {
@@ -480,11 +480,16 @@ const MoveShare = struct {
     }
 };
 
+/// Threads `moveAcrossThreads` splits the scene's edits over; 1 means none.
+fn moveThreads(self: *Renderer, scene: *const SceneData) usize {
+    return std.math.clamp(scene.edited.items.len / move_batch, 1, workerThreads(self));
+}
+
 /// Hands the edited entities that only move to threads, when there are
 /// enough of them. What it leaves in `scene.edited` is still to be done.
 fn moveAcrossThreads(self: *Renderer, scene: *SceneData, changes: *Changes, room: u32) !void {
     const edited = scene.edited.items;
-    const threads = std.math.clamp(edited.len / move_batch, 1, workerThreads(self));
+    const threads = moveThreads(self, scene);
     if (threads == 1) return;
     const base = changes.move_count;
     try self.internal.scratch_moved.resize(self.internal.gpa, room);
@@ -593,7 +598,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
     scene.movers.clearRetainingCapacity();
     scene.movers_overflow = false;
     for (scene.hairs.items) |hair_handle| {
-        const hair = self.hairs.table.get(hair_handle) orelse continue;
+        const hair = self.hairs.internal.table.get(hair_handle) orelse continue;
         if (hair.simulation == null) continue;
         const center = math.transformPoint(hair.desc.transform, hair.bounds[0..3].*);
         noteMover(self, scene, .{ center[0], center[1], center[2], hair.bounds[3] * math.maxScale(hair.desc.transform) * 1.6 });
@@ -636,8 +641,11 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         @memset(scene.chunk_stale.items, true);
         changes.tlas_changed = true;
     } else {
-        const threaded_room: u32 = @intCast(scene.edited_entries + scene.edited_entries / 8 + max_worker_threads * MoveShare.block);
-        const moves = try arena.alloc(device, InstanceMove, scene.edited_entries + scene.settling.items.len + scene.posed_entries + threaded_room);
+        var edited_entries: usize = 0;
+        for (scene.edited.items) |slot| edited_entries += self.internal.entity_marks.items[slot].layout_count;
+        edited_entries = @max(edited_entries, scene.edited_entries);
+        const threaded_room: u32 = if (moveThreads(self, scene) == 1) 0 else @intCast(edited_entries + edited_entries / 8 + max_worker_threads * MoveShare.block);
+        const moves = try arena.alloc(device, InstanceMove, edited_entries + scene.settling.items.len + scene.posed_entries + threaded_room);
         const rewrites = try arena.alloc(device, InstanceRewrite, @min(entity_count, scene.restyled_entries + scene.posed_entries));
         changes.moves = moves.items;
         changes.rewrites = rewrites.items;
@@ -657,7 +665,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         var deferred: usize = 0;
         for (scene.edited.items) |slot| {
             const mark = &self.internal.entity_marks.items[slot];
-            if (mark.handle == 0 or mark.bits & EntityMark.listed == 0 or self.scenes.table.get(mark.scene) != scene) continue;
+            if (mark.handle == 0 or mark.bits & EntityMark.listed == 0 or self.scenes.internal.table.get(mark.scene) != scene) continue;
             mark.bits &= ~EntityMark.listed;
             const now = self.internal.entity_transforms.items[slot];
             const before = &self.internal.entity_previous.items[slot];
@@ -678,8 +686,8 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
                 const transform = math.mul(now, rest.*);
                 if (whole_records) {
                     const entry = layout[index];
-                    const entity = self.entities.table.get(entry.entity).?;
-                    const model = self.models.table.get(entity.model).?;
+                    const entity = self.entities.internal.table.get(entry.entity).?;
+                    const model = self.models.internal.table.get(entity.model).?;
                     const record = rigidRecord(self, entity, model, model.source.?.instances[entry.model_instance].mesh, transform, !changed, info.bits & EntryInfo.glows != 0);
                     changes.rewrite(@intCast(index), info, record, math.mul(before.*, rest.*), transform, changed or jumped);
                 } else changes.move(@intCast(index), info, transform, flags);
@@ -708,8 +716,8 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
     for (scene.posed.items) |handle_value| {
         const slot = handle_value.index;
         const mark = &self.internal.entity_marks.items[slot];
-        const entity = self.entities.table.get(handle_value).?;
-        const model = self.models.table.get(entity.model).?;
+        const entity = self.entities.internal.table.get(handle_value).?;
+        const model = self.models.internal.table.get(entity.model).?;
         const source = &model.source.?;
         const now = self.internal.entity_transforms.items[slot];
         const before = self.internal.entity_previous.items[slot];
@@ -838,7 +846,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
     for (scene.edited.items) |slot| {
         const mark = &self.internal.entity_marks.items[slot];
         if (whole) {
-            if (mark.handle == 0 or self.scenes.table.get(mark.scene) != scene) continue;
+            if (mark.handle == 0 or self.scenes.internal.table.get(mark.scene) != scene) continue;
         } else {
             const now = self.internal.entity_transforms.items[slot];
             const before = &self.internal.entity_previous.items[slot];
@@ -895,7 +903,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
 
     var driven = false;
     for (scene.groups.items) |group_handle| {
-        const group = self.instances.table.get(group_handle) orelse continue;
+        const group = self.instances.internal.table.get(group_handle) orelse continue;
         if (group.driver != null) driven = true;
     }
     if (driven or records.static_version != scene.static_version or records.entity_count != entity_count) {
@@ -907,9 +915,9 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         scene.static_transmissive = false;
         try self.internal.scratch_instances.ensureTotalCapacity(self.internal.gpa, scene.static_count);
         for (scene.groups.items) |group_handle| {
-            const group = self.instances.table.get(group_handle) orelse continue;
+            const group = self.instances.internal.table.get(group_handle) orelse continue;
             if (group.per_copy == 0) continue;
-            const model = self.models.table.get(group.model) orelse continue;
+            const model = self.models.internal.table.get(group.model) orelse continue;
             const source = &model.source.?;
             const driver = groupDriver(self, group, source.instances.len);
             var impostor_index: u32 = 0;
@@ -1022,9 +1030,9 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
             scene.static_tlas.clearRetainingCapacity();
             var record: u32 = @intCast(entity_count);
             for (scene.groups.items) |group_handle| {
-                const group = self.instances.table.get(group_handle) orelse continue;
+                const group = self.instances.internal.table.get(group_handle) orelse continue;
                 if (group.per_copy == 0) continue;
-                const model = self.models.table.get(group.model) orelse continue;
+                const model = self.models.internal.table.get(group.model) orelse continue;
                 const source = &model.source.?;
                 const driver = groupDriver(self, group, source.instances.len);
                 for (group.transforms) |placement| {
@@ -1128,7 +1136,7 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
     const device = self.device;
     var fluid_lights: usize = 0;
     for (scene.fluids.items) |item| {
-        if (self.fluids.table.get(item)) |state| fluid_lights += @intFromBool(state.desc.light > 0);
+        if (self.fluids.internal.table.get(item)) |state| fluid_lights += @intFromBool(state.desc.light > 0);
     }
     const lights = try arena.alloc(device, gpu.Light, scene.lights.items.len + fluid_lights);
     const tiles = try arena.alloc(device, gpu.ShadowTile, max_local_shadow_views);
@@ -1143,17 +1151,17 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
     const tiles_per_side = std.math.clamp(self.options.shadows.local_tiles_per_side, 1, local_shadow_tiles_per_side);
     const tile_scale = 1.0 / @as(f32, @floatFromInt(tiles_per_side));
     const axes = [6]Vec3{ .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 } };
-    const granted = try self.internal.gpa.alloc(bool, scene.lights.items.len);
-    defer self.internal.gpa.free(granted);
+    try self.internal.scratch_granted.resize(self.internal.gpa, scene.lights.items.len);
+    const granted = self.internal.scratch_granted.items;
     @memset(granted, false);
     const shared = shadows and scene.shadow_grants_frame == self.internal.frame_index and
         scene.shadow_grants_traced == traced_shadows and scene.shadow_grants.items.len == granted.len;
     if (shared) {
         @memcpy(granted, scene.shadow_grants.items);
     } else if (shadows) {
-        const Candidate = struct { index: u32, score: f32 };
-        const candidates = try self.internal.gpa.alloc(Candidate, scene.lights.items.len);
-        defer self.internal.gpa.free(candidates);
+        const Candidate = render.LightRank;
+        try self.internal.scratch_light_ranks.resize(self.internal.gpa, scene.lights.items.len);
+        const candidates = self.internal.scratch_light_ranks.items;
         var candidate_count: usize = 0;
         for (scene.lights.items, 0..) |light, index| {
             if (!light.cast_shadows or light.kind == .directional or light.kind == .rectangle) continue;
@@ -1198,8 +1206,8 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
             .source_radius = @max(light.source_radius, 0),
             .source_length = if (light.kind == .point or light.kind == .rectangle) @max(light.source_length, 0) else 0,
             .source_height = if (light.kind == .rectangle) @max(light.source_height, 0) else 0,
-            .cookie = if (light.cookie) |image| image.index else gpu.invalid_id,
-            .profile = if (light.profile) |image| image.index else gpu.invalid_id,
+            .cookie = self.images.indexOf(light.cookie),
+            .profile = self.images.indexOf(light.profile),
             .direction = direction,
             .cone_scale = cone_scale,
             .cone_offset = -cos_outer * cone_scale,
@@ -1235,7 +1243,7 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
     }
     var fluid_slot: usize = scene.lights.items.len;
     for (scene.fluids.items) |item| {
-        const state = self.fluids.table.get(item) orelse continue;
+        const state = self.fluids.internal.table.get(item) orelse continue;
         if (state.desc.light <= 0) continue;
         const t = state.desc.transform;
         const height = math.length(.{ t[4], t[5], t[6] });
@@ -1265,7 +1273,7 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
             var last_entry: ?*ModelEntry = null;
             var last_mesh: usize = 0;
             var last_end: u32 = 0;
-            for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
+            for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
                 if (entry.state != .ready or !entry.geometry_resident or entry.geometry_coarse) continue;
                 for (entry.meshes, 0..) |mesh, index| {
                     const end = if (vertices) mesh.vertex_offset + mesh.vertex_count else mesh.index_offset + mesh.index_count;
@@ -1303,7 +1311,7 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
                 };
                 try self.internal.meshes.write(self.device, entry.mesh_base + @as(u32, @intCast(last_mesh)), std.mem.asBytes(&record));
             }
-            for (self.scenes.table.slots.items) |*slot| if (slot.value) |*scene| {
+            for (self.scenes.internal.table.slots.items) |*slot| if (slot.value) |*scene| {
                 scene.static_version += 1;
                 scene.layout_dirty = true;
             };

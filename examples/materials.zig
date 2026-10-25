@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
             .indices = &indices,
             .material = .{ .base_color = .{ 0.82, 0.3, 0.16, 1 }, .metallic = metallic, .roughness = roughness },
         }});
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.translation(.{
             (@as(f32, @floatFromInt(column)) - (columns - 1) * 0.5) * spacing,
             1.2 + @as(f32, @floatFromInt(row)) * spacing,
             -1.5,
@@ -61,16 +61,16 @@ pub fn main(init: std.process.Init) !void {
     };
     for (special, 0..) |item, index| {
         const model = try renderer.models.create(&.{.{ .positions = &positions, .normals = &normals, .indices = &indices, .material = item.material }});
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - @as(f32, special.len - 1) * 0.5) * spacing, 0.5, 1.2 }) });
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - @as(f32, special.len - 1) * 0.5) * spacing, 0.5, 1.2 }) });
     }
 
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 9, 0.05, 6 }, &box_positions, &box_indices);
     const floor = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.2, 0.2, 0.21, 1 }, .metallic = 0, .roughness = 0.35 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = floor, .transform = math.translation(.{ 0, -0.05, 0 }) });
+    _ = try renderer.entities.create(scene, .{ .model = floor, .transform = math.translation(.{ 0, -0.05, 0 }) });
     const helmet = try renderer.models.load("examples/assets/DamagedHelmet.glb");
-    _ = try renderer.entities.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 6.2, 1.0, 0.3 }), math.mul(math.rotationY(-0.7), math.rotationX(std.math.pi * 0.5))) });
+    _ = try renderer.entities.create(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 6.2, 1.0, 0.3 }), math.mul(math.rotationY(-0.7), math.rotationX(std.math.pi * 0.5))) });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(init.gpa);

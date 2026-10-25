@@ -4,6 +4,7 @@ const math = @import("../../math.zig");
 const animation = @import("../animation.zig");
 const handle = @import("../../handle.zig");
 const render = @import("../renderer.zig");
+const view_math = @import("../renderer/view_math.zig");
 
 const Mat4 = render.Mat4;
 const Vec3 = render.Vec3;
@@ -11,6 +12,9 @@ const Vec3 = render.Vec3;
 const api = @import("../api.zig");
 const Image = api.Image;
 const Model = api.Model;
+const Scene = api.Scene;
+const Entity = api.Entity;
+const Pose = api.Pose;
 const Shadows = api.Shadows;
 const View = api.View;
 
@@ -47,6 +51,60 @@ pub const Camera = struct {
         return .{ .position = position, .forward = math.sub(target, position) };
     }
 
+    /// Whether the camera can be drawn from: finite numbers, a direction to
+    /// look in, a field of view between 0 and pi, a near plane in front and,
+    /// when orthographic, a height and a far plane beyond the near one. A
+    /// view whose camera is not fails with `error.InvalidCamera`.
+    pub fn valid(self: Camera) bool {
+        const numbers = self.position ++ self.forward ++ self.up ++ self.lens_shift ++ [2]f32{ self.fov_y, self.near };
+        for (numbers) |number| if (!std.math.isFinite(number)) return false;
+        if (math.dot(self.forward, self.forward) < 1e-20 or math.dot(self.up, self.up) < 1e-20) return false;
+        if (!(self.near > 0)) return false;
+        if (self.orthographic) |parallel| {
+            if (!std.math.isFinite(parallel.height) or !std.math.isFinite(parallel.far)) return false;
+            return parallel.height > 0 and parallel.far > self.near;
+        }
+        return self.fov_y > 0 and self.fov_y < std.math.pi;
+    }
+
+    /// World space to clip space for a picture `size` pixels wide and high,
+    /// as views draw with it, without antialiasing jitter.
+    pub fn viewProjection(self: Camera, size: [2]f32) Mat4 {
+        const projection = view_math.cameraProjection(self, size[0] / @max(size[1], 1e-6));
+        return math.mul(projection, math.lookTo(self.position, self.forward, self.up));
+    }
+
+    /// Where `point` is drawn in a picture `size` pixels wide and high, in
+    /// pixels from its top-left corner, and how far in front of the camera
+    /// it is along the view; null when it is not in front. Points off the
+    /// picture are still projected.
+    pub fn project(self: Camera, point: Vec3, size: [2]f32) ?Projected {
+        const clip = math.transformVec4(self.viewProjection(size), .{ point[0], point[1], point[2], 1 });
+        const view = math.transformPoint(math.lookTo(self.position, self.forward, self.up), point);
+        if (!(-view[2] > 0) or !(clip[3] > 0)) return null;
+        return .{
+            .pixel = .{ (clip[0] / clip[3] * 0.5 + 0.5) * size[0], (clip[1] / clip[3] * 0.5 + 0.5) * size[1] },
+            .depth = -view[2],
+        };
+    }
+
+    /// The ray through `pixel` (from the top-left corner, in pixels) of a
+    /// picture `size` pixels wide and high. It starts on the near plane, so
+    /// nothing nearer than the camera draws is hit.
+    pub fn ray(self: Camera, pixel: [2]f32, size: [2]f32) Ray {
+        const inverse = math.inverse(self.viewProjection(size));
+        const ndc = [2]f32{ pixel[0] / size[0] * 2 - 1, pixel[1] / size[1] * 2 - 1 };
+        const unproject = struct {
+            fn at(matrix: Mat4, x: f32, y: f32, depth: f32) Vec3 {
+                const point = math.transformVec4(matrix, .{ x, y, depth, 1 });
+                return .{ point[0] / point[3], point[1] / point[3], point[2] / point[3] };
+            }
+        };
+        const near = unproject.at(inverse, ndc[0], ndc[1], 1);
+        const far = unproject.at(inverse, ndc[0], ndc[1], 0.5);
+        return .{ .origin = near, .direction = math.normalize(math.sub(far, near)) };
+    }
+
     /// Left and right eye cameras `eye_separation` apart in world units,
     /// converging at distance `convergence`. Draw each as its own view with its
     /// own `View` handle.
@@ -67,6 +125,46 @@ pub const Camera = struct {
     }
 };
 
+/// A point as `Camera.project` finds it in the picture.
+pub const Projected = struct {
+    /// Pixels from the picture's top-left corner.
+    pixel: [2]f32,
+    /// World units in front of the camera, along the view.
+    depth: f32,
+};
+
+/// A half-line from `origin` along `direction`, which is unit length.
+pub const Ray = struct {
+    origin: Vec3,
+    direction: Vec3,
+
+    /// The point `distance` along the ray.
+    pub fn at(self: Ray, distance: f32) Vec3 {
+        return math.add(self.origin, math.scale(self.direction, distance));
+    }
+};
+
+test "a camera's ray lands where it projects" {
+    const size = [2]f32{ 640, 360 };
+    for ([_]Camera{
+        Camera.lookAt(.{ 1, 2, 3 }, .{ 0, 0, 0 }),
+        .{ .position = .{ -2, 1, 4 }, .forward = .{ 0.3, -0.2, -1 }, .lens_shift = .{ 0.2, -0.1 } },
+        .{ .position = .{ 0, 5, 5 }, .forward = .{ 0, -1, -1 }, .orthographic = .{ .height = 8 } },
+    }) |camera| {
+        for ([_][2]f32{ .{ 320, 180 }, .{ 10, 20 }, .{ 600, 350 } }) |pixel| {
+            const ray = camera.ray(pixel, size);
+            const projected = camera.project(ray.at(7), size) orelse return error.TestBehindCamera;
+            try std.testing.expectApproxEqAbs(pixel[0], projected.pixel[0], 1e-2);
+            try std.testing.expectApproxEqAbs(pixel[1], projected.pixel[1], 1e-2);
+        }
+        try std.testing.expect(camera.project(math.sub(camera.position, camera.forward), size) == null);
+    }
+    const centered = Camera.lookAt(.{ 0, 0, 5 }, .{ 0, 0, 0 }).project(.{ 0, 1, 0 }, size).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 320), centered.pixel[0], 1e-3);
+    try std.testing.expect(centered.pixel[1] < 180);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), centered.depth, 1e-4);
+}
+
 /// A parallel projection; see `Camera.orthographic`.
 pub const Orthographic = struct {
     /// World units the picture spans from top to bottom.
@@ -76,13 +174,14 @@ pub const Orthographic = struct {
 };
 
 /// The scene's one shadow-casting directional light; see `Renderer.scenes.setSun`.
-pub const Sun = struct {
+pub const SunDesc = struct {
     /// Direction the light travels.
     direction: Vec3 = .{ -0.4, -1.0, -0.3 },
     /// Linear color; `intensity` scales it.
     color: Vec3 = .{ 1.0, 0.96, 0.9 },
-    /// In the units of the environment map. 0 turns the sun off.
-    intensity: f32 = 0,
+    /// In the units of the environment map; 0 turns the sun off. `skySun`
+    /// gives a sun matching a sky.
+    intensity: f32,
 };
 
 pub const LightKind = enum {
@@ -98,7 +197,7 @@ pub const LightKind = enum {
 };
 
 /// A point, spot, directional or rectangle light.
-pub const Light = struct {
+pub const LightDesc = struct {
     kind: LightKind = .point,
     position: Vec3,
     /// Ignored for point lights.
@@ -106,7 +205,7 @@ pub const Light = struct {
     /// Linear color; `intensity` scales it.
     color: Vec3 = .{ 1, 1, 1 },
     intensity: f32 = 1,
-    /// Distance at which the light's contribution reaches zero.
+    /// Distance, in world units, at which the light's contribution reaches zero.
     range: f32 = 5,
     /// Spot cone half-angles in radians: full brightness inside `inner_angle`,
     /// none outside `outer_angle`.
@@ -132,7 +231,7 @@ pub const Light = struct {
     profile: ?Image = null,
 };
 
-/// What `Renderer.entities.spawn` makes an entity from. Everything but the model can be
+/// What `Renderer.entities.create` makes an entity from. Everything but the model can be
 /// changed afterwards.
 pub const EntityDesc = struct {
     /// May still be loading; the entity appears once it is ready.
@@ -146,6 +245,23 @@ pub const EntityDesc = struct {
     params: [4]f32 = .{ 0, 0, 0, 0 },
     /// False keeps the scene's decals off this entity.
     receive_decals: bool = true,
+};
+
+/// An entity as it stands; see `Renderer.entities.info`.
+pub const EntityInfo = struct {
+    scene: Scene,
+    model: Model,
+    /// As last set: relative to `parent` when there is one.
+    transform: Mat4,
+    /// Model space to world, after the parents' transforms.
+    world_transform: Mat4,
+    parent: ?Entity,
+    visible: bool,
+    /// As stored, to 1/255.
+    tint: [3]f32,
+    params: [4]f32,
+    receive_decals: bool,
+    pose: ?Pose,
 };
 
 /// One animation clip of a model; see `Renderer.models.animationInfo`.
@@ -178,6 +294,6 @@ pub const ModelInfo = struct {
 /// See `Renderer.environments.info`.
 pub const EnvironmentInfo = struct {
     /// Direction toward the brightest part of the panorama, usually the sun.
-    /// Negate it to get a matching `Sun.direction`.
+    /// Negate it to get a matching `SunDesc.direction`.
     brightest_direction: Vec3,
 };

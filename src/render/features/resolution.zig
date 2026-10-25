@@ -34,15 +34,13 @@ pub const View = struct {
         self.upscaler.deinit(device);
     }
 
-    /// Makes the pictures `width` by `height`.
+    /// Sizes the pictures `width` by `height`; `history` makes them when first
+    /// asked, so a view without temporal antialiasing has none.
     pub fn fit(self: *View, device: *rhi.Device, width: u32, height: u32) !void {
-        if (self.history[0] != null and self.width == width and self.height == height) return;
+        if (self.width == width and self.height == height) return;
         for (&self.history) |*texture| {
             if (texture.*) |made| device.destroyTexture(made);
             texture.* = null;
-        }
-        for (&self.history) |*texture| {
-            texture.* = try device.createTexture(.{ .name = "taa history", .width = width, .height = height, .format = render.hdr_format, .usage = .{ .sampled = true, .color_attachment = true, .storage = device.caps.storage_images, .copy_dst = true } });
         }
         self.width = width;
         self.height = height;
@@ -52,7 +50,11 @@ pub const View = struct {
 /// The view's resolved pictures, indexed by frame parity: `[frames & 1]` is
 /// this frame's, the other the last.
 pub fn history(renderer: *Renderer, view_data: *render.ViewData) ![2]rhi.Texture {
-    const own = try features.stateOf(view_data, renderer.device, @This());
+    const device = renderer.device;
+    const own = try features.stateOf(view_data, device, @This());
+    for (&own.history) |*texture| if (texture.* == null) {
+        texture.* = try device.createTexture(.{ .name = "taa history", .width = own.width, .height = own.height, .format = render.hdr_format, .usage = .{ .sampled = true, .color_attachment = true, .storage = device.caps.storage_images, .copy_dst = true } });
+    };
     return .{ own.history[0].?, own.history[1].? };
 }
 

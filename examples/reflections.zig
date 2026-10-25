@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
             .indices = &sphere_indices,
             .material = .{ .base_color = .{ 0.6, 0.6, 0.62, 1 }, .metallic = 0, .roughness = roughness },
         }});
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - 3) * 1.6, 0.6, 1.5 }) });
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - 3) * 1.6, 0.6, 1.5 }) });
     }
     const back = [_]struct { name: []const u8, material: gfx.Material }{
         .{ .name = "gold", .material = .{ .base_color = .{ 1.0, 0.77, 0.34, 1 }, .metallic = 1, .roughness = 0.12 } },
@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
             .indices = &sphere_indices,
             .material = item.material,
         }});
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - 2) * 2.0, 0.6, -1.6 }) });
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - 2) * 2.0, 0.6, -1.6 }) });
     }
 
     helpers.boxMesh(.{ 0.25, 0.9, 0.25 }, &box_positions, &box_indices);
@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
             .indices = &box_indices,
             .material = .{ .base_color = .{ 0.02, 0.02, 0.02, 1 }, .emissive = color, .metallic = 0, .roughness = 0.5 },
         }});
-        entity.* = try renderer.entities.spawn(scene, .{ .model = model });
+        entity.* = try renderer.entities.create(scene, .{ .model = model });
     }
     try renderer.waitUntilLoaded();
 

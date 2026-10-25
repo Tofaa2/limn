@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
     var backdrop = gfx.DrawList.init(init.gpa);
     defer backdrop.deinit();
     const font = renderer.fonts.default();
-    var lights: [walker_names.len]gfx.Light = undefined;
+    var lights: [walker_names.len]gfx.LightDesc = undefined;
     var turn: f32 = 0;
     var turn_target: f32 = 0;
     var span: f32 = 13;

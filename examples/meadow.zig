@@ -177,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
     defer ground_shape.deinit(gpa);
     try buildGround(gpa, &ground_shape);
     const ground = try renderer.models.create(&.{ground_shape.desc(.{ .metallic = 0, .roughness = 0.95 })});
-    _ = try renderer.entities.spawn(scene, .{ .model = ground });
+    _ = try renderer.entities.create(scene, .{ .model = ground });
 
     var tuft_shape = Shape{};
     defer tuft_shape.deinit(gpa);
@@ -265,12 +265,12 @@ pub fn main(init: std.process.Init) !void {
     }
     const display = [2]f32{ 3.5, -4.5 };
     const display_height = groundHeight(display[0], display[1]);
-    _ = try renderer.entities.spawn(scene, .{ .model = stone, .transform = math.mul(math.translation(.{ display[0], display_height + 0.45, display[1] }), math.scaling(.{ 0.9, 1.0, 0.9 })) });
-    _ = try renderer.entities.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ display[0], display_height + 1.55, display[1] }), math.mul(math.rotationY(2.4), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.6)))) });
+    _ = try renderer.entities.create(scene, .{ .model = stone, .transform = math.mul(math.translation(.{ display[0], display_height + 0.45, display[1] }), math.scaling(.{ 0.9, 1.0, 0.9 })) });
+    _ = try renderer.entities.create(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ display[0], display_height + 1.55, display[1] }), math.mul(math.rotationY(2.4), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.6)))) });
     for ([_]gfx.Model{ gold, chrome, lacquer }, 0..) |model, index| {
         const x = display[0] + 1.6 + @as(f32, @floatFromInt(index)) * 1.3;
         const z = display[1] + 0.6 * @as(f32, @floatFromInt(index));
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{ x, groundHeight(x, z) + 0.5, z }) });
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.translation(.{ x, groundHeight(x, z) + 0.5, z }) });
     }
 
     _ = try renderer.waters.create(scene, .{
@@ -300,7 +300,7 @@ pub fn main(init: std.process.Init) !void {
 
     const player_info = renderer.models.info(player_model).?;
     const player_scale = 2.0 / @max(player_info.bounds_max[1] - player_info.bounds_min[1], 1e-3);
-    const player = try renderer.entities.spawn(scene, .{ .model = player_model });
+    const player = try renderer.entities.create(scene, .{ .model = player_model });
     const clip_idle = renderer.models.findAnimation(player_model, "Idle") orelse 0;
     const clip_run = renderer.models.findAnimation(player_model, "Running_A") orelse clip_idle;
     const clip_jump = renderer.models.findAnimation(player_model, "Jump_Idle") orelse clip_idle;
@@ -406,7 +406,7 @@ pub fn main(init: std.process.Init) !void {
         renderer.emitters.set(motes, motes_desc);
 
         list.clear();
-        const stats = renderer.getStats();
+        const stats = renderer.stats();
         try list.rect(.{ .x = 12, .y = 12, .width = 560, .height = 62 }, gfx.Color.rgba(10, 12, 20, 170));
         try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · {d} instances · {d} of {d} meshlets drawn", .{ stage.fps, stage.gpu_ms, stats.instances, stats.meshlets_drawn, stats.meshlets }), .{ 24, 22 }, .{ .size = 16 });
         try list.text(font, "Mouse look · WASD move · Shift sprint · Space jump · Z/X zoom · hold T sun · C clouds", .{ 24, 48 }, .{ .size = 13, .color = gfx.Color.hex(0x9aa7d0) });

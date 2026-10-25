@@ -153,17 +153,17 @@ pub fn main(init: std.process.Init) !void {
     const ground = try renderer.models.create(&.{.{ .positions = &positions[0], .indices = &indices[0], .material = .{ .base_color = .{ 0.3, 0.3, 0.32, 1 }, .metallic = 0, .roughness = 0.85 } }});
     const hearth = try renderer.models.create(&.{.{ .positions = &positions[1], .indices = &indices[1], .material = .{ .base_color = .{ 0.12, 0.1, 0.09, 1 }, .metallic = 0, .roughness = 0.9 } }});
     const pillar = try renderer.models.create(&.{.{ .positions = &positions[2], .indices = &indices[2], .material = .{ .base_color = .{ 0.7, 0.66, 0.6, 1 }, .metallic = 0, .roughness = 0.7 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.25, 0 }) });
-    _ = try renderer.entities.spawn(scene, .{ .model = hearth, .transform = math.translation(.{ 0, 0.12, 0 }) });
-    _ = try renderer.entities.spawn(scene, .{ .model = pillar, .transform = math.translation(.{ -3.2, 1.4, -1.5 }) });
-    _ = try renderer.entities.spawn(scene, .{ .model = pillar, .transform = math.translation(.{ 3.0, 1.4, -2.2 }) });
+    _ = try renderer.entities.create(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.25, 0 }) });
+    _ = try renderer.entities.create(scene, .{ .model = hearth, .transform = math.translation(.{ 0, 0.12, 0 }) });
+    _ = try renderer.entities.create(scene, .{ .model = pillar, .transform = math.translation(.{ -3.2, 1.4, -1.5 }) });
+    _ = try renderer.entities.create(scene, .{ .model = pillar, .transform = math.translation(.{ 3.0, 1.4, -2.2 }) });
     const helpers = @import("window");
     var ball_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(ball_radius, &ball_positions, &ball_normals, &ball_indices);
     const ball = try renderer.models.create(&.{.{ .positions = &ball_positions, .normals = &ball_normals, .indices = &ball_indices, .material = .{ .base_color = .{ 0.2, 0.2, 0.22, 1 }, .metallic = 1, .roughness = 0.35 } }});
-    const ball_entity = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.translation(ballAt(.hung, 0)) });
+    const ball_entity = try renderer.entities.create(scene, .{ .model = ball, .transform = math.translation(ballAt(.hung, 0)) });
     try renderer.waitUntilLoaded();
 
     var scene_obstacles = false;

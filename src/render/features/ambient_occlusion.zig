@@ -21,7 +21,7 @@ pub const Settings = struct {
     /// World-space radius searched for occluders.
     radius: f32 = 1.2,
     /// Exponent applied to the occlusion term; higher is darker.
-    intensity: f32 = 1.3,
+    power: f32 = 1.3,
     /// Blend occlusion over frames; it then lags fast motion slightly.
     temporal_filter: bool = true,
     /// Strength of bounce light from nearby occluders; 0 for none. Needs
@@ -156,7 +156,7 @@ fn trace(frame: *Frame) !void {
         .depth_texture = ctx.index(frame.pyramid),
         .color_texture = if (frame.seen) |seen| ctx.index(seen) else gpu.invalid_id,
         .radius = frame.settings.radius,
-        .intensity = frame.settings.intensity,
+        .intensity = frame.settings.power,
         .slice_count = @intCast(frame.settings.slices),
         .step_count = @intCast(frame.settings.steps),
     });

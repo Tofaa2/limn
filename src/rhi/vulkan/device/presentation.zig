@@ -65,7 +65,7 @@ pub fn setFrameGenerator(self: *Device, generator: ?FrameGenerator) void {
 pub fn prepareSurface(self: *Device) !bool {
     const swapchain = if (self.swapchain) |*value| value else return true;
     if (swapchain.requested_width == 0 or swapchain.requested_height == 0) return false;
-    if (swapchain.dirty or swapchain.stale or swapchain.handle == .null_handle) {
+    if (swapchain.dirty or swapchain.stale.load(.monotonic) or swapchain.handle == .null_handle) {
         finishPacedPresent(self);
         recreateSwapchain(self) catch |err| switch (err) {
             error.NoDrawableArea => return false,
@@ -82,7 +82,7 @@ pub fn acquireImage(self: *Device) !bool {
     const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
     swapchain.image_index = acquire(self, frame.image_available) catch |err| switch (err) {
         error.OutOfDateKHR => {
-            swapchain.stale = true;
+            swapchain.stale.store(true, .monotonic);
             return false;
         },
         else => return err,
@@ -103,7 +103,7 @@ fn acquire(self: *Device, semaphore: vk.Semaphore) !u32 {
         switch (result.result) {
             .timeout, .not_ready => self.io.sleep(std.Io.Duration.fromNanoseconds(100_000), .awake) catch {},
             else => {
-                if (result.result == .suboptimal_khr) swapchain.stale = true;
+                if (result.result == .suboptimal_khr) swapchain.stale.store(true, .monotonic);
                 return result.image_index;
             },
         }
@@ -126,7 +126,7 @@ pub fn recordGeneratedFrame(self: *Device, frame: *FrameData) void {
     cmd.transition(output, .shader_read);
     if (!generator.generate(generator.context, cmd, shown, output)) return;
     const index = acquire(self, frame.generated_available) catch {
-        swapchain.stale = true;
+        swapchain.stale.store(true, .monotonic);
         return;
     };
     const image = swapchain.textures.items[index];
@@ -141,7 +141,7 @@ pub fn recordGeneratedFrame(self: *Device, frame: *FrameData) void {
 /// and the acquire semaphore are recreated before the next frame.
 pub fn abandonAcquiredImage(self: *Device, frame: *FrameData) void {
     const swapchain = if (self.swapchain) |*value| value else return;
-    swapchain.stale = true;
+    swapchain.stale.store(true, .monotonic);
     frame.acquire_abandoned = true;
 }
 
@@ -186,7 +186,7 @@ fn present(self: *Device, image: u32) !void {
         error.OutOfDateKHR => vk.Result.suboptimal_khr,
         else => return err,
     };
-    if (result == .suboptimal_khr) swapchain.stale = true;
+    if (result == .suboptimal_khr) swapchain.stale.store(true, .monotonic);
 }
 
 fn presentPaced(self: *Device, image: u32, at: std.Io.Timestamp) void {
@@ -195,7 +195,7 @@ fn presentPaced(self: *Device, image: u32, at: std.Io.Timestamp) void {
     present(self, image) catch {
         self.swapchain_mutex.lockUncancelable(self.io);
         defer self.swapchain_mutex.unlock(self.io);
-        self.swapchain.?.stale = true;
+        self.swapchain.?.stale.store(true, .monotonic);
     };
     self.pacing.store(false, .release);
 }
@@ -314,12 +314,13 @@ fn recreateSwapchain(self: *Device) !void {
             .mip_levels = 1,
             .layers = 1,
             .kind = .@"2d",
+            .usage = .{ .color_attachment = true, .copy_dst = true },
         }, false));
         try swapchain.render_finished.append(self.gpa, try self.vkd.createSemaphore(&.{}, null));
     }
     if (generating) swapchain.generated = createGeneratedTextures(self, texture_format, extent) catch null;
     swapchain.dirty = false;
-    swapchain.stale = false;
+    swapchain.stale.store(false, .monotonic);
 }
 
 fn createGeneratedTextures(self: *Device, format: types.Format, extent: vk.Extent2D) ![2]types.Texture {

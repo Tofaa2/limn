@@ -113,13 +113,15 @@ float3 hashColor(uint value) {
     return float3(float(value & 255u), float((value >> 8u) & 255u), float((value >> 16u) & 255u)) / 255.0;
 }
 
-/// The cofactor matrix of the model matrix as rows: `mul(normal, rows)` turns
-/// object normals to world space up to scale.
+/// The cofactor matrix of the model matrix as rows, its sign taken from the
+/// determinant so mirrored instances keep their normals pointing out:
+/// `mul(normal, rows)` turns object normals to world space up to scale.
 float3x3 cofactorRows(float3x4 m) {
     float3 c0 = matrixColumn(m, 0);
     float3 c1 = matrixColumn(m, 1);
     float3 c2 = matrixColumn(m, 2);
-    return float3x3(cross(c1, c2), cross(c2, c0), cross(c0, c1));
+    float3x3 rows = float3x3(cross(c1, c2), cross(c2, c0), cross(c0, c1));
+    return dot(c0, rows[0]) < 0.0 ? -rows : rows;
 }
 
 [shader("fragment")]
@@ -152,7 +154,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
         return result;
     }
 
-    MeshletRef ref = frame.meshlet_refs.data[id >> 7];
+    MeshletRef ref = frame.meshlet_refs.data[id == INVALID_ID ? 0u : id >> 7];
     uint triangle = id & 127u;
     Instance instance = frame.instances.data[ref.instance];
     Mesh mesh = loadAligned<16>(frame.meshes.data + instance.mesh);
@@ -283,9 +285,15 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
         coat_normal = normalize(custom.clearcoat_normal);
     }
 #endif
+    float3 world_dx = w0 * bary.ddx.x + w1 * bary.ddx.y + w2 * bary.ddx.z;
+    float3 world_dy = w0 * bary.ddy.x + w1 * bary.ddy.y + w2 * bary.ddy.z;
     DECAL_LOOP_BEGIN(world_position, fragment.xy)
         Decal decal = frame.shading.decals.data[i];
         float3 local = (mul(decal.world_to_decal, float4(world_position, 1.0))).xyz;
+        float3 local_dx = mul((float3x3)decal.world_to_decal, world_dx);
+        float3 local_dy = mul((float3x3)decal.world_to_decal, world_dy);
+        float2 decal_uv_dx = float2(local_dx.x, -local_dx.y);
+        float2 decal_uv_dy = float2(local_dy.x, -local_dy.y);
         if (any((abs(local) > float3(0.5)))) continue;
         float3 axis = normalize(float3(decal.world_to_decal[2][0], decal.world_to_decal[2][1], decal.world_to_decal[2][2]));
         float facing = dot(geometric_normal, axis) * (dot(geometric_normal, view_direction) < 0.0 ? -1.0 : 1.0);
@@ -294,7 +302,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
         float4 tint = decal.color;
         if (decal.image != INVALID_ID) {
             float2 decal_uv = float2(local.x + 0.5, 0.5 - local.y);
-            tint *= sampleTextureGrad(decal.image, frame.sampler_linear_clamp, decal_uv, ddx(decal_uv), ddy(decal_uv));
+            tint *= sampleTextureGrad(decal.image, frame.sampler_linear_clamp, decal_uv, decal_uv_dx, decal_uv_dy);
         }
         weight *= tint.a;
         base_color.rgb = lerp(base_color.rgb, tint.rgb, weight);
@@ -302,7 +310,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
         if (decal.roughness >= 0.0) roughness = lerp(roughness, clamp(decal.roughness, 0.045, 1.0), weight);
         if (decal.normal_image != INVALID_ID) {
             float2 decal_uv = float2(local.x + 0.5, 0.5 - local.y);
-            float3 mapped = sampleTextureGrad(decal.normal_image, frame.sampler_linear_clamp, decal_uv, ddx(decal_uv), ddy(decal_uv)).xyz * 2.0 - 1.0;
+            float3 mapped = sampleTextureGrad(decal.normal_image, frame.sampler_linear_clamp, decal_uv, decal_uv_dx, decal_uv_dy).xyz * 2.0 - 1.0;
             mapped.xy *= decal.normal_strength;
             float3 right = normalize(float3(decal.world_to_decal[0][0], decal.world_to_decal[0][1], decal.world_to_decal[0][2]));
             float3 up = normalize(float3(decal.world_to_decal[1][0], decal.world_to_decal[1][1], decal.world_to_decal[1][2]));
@@ -420,7 +428,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     soft_history_depth = linearDepth(previous_clip.z / previous_clip.w, frame.depth_terms);
     soft_history_slack = 0.05 * soft_history_depth + 2.0 * fwidth(soft_history_depth);
     if (instance.lightmap != INVALID_ID) gathered = float4(sampleTextureLod(instance.lightmap, frame.sampler_linear_clamp, raw1, 0.0).rgb, 1.0);
-    float3 lit = emissive + shadeSurface(frame, surface, fragment.xy, noise, gathered);
+    float3 lit = (material.flags & MATERIAL_UNLIT) != 0u ? emissive : emissive + shadeSurface(frame, surface, fragment.xy, noise, gathered);
     if ((SHADE_FEATURES & FEATURE_AERIAL) != 0u && frame.shading.aerial != 0.0 && frame.environment != 0u) {
         float3 air_through;
         float3 air;

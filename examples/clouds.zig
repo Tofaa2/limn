@@ -57,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
         land_indices[(row * cells + column) * 6 ..][0..6].* = .{ corner, corner + cells + 1, corner + 1, corner + 1, corner + cells + 1, corner + cells + 2 };
     };
     const land = try renderer.models.create(&.{.{ .positions = land_positions, .normals = land_normals, .colors = land_colors, .indices = land_indices, .material = .{ .metallic = 0, .roughness = 0.95 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = land });
+    _ = try renderer.entities.create(scene, .{ .model = land });
 
     var fir_positions: [4 * 9][3]f32 = undefined;
     var fir_normals: [4 * 9][3]f32 = undefined;
@@ -122,7 +122,7 @@ pub fn main(init: std.process.Init) !void {
                 .indices = &.{ 0, 2, 1, 0, 3, 2 },
                 .material = .{ .base_color = .{ 0.9, 0.15, 0.1, 0.6 }, .metallic = 0, .roughness = 0.1, .alpha_mode = .blend, .double_sided = true },
             }});
-            _ = try renderer.entities.spawn(scene, .{ .model = pane, .transform = math.translation(.{ 0, 22, -110 }) });
+            _ = try renderer.entities.create(scene, .{ .model = pane, .transform = math.translation(.{ 0, 22, -110 }) });
             settings.shadows = .{ .distance = 900, .colored = true };
         }
         if (std.mem.eql(u8, argument, "--clear")) {

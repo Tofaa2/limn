@@ -9,10 +9,85 @@ const view_math = @import("../renderer/view_math.zig");
 
 const ViewContext = features.ViewContext;
 
-/// Whether any of the view's passes draws before tone mapping.
+/// Whether any of the view's passes draws into the picture before tone mapping.
 pub fn lit(desc: *const api.ViewDesc) bool {
-    for (desc.passes) |pass| if (pass.stage != .after_tonemap) return true;
+    for (desc.passes) |pass| switch (pass.stage) {
+        .after_opaque, .after_transparency, .after_resolve => return true,
+        .after_tonemap, .sun_shadow, .light_shadow => {},
+    };
     return false;
+}
+
+/// Whether a pass of the view at `stage` draws casters that move.
+pub fn movingCasters(desc: *const api.ViewDesc, stage: api.PassStage) bool {
+    for (desc.passes) |pass| if (pass.stage == stage and pass.moving) return true;
+    return false;
+}
+
+/// Runs the view's `.light_shadow` passes into each tile of `atlas` that
+/// `dirty` marks; `tile_size` texels a side, `per_side` tiles a row.
+pub fn lightShadows(ctx: *ViewContext, atlas: rhi.Texture, view_proj: []const math.Mat4, dirty: []const bool, tile_size: u32, per_side: u32) !void {
+    if (!wants(ctx.desc, .light_shadow)) return;
+    const info = ctx.device.textureInfo(atlas);
+    for (view_proj, dirty, 0..) |matrix, wanted, tile| {
+        if (!wanted) continue;
+        for (ctx.desc.passes) |pass| {
+            if (pass.stage != .light_shadow) continue;
+            ctx.cmd.beginScope("custom pass");
+            defer ctx.cmd.endScope();
+            try pass.run(pass.context, .{
+                .cmd = ctx.cmd,
+                .device = ctx.device,
+                .stage = .light_shadow,
+                .frame = ctx.frame_address,
+                .color = atlas,
+                .color_format = info.format,
+                .depth = atlas,
+                .motion = null,
+                .width = tile_size,
+                .height = tile_size,
+                .origin = .{ @intCast(tile % per_side * tile_size), @intCast(tile / per_side * tile_size) },
+                .camera = ctx.desc.camera,
+                .view = math.identity,
+                .projection = matrix,
+                .view_projection = matrix,
+                .settings = ctx.settings,
+            });
+        }
+    }
+}
+
+/// Runs the view's `.sun_shadow` passes into each cascade of `map` that
+/// `update` marks.
+pub fn sunShadows(ctx: *ViewContext, map: rhi.Texture, view_proj: []const math.Mat4, update: []const bool) !void {
+    if (!wants(ctx.desc, .sun_shadow)) return;
+    const info = ctx.device.textureInfo(map);
+    for (view_proj, update, 0..) |matrix, wanted, cascade| {
+        if (!wanted) continue;
+        for (ctx.desc.passes) |pass| {
+            if (pass.stage != .sun_shadow) continue;
+            ctx.cmd.beginScope("custom pass");
+            defer ctx.cmd.endScope();
+            try pass.run(pass.context, .{
+                .cmd = ctx.cmd,
+                .device = ctx.device,
+                .stage = .sun_shadow,
+                .frame = ctx.frame_address,
+                .color = map,
+                .color_format = info.format,
+                .depth = map,
+                .motion = null,
+                .width = info.width,
+                .height = info.height,
+                .layer = @intCast(cascade),
+                .camera = ctx.desc.camera,
+                .view = math.identity,
+                .projection = matrix,
+                .view_projection = matrix,
+                .settings = ctx.settings,
+            });
+        }
+    }
 }
 
 fn wants(desc: *const api.ViewDesc, stage: api.PassStage) bool {

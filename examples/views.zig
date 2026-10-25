@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
     const block = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.7, 0.7, 0.72, 1 }, .metallic = 0, .roughness = 0.6 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 40, 0.5, 40 })), .tint = .{ 0.45, 0.5, 0.42 } });
+    _ = try renderer.entities.create(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 40, 0.5, 40 })), .tint = .{ 0.45, 0.5, 0.42 } });
     var towers: [64]math.Mat4 = undefined;
     var colors: [64][3]f32 = undefined;
     for (&towers, &colors, 0..) |*tower, *color, index| {
@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     const group = try renderer.instances.create(scene, block, &towers);
     try renderer.instances.setColors(group, &colors);
     const fox_model = try renderer.models.load("examples/assets/world/Fox.glb");
-    const fox = try renderer.entities.spawn(scene, .{ .model = fox_model });
+    const fox = try renderer.entities.create(scene, .{ .model = fox_model });
     try renderer.waitUntilLoaded();
     const run = renderer.models.findAnimation(fox_model, "Run") orelse 0;
     const run_length = if (renderer.models.animationInfo(fox_model, run)) |clip| clip.duration else 1;

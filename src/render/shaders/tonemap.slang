@@ -82,8 +82,10 @@ float4 fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Posit
     }
 
     float exposure = frame.exposure.data.exposure;
-    float3 bloom = sampleTextureLod(push.bloom_texture, linear, in_uv, 0.0).rgb;
-    color = lerp(color, bloom * push.bloom_scale, push.bloom_strength);
+    if (push.bloom_strength > 0.0) {
+        float3 bloom = sampleTextureLod(push.bloom_texture, linear, in_uv, 0.0).rgb;
+        color = lerp(color, bloom * push.bloom_scale, push.bloom_strength);
+    }
     if (push.flare > 0.0) {
         float2 mirrored = float2(1.0) - in_uv;
         float2 toward_center = float2(0.5) - mirrored;
@@ -102,11 +104,11 @@ float4 fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Posit
     }
     color *= exposure * push.color_filter;
 
-    if (push.encode_srgb == 2u) {
+    if (push.curve != 0u && push.encode_srgb == 2u) {
         float peak = max(push.hdr_peak / max(push.hdr_paper_white, 1.0), 1.0);
         color = color * (1.0 + color / (peak * peak)) / (1.0 + color);
         color *= min(peak, 2.0) * 0.5 + 0.5;
-    } else {
+    } else if (push.curve != 0u) {
         color = agxEotf(agxLook(agx(color)));
     }
 

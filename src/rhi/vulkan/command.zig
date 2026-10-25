@@ -24,8 +24,8 @@ pub const CommandEncoder = struct {
     scope_depth: u8 = 0,
     /// True between `beginRendering` and `endRendering`.
     rendering: bool = false,
-    /// Number of `drawIndexedIndirectCount` draws recorded.
-    indirect_draws: u32 = 0,
+    /// What has been recorded so far.
+    work: types.Work = .{},
     /// Mips of sampled textures left in an attachment or copy state, owed a
     /// return to `shader_read`.
     owed: [max_owed]Mip = undefined,
@@ -50,6 +50,12 @@ pub const CommandEncoder = struct {
             return false;
         }
     };
+
+    fn pipelineBarrier(self: *CommandEncoder, info: *const vk.DependencyInfo) void {
+        self.work.barriers += 1;
+        self.work.image_barriers += info.image_memory_barrier_count;
+        self.device.vkd.cmdPipelineBarrier2(self.command, info);
+    }
 
     fn owe(self: *CommandEncoder, entry: Mip) void {
         const resource = self.device.textures.get(entry.texture) orelse return;
@@ -90,13 +96,13 @@ pub const CommandEncoder = struct {
                 .color_attachment, .depth_attachment, .copy_src, .copy_dst => {},
                 else => continue,
             }
-            barriers[count] = imageBarrier(resource, entry.mip, 1, from, .shader_read);
+            barriers[count] = imageBarrier(self.device.caps.mesh_shaders, resource, entry.mip, 1, from, .shader_read);
             count += 1;
             resource.states[entry.mip] = .shader_read;
         }
         self.owed_count = kept;
         if (count == 0) return;
-        self.device.vkd.cmdPipelineBarrier2(self.command, &.{
+        self.pipelineBarrier(&.{
             .image_memory_barrier_count = count,
             .p_image_memory_barriers = &barriers,
         });
@@ -120,14 +126,14 @@ pub const CommandEncoder = struct {
             var end = mip + 1;
             while (end < resource.info.mip_levels and resource.states[end] == from) end += 1;
             if (from != state) {
-                barriers[count] = imageBarrier(resource, mip, end - mip, from, state);
+                barriers[count] = imageBarrier(self.device.caps.mesh_shaders, resource, mip, end - mip, from, state);
                 count += 1;
             }
             mip = end;
         }
         if (count == 0) return;
         for (resource.states[0..resource.info.mip_levels]) |*value| value.* = state;
-        self.device.vkd.cmdPipelineBarrier2(self.command, &.{
+        self.pipelineBarrier(&.{
             .image_memory_barrier_count = count,
             .p_image_memory_barriers = &barriers,
         });
@@ -138,9 +144,9 @@ pub const CommandEncoder = struct {
         const resource = self.device.textureResource(texture);
         const from = resource.states[mip];
         if (from == state) return;
-        const barrier = imageBarrier(resource, mip, 1, from, state);
+        const barrier = imageBarrier(self.device.caps.mesh_shaders, resource, mip, 1, from, state);
         resource.states[mip] = state;
-        self.device.vkd.cmdPipelineBarrier2(self.command, &.{
+        self.pipelineBarrier(&.{
             .image_memory_barrier_count = 1,
             .p_image_memory_barriers = @ptrCast(&barrier),
         });
@@ -185,7 +191,7 @@ pub const CommandEncoder = struct {
                 .dst_access_mask = .{ .transfer_read_bit = true, .transfer_write_bit = true },
             },
         };
-        self.device.vkd.cmdPipelineBarrier2(self.command, &.{
+        self.pipelineBarrier(&.{
             .memory_barrier_count = 1,
             .p_memory_barriers = @ptrCast(&barrier),
         });
@@ -199,6 +205,10 @@ pub const CommandEncoder = struct {
         self.attached_count = 0;
         for (desc.color) |attachment| self.attach(.{ .texture = attachment.texture, .mip = attachment.mip, .drawn = layerBit(attachment.layer) });
         if (desc.depth) |attachment| self.attach(.{ .texture = attachment.texture, .mip = attachment.mip, .drawn = layerBit(attachment.layer) });
+        errdefer {
+            for (self.attached[0..self.attached_count]) |entry| self.owe(entry);
+            self.attached_count = 0;
+        }
         self.settleExcept(self.attached[0..self.attached_count]);
         for (desc.color) |attachment| self.redraw(attachment.texture, attachment.mip, attachment.layer, .color_attachment);
         if (desc.depth) |attachment| self.redraw(attachment.texture, attachment.mip, attachment.layer, .depth_attachment);
@@ -246,6 +256,7 @@ pub const CommandEncoder = struct {
                 .shading_rate_attachment_texel_size = .{ .width = tile, .height = tile },
             };
         }
+        self.work.render_passes += 1;
         self.device.vkd.cmdBeginRendering(self.command, &.{
             .p_next = if (desc.shading_rate != null) &rate else null,
             .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = extent },
@@ -294,8 +305,8 @@ pub const CommandEncoder = struct {
             entry.drawn = 0;
             break;
         }
-        const barrier = imageBarrier(resource, mip, 1, state, state);
-        self.device.vkd.cmdPipelineBarrier2(self.command, &.{
+        const barrier = imageBarrier(self.device.caps.mesh_shaders, resource, mip, 1, state, state);
+        self.pipelineBarrier(&.{
             .image_memory_barrier_count = 1,
             .p_image_memory_barriers = @ptrCast(&barrier),
         });
@@ -330,6 +341,7 @@ pub const CommandEncoder = struct {
     /// constants stay valid across binds.
     pub fn bindPipeline(self: *CommandEncoder, pipeline: types.Pipeline) void {
         const resource = self.device.pipelineResource(pipeline);
+        self.work.pipeline_binds += 1;
         self.device.vkd.cmdBindPipeline(self.command, resource.bind_point, resource.handle);
     }
 
@@ -338,6 +350,7 @@ pub const CommandEncoder = struct {
         const T = @TypeOf(value);
         comptime std.debug.assert(@sizeOf(T) <= device_module.push_constant_size);
         comptime std.debug.assert(@sizeOf(T) % 4 == 0);
+        self.work.push_constants += 1;
         self.device.vkd.cmdPushConstants(self.command, self.device.pipeline_layout, pipelines.shaderStages(self.device), 0, @sizeOf(T), @ptrCast(&value));
     }
 
@@ -370,19 +383,21 @@ pub const CommandEncoder = struct {
     /// Non-indexed draw; inside a render pass. `first_instance` is the base of
     /// `gl_InstanceIndex`.
     pub fn draw(self: *CommandEncoder, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) void {
+        self.work.draws += 1;
         self.device.vkd.cmdDraw(self.command, vertex_count, instance_count, first_vertex, first_instance);
     }
 
     /// `draw` with its four arguments read from `buffer` at `offset`. Needs
     /// `BufferUsage.indirect`.
     pub fn drawIndirect(self: *CommandEncoder, buffer: types.Buffer, offset: u64) void {
-        self.indirect_draws += 1;
+        self.work.indirect_draws += 1;
         self.device.vkd.cmdDrawIndirect(self.command, self.device.bufferResource(buffer).handle, offset, 1, 4 * @sizeOf(u32));
     }
 
     /// Draws one triangle covering the viewport; the vertex shader derives
     /// positions from `gl_VertexIndex`.
     pub fn drawFullscreen(self: *CommandEncoder) void {
+        self.work.draws += 1;
         self.device.vkd.cmdDraw(self.command, 3, 1, 0, 0);
     }
 
@@ -396,13 +411,14 @@ pub const CommandEncoder = struct {
         vertex_offset: i32,
         first_instance: u32,
     ) void {
+        self.work.draws += 1;
         self.device.vkd.cmdDrawIndexed(self.command, index_count, instance_count, first_index, vertex_offset, first_instance);
     }
 
     /// Mesh shader draw with its three 32-bit task group counts read from
     /// `buffer` at `offset`. Needs `BufferUsage.indirect`.
     pub fn drawMeshTasksIndirect(self: *CommandEncoder, buffer: types.Buffer, offset: u64) void {
-        self.indirect_draws += 1;
+        self.work.indirect_draws += 1;
         self.device.vkd.cmdDrawMeshTasksIndirectEXT(self.command, self.device.bufferResource(buffer).handle, offset, 1, 3 * @sizeOf(u32));
     }
 
@@ -415,7 +431,7 @@ pub const CommandEncoder = struct {
         count_offset: u64,
         max_draws: u32,
     ) void {
-        self.indirect_draws += 1;
+        self.work.indirect_draws += 1;
         self.device.vkd.cmdDrawIndexedIndirectCount(
             self.command,
             self.device.bufferResource(commands).handle,
@@ -431,6 +447,7 @@ pub const CommandEncoder = struct {
     /// are not visible to later passes until `sync(.compute_to_all)`.
     pub fn dispatch(self: *CommandEncoder, x: u32, y: u32, z: u32) void {
         self.settle();
+        self.work.dispatches += 1;
         self.device.vkd.cmdDispatch(self.command, x, y, z);
     }
 
@@ -438,6 +455,7 @@ pub const CommandEncoder = struct {
     /// `offset`. Needs `BufferUsage.indirect`.
     pub fn dispatchIndirect(self: *CommandEncoder, buffer: types.Buffer, offset: u64) void {
         self.settle();
+        self.work.dispatches += 1;
         self.device.vkd.cmdDispatchIndirect(self.command, self.device.bufferResource(buffer).handle, offset);
     }
 
@@ -445,12 +463,14 @@ pub const CommandEncoder = struct {
     /// multiples of 4. Outside a render pass; `sync(.transfer_to_all)` before
     /// the buffer is read.
     pub fn fillBuffer(self: *CommandEncoder, buffer: types.Buffer, offset: u64, size: u64, value: u32) void {
+        self.work.transfers += 1;
         self.device.vkd.cmdFillBuffer(self.command, self.device.bufferResource(buffer).handle, offset, size, value);
     }
 
     /// `source` needs `copy_src`; the ranges must not overlap. Outside a render
     /// pass; `sync(.transfer_to_all)` before the destination is read.
     pub fn copyBuffer(self: *CommandEncoder, source: types.Buffer, destination: types.Buffer, source_offset: u64, destination_offset: u64, size: u64) void {
+        self.work.transfers += 1;
         self.device.vkd.cmdCopyBuffer(
             self.command,
             self.device.bufferResource(source).handle,
@@ -465,7 +485,10 @@ pub const CommandEncoder = struct {
         std.debug.assert(!self.rendering);
         const device = self.device;
         if (device.uploads.items.len == 0) return;
-        var uploads = device.takeUploads();
+        const waits = try rewrites(device.gpa, device.uploads.items);
+        defer device.gpa.free(waits);
+        self.work.staged_bytes += device.pending_upload_bytes;
+        var uploads = device.internal.takeUploads();
         defer uploads.deinit(device.gpa);
         for (uploads.items) |upload| switch (upload) {
             .buffer, .copy => {
@@ -475,17 +498,31 @@ pub const CommandEncoder = struct {
             else => {},
         };
         var copied_buffers = false;
+        for (uploads.items, waits) |upload, wait| {
+            if (wait) self.sync(.transfer_to_all);
+            self.recordUpload(upload, &copied_buffers);
+        }
+        if (copied_buffers) self.sync(.transfer_to_all);
         for (uploads.items) |upload| switch (upload) {
+            .texture => |copy| self.transition(copy.destination, .shader_read),
+            else => {},
+        };
+    }
+
+    fn recordUpload(self: *CommandEncoder, upload: device_module.PendingUpload, copied_buffers: *bool) void {
+        const device = self.device;
+        switch (upload) {
             .buffer => |copy| {
                 self.copyBuffer(copy.staging, copy.destination, 0, copy.offset, copy.size);
                 device.destroyBuffer(copy.staging);
-                copied_buffers = true;
+                copied_buffers.* = true;
             },
             .texture => |copy| {
                 const resource = device.textureResource(copy.destination);
                 self.transitionMip(copy.destination, copy.mip, .copy_dst);
                 const whole = mipExtent(resource.info, copy.mip);
                 const region: [4]u32 = copy.region orelse .{ 0, 0, whole.width, whole.height };
+                self.work.transfers += 1;
                 device.vkd.cmdCopyBufferToImage(self.command, device.bufferResource(copy.staging).handle, resource.image, .transfer_dst_optimal, &.{.{
                     .buffer_offset = copy.offset,
                     .buffer_row_length = 0,
@@ -501,14 +538,9 @@ pub const CommandEncoder = struct {
                 self.sync(.transfer_to_all);
                 self.copyBuffer(copy.source, copy.destination, 0, 0, copy.size);
                 device.destroyBuffer(copy.source);
-                copied_buffers = true;
+                copied_buffers.* = true;
             },
-        };
-        if (copied_buffers) self.sync(.transfer_to_all);
-        for (uploads.items) |upload| switch (upload) {
-            .texture => |copy| self.transition(copy.destination, .shader_read),
-            else => {},
-        };
+        }
     }
 
     /// Copies mip 0 of `source` to `destination` texel for texel: same size,
@@ -523,6 +555,7 @@ pub const CommandEncoder = struct {
         self.transition(destination, .copy_dst);
         const from = self.device.textureResource(source);
         const to = self.device.textureResource(destination);
+        self.work.transfers += 1;
         self.device.vkd.cmdCopyImage(self.command, from.image, .transfer_src_optimal, to.image, .transfer_dst_optimal, &.{.{
             .src_subresource = .{ .aspect_mask = from.aspect, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
             .src_offset = .{ .x = 0, .y = 0, .z = 0 },
@@ -543,6 +576,7 @@ pub const CommandEncoder = struct {
             self.transitionMip(texture, mip, .copy_dst);
             const source = mipExtent(info, mip - 1);
             const destination = mipExtent(info, mip);
+            self.work.transfers += 1;
             self.device.vkd.cmdBlitImage(self.command, resource.image, .transfer_src_optimal, resource.image, .transfer_dst_optimal, &.{.{
                 .src_subresource = .{ .aspect_mask = resource.aspect, .mip_level = mip - 1, .base_array_layer = 0, .layer_count = info.layers },
                 .src_offsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{ .x = @intCast(source.width), .y = @intCast(source.height), .z = 1 } },
@@ -563,6 +597,7 @@ pub const CommandEncoder = struct {
     pub fn buildBlases(self: *CommandEncoder, builds: []const types.BlasBuild) !void {
         std.debug.assert(!self.rendering);
         self.rayQueryBarrier();
+        self.work.builds += @intCast(builds.len);
         try acceleration.buildBlasesCommand(self.device, self.command, builds);
     }
 
@@ -579,6 +614,7 @@ pub const CommandEncoder = struct {
     pub fn compactBlas(self: *CommandEncoder, source: types.AccelerationStructure, destination: types.AccelerationStructure) void {
         std.debug.assert(!self.rendering);
         self.accelerationBarrier();
+        self.work.builds += 1;
         acceleration.compactBlasCommand(self.device, self.command, source, destination);
         self.accelerationBarrier();
     }
@@ -589,6 +625,7 @@ pub const CommandEncoder = struct {
         std.debug.assert(!self.rendering);
         self.rayQueryBarrier();
         self.accelerationBarrier();
+        self.work.builds += 1;
         acceleration.buildTlasCommand(self.device, self.command, tlas, instances_address, instance_count, false);
         self.accelerationBarrier();
     }
@@ -600,6 +637,7 @@ pub const CommandEncoder = struct {
         std.debug.assert(!self.rendering);
         self.rayQueryBarrier();
         self.accelerationBarrier();
+        self.work.builds += 1;
         acceleration.buildTlasCommand(self.device, self.command, tlas, instances_address, instance_count, true);
         self.accelerationBarrier();
     }
@@ -611,7 +649,7 @@ pub const CommandEncoder = struct {
             .src_stage_mask = .{ .compute_shader_bit = true, .fragment_shader_bit = true },
             .dst_stage_mask = .{ .acceleration_structure_build_bit_khr = true },
         };
-        self.device.vkd.cmdPipelineBarrier2(self.command, &.{
+        self.pipelineBarrier(&.{
             .memory_barrier_count = 1,
             .p_memory_barriers = @ptrCast(&barrier),
         });
@@ -625,7 +663,7 @@ pub const CommandEncoder = struct {
             .dst_stage_mask = .{ .acceleration_structure_build_bit_khr = true, .compute_shader_bit = true, .fragment_shader_bit = true },
             .dst_access_mask = .{ .acceleration_structure_read_bit_khr = true, .acceleration_structure_write_bit_khr = true },
         };
-        self.device.vkd.cmdPipelineBarrier2(self.command, &.{
+        self.pipelineBarrier(&.{
             .memory_barrier_count = 1,
             .p_memory_barriers = @ptrCast(&barrier),
         });
@@ -643,7 +681,7 @@ pub const CommandEncoder = struct {
         var index: u32 = std.math.maxInt(u32);
         if (frame.scope_count < device_module.max_timing_scopes) {
             index = frame.scope_count;
-            frame.scopes[index] = .{ .name = name, .depth = self.scope_depth };
+            frame.scopes[index] = .{ .name = name, .depth = self.scope_depth, .work = self.work };
             frame.scope_count += 1;
             self.device.vkd.cmdWriteTimestamp2(self.command, .{ .all_commands_bit = true }, frame.query_pool, index * 2);
         }
@@ -658,8 +696,9 @@ pub const CommandEncoder = struct {
         const frame = self.frameData() orelse return;
         self.scope_depth -= 1;
         const index = self.scope_stack[self.scope_depth];
-        if (index != std.math.maxInt(u32))
-            self.device.vkd.cmdWriteTimestamp2(self.command, .{ .all_commands_bit = true }, frame.query_pool, index * 2 + 1);
+        if (index == std.math.maxInt(u32)) return;
+        frame.scopes[index].work = self.work.since(frame.scopes[index].work);
+        self.device.vkd.cmdWriteTimestamp2(self.command, .{ .all_commands_bit = true }, frame.query_pool, index * 2 + 1);
     }
 
     fn frameData(self: *CommandEncoder) ?*FrameData {
@@ -668,6 +707,53 @@ pub const CommandEncoder = struct {
 };
 
 const FrameData = device_module.FrameData;
+
+/// For each upload, whether it writes bytes an earlier one in `uploads`
+/// also writes, so it must wait for that copy. Of a run of overlapping
+/// buffer ranges, every upload but the first waits; of a texture level,
+/// every upload after the first.
+fn rewrites(gpa: std.mem.Allocator, uploads: []const device_module.PendingUpload) ![]bool {
+    const waits = try gpa.alloc(bool, uploads.len);
+    errdefer gpa.free(waits);
+    @memset(waits, false);
+    const Span = struct {
+        texture: bool,
+        target: u64,
+        start: u64,
+        end: u64,
+        index: u32,
+
+        fn before(_: void, a: @This(), b: @This()) bool {
+            if (a.texture != b.texture) return b.texture;
+            return if (a.target != b.target) a.target < b.target else if (a.start != b.start) a.start < b.start else a.index < b.index;
+        }
+    };
+    var spans: std.ArrayList(Span) = .empty;
+    defer spans.deinit(gpa);
+    for (uploads, 0..) |upload, index| switch (upload) {
+        .buffer => |copy| try spans.append(gpa, .{ .texture = false, .target = @bitCast(copy.destination), .start = copy.offset, .end = copy.offset + copy.size, .index = @intCast(index) }),
+        .copy => |copy| try spans.append(gpa, .{ .texture = false, .target = @bitCast(copy.destination), .start = 0, .end = copy.size, .index = @intCast(index) }),
+        .texture => |copy| try spans.append(gpa, .{ .texture = true, .target = @bitCast(copy.destination), .start = @as(u64, copy.mip) << 32 | copy.layer, .end = (@as(u64, copy.mip) << 32 | copy.layer) + 1, .index = @intCast(index) }),
+        .mips => {},
+    };
+    if (spans.items.len < 2) return waits;
+    std.mem.sort(Span, spans.items, {}, Span.before);
+    var first: usize = 0;
+    while (first < spans.items.len) {
+        var last = first + 1;
+        var end = spans.items[first].end;
+        var earliest = spans.items[first].index;
+        while (last < spans.items.len and spans.items[last].texture == spans.items[first].texture and spans.items[last].target == spans.items[first].target and spans.items[last].start < end) : (last += 1) {
+            end = @max(end, spans.items[last].end);
+            earliest = @min(earliest, spans.items[last].index);
+        }
+        if (last - first > 1) for (spans.items[first..last]) |span| {
+            if (span.index != earliest) waits[span.index] = true;
+        };
+        first = last;
+    }
+    return waits;
+}
 
 fn mipExtent(info: types.TextureInfo, mip: u32) vk.Extent2D {
     return .{
@@ -690,12 +776,15 @@ const StateInfo = struct {
     access: vk.AccessFlags2,
 };
 
-fn stateInfo(state: types.TextureState) StateInfo {
+/// `mesh_shaders` adds the task and mesh stages to `shader_read` and
+/// `storage`, which also covers every graphics stage, for pipelines of the
+/// application's that use textures there.
+fn stateInfo(state: types.TextureState, mesh_shaders: bool) StateInfo {
     return switch (state) {
         .undefined => .{ .layout = .undefined, .stage = .{}, .access = .{} },
         .shader_read => .{
             .layout = .read_only_optimal,
-            .stage = .{ .vertex_shader_bit = true, .fragment_shader_bit = true, .compute_shader_bit = true },
+            .stage = .{ .vertex_shader_bit = true, .fragment_shader_bit = true, .compute_shader_bit = true, .task_shader_bit_ext = mesh_shaders, .mesh_shader_bit_ext = mesh_shaders },
             .access = .{ .shader_read_bit = true },
         },
         .color_attachment => .{
@@ -720,7 +809,7 @@ fn stateInfo(state: types.TextureState) StateInfo {
         },
         .storage => .{
             .layout = .general,
-            .stage = .{ .compute_shader_bit = true },
+            .stage = .{ .vertex_shader_bit = true, .fragment_shader_bit = true, .compute_shader_bit = true, .task_shader_bit_ext = mesh_shaders, .mesh_shader_bit_ext = mesh_shaders },
             .access = .{ .shader_storage_read_bit = true, .shader_storage_write_bit = true },
         },
         .external => .{
@@ -738,14 +827,15 @@ fn stateInfo(state: types.TextureState) StateInfo {
 }
 
 fn imageBarrier(
+    mesh_shaders: bool,
     resource: *const device_module.TextureResource,
     base_mip: u32,
     mip_count: u32,
     from: types.TextureState,
     to: types.TextureState,
 ) vk.ImageMemoryBarrier2 {
-    const source = stateInfo(from);
-    const destination = stateInfo(to);
+    const source = stateInfo(from, mesh_shaders);
+    const destination = stateInfo(to, mesh_shaders);
     return .{
         .src_stage_mask = source.stage,
         .src_access_mask = source.access,
