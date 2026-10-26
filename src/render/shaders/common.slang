@@ -196,7 +196,15 @@ struct Material {
     float clearcoat_normal_scale;
     uint texture_transforms;
     float sway;
+    float4 attenuation;
+    float4 reflectance;
+    float4 iridescence;
 };
+
+/// Reflectance of a non-metal at normal incidence.
+float3 dielectricF0(Material material) {
+    return min(0.04 * material.reflectance.rgb, float3(1.0)) * material.reflectance.a;
+}
 
 void specularGlossiness(Material material, float4 packed, inout float3 color, out float roughness, out float metallic) {
     const float dielectric = 0.04;
@@ -412,12 +420,11 @@ struct Lights { Light* data; };
 static const uint CLUSTERS_X = 16u;
 static const uint CLUSTERS_Y = 9u;
 static const uint CLUSTERS_Z = 24u;
-static const uint CLUSTER_CAPACITY = 127u;
 static const uint CLUSTER_DECAL_WORDS = 8u;
 
 struct Cluster {
+    uint offset;
     uint count;
-    uint lights[CLUSTER_CAPACITY];
     uint decals[CLUSTER_DECAL_WORDS];
 };
 struct Clusters { Cluster* data; };
@@ -462,7 +469,7 @@ struct ReflectionProbes { ReflectionProbeData* data; };
 
 #include "frame_constants.slang"
 
-static const uint MATERIAL_WORDS = 13u;
+static const uint MATERIAL_WORDS = 16u;
 
 /// A texture's coordinates with its own transform applied, where the
 /// material has per-texture transforms; `offset` is false for derivatives.

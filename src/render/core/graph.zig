@@ -63,6 +63,16 @@ pub const Slot = enum {
 /// A target of one frame's graph.
 pub const Target = enum(u16) { _ };
 
+/// A buffer of one frame's graph, and a pass's use of one. The graph puts a
+/// barrier before a pass whose uses must wait for earlier passes' writes, or
+/// whose writes must wait for earlier reads.
+pub const Resource = enum(u16) { _ };
+
+pub const BufferUse = struct {
+    resource: Resource,
+    access: rhi.BufferAccess,
+};
+
 pub const Color = struct {
     target: Target,
     load: rhi.LoadOp = .discard,
@@ -86,6 +96,8 @@ pub const PassDesc = struct {
     /// the pass runs.
     color: []const Color = &.{},
     depth: ?Depth = null,
+    /// Buffers the pass reads or writes, and how.
+    buffers: []const BufferUse = &.{},
     /// Runs whether or not anything uses what it writes.
     always: bool = false,
     /// Wrap the pass in a profiler scope of its name.
@@ -94,8 +106,10 @@ pub const PassDesc = struct {
 
 pub const max_passes = 96;
 pub const max_targets = 128;
+pub const max_resources = 64;
 const max_links = 768;
 const max_colors = 256;
+const max_uses = 256;
 
 const Span = struct { first: u16 = 0, count: u16 = 0 };
 
@@ -105,6 +119,7 @@ const Pass = struct {
     reads: Span,
     writes: Span,
     color: Span,
+    uses: Span,
     depth: ?Depth,
     always: bool,
     scope: bool,
@@ -121,6 +136,20 @@ const Node = struct {
     used: bool = false,
     first: u16 = 0,
     last: u16 = 0,
+};
+
+/// What an imported buffer is taken to have been read by before the graph
+/// runs, as views share buffers: its first write waits for all of it.
+const earlier_reads = rhi.BufferAccess{ .compute_read = true, .graphics_read = true, .indirect = true, .index = true, .vertex_input = true, .transfer_read = true, .build_read = true };
+
+const BufferNode = struct {
+    buffer: rhi.Buffer,
+    wanted: bool = false,
+    /// While the graph runs: writes since the last barrier that waited for
+    /// them, what the last write was made visible to, and reads since it.
+    written: rhi.BufferAccess = .{},
+    visible: rhi.BufferAccess = .{},
+    read: rhi.BufferAccess = .{},
 };
 
 /// The passes to run, in order, with the lifetimes of pooled targets.
@@ -142,7 +171,13 @@ pub const Graph = struct {
     link_count: usize = 0,
     colors: [max_colors]Color = undefined,
     color_count: usize = 0,
+    buffers: [max_resources]BufferNode = undefined,
+    buffer_count: usize = 0,
+    uses: [max_uses]BufferUse = undefined,
+    use_count: usize = 0,
     slots: std.EnumArray(Slot, ?Target) = .initFill(null),
+    /// Set by `stage` for `record`.
+    staged: ?Plan = null,
 
     /// Empties a graph in place. Unlike assigning `Graph{}`, it does not
     /// write the storage of passes and targets that are not there yet.
@@ -151,7 +186,10 @@ pub const Graph = struct {
         self.pass_count = 0;
         self.link_count = 0;
         self.color_count = 0;
+        self.buffer_count = 0;
+        self.use_count = 0;
         self.slots = .initFill(null);
+        self.staged = null;
     }
 
     fn node(self: *Graph, value: Node) !Target {
@@ -171,6 +209,24 @@ pub const Graph = struct {
     /// that reads it. Its texture is known only while a pass runs.
     pub fn transient(self: *Graph, desc: rhi.TextureDesc) !Target {
         return self.node(.{ .texture = null, .transient = desc });
+    }
+
+    /// A buffer that exists outside the graph. Barriers for work outside the
+    /// graph stay with that work.
+    pub fn importBuffer(self: *Graph, buffer: rhi.Buffer) !Resource {
+        for (self.buffers[0..self.buffer_count], 0..) |known, index| {
+            if (known.buffer == buffer) return @enumFromInt(index);
+        }
+        if (self.buffer_count == max_resources) return error.TooManyTargets;
+        self.buffers[self.buffer_count] = .{ .buffer = buffer };
+        self.buffer_count += 1;
+        return @enumFromInt(self.buffer_count - 1);
+    }
+
+    /// Asks for what is written into `resource` to be made: passes that
+    /// lead to it run.
+    pub fn wantBuffer(self: *Graph, resource: Resource) void {
+        self.buffers[@intFromEnum(resource)].wanted = true;
     }
 
     pub fn publish(self: *Graph, name: Slot, target: Target) void {
@@ -207,6 +263,43 @@ pub const Graph = struct {
         return self.colors[span.first..][0..span.count];
     }
 
+    fn used(self: *const Graph, span: Span) []const BufferUse {
+        return self.uses[span.first..][0..span.count];
+    }
+
+    /// What a pass must wait for before its buffer uses: the earlier writes
+    /// its uses read or overwrite and the earlier reads its writes replace.
+    /// Records the pass's uses as done.
+    fn bufferWaits(self: *Graph, pass: *const Pass) struct { from: rhi.BufferAccess, to: rhi.BufferAccess } {
+        var from = rhi.BufferAccess{};
+        var to = rhi.BufferAccess{};
+        for (self.used(pass.uses)) |use| {
+            const made = &self.buffers[@intFromEnum(use.resource)];
+            const reads = use.access.reads();
+            const unseen: rhi.BufferAccess = @bitCast(@as(u16, @bitCast(reads)) & ~@as(u16, @bitCast(made.visible)));
+            if (!made.written.empty() and (!unseen.empty() or use.access.writes())) {
+                from = from.merge(made.written);
+                to = to.merge(use.access);
+            }
+            if (use.access.writes() and !made.read.empty()) {
+                from = from.merge(made.read);
+                to = to.merge(use.access);
+            }
+        }
+        for (self.used(pass.uses)) |use| {
+            const made = &self.buffers[@intFromEnum(use.resource)];
+            if (use.access.writes()) {
+                made.written = @bitCast(@as(u16, @bitCast(use.access)) & ~@as(u16, @bitCast(use.access.reads())));
+                made.visible = .{};
+                made.read = .{};
+            } else if (!made.written.empty()) {
+                made.visible = made.visible.merge(use.access);
+            }
+            made.read = made.read.merge(use.access.reads());
+        }
+        return .{ .from = from, .to = to };
+    }
+
     /// Adds a pass that calls `run(context)`; `context` is a pointer that
     /// stays valid until the graph has run.
     pub fn add(self: *Graph, desc: PassDesc, context: anytype, comptime run: anytype) !void {
@@ -218,14 +311,18 @@ pub const Graph = struct {
         };
         if (self.pass_count == max_passes) return error.TooManyPasses;
         if (self.color_count + desc.color.len > max_colors) return error.TooManyPasses;
+        if (self.use_count + desc.buffers.len > max_uses) return error.TooManyPasses;
         @memcpy(self.colors[self.color_count..][0..desc.color.len], desc.color);
         self.color_count += desc.color.len;
+        @memcpy(self.uses[self.use_count..][0..desc.buffers.len], desc.buffers);
+        self.use_count += desc.buffers.len;
         self.passes[self.pass_count] = .{
             .name = desc.name,
             .stage = desc.stage,
             .reads = try self.link(desc.reads),
             .writes = try self.link(desc.writes),
             .color = .{ .first = @intCast(self.color_count - desc.color.len), .count = @intCast(desc.color.len) },
+            .uses = .{ .first = @intCast(self.use_count - desc.buffers.len), .count = @intCast(desc.buffers.len) },
             .depth = desc.depth,
             .always = desc.always,
             .scope = desc.scope,
@@ -252,6 +349,8 @@ pub const Graph = struct {
             needed[index] = made.wanted;
             made.used = false;
         }
+        var needed_buffers: [max_resources]bool = undefined;
+        for (self.buffers[0..self.buffer_count], 0..) |made, index| needed_buffers[index] = made.wanted;
         var live: [max_passes]bool = @splat(false);
         var position = self.pass_count;
         while (position > 0) {
@@ -261,9 +360,13 @@ pub const Graph = struct {
             for (self.linked(pass.writes)) |target| runs = runs or needed[@intFromEnum(target)];
             for (self.colored(pass.color)) |color| runs = runs or needed[@intFromEnum(color.target)];
             if (pass.depth) |depth| runs = runs or needed[@intFromEnum(depth.target)];
+            for (self.used(pass.uses)) |use| runs = runs or (use.access.writes() and needed_buffers[@intFromEnum(use.resource)]);
             if (!runs) continue;
             live[position] = true;
             for (self.linked(pass.reads)) |target| needed[@intFromEnum(target)] = true;
+            for (self.used(pass.uses)) |use| {
+                if (!use.access.reads().empty()) needed_buffers[@intFromEnum(use.resource)] = true;
+            }
             for (self.colored(pass.color)) |color| {
                 if (color.load == .load) needed[@intFromEnum(color.target)] = true;
             }
@@ -313,25 +416,56 @@ pub const Graph = struct {
         made.last = step;
     }
 
-    /// Runs the planned passes. Targets a pass names are in the shader-read
-    /// state when it runs, apart from the attachments rendering has begun
-    /// into; what it writes besides attachments is returned to it afterwards.
-    pub fn execute(self: *Graph, gpa: std.mem.Allocator, device: *rhi.Device, cmd: *rhi.CommandEncoder, pool: *targets.Pool, frame: u64) !void {
+    /// Plans the passes and lends the pooled targets from the pool in the
+    /// order the passes take and give them back, so a later target may reuse
+    /// an earlier one's texture. After this `record` records the passes, on any
+    /// thread, while the pool goes on to other graphs.
+    pub fn stage(self: *Graph, gpa: std.mem.Allocator, device: *rhi.Device, pool: *targets.Pool, frame: u64) !void {
         const planned = try self.plan();
         var held: [max_targets]bool = @splat(false);
         defer for (self.nodes[0..self.node_count], 0..) |made, index| {
             if (held[index]) pool.release(made.texture.?);
         };
-        for (planned.passes(), 0..) |index, step| {
-            const pass = &self.passes[index];
+        for (0..planned.count) |step| {
             for (self.nodes[0..self.node_count], 0..) |*made, target| {
                 const desc = made.transient orelse continue;
                 if (held[target] or !made.used or made.first != step) continue;
                 made.texture = try pool.acquire(gpa, device, desc, frame);
                 held[target] = true;
             }
+            for (self.nodes[0..self.node_count], 0..) |made, target| {
+                if (!held[target] or made.last != step) continue;
+                pool.release(made.texture.?);
+                held[target] = false;
+            }
+        }
+        self.staged = planned;
+    }
+
+    /// Stages and runs the graph.
+    pub fn execute(self: *Graph, gpa: std.mem.Allocator, device: *rhi.Device, cmd: *rhi.CommandEncoder, pool: *targets.Pool, frame: u64) !void {
+        try self.stage(gpa, device, pool, frame);
+        try self.record(cmd);
+    }
+
+    /// Records the passes `stage` planned. Targets a pass names are in the
+    /// shader-read state when it runs, apart from the attachments rendering
+    /// has begun into; what it writes besides attachments is returned to it
+    /// afterwards.
+    pub fn record(self: *Graph, cmd: *rhi.CommandEncoder) !void {
+        const planned = self.staged orelse return error.GraphNotStaged;
+        self.staged = null;
+        for (self.buffers[0..self.buffer_count]) |*made| {
+            made.written = .{};
+            made.visible = .{};
+            made.read = earlier_reads;
+        }
+        for (planned.passes()) |index| {
+            const pass = &self.passes[index];
+            const waits = self.bufferWaits(pass);
             if (pass.scope) cmd.beginScope(pass.name);
             for (self.linked(pass.reads)) |target| cmd.transition(self.texture(target), .shader_read);
+            cmd.dependency(waits.from, waits.to);
             const attached = pass.color.count != 0 or pass.depth != null;
             if (attached) {
                 var colors: [8]rhi.ColorAttachment = undefined;
@@ -347,11 +481,6 @@ pub const Graph = struct {
             if (pass.scope) cmd.endScope();
             try outcome;
             for (self.linked(pass.writes)) |target| cmd.transition(self.texture(target), .shader_read);
-            for (self.nodes[0..self.node_count], 0..) |made, target| {
-                if (!held[target] or made.last != step) continue;
-                pool.release(made.texture.?);
-                held[target] = false;
-            }
         }
     }
 };
@@ -390,4 +519,23 @@ test "a pass cannot read a pooled target before it is drawn" {
     graph.want(output);
     try graph.add(.{ .name = "tonemap", .stage = .tonemap, .reads = &.{lit}, .color = &.{.{ .target = output }} }, &trace, skip);
     try std.testing.expectError(error.ReadBeforeDrawn, graph.plan());
+}
+
+test "buffer uses wait for the writes they read and the reads they overwrite" {
+    var trace = Trace{};
+    var graph = Graph{};
+    const lists = try graph.importBuffer(std.mem.zeroes(rhi.Buffer));
+    try graph.add(.{ .name = "fill", .stage = .lighting, .always = true, .buffers = &.{.{ .resource = lists, .access = .{ .compute_write = true } }} }, &trace, skip);
+    try graph.add(.{ .name = "shade", .stage = .surfaces, .always = true, .buffers = &.{.{ .resource = lists, .access = .{ .graphics_read = true } }} }, &trace, skip);
+    try graph.add(.{ .name = "forward", .stage = .transparent, .always = true, .buffers = &.{.{ .resource = lists, .access = .{ .graphics_read = true } }} }, &trace, skip);
+    try graph.add(.{ .name = "refill", .stage = .overlay, .always = true, .buffers = &.{.{ .resource = lists, .access = .{ .compute_write = true } }} }, &trace, skip);
+    const fill = graph.bufferWaits(&graph.passes[0]);
+    try std.testing.expect(fill.from.empty());
+    const shade = graph.bufferWaits(&graph.passes[1]);
+    try std.testing.expectEqual(rhi.BufferAccess{ .compute_write = true }, shade.from);
+    try std.testing.expectEqual(rhi.BufferAccess{ .graphics_read = true }, shade.to);
+    const forward = graph.bufferWaits(&graph.passes[2]);
+    try std.testing.expect(forward.from.empty());
+    const refill = graph.bufferWaits(&graph.passes[3]);
+    try std.testing.expectEqual(rhi.BufferAccess{ .compute_write = true, .graphics_read = true }, refill.from);
 }

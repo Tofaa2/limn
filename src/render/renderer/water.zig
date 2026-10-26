@@ -29,6 +29,7 @@ pub const Waters = struct {
         pub fn free(owner: *Renderer, entry: *renderer_state.WaterState) void {
             if (entry.splash) |emitter| destroyEmitterLocked(owner, emitter);
             for (entry.state) |texture| owner.device.destroyTexture(texture);
+            if (entry.ocean) |ocean| for (ocean) |buffer| owner.device.destroyBuffer(buffer);
         }
     };
 

@@ -59,6 +59,8 @@ fn createAcceleration(self: *Device, top_level: bool, size: u64, scratch_size: u
 
 /// Sized for `desc`; build with `CommandEncoder.buildBlas`.
 pub fn createBlas(self: *Device, desc: types.BlasDesc) !types.AccelerationStructure {
+    self.lockResources();
+    defer self.unlockResources();
     if (!self.caps.ray_tracing) return error.RayTracingUnavailable;
     var geometries: [types.max_blas_geometries]vk.AccelerationStructureGeometryKHR = undefined;
     var triangles: [types.max_blas_geometries]u32 = undefined;
@@ -86,6 +88,8 @@ pub fn createBlas(self: *Device, desc: types.BlasDesc) !types.AccelerationStruct
 
 /// Allocates a top-level structure with room for `desc.max_instances`.
 pub fn createTlas(self: *Device, desc: types.TlasDesc) !types.AccelerationStructure {
+    self.lockResources();
+    defer self.unlockResources();
     if (!self.caps.ray_tracing) return error.RayTracingUnavailable;
     const geometry = tlasGeometry(0);
     var sizes: vk.AccelerationStructureBuildSizesInfoKHR = .{
@@ -116,6 +120,8 @@ fn tlasFlags(updatable: bool) vk.BuildAccelerationStructureFlagsKHR {
 
 /// Deferred like `destroyBuffer`; also releases its buffers.
 pub fn destroyAcceleration(self: *Device, acceleration: types.AccelerationStructure) void {
+    self.lockResources();
+    defer self.unlockResources();
     const resource = self.accelerations.remove(acceleration) orelse return;
     if (resource.compaction_slot) |slot| self.compaction_slots.unset(slot);
     retire(self, .{ .acceleration = resource.handle });
@@ -222,6 +228,8 @@ pub fn blasMeasured(self: *Device, blas: types.AccelerationStructure) bool {
 /// An empty structure of `size` bytes for `CommandEncoder.compactBlas` to
 /// fill from `source`.
 pub fn createCompactBlas(self: *Device, source: types.AccelerationStructure, size: u64) !types.AccelerationStructure {
+    self.lockResources();
+    defer self.unlockResources();
     const capacity = self.accelerationResource(source).capacity;
     return createAcceleration(self, false, size, 0, capacity);
 }

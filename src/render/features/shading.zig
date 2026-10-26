@@ -1,6 +1,7 @@
 //! How lit surfaces are shaded.
 const pipelines_module = @import("../renderer/pipelines.zig");
 const shade_pass_push = @import("../shaders/push/shade.zig");
+const subsurface_push = @import("../shaders/push/subsurface.zig");
 const shading_rate_push = @import("../shaders/push/shading_rate.zig");
 const scene_pass = @import("../scene_pass.zig");
 const filled = @import("../api.zig").filled;
@@ -10,6 +11,7 @@ const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
 const gpu = @import("../gpu.zig");
 const std = @import("std");
+const lights_feature = @import("lights.zig");
 const global_illumination_feature = @import("global_illumination.zig");
 const api = @import("../api.zig");
 const features = @import("../core/features.zig");
@@ -37,6 +39,12 @@ pub const Settings = struct {
     /// Haze per world unit fading distant opaque surfaces into the sky (0.0005
     /// shows at a kilometre); 0 for none. Needs an environment.
     aerial_perspective: f32 = 0,
+    /// Light under the skin spreads across the screen from where it lands
+    /// (separable subsurface scattering) for materials with `subsurface`, in
+    /// place of the softened lighting they get alone.
+    subsurface_scattering: bool = false,
+    /// World units light travels beneath a surface of `subsurface` 1.
+    subsurface_radius: f32 = 0.02,
     /// `.atmosphere` is air lit by sun and sky, scattering blue more than red;
     /// `.sky` fades to the sky behind.
     aerial_model: api.AerialModel = .atmosphere,
@@ -73,6 +81,7 @@ pub fn declare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
     const own = p.settings.shading;
     ctx.constants.shading.specular_aa = @intFromBool(own.specular_antialiasing);
+    ctx.constants.shading.screen_subsurface = @intFromBool(own.subsurface_scattering and !p.debugging);
     ctx.constants.shading.aerial = if (own.aerial_model == .sky) -@max(own.aerial_perspective, 0) else @max(own.aerial_perspective, 0);
     const g = ctx.graph;
     const read_slots = [_]features.graph.Slot{ .ambient_occlusion, .occluder_light, .diffuse_gi };
@@ -88,7 +97,8 @@ pub fn declare(ctx: *ViewContext) !void {
         writes[write_count] = target;
         write_count += 1;
     };
-    try g.add(.{ .name = "shading", .stage = .surfaces, .reads = reads[0..read_count], .writes = writes[0..write_count], .always = true, .scope = false }, ctx, shade);
+    const light_reads = try lights_feature.reads(ctx);
+    try g.add(.{ .name = "shading", .stage = .surfaces, .reads = reads[0..read_count], .writes = writes[0..write_count], .always = true, .scope = false, .buffers = &light_reads }, ctx, shade);
 }
 
 fn shade(ctx: *ViewContext) !void {
@@ -289,7 +299,52 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
         cmd.drawFullscreen();
     }
     cmd.endRendering();
+    if (settings.shading.subsurface_scattering and !debugging) try scatterBeneath(renderer, p, shade_push);
     cmd.endScope();
+}
+
+/// `Settings.shading.subsurface_scattering`: the diffuse light of subsurface
+/// pixels, blurred across and then down the screen, added to the picture in
+/// place of their own.
+fn scatterBeneath(renderer: *Renderer, p: *const ScenePass, shade_push: shade_pass_push.Push) !void {
+    const device = renderer.device;
+    const cmd = p.cmd;
+    const view = p.view;
+    const light = try p.keep(renderer, "subsurface light", p.width, p.height, render.hdr_format);
+    const across = try p.keep(renderer, "subsurface across", p.width, p.height, render.hdr_format);
+    var push = shade_push;
+    push.material_shader = 0;
+    try cmd.beginRendering(.{ .color = &.{
+        .{ .texture = light, .load = .clear, .clear = .{ 0, 0, 0, 0 } },
+        .{ .texture = view.motion, .load = .load },
+    } });
+    cmd.bindPipeline(try renderer.internal.pipelines.of(subsurfaceShadePipeline));
+    cmd.pushConstants(push);
+    cmd.drawFullscreen();
+    cmd.endRendering();
+    const radius = @max(p.settings.shading.subsurface_radius, 0);
+    try cmd.beginRendering(.{ .color = &.{.{ .texture = across, .load = .discard }} });
+    cmd.bindPipeline(try renderer.internal.pipelines.of(subsurfaceBlurPipeline));
+    cmd.pushConstants(subsurface_push.BlurPush{ .frame = p.frame_address, .source = device.textureIndex(light), .original = device.textureIndex(light), .depth = device.textureIndex(view.depth), .last = 0, .direction = .{ 1, 0 }, .radius = radius });
+    cmd.drawFullscreen();
+    cmd.endRendering();
+    try cmd.beginRendering(.{ .color = &.{.{ .texture = view.hdr, .load = .load }} });
+    cmd.bindPipeline(try renderer.internal.pipelines.of(subsurfaceAddPipeline));
+    cmd.pushConstants(subsurface_push.BlurPush{ .frame = p.frame_address, .source = device.textureIndex(across), .original = device.textureIndex(light), .depth = device.textureIndex(view.depth), .last = 1, .direction = .{ 0, 1 }, .radius = radius });
+    cmd.drawFullscreen();
+    cmd.endRendering();
+}
+
+fn subsurfaceShadePipeline(device: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("subsurface light", if (device.caps.ray_tracing) pipelines_module.shaderCode("shade_rt_subsurface.frag.spv") else pipelines_module.shaderCode("shade_subsurface.frag.spv"), &pipelines_module.shade_plain_targets);
+}
+
+fn subsurfaceBlurPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("subsurface blur", pipelines_module.shaderCode("subsurface_blur.frag.spv"), &.{.{ .format = render.hdr_format }});
+}
+
+fn subsurfaceAddPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("subsurface add", pipelines_module.shaderCode("subsurface_blur.frag.spv"), &.{.{ .format = render.hdr_format, .blend = .additive }});
 }
 
 fn shadingRatePipeline(_: *rhi.Device) pipelines_module.Desc {

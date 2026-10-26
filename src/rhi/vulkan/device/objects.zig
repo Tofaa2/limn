@@ -1,7 +1,8 @@
 //! Debug names and the deferred destruction of Vulkan objects. Internal to the device.
 const vk = @import("vulkan");
 const device_module = @import("../device.zig");
-const waitQueue = @import("frames.zig").waitQueue;
+const frames_module = @import("frames.zig");
+const waitQueue = frames_module.waitQueue;
 
 const Device = device_module.Device;
 const Deletion = device_module.Deletion;
@@ -18,17 +19,21 @@ pub fn setName(self: *Device, object_type: vk.ObjectType, handle: u64, label: [:
 }
 
 pub fn retire(self: *Device, object: Deletion) void {
-    self.deletions.append(self.gpa, .{ .frame = self.frame_number, .object = object }) catch {
+    self.lockResources();
+    defer self.unlockResources();
+    self.deletions.append(self.gpa, .{ .frame = self.frame_number, .detached = self.detached_signaled, .object = object }) catch {
         waitQueue(self) catch {};
         destroyNow(self, object);
     };
 }
 
-/// Destroys retired objects no in-flight frame can reference.
+/// Destroys retired objects that no frame in flight and no detached job
+/// submitted before their retirement can still use.
 pub fn collectGarbage(self: *Device, everything: bool) void {
+    const detached = if (self.detached_signaled == 0) 0 else frames_module.detachedReached(self);
     var write: usize = 0;
     for (self.deletions.items) |pending| {
-        if (everything or (self.detached_outstanding == 0 and pending.frame + frames_in_flight <= self.frame_number)) {
+        if (everything or (pending.detached <= detached and pending.frame + frames_in_flight <= self.frame_number)) {
             destroyNow(self, pending.object);
         } else {
             self.deletions.items[write] = pending;

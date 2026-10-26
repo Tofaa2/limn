@@ -41,7 +41,7 @@ const FeatureChain = struct {
 
 /// The device extensions to enable.
 const ExtensionList = struct {
-    names: [24][*:0]const u8 = undefined,
+    names: [32][*:0]const u8 = undefined,
     count: u32 = 0,
 
     fn add(self: *ExtensionList, extensions: []const [*:0]const u8) void {
@@ -144,16 +144,21 @@ pub const Deletion = union(enum) {
     storage_volume_slot: u32,
 };
 
-const PendingDeletion = struct { frame: u64, object: Deletion };
+/// A destroyed object, the frame it was destroyed in and the detached jobs
+/// submitted by then, which may still use it.
+const PendingDeletion = struct { frame: u64, detached: u64, object: Deletion };
 
 /// Work submitted to the second queue by `Device.submitDetached`.
 pub const Detached = struct {
     command: u64,
-    fence: u64,
+    /// What the detached timeline reaches when the job is done.
+    value: u64,
+    /// The frame whose submission the job waits for.
+    after: u64,
 };
 
 pub const PendingUpload = union(enum) {
-    buffer: struct { staging: types.Buffer, destination: types.Buffer, offset: u64, size: u64 },
+    buffer: struct { staging: types.Buffer, destination: types.Buffer, offset: u64, size: u64, staging_offset: u64 = 0 },
     /// `offset` is the level's start in the staging buffer, which levels
     /// may share; the entry marked `last` releases it.
     texture: struct {
@@ -169,6 +174,20 @@ pub const PendingUpload = union(enum) {
     mips: types.Texture,
     /// The source is destroyed afterwards.
     copy: struct { source: types.Buffer, destination: types.Buffer, size: u64 },
+};
+
+/// The part of `Device.staging_ring` in use runs from `tail` to `head`,
+/// wrapping at the end. A fence frees up to its `end` once the frame
+/// timeline reaches its `value`.
+pub const StagingRing = struct {
+    head: u64 = 0,
+    tail: u64 = 0,
+    fences: [8]Fence = undefined,
+    fence_count: u32 = 0,
+    /// `head` when the last fence was set.
+    fenced: u64 = 0,
+
+    pub const Fence = struct { end: u64, value: u64 };
 };
 
 /// While open, `work` holds the encoder's count at the start; once closed,
@@ -195,7 +214,18 @@ pub const FrameData = struct {
     /// An image was acquired and never presented; see
     /// `Device.abandonAcquiredImage`.
     acquire_abandoned: bool = false,
+    /// A pool and command buffer for each encoder recorded beside the others,
+    /// made on first use; the command buffer the frame goes on in after
+    /// them; and what the frame submits, in order.
+    worker_pools: [max_parallel]vk.CommandPool = @splat(.null_handle),
+    worker_commands: [max_parallel]vk.CommandBuffer = @splat(.null_handle),
+    tail: vk.CommandBuffer = .null_handle,
+    submits: [max_parallel + 2]vk.CommandBuffer = undefined,
+    submit_count: u32 = 0,
 };
+
+/// Most encoders `Device.beginParallel` gives at once.
+pub const max_parallel = 8;
 
 const Swapchain = struct {
     handle: vk.SwapchainKHR = .null_handle,
@@ -266,6 +296,8 @@ pub const Device = struct {
     device_wrapper: dispatch.DeviceWrapper,
     /// `VK_EXT_device_fault` is enabled: a lost device says where it faulted.
     device_fault: bool = false,
+    /// `VK_EXT_memory_budget` is enabled: `memoryStats` reports the budget.
+    memory_budget: bool = false,
     vkd: dispatch.Device,
     /// The only queue; submit under `queue_mutex`.
     queue: vk.Queue,
@@ -324,16 +356,38 @@ pub const Device = struct {
     frame_number: u64 = 0,
     /// True between `startFrame` and `submitFrame`.
     in_frame: bool = false,
+    /// Made with a surface: it can present, and `setSurface` can replace it.
+    presents: bool = false,
     /// Frame waits left before `failDevice` makes the device report lost.
     lose_after: ?u32 = null,
     /// Set by `failDevice`: every frame wait fails with `error.DeviceLost`.
     faked_lost: bool = false,
     /// Meaningful while `in_frame`.
     encoder: CommandEncoder = undefined,
+    /// Timelines the frames and the detached jobs signal: frame `n` signals
+    /// `n + 1` when it is done, and the detached jobs count up.
+    frame_timeline: vk.Semaphore = .null_handle,
+    detached_timeline: vk.Semaphore = .null_handle,
+    detached_signaled: u64 = 0,
+    /// Encoders recording beside each other between `beginParallel` and
+    /// `joinParallel`, and their texture states.
+    parallel: [max_parallel]CommandEncoder = undefined,
+    parallel_states: [max_parallel]CommandEncoder.LocalStates = undefined,
+    parallel_count: u32 = 0,
+    /// `parallel_states` made so far, kept from frame to frame for their room.
+    parallel_made: u32 = 0,
+    /// Held to make, destroy or add views to resources, and to queue uploads
+    /// and deletions, which encoders recording beside each other may do.
+    resource_mutex: std.Io.Mutex = .init,
     /// Destroyed objects waiting out the frames in flight.
     deletions: std.ArrayList(PendingDeletion) = .empty,
     uploads: std.ArrayList(PendingUpload) = .empty,
+    /// The list `takeUploads` hands back next, emptied, so frames reuse its memory.
+    spare_uploads: std.ArrayList(PendingUpload) = .empty,
     pending_upload_bytes: u64 = 0,
+    /// Host-visible buffer most uploads are staged in, made on first use.
+    staging_ring: types.Buffer = .invalid,
+    ring: StagingRing = .{},
     timings: [max_timing_scopes]types.PassTiming = undefined,
     timing_count: u32 = 0,
     /// Command pool and buffer behind `beginImmediate`.
@@ -386,6 +440,14 @@ pub const Device = struct {
         pub fn takeUploads(loop: *FrameLoop) std.ArrayList(PendingUpload) {
             return frames_module.takeUploads(loop.device());
         }
+
+        pub fn returnUploads(loop: *FrameLoop, list: std.ArrayList(PendingUpload)) void {
+            frames_module.returnUploads(loop.device(), list);
+        }
+
+        pub fn fenceRing(loop: *FrameLoop) void {
+            frames_module.fenceRing(loop.device());
+        }
     };
 
     /// Creates a device on the best Vulkan 1.3 adapter. Keeps `gpa` and `io`;
@@ -407,7 +469,7 @@ pub const Device = struct {
             vk.API_VERSION_1_0.toU32();
         if (loader_version < required_api_version) return error.Vulkan13Unavailable;
 
-        var instance_extensions: [5][*:0]const u8 = undefined;
+        var instance_extensions: [6][*:0]const u8 = undefined;
         var instance_extension_count: u32 = 0;
         var hdr_wanted = false;
         const debug_utils = desc.validation or (desc.debug_names and try instanceExtensionAvailable(gpa, base, vk.extensions.ext_debug_utils.name));
@@ -427,7 +489,14 @@ pub const Device = struct {
                 .xlib => vk.extensions.khr_xlib_surface.name,
                 .wayland => vk.extensions.khr_wayland_surface.name,
                 .win32 => vk.extensions.khr_win_32_surface.name,
+                .metal => vk.extensions.ext_metal_surface.name,
+                .android => vk.extensions.khr_android_surface.name,
             };
+            instance_extension_count += 1;
+        }
+        const portability = try instanceExtensionAvailable(gpa, base, vk.extensions.khr_portability_enumeration.name);
+        if (portability) {
+            instance_extensions[instance_extension_count] = vk.extensions.khr_portability_enumeration.name;
             instance_extension_count += 1;
         }
         const validation_layers = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
@@ -438,6 +507,7 @@ pub const Device = struct {
         };
         const instance_handle = try base.createInstance(&.{
             .p_next = if (desc.validation) &validation_features else null,
+            .flags = .{ .enumerate_portability_bit_khr = portability },
             .p_application_info = &.{
                 .p_application_name = desc.application_name,
                 .application_version = 1,
@@ -482,6 +552,7 @@ pub const Device = struct {
             self.instance.destroyDebugUtilsMessengerEXT(self.debug_messenger, null);
 
         if (desc.surface) |surface| self.surface = try createSurface(self.instance, surface.window);
+        self.presents = desc.surface != null;
         errdefer if (self.surface != .null_handle) self.instance.destroySurfaceKHR(self.surface, null);
 
         const selected = try selectPhysicalDevice(gpa, self.instance, self.surface, desc.preferred_device);
@@ -508,15 +579,23 @@ pub const Device = struct {
             });
         }
 
-        self.caps.ray_tracing = desc.ray_tracing and try supportsRayQueries(gpa, self.instance, self.physical);
+        const core_features = blk: {
+            var supported = vk.PhysicalDeviceFeatures2{ .features = .{} };
+            self.instance.getPhysicalDeviceFeatures2(self.physical, &supported);
+            break :blk supported.features;
+        };
+        self.caps.primitive_id = desc.primitive_id and core_features.geometry_shader == .true;
+        self.caps.int64 = core_features.shader_int_64 == .true;
+        self.caps.ray_tracing = desc.ray_tracing and self.caps.int64 and try supportsRayQueries(gpa, self.instance, self.physical);
         self.caps.nvidia_ngx = desc.nvidia_ngx and for (ngx_extensions) |extension| {
             if (!try deviceExtensionListed(gpa, self.instance, self.physical, extension)) break false;
         } else true;
         self.caps.bc_textures = blk: {
             var supported = vk.PhysicalDeviceFeatures2{ .features = .{} };
             self.instance.getPhysicalDeviceFeatures2(self.physical, &supported);
-            break :blk supported.features.texture_compression_bc == .true;
+            break :blk desc.block_formats and supported.features.texture_compression_bc == .true;
         };
+        self.caps.astc_textures = desc.block_formats and core_features.texture_compression_astc_ldr == .true;
         self.caps.storage_images = blk: {
             var supported12 = vk.PhysicalDeviceVulkan12Features{};
             var supported = vk.PhysicalDeviceFeatures2{ .p_next = &supported12, .features = .{} };
@@ -567,6 +646,7 @@ pub const Device = struct {
             .scalar_block_layout = .true,
             .buffer_device_address = .true,
             .draw_indirect_count = .true,
+            .timeline_semaphore = .true,
         };
         var features11 = vk.PhysicalDeviceVulkan11Features{
             .p_next = &features12,
@@ -581,10 +661,11 @@ pub const Device = struct {
                 .independent_blend = .true,
                 .depth_clamp = .true,
                 .depth_bias_clamp = .true,
-                .shader_int_64 = .true,
-                .geometry_shader = .true,
+                .shader_int_64 = if (self.caps.int64) .true else .false,
+                .geometry_shader = if (self.caps.primitive_id) .true else .false,
                 .image_cube_array = .true,
                 .texture_compression_bc = if (self.caps.bc_textures) .true else .false,
+                .texture_compression_astc_ldr = if (self.caps.astc_textures) .true else .false,
                 .shader_clip_distance = .true,
                 .shader_storage_image_array_dynamic_indexing = if (self.caps.storage_images) .true else .false,
                 .shader_storage_image_write_without_format = if (self.caps.storage_images) .true else .false,
@@ -598,12 +679,15 @@ pub const Device = struct {
         if (self.caps.mesh_shaders) extensions.add(&.{vk.extensions.ext_mesh_shader.name});
         if (self.device_fault) extensions.add(&.{vk.extensions.ext_device_fault.name});
         if (self.surface != .null_handle) extensions.add(&.{vk.extensions.khr_swapchain.name});
+        if (try deviceExtensionListed(gpa, self.instance, self.physical, vk.extensions.khr_portability_subset.name)) extensions.add(&.{vk.extensions.khr_portability_subset.name});
         if (self.caps.ray_tracing) extensions.add(&ray_query_extensions);
         if (self.caps.nvidia_ngx) extensions.add(&ngx_extensions);
         if (self.caps.shared_textures) extensions.add(&.{vk.extensions.khr_external_memory_fd.name});
         for ([_][*:0]const u8{ vk.extensions.khr_get_memory_requirements_2.name, vk.extensions.khr_dedicated_allocation.name }) |extension| {
             if (try deviceExtensionListed(gpa, self.instance, self.physical, extension)) extensions.add(&.{extension});
         }
+        self.memory_budget = try deviceExtensionListed(gpa, self.instance, self.physical, vk.extensions.ext_memory_budget.name);
+        if (self.memory_budget) extensions.add(&.{vk.extensions.ext_memory_budget.name});
         const device_handle = try self.instance.createDevice(self.physical, &.{
             .p_next = &features,
             .queue_create_info_count = 1,
@@ -694,6 +778,11 @@ pub const Device = struct {
             };
             frames_made += 1;
         }
+        var timeline_type = vk.SemaphoreTypeCreateInfo{ .semaphore_type = .timeline, .initial_value = 0 };
+        self.frame_timeline = try self.vkd.createSemaphore(&.{ .p_next = &timeline_type }, null);
+        errdefer self.vkd.destroySemaphore(self.frame_timeline, null);
+        self.detached_timeline = try self.vkd.createSemaphore(&.{ .p_next = &timeline_type }, null);
+        errdefer self.vkd.destroySemaphore(self.detached_timeline, null);
         self.immediate_pool = try self.vkd.createCommandPool(&.{ .queue_family_index = self.queue_family }, null);
         errdefer self.vkd.destroyCommandPool(self.immediate_pool, null);
         if (self.detached_queue != null)
@@ -716,6 +805,7 @@ pub const Device = struct {
     /// Waits for the GPU, writes the pipeline cache and destroys everything,
     /// including resources the application leaked. All handles become invalid.
     pub fn deinit(self: *Device) void {
+        for (self.parallel_states[0..self.parallel_made]) |*local| local.deinit();
         presentation_module.finishPacedPresent(self);
         frames_module.waitQueue(self) catch {};
         persistPipelineCache(self) catch |err| std.log.warn("could not persist pipeline cache: {}", .{err});
@@ -746,6 +836,7 @@ pub const Device = struct {
         for (self.deletions.items) |pending| destroyNow(self, pending.object);
         self.deletions.deinit(self.gpa);
         self.uploads.deinit(self.gpa);
+        self.spare_uploads.deinit(self.gpa);
         self.buffers.deinit();
         self.textures.deinit();
         self.samplers.deinit();
@@ -757,6 +848,8 @@ pub const Device = struct {
         self.sampler_slots.deinit(self.gpa);
         for (&self.frames) |*frame| destroyFrame(self, frame);
         self.vkd.destroyCommandPool(self.immediate_pool, null);
+        self.vkd.destroySemaphore(self.frame_timeline, null);
+        self.vkd.destroySemaphore(self.detached_timeline, null);
         if (self.detached_pool != .null_handle) self.vkd.destroyCommandPool(self.detached_pool, null);
         self.vkd.destroyPipelineCache(self.pipeline_cache, null);
         if (self.pipeline_cache_path) |path| self.gpa.free(path);
@@ -789,7 +882,18 @@ pub const Device = struct {
     /// Swapchain images are not counted.
     pub fn memoryStats(self: *const Device) types.MemoryStats {
         const stats = self.allocator.stats();
-        return .{ .reserved_bytes = stats.reserved_bytes, .used_bytes = stats.used_bytes };
+        var result: types.MemoryStats = .{ .reserved_bytes = stats.reserved_bytes, .used_bytes = stats.used_bytes };
+        if (!self.memory_budget) return result;
+        var budget: vk.PhysicalDeviceMemoryBudgetPropertiesEXT = .{ .heap_budget = @splat(0), .heap_usage = @splat(0) };
+        var properties: vk.PhysicalDeviceMemoryProperties2 = .{ .p_next = &budget, .memory_properties = undefined };
+        self.instance.getPhysicalDeviceMemoryProperties2(self.physical, &properties);
+        const heaps = properties.memory_properties;
+        for (heaps.memory_heaps[0..heaps.memory_heap_count], 0..) |heap, index| {
+            if (!heap.flags.device_local_bit) continue;
+            result.budget_bytes += budget.heap_budget[index];
+            result.process_bytes += budget.heap_usage[index];
+        }
+        return result;
     }
 
     pub fn adapterInfo(self: *const Device) types.AdapterInfo {
@@ -886,6 +990,7 @@ pub const Device = struct {
     pub const backbufferSize = presentation_module.backbufferSize;
     pub const resize = presentation_module.resize;
     pub const setVsync = presentation_module.setVsync;
+    pub const setSurface = presentation_module.setSurface;
     pub const setFrameGenerator = presentation_module.setFrameGenerator;
     pub const beginFrame = frames_module.beginFrame;
     pub const endFrame = frames_module.endFrame;
@@ -896,8 +1001,22 @@ pub const Device = struct {
     pub const submitDetached = frames_module.submitDetached;
     pub const detachedDone = frames_module.detachedDone;
     pub const releaseDetached = frames_module.releaseDetached;
+    pub const detachedStarted = frames_module.detachedStarted;
     pub const beginImmediate = frames_module.beginImmediate;
     pub const endImmediate = frames_module.endImmediate;
+    pub const beginParallel = frames_module.beginParallel;
+    pub const joinParallel = frames_module.joinParallel;
+
+    /// Takes `resource_mutex` unless this thread holds it already.
+    pub fn lockResources(self: *Device) void {
+        if (resources_held == 0) self.resource_mutex.lockUncancelable(self.io);
+        resources_held += 1;
+    }
+
+    pub fn unlockResources(self: *Device) void {
+        resources_held -= 1;
+        if (resources_held == 0) self.resource_mutex.unlock(self.io);
+    }
 
     fn createDescriptorTable(self: *Device) !void {
         const all_bindings = [_]vk.DescriptorSetLayoutBinding{
@@ -1016,6 +1135,8 @@ pub fn vkFormat(format: types.Format) vk.Format {
         .a2b10g10r10_unorm => .a2b10g10r10_unorm_pack32,
         .bc7_unorm => .bc7_unorm_block,
         .bc7_srgb => .bc7_srgb_block,
+        .astc_4x4_unorm => .astc_4x_4_unorm_block,
+        .astc_4x4_srgb => .astc_4x_4_srgb_block,
         .bc5_unorm => .bc5_unorm_block,
         .bc4_unorm => .bc4_unorm_block,
         .bc1_unorm => .bc1_rgba_unorm_block,
@@ -1065,8 +1186,13 @@ fn destroyFrame(self: *Device, frame: *FrameData) void {
     self.vkd.destroySemaphore(frame.image_available, null);
     self.vkd.destroySemaphore(frame.generated_available, null);
     self.vkd.destroyFence(frame.fence, null);
+    for (frame.worker_pools) |pool| if (pool != .null_handle) self.vkd.destroyCommandPool(pool, null);
     self.vkd.destroyCommandPool(frame.pool, null);
 }
+
+/// Calls into `resource_mutex` this thread holds; the lock is taken on the
+/// first and given back on the last.
+threadlocal var resources_held: u32 = 0;
 
 pub fn sameHandle(a: anytype, b: @TypeOf(a)) bool {
     return std.meta.eql(a, b);

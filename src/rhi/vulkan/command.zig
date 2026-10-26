@@ -33,8 +33,55 @@ pub const CommandEncoder = struct {
     /// The attachments of the open rendering.
     attached: [9]Mip = undefined,
     attached_count: u8 = 0,
+    /// Set for an encoder recorded beside others (`Device.beginParallel`):
+    /// texture states are kept here instead of on the device, whose states
+    /// stay as they were until `Device.joinParallel`.
+    local: ?*LocalStates = null,
 
     const max_owed = 64;
+
+    /// What an encoder recorded beside others did to texture states: each mip
+    /// it touched, the state it found it in, and the one it left it in.
+    pub const LocalStates = struct {
+        gpa: std.mem.Allocator,
+        entries: std.ArrayList(Entry) = .empty,
+        /// A state could not be kept for want of memory; the frame fails.
+        failed: bool = false,
+
+        pub const Entry = struct { texture: types.Texture, mip: u32, found: types.TextureState, state: types.TextureState };
+
+        pub fn deinit(self: *LocalStates) void {
+            self.entries.deinit(self.gpa);
+        }
+    };
+
+    /// The state of a mip as of the commands this encoder recorded so far.
+    fn stateOf(self: *CommandEncoder, texture: types.Texture, resource: *const device_module.TextureResource, mip: u32) types.TextureState {
+        const local = self.local orelse return resource.states[mip];
+        for (local.entries.items) |entry| {
+            if (entry.texture == texture and entry.mip == mip) return entry.state;
+        }
+        const found = resource.states[mip];
+        local.entries.append(local.gpa, .{ .texture = texture, .mip = mip, .found = found, .state = found }) catch {
+            local.failed = true;
+        };
+        return found;
+    }
+
+    fn setState(self: *CommandEncoder, texture: types.Texture, resource: *device_module.TextureResource, mip: u32, state: types.TextureState) void {
+        const local = self.local orelse {
+            resource.states[mip] = state;
+            return;
+        };
+        for (local.entries.items) |*entry| {
+            if (entry.texture != texture or entry.mip != mip) continue;
+            entry.state = state;
+            return;
+        }
+        local.entries.append(local.gpa, .{ .texture = texture, .mip = mip, .found = resource.states[mip], .state = state }) catch {
+            local.failed = true;
+        };
+    }
 
     const Mip = struct {
         texture: types.Texture,
@@ -91,14 +138,14 @@ pub const CommandEncoder = struct {
                 continue;
             }
             const resource = self.device.textures.get(entry.texture) orelse continue;
-            const from = resource.states[entry.mip];
+            const from = self.stateOf(entry.texture, resource, entry.mip);
             switch (from) {
                 .color_attachment, .depth_attachment, .copy_src, .copy_dst => {},
                 else => continue,
             }
             barriers[count] = imageBarrier(self.device.caps.mesh_shaders, resource, entry.mip, 1, from, .shader_read);
             count += 1;
-            resource.states[entry.mip] = .shader_read;
+            self.setState(entry.texture, resource, entry.mip, .shader_read);
         }
         self.owed_count = kept;
         if (count == 0) return;
@@ -122,9 +169,9 @@ pub const CommandEncoder = struct {
         var count: u32 = 0;
         var mip: u32 = 0;
         while (mip < resource.info.mip_levels) {
-            const from = resource.states[mip];
+            const from = self.stateOf(texture, resource, mip);
             var end = mip + 1;
-            while (end < resource.info.mip_levels and resource.states[end] == from) end += 1;
+            while (end < resource.info.mip_levels and self.stateOf(texture, resource, end) == from) end += 1;
             if (from != state) {
                 barriers[count] = imageBarrier(self.device.caps.mesh_shaders, resource, mip, end - mip, from, state);
                 count += 1;
@@ -132,20 +179,31 @@ pub const CommandEncoder = struct {
             mip = end;
         }
         if (count == 0) return;
-        for (resource.states[0..resource.info.mip_levels]) |*value| value.* = state;
+        for (0..resource.info.mip_levels) |level| self.setState(texture, resource, @intCast(level), state);
         self.pipelineBarrier(&.{
             .image_memory_barrier_count = count,
             .p_image_memory_barriers = &barriers,
         });
     }
 
+    /// Records a barrier that moves a mip from `from` to `to` for commands
+    /// recorded elsewhere, leaving this encoder's states as they are.
+    pub fn moveMip(self: *CommandEncoder, texture: types.Texture, mip: u32, from: types.TextureState, to: types.TextureState) void {
+        const resource = self.device.textures.get(texture) orelse return;
+        const barrier = imageBarrier(self.device.caps.mesh_shaders, resource, mip, 1, from, to);
+        self.pipelineBarrier(&.{
+            .image_memory_barrier_count = 1,
+            .p_image_memory_barriers = @ptrCast(&barrier),
+        });
+    }
+
     /// Moves a single mip (all layers) into `state`.
     pub fn transitionMip(self: *CommandEncoder, texture: types.Texture, mip: u32, state: types.TextureState) void {
         const resource = self.device.textureResource(texture);
-        const from = resource.states[mip];
+        const from = self.stateOf(texture, resource, mip);
         if (from == state) return;
         const barrier = imageBarrier(self.device.caps.mesh_shaders, resource, mip, 1, from, state);
-        resource.states[mip] = state;
+        self.setState(texture, resource, mip, state);
         self.pipelineBarrier(&.{
             .image_memory_barrier_count = 1,
             .p_image_memory_barriers = @ptrCast(&barrier),
@@ -154,42 +212,26 @@ pub const CommandEncoder = struct {
 
     /// Declares a buffer hand-off between pipeline stages.
     pub fn sync(self: *CommandEncoder, kind: types.BufferSync) void {
-        const shader_stages = vk.PipelineStageFlags2{
-            .vertex_shader_bit = true,
-            .fragment_shader_bit = true,
-            .compute_shader_bit = true,
-            .draw_indirect_bit = true,
-            .vertex_input_bit = true,
-            .acceleration_structure_build_bit_khr = self.device.caps.ray_tracing,
-            .task_shader_bit_ext = self.device.caps.mesh_shaders,
-            .mesh_shader_bit_ext = self.device.caps.mesh_shaders,
-        };
-        const shader_access = vk.AccessFlags2{
-            .shader_read_bit = true,
-            .shader_write_bit = true,
-            .indirect_command_read_bit = true,
-            .index_read_bit = true,
-            .vertex_attribute_read_bit = true,
-        };
-        const barrier: vk.MemoryBarrier2 = switch (kind) {
-            .compute_to_all => .{
-                .src_stage_mask = .{ .compute_shader_bit = true },
-                .src_access_mask = .{ .shader_write_bit = true },
-                .dst_stage_mask = shader_stages.merge(.{ .all_transfer_bit = true }),
-                .dst_access_mask = shader_access.merge(.{ .transfer_read_bit = true }),
-            },
-            .transfer_to_all => .{
-                .src_stage_mask = .{ .all_transfer_bit = true },
-                .src_access_mask = .{ .transfer_write_bit = true },
-                .dst_stage_mask = shader_stages.merge(.{ .all_transfer_bit = true }),
-                .dst_access_mask = shader_access.merge(.{ .transfer_read_bit = true, .transfer_write_bit = true }),
-            },
-            .all_to_transfer => .{
-                .src_stage_mask = shader_stages.merge(.{ .all_transfer_bit = true }),
-                .src_access_mask = shader_access.merge(.{ .transfer_read_bit = true, .transfer_write_bit = true }),
-                .dst_stage_mask = .{ .all_transfer_bit = true },
-                .dst_access_mask = .{ .transfer_read_bit = true, .transfer_write_bit = true },
-            },
+        const reads = types.BufferAccess{ .compute_read = true, .graphics_read = true, .indirect = true, .index = true, .vertex_input = true, .transfer_read = true, .build_read = true };
+        switch (kind) {
+            .compute_to_all => self.dependency(.{ .compute_write = true }, reads),
+            .transfer_to_all => self.dependency(.{ .transfer_write = true }, reads.merge(.{ .transfer_write = true })),
+            .all_to_transfer => self.dependency(reads.merge(.{ .compute_write = true, .graphics_write = true, .transfer_write = true }), .{ .transfer_read = true, .transfer_write = true }),
+        }
+    }
+
+    /// Makes buffer work in `from` finish, and its writes visible, before
+    /// buffer work in `to`. Nothing is recorded when either is empty.
+    pub fn dependency(self: *CommandEncoder, from: types.BufferAccess, to: types.BufferAccess) void {
+        if (from.empty() or to.empty()) return;
+        const source = bufferAccessInfo(from, self.device.caps.ray_tracing, self.device.caps.mesh_shaders);
+        const destination = bufferAccessInfo(to, self.device.caps.ray_tracing, self.device.caps.mesh_shaders);
+        if (@as(u64, @bitCast(source.stage)) == 0 or @as(u64, @bitCast(destination.stage)) == 0) return;
+        const barrier = vk.MemoryBarrier2{
+            .src_stage_mask = source.stage,
+            .src_access_mask = if (from.writes()) source.access else .{},
+            .dst_stage_mask = destination.stage,
+            .dst_access_mask = if (from.writes()) destination.access else .{},
         };
         self.pipelineBarrier(&.{
             .memory_barrier_count = 1,
@@ -298,7 +340,7 @@ pub const CommandEncoder = struct {
     /// drawing that left it there. Other layers of the mip need no order.
     fn redraw(self: *CommandEncoder, texture: types.Texture, mip: u32, layer: u32, state: types.TextureState) void {
         const resource = self.device.textureResource(texture);
-        if (resource.states[mip] != state) return;
+        if (self.stateOf(texture, resource, mip) != state) return;
         for (self.owed[0..self.owed_count]) |*entry| {
             if (entry.texture != texture or entry.mip != mip) continue;
             if (entry.drawn & layerBit(layer) == 0) return;
@@ -443,6 +485,28 @@ pub const CommandEncoder = struct {
         );
     }
 
+    /// As `drawIndexedIndirectCount` for draws that are not indexed: four
+    /// words each, `VkDrawIndirectCommand`.
+    pub fn drawIndirectCount(
+        self: *CommandEncoder,
+        commands: types.Buffer,
+        commands_offset: u64,
+        count: types.Buffer,
+        count_offset: u64,
+        max_draws: u32,
+    ) void {
+        self.work.indirect_draws += 1;
+        self.device.vkd.cmdDrawIndirectCount(
+            self.command,
+            self.device.bufferResource(commands).handle,
+            commands_offset,
+            self.device.bufferResource(count).handle,
+            count_offset,
+            max_draws,
+            @sizeOf(vk.DrawIndirectCommand),
+        );
+    }
+
     /// Runs the bound compute pipeline; outside a render pass. Buffer writes
     /// are not visible to later passes until `sync(.compute_to_all)`.
     pub fn dispatch(self: *CommandEncoder, x: u32, y: u32, z: u32) void {
@@ -488,8 +552,8 @@ pub const CommandEncoder = struct {
         const waits = try rewrites(device.gpa, device.uploads.items);
         defer device.gpa.free(waits);
         self.work.staged_bytes += device.pending_upload_bytes;
-        var uploads = device.internal.takeUploads();
-        defer uploads.deinit(device.gpa);
+        const uploads = device.internal.takeUploads();
+        defer device.internal.returnUploads(uploads);
         for (uploads.items) |upload| switch (upload) {
             .buffer, .copy => {
                 self.sync(.all_to_transfer);
@@ -503,6 +567,7 @@ pub const CommandEncoder = struct {
             self.recordUpload(upload, &copied_buffers);
         }
         if (copied_buffers) self.sync(.transfer_to_all);
+        device.internal.fenceRing();
         for (uploads.items) |upload| switch (upload) {
             .texture => |copy| self.transition(copy.destination, .shader_read),
             else => {},
@@ -513,8 +578,8 @@ pub const CommandEncoder = struct {
         const device = self.device;
         switch (upload) {
             .buffer => |copy| {
-                self.copyBuffer(copy.staging, copy.destination, 0, copy.offset, copy.size);
-                device.destroyBuffer(copy.staging);
+                self.copyBuffer(copy.staging, copy.destination, copy.staging_offset, copy.offset, copy.size);
+                if (ownsStaging(device, copy.staging)) device.destroyBuffer(copy.staging);
                 copied_buffers.* = true;
             },
             .texture => |copy| {
@@ -531,7 +596,7 @@ pub const CommandEncoder = struct {
                     .image_offset = .{ .x = @intCast(region[0]), .y = @intCast(region[1]), .z = 0 },
                     .image_extent = .{ .width = region[2], .height = region[3], .depth = 1 },
                 }});
-                if (copy.last) device.destroyBuffer(copy.staging);
+                if (copy.last and ownsStaging(device, copy.staging)) device.destroyBuffer(copy.staging);
             },
             .mips => |texture| self.generateMips(texture),
             .copy => |copy| {
@@ -679,10 +744,10 @@ pub const CommandEncoder = struct {
         const frame = self.frameData() orelse return;
         if (self.scope_depth == self.scope_stack.len) @panic("timing scopes nested too deeply");
         var index: u32 = std.math.maxInt(u32);
-        if (frame.scope_count < device_module.max_timing_scopes) {
-            index = frame.scope_count;
+        const taken = @atomicRmw(u32, &frame.scope_count, .Add, 1, .monotonic);
+        if (taken < device_module.max_timing_scopes) {
+            index = taken;
             frame.scopes[index] = .{ .name = name, .depth = self.scope_depth, .work = self.work };
-            frame.scope_count += 1;
             self.device.vkd.cmdWriteTimestamp2(self.command, .{ .all_commands_bit = true }, frame.query_pool, index * 2);
         }
         self.scope_stack[self.scope_depth] = index;
@@ -755,6 +820,11 @@ fn rewrites(gpa: std.mem.Allocator, uploads: []const device_module.PendingUpload
     return waits;
 }
 
+/// The staging buffer is the upload's own rather than the shared ring.
+fn ownsStaging(device: *const device_module.Device, buffer: types.Buffer) bool {
+    return !device_module.sameHandle(buffer, device.staging_ring);
+}
+
 fn mipExtent(info: types.TextureInfo, mip: u32) vk.Extent2D {
     return .{
         .width = @max(info.width >> @intCast(mip), 1),
@@ -775,6 +845,66 @@ const StateInfo = struct {
     stage: vk.PipelineStageFlags2,
     access: vk.AccessFlags2,
 };
+
+const AccessInfo = struct { stage: vk.PipelineStageFlags2, access: vk.AccessFlags2 };
+
+/// The stages and memory accesses of a set of buffer uses. Shader reads take
+/// in acceleration structure reads when there is ray tracing, for ray
+/// queries; `mesh_shaders` adds the task and mesh stages to graphics.
+fn bufferAccessInfo(uses: types.BufferAccess, ray_tracing: bool, mesh_shaders: bool) AccessInfo {
+    const graphics = vk.PipelineStageFlags2{ .vertex_shader_bit = true, .fragment_shader_bit = true, .task_shader_bit_ext = mesh_shaders, .mesh_shader_bit_ext = mesh_shaders };
+    const shader_read = vk.AccessFlags2{ .shader_read_bit = true, .acceleration_structure_read_bit_khr = ray_tracing };
+    var info = AccessInfo{ .stage = .{}, .access = .{} };
+    if (uses.compute_read) {
+        info.stage = info.stage.merge(.{ .compute_shader_bit = true });
+        info.access = info.access.merge(shader_read);
+    }
+    if (uses.compute_write) {
+        info.stage = info.stage.merge(.{ .compute_shader_bit = true });
+        info.access = info.access.merge(.{ .shader_write_bit = true });
+    }
+    if (uses.graphics_read) {
+        info.stage = info.stage.merge(graphics);
+        info.access = info.access.merge(shader_read);
+    }
+    if (uses.graphics_write) {
+        info.stage = info.stage.merge(graphics);
+        info.access = info.access.merge(.{ .shader_write_bit = true });
+    }
+    if (uses.indirect) {
+        info.stage = info.stage.merge(.{ .draw_indirect_bit = true });
+        info.access = info.access.merge(.{ .indirect_command_read_bit = true });
+    }
+    if (uses.index) {
+        info.stage = info.stage.merge(.{ .index_input_bit = true });
+        info.access = info.access.merge(.{ .index_read_bit = true });
+    }
+    if (uses.vertex_input) {
+        info.stage = info.stage.merge(.{ .vertex_attribute_input_bit = true });
+        info.access = info.access.merge(.{ .vertex_attribute_read_bit = true });
+    }
+    if (uses.transfer_read) {
+        info.stage = info.stage.merge(.{ .all_transfer_bit = true });
+        info.access = info.access.merge(.{ .transfer_read_bit = true });
+    }
+    if (uses.transfer_write) {
+        info.stage = info.stage.merge(.{ .all_transfer_bit = true });
+        info.access = info.access.merge(.{ .transfer_write_bit = true });
+    }
+    if (ray_tracing and uses.build_read) {
+        info.stage = info.stage.merge(.{ .acceleration_structure_build_bit_khr = true });
+        info.access = info.access.merge(.{ .acceleration_structure_read_bit_khr = true, .shader_read_bit = true });
+    }
+    if (ray_tracing and uses.build_write) {
+        info.stage = info.stage.merge(.{ .acceleration_structure_build_bit_khr = true });
+        info.access = info.access.merge(.{ .acceleration_structure_write_bit_khr = true });
+    }
+    if (uses.host_read) {
+        info.stage = info.stage.merge(.{ .host_bit = true });
+        info.access = info.access.merge(.{ .host_read_bit = true });
+    }
+    return info;
+}
 
 /// `mesh_shaders` adds the task and mesh stages to `shader_read` and
 /// `storage`, which also covers every graphics stage, for pipelines of the

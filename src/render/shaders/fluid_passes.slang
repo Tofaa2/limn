@@ -289,12 +289,12 @@ float4 solidMain(float4 fragment : SV_Position) : SV_Target {
         }
     }
 #ifdef RAY_TRACED
-    if (solid == 0.0 && solid_push.tlas != 0 && cell.z < fluid.data.size.z) {
+    if (solid == 0.0 && (solid_push.tlas_low | solid_push.tlas_high) != 0u && cell.z < fluid.data.size.z) {
         float4x4 box_to_world = fluid.data.box_to_world;
         float3 origin = mul(box_to_world, float4(center / float3(fluid.data.size), 1.0)).xyz;
         Tracer tracer;
         tracer.frame = (FrameConstants)nullptr;
-        tracer.scene = solid_push.tlas;
+        tracer.scene = uint64_t(solid_push.tlas_low) | (uint64_t(solid_push.tlas_high) << 32);
         for (int axis = 0; axis < 3 && solid == 0.0; axis++) {
             float3 half_cell = matrixColumn(box_to_world, axis) * (0.5 / float(fluid.data.size[axis]));
             float reach = length(half_cell);

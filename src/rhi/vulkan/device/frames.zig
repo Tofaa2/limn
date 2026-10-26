@@ -15,6 +15,7 @@ const collectGarbage = @import("objects.zig").collectGarbage;
 const finishPacedPresent = @import("presentation.zig").finishPacedPresent;
 const frames_in_flight = device_module.frames_in_flight;
 const max_timing_scopes = device_module.max_timing_scopes;
+const max_parallel = device_module.max_parallel;
 const recordGeneratedFrame = @import("presentation.zig").recordGeneratedFrame;
 const presentation = @import("presentation.zig");
 
@@ -71,6 +72,8 @@ pub fn startFrame(self: *Device) !Frame {
         self.textureResource(backbuffer.?).states[0] = .undefined;
     }
     try self.vkd.resetCommandPool(frame.pool, .{});
+    for (frame.worker_pools) |pool| if (pool != .null_handle) try self.vkd.resetCommandPool(pool, .{});
+    frame.submit_count = 0;
     try self.vkd.beginCommandBuffer(frame.command, &.{ .flags = .{ .one_time_submit_bit = true } });
     frame.scope_count = 0;
     self.vkd.cmdResetQueryPool(frame.command, frame.query_pool, 0, max_timing_scopes * 2);
@@ -97,7 +100,9 @@ pub fn submitFrame(self: *Device) !void {
         recordGeneratedFrame(self, frame);
         self.encoder.transition(self.swapchain.?.textures.items[self.swapchain.?.image_index], .present);
     }
-    try self.vkd.endCommandBuffer(frame.command);
+    try self.vkd.endCommandBuffer(self.encoder.command);
+    frame.submits[frame.submit_count] = self.encoder.command;
+    frame.submit_count += 1;
     self.in_frame = false;
 
     try self.vkd.resetFences(&.{frame.fence});
@@ -105,9 +110,10 @@ pub fn submitFrame(self: *Device) !void {
         self.vkd.destroyFence(frame.fence, null);
         frame.fence = signaled;
     } else |_| {};
-    const command_info = vk.CommandBufferSubmitInfo{ .command_buffer = frame.command, .device_mask = 0 };
+    var command_infos: [max_parallel + 2]vk.CommandBufferSubmitInfo = undefined;
+    for (frame.submits[0..frame.submit_count], command_infos[0..frame.submit_count]) |command, *info| info.* = .{ .command_buffer = command, .device_mask = 0 };
     var wait_info: [2]vk.SemaphoreSubmitInfo = undefined;
-    var signal_info: [2]vk.SemaphoreSubmitInfo = undefined;
+    var signal_info: [3]vk.SemaphoreSubmitInfo = undefined;
     var semaphore_count: u32 = 0;
     if (self.swapchain) |*swapchain| {
         const acquired = [2]vk.Semaphore{ frame.image_available, frame.generated_available };
@@ -124,14 +130,15 @@ pub fn submitFrame(self: *Device) !void {
             semaphore_count += 1;
         }
     }
+    signal_info[semaphore_count] = .{ .semaphore = self.frame_timeline, .value = self.frame_number + 1, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
     self.queue_mutex.lockUncancelable(self.io);
     defer self.queue_mutex.unlock(self.io);
     try self.vkd.queueSubmit2(self.queue, &.{.{
         .wait_semaphore_info_count = semaphore_count,
         .p_wait_semaphore_infos = &wait_info,
-        .command_buffer_info_count = 1,
-        .p_command_buffer_infos = @ptrCast(&command_info),
-        .signal_semaphore_info_count = semaphore_count,
+        .command_buffer_info_count = frame.submit_count,
+        .p_command_buffer_infos = &command_infos,
+        .signal_semaphore_info_count = semaphore_count + 1,
         .p_signal_semaphore_infos = &signal_info,
     }}, frame.fence);
     if (self.swapchain) |*swapchain| swapchain.present_pending = true;
@@ -169,6 +176,7 @@ pub fn flushUploadsBlocking(self: *Device) !void {
     var encoder = try self.beginImmediate();
     try encoder.flushUploads();
     try self.endImmediate(&encoder);
+    if (self.ring.fenced == self.ring.head) self.ring = .{};
     collectGarbage(self, true);
 }
 
@@ -195,32 +203,49 @@ pub fn beginDetached(self: *Device) !?CommandEncoder {
     return encoder;
 }
 
-/// Submits without waiting; poll `detachedDone`, then `releaseDetached`.
-pub fn submitDetached(self: *Device, encoder: CommandEncoder) !Detached {
+/// Submits without waiting; poll `detachedDone`, then `releaseDetached`. The
+/// job starts once frame `after` is done on the GPU, so it may read what that
+/// frame uploads.
+pub fn submitDetached(self: *Device, encoder: CommandEncoder, after: u64) !Detached {
     var settled = encoder;
     settled.settle();
     errdefer self.vkd.freeCommandBuffers(self.detached_pool, &.{encoder.command});
     try self.vkd.endCommandBuffer(encoder.command);
-    const fence = try self.vkd.createFence(&.{}, null);
-    errdefer self.vkd.destroyFence(fence, null);
+    const value = self.detached_signaled + 1;
     const command_info = vk.CommandBufferSubmitInfo{ .command_buffer = encoder.command, .device_mask = 0 };
+    const wait = vk.SemaphoreSubmitInfo{ .semaphore = self.frame_timeline, .value = after + 1, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
+    const signal = vk.SemaphoreSubmitInfo{ .semaphore = self.detached_timeline, .value = value, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
     try self.vkd.queueSubmit2(self.detached_queue.?, &.{.{
+        .wait_semaphore_info_count = 1,
+        .p_wait_semaphore_infos = @ptrCast(&wait),
         .command_buffer_info_count = 1,
         .p_command_buffer_infos = @ptrCast(&command_info),
-    }}, fence);
+        .signal_semaphore_info_count = 1,
+        .p_signal_semaphore_infos = @ptrCast(&signal),
+    }}, .null_handle);
+    self.detached_signaled = value;
     self.detached_outstanding += 1;
-    return .{ .command = @intFromEnum(encoder.command), .fence = @intFromEnum(fence) };
+    return .{ .command = @intFromEnum(encoder.command), .value = value, .after = after };
+}
+
+/// How far the detached jobs have got: those signalling up to this are done.
+pub fn detachedReached(self: *Device) u64 {
+    return self.vkd.getSemaphoreCounterValue(self.detached_timeline) catch 0;
 }
 
 pub fn detachedDone(self: *Device, job: Detached) bool {
-    return (self.vkd.getFenceStatus(@enumFromInt(job.fence)) catch return false) == .success;
+    return detachedReached(self) >= job.value;
 }
 
-/// Waits for the job if it is still running.
+/// The frame the job waits for has been submitted, so waiting for the job
+/// cannot block on frames not yet recorded.
+pub fn detachedStarted(self: *const Device, job: Detached) bool {
+    return self.frame_number > job.after;
+}
+
+/// Waits for the job if it is still running; only once `detachedStarted`.
 pub fn releaseDetached(self: *Device, job: Detached) void {
-    const fence: vk.Fence = @enumFromInt(job.fence);
-    _ = self.vkd.waitForFences(&.{fence}, .true, std.math.maxInt(u64)) catch {};
-    self.vkd.destroyFence(fence, null);
+    _ = self.vkd.waitSemaphores(&.{ .semaphore_count = 1, .p_semaphores = @ptrCast(&self.detached_timeline), .p_values = @ptrCast(&job.value) }, std.math.maxInt(u64)) catch {};
     self.vkd.freeCommandBuffers(self.detached_pool, &.{@as(vk.CommandBuffer, @enumFromInt(job.command))});
     self.detached_outstanding -= 1;
 }
@@ -255,7 +280,26 @@ pub fn endImmediate(self: *Device, encoder: *CommandEncoder) !void {
     try self.waitIdle();
 }
 
-pub fn createStaging(self: *Device, data: []const u8) !types.Buffer {
+const staging_ring_size = 32 * 1024 * 1024;
+
+/// Where `createStaging` put the data.
+pub const Staging = struct {
+    buffer: types.Buffer,
+    offset: u64 = 0,
+
+    /// The buffer is the data's own, for the upload to destroy.
+    pub fn owned(self: Staging, device: *const Device) bool {
+        return !device_module.sameHandle(self.buffer, device.staging_ring);
+    }
+};
+
+/// Copies `data` into the staging ring, or into a buffer of its own when it
+/// is a quarter of the ring or more or the ring is full.
+pub fn createStaging(self: *Device, data: []const u8) !Staging {
+    if (data.len < staging_ring_size / 4) if (try ringSpace(self, data.len)) |offset| {
+        @memcpy(self.mapped(self.staging_ring)[@intCast(offset)..][0..data.len], data);
+        return .{ .buffer = self.staging_ring, .offset = offset };
+    };
     const staging = try self.createBuffer(.{
         .name = "staging",
         .size = data.len,
@@ -263,32 +307,92 @@ pub fn createStaging(self: *Device, data: []const u8) !types.Buffer {
         .memory = .cpu_to_gpu,
     });
     @memcpy(self.mapped(staging)[0..data.len], data);
-    return staging;
+    return .{ .buffer = staging };
+}
+
+fn ringSpace(self: *Device, size: usize) !?u64 {
+    if (!self.staging_ring.isValid()) self.staging_ring = try self.createBuffer(.{
+        .name = "staging ring",
+        .size = staging_ring_size,
+        .usage = .{ .copy_src = true },
+        .memory = .cpu_to_gpu,
+    });
+    retireRing(self);
+    const ring = &self.ring;
+    if (ring.head == ring.tail) ring.* = .{};
+    const length = std.mem.alignForward(u64, size, 16);
+    var offset = ring.head;
+    if (ring.head >= ring.tail) {
+        if (staging_ring_size - ring.head < length) {
+            if (length >= ring.tail) return null;
+            offset = 0;
+        }
+    } else if (ring.tail - ring.head <= length) return null;
+    ring.head = offset + length;
+    return offset;
+}
+
+fn retireRing(self: *Device) void {
+    const ring = &self.ring;
+    if (ring.fence_count == 0) return;
+    const reached = self.vkd.getSemaphoreCounterValue(self.frame_timeline) catch return;
+    var done: u32 = 0;
+    while (done < ring.fence_count and ring.fences[done].value <= reached) : (done += 1) ring.tail = ring.fences[done].end;
+    std.mem.copyForwards(device_module.StagingRing.Fence, ring.fences[0 .. ring.fence_count - done], ring.fences[done..ring.fence_count]);
+    ring.fence_count -= done;
+}
+
+/// Called once uploads are recorded: what was staged so far is free again
+/// when the frame being recorded has finished. Earlier submissions are done
+/// by then too, so this covers immediate encoders as well.
+pub fn fenceRing(self: *Device) void {
+    const ring = &self.ring;
+    if (ring.fenced == ring.head) return;
+    const value = self.frame_number + 1;
+    if (ring.fence_count == ring.fences.len) {
+        ring.fences[ring.fence_count - 1] = .{ .end = ring.head, .value = value };
+    } else {
+        ring.fences[ring.fence_count] = .{ .end = ring.head, .value = value };
+        ring.fence_count += 1;
+    }
+    ring.fenced = ring.head;
 }
 
 /// Called by `CommandEncoder.flushUploads`; use that. The caller owns the
-/// list (free with `gpa`) and must record and destroy its staging buffers.
+/// list, gives it back with `returnUploads`, and destroys the staging
+/// buffers that are its own.
 pub fn takeUploads(self: *Device) std.ArrayList(PendingUpload) {
     const result = self.uploads;
-    self.uploads = .empty;
+    self.uploads = self.spare_uploads;
+    self.spare_uploads = .empty;
     self.pending_upload_bytes = 0;
     return result;
 }
 
+/// Gives back a list from `takeUploads` once its uploads are recorded.
+pub fn returnUploads(self: *Device, list: std.ArrayList(PendingUpload)) void {
+    var spare = list;
+    spare.clearRetainingCapacity();
+    if (self.spare_uploads.capacity >= spare.capacity) return spare.deinit(self.gpa);
+    self.spare_uploads.deinit(self.gpa);
+    self.spare_uploads = spare;
+}
+
 fn collectTimings(self: *Device, frame: *FrameData) void {
-    if (!frame.submitted or frame.scope_count == 0) return;
+    const scope_count: u32 = @min(frame.scope_count, max_timing_scopes);
+    if (!frame.submitted or scope_count == 0) return;
     var raw: [max_timing_scopes * 2]u64 = undefined;
     _ = self.vkd.getQueryPoolResults(
         frame.query_pool,
         0,
-        frame.scope_count * 2,
-        @sizeOf(u64) * frame.scope_count * 2,
+        scope_count * 2,
+        @sizeOf(u64) * scope_count * 2,
         &raw,
         @sizeOf(u64),
         .{ .@"64_bit" = true },
     ) catch return;
     const period: f64 = self.properties.limits.timestamp_period;
-    for (frame.scopes[0..frame.scope_count], 0..) |scope, index| {
+    for (frame.scopes[0..scope_count], 0..) |scope, index| {
         const ticks = raw[index * 2 + 1] -% raw[index * 2];
         self.timings[index] = .{
             .name = scope.name,
@@ -297,7 +401,7 @@ fn collectTimings(self: *Device, frame: *FrameData) void {
             .work = scope.work,
         };
     }
-    self.timing_count = frame.scope_count;
+    self.timing_count = scope_count;
 }
 
 /// Logs where a lost device faulted, when the driver says: each address,
@@ -328,4 +432,81 @@ pub fn reportFault(self: *Device) void {
         std.log.err("  fault type {d} (1 read, 2 write, 3 execute) at 0x{x} (within 0x{x}): {s} + {d}", .{ @intFromEnum(entry.address_type), entry.reported_address, entry.address_precision, buffer_name, offset });
     }
     for (vendors[0..counts.vendor_info_count]) |vendor| std.log.err("  {s} (code 0x{x}, data 0x{x})", .{ std.mem.sliceTo(&vendor.description, 0), vendor.vendor_fault_code, vendor.vendor_fault_data });
+}
+
+/// Gives `count` encoders that may record on as many threads at once, after
+/// what the frame's encoder recorded so far and before what it records after
+/// `joinParallel`. Until then the frame's encoder records nothing, device
+/// texture states stay as they are, and resources may be made, destroyed
+/// and given views only through the device's own calls, which lock.
+pub fn beginParallel(self: *Device, count: u32) ![]CommandEncoder {
+    std.debug.assert(self.in_frame and self.parallel_count == 0 and count != 0 and count <= max_parallel);
+    const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
+    self.encoder.settle();
+    try self.textures.slots.ensureUnusedCapacity(self.textures.allocator, parallel_room);
+    try self.buffers.slots.ensureUnusedCapacity(self.buffers.allocator, parallel_room);
+    try self.pipelines.slots.ensureUnusedCapacity(self.pipelines.allocator, parallel_room);
+    for (0..count) |index| {
+        if (frame.worker_pools[index] == .null_handle) {
+            const pool = try self.vkd.createCommandPool(&.{ .queue_family_index = self.queue_family }, null);
+            errdefer self.vkd.destroyCommandPool(pool, null);
+            try self.vkd.allocateCommandBuffers(&.{ .command_pool = pool, .level = .primary, .command_buffer_count = 1 }, @ptrCast(&frame.worker_commands[index]));
+            frame.worker_pools[index] = pool;
+        }
+    }
+    try self.vkd.endCommandBuffer(self.encoder.command);
+    frame.submits[frame.submit_count] = self.encoder.command;
+    frame.submit_count += 1;
+    for (0..count) |index| {
+        try self.vkd.beginCommandBuffer(frame.worker_commands[index], &.{ .flags = .{ .one_time_submit_bit = true } });
+        if (index >= self.parallel_made) {
+            self.parallel_states[index] = .{ .gpa = self.gpa };
+            self.parallel_made = @intCast(index + 1);
+        }
+        self.parallel_states[index].entries.clearRetainingCapacity();
+        self.parallel_states[index].failed = false;
+        self.parallel[index] = .{ .device = self, .command = frame.worker_commands[index], .frame = frame, .local = &self.parallel_states[index] };
+        self.parallel[index].bindGlobals();
+        self.parallel_count += 1;
+    }
+    return self.parallel[0..count];
+}
+
+/// Resources each kind of handle table has room for, without growing, while
+/// encoders record beside each other.
+const parallel_room = 4096;
+
+/// Ends the encoders `beginParallel` gave, in order. Before each one goes
+/// what moves the textures it used from the states the ones before left to
+/// those it found; the device's states become those the last one left. The
+/// frame's encoder goes on in a command buffer of its own after them.
+pub fn joinParallel(self: *Device) !void {
+    const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
+    const encoders = self.parallel[0..self.parallel_count];
+    const states = self.parallel_states[0..self.parallel_count];
+    defer self.parallel_count = 0;
+    var failed = false;
+    for (encoders, states, 0..) |*encoder, *local, index| {
+        std.debug.assert(encoder.scope_depth == 0 and !encoder.rendering);
+        encoder.settle();
+        failed = failed or local.failed;
+        for (local.entries.items) |entry| {
+            const resource = self.textures.get(entry.texture) orelse continue;
+            resource.states[entry.mip] = entry.state;
+        }
+        if (index + 1 < encoders.len) for (states[index + 1].entries.items) |entry| {
+            const resource = self.textures.get(entry.texture) orelse continue;
+            const now = resource.states[entry.mip];
+            if (now != entry.found) encoder.moveMip(entry.texture, entry.mip, now, entry.found);
+        };
+        inline for (std.meta.fields(types.Work)) |field| @field(self.encoder.work, field.name) += @field(encoder.work, field.name);
+        try self.vkd.endCommandBuffer(encoder.command);
+        frame.submits[frame.submit_count] = encoder.command;
+        frame.submit_count += 1;
+    }
+    if (frame.tail == .null_handle) try self.vkd.allocateCommandBuffers(&.{ .command_pool = frame.pool, .level = .primary, .command_buffer_count = 1 }, @ptrCast(&frame.tail));
+    try self.vkd.beginCommandBuffer(frame.tail, &.{ .flags = .{ .one_time_submit_bit = true } });
+    self.encoder.command = frame.tail;
+    self.encoder.bindGlobals();
+    if (failed) return error.OutOfMemory;
 }

@@ -6,6 +6,7 @@ const render = @import("../renderer.zig");
 const scene_pass = @import("../scene_pass.zig");
 const math = @import("../../math.zig");
 const features = @import("../core/features.zig");
+const lights_feature = @import("lights.zig");
 
 const ScenePass = scene_pass.ScenePass;
 const Renderer = render.Renderer;
@@ -17,8 +18,9 @@ const ViewContext = features.ViewContext;
 pub fn declare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
     const g = ctx.graph;
-    try g.add(.{ .name = "impostor pictures", .stage = .transparent, .always = true, .scope = false }, ctx, impostorPictures);
-    if (!p.tracing) try g.add(.{ .name = "impostors", .stage = .transparent, .always = true, .scope = false }, ctx, impostors);
+    const light_reads = try lights_feature.reads(ctx);
+    try g.add(.{ .name = "impostor pictures", .stage = .transparent, .always = true, .scope = false, .buffers = &light_reads }, ctx, impostorPictures);
+    if (!p.tracing) try g.add(.{ .name = "impostors", .stage = .transparent, .always = true, .scope = false, .buffers = &light_reads }, ctx, impostors);
 }
 
 fn impostorPictures(ctx: *ViewContext) !void {
@@ -125,7 +127,7 @@ pub fn drawImpostors(renderer: *Renderer, p: *const ScenePass) !void {
         .impostors = device.bufferAddress(table),
         .instances = device.bufferAddress(bounds),
         .list = device.bufferAddress(list),
-        .entity_instances = @intCast(scene.layout.items.len),
+        .entity_instances = scene.entity_capacity,
     });
     cmd.drawIndirect(renderer.internal.impostor_draw, 0);
     cmd.endRendering();

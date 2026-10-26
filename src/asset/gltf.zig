@@ -209,6 +209,19 @@ pub const Material = struct {
     ior: f32 = 1.5,
     /// Thickness used for refraction, in world units (`KHR_materials_volume`).
     thickness: f32 = 0.1,
+    /// Color light inside turns after `attenuation_distance` (`KHR_materials_volume`).
+    attenuation_color: [3]f32 = .{ 1, 1, 1 },
+    /// World units; 0 absorbs nothing.
+    attenuation_distance: f32 = 0,
+    /// `KHR_materials_specular`: tints and scales the 4% reflectance of
+    /// non-metals at normal incidence.
+    reflectance_color: [3]f32 = .{ 1, 1, 1 },
+    reflectance: f32 = 1,
+    /// `KHR_materials_iridescence`: strength of a thin film on top, 0..1.
+    iridescence: f32 = 0,
+    /// The film's index of refraction and thickness in nanometres.
+    iridescence_ior: f32 = 1.3,
+    iridescence_thickness: f32 = 400,
     /// `KHR_materials_sheen`.
     sheen_color: [3]f32 = .{ 0, 0, 0 },
     sheen_roughness: f32 = 0.5,
@@ -302,7 +315,7 @@ pub const Image = struct {
 
     /// Texel format of `compressed`. `.rgba8` is an uncompressed mip chain
     /// (`LoadOptions.raw_mips`).
-    pub const Block = enum(u8) { bc7, bc1, bc3, bc6h, rgba8 };
+    pub const Block = enum(u8) { bc7, bc1, bc3, bc6h, rgba8, astc4x4 };
 
     /// RGBA8 pixels of `decoded`, top row first; empty when compressed or
     /// released.
@@ -536,6 +549,8 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: LoadO
     const path_z = try gpa.dupeZ(u8, path);
     defer gpa.free(path_z);
     try gltf.loadBuffers(parse_options, data, path_z.ptr);
+    try checkRequired(data);
+    try decodeMeshopt(data);
     if (build_features.validate_input and gltf.validate(data) != .success) return error.InvalidGltf;
 
     model.images = try arena.alloc(Image, data.images_count);
@@ -607,17 +622,87 @@ fn decodeImage(job: *ImageJob) std.Io.Cancelable!void {
 extern fn stbi_info_from_memory(buffer: [*]const u8, len: c_int, x: *c_int, y: *c_int, comp: *c_int) c_int;
 
 /// Widest and tallest image a model may carry.
+/// Extensions a file may list as required.
+const supported_extensions = [_][]const u8{
+    "KHR_texture_transform",   "KHR_texture_basisu",                  "KHR_mesh_quantization",
+    "KHR_materials_unlit",     "KHR_materials_pbrSpecularGlossiness", "KHR_materials_emissive_strength",
+    "KHR_materials_ior",       "KHR_materials_volume",                "KHR_materials_transmission",
+    "KHR_materials_clearcoat", "KHR_materials_sheen",                 "KHR_materials_anisotropy",
+    "KHR_lights_punctual",     "EXT_meshopt_compression",             "MSFT_texture_dds",
+};
+
+/// `error.UnsupportedExtension`, logged by name, for a required extension the
+/// loader cannot honor. Draco files are told to use meshopt compression instead.
+fn checkRequired(data: *gltf.Data) !void {
+    const required = data.extensions_required orelse return;
+    for (required[0..data.extensions_required_count]) |pointer| {
+        const name = std.mem.span(pointer);
+        for (supported_extensions) |supported| {
+            if (std.mem.eql(u8, name, supported)) break;
+        } else {
+            if (std.mem.eql(u8, name, "KHR_draco_mesh_compression")) {
+                std.log.warn("glTF: Draco compression is not supported; re-export with EXT_meshopt_compression", .{});
+            } else std.log.warn("glTF: required extension {s} is not supported", .{name});
+            return error.UnsupportedExtension;
+        }
+    }
+}
+
+extern fn meshopt_decodeVertexBuffer(destination: *anyopaque, count: usize, size: usize, buffer: [*]const u8, buffer_size: usize) c_int;
+extern fn meshopt_decodeIndexBuffer(destination: *anyopaque, count: usize, size: usize, buffer: [*]const u8, buffer_size: usize) c_int;
+extern fn meshopt_decodeIndexSequence(destination: *anyopaque, count: usize, size: usize, buffer: [*]const u8, buffer_size: usize) c_int;
+extern fn meshopt_decodeFilterOct(buffer: *anyopaque, count: usize, stride: usize) void;
+extern fn meshopt_decodeFilterQuat(buffer: *anyopaque, count: usize, stride: usize) void;
+extern fn meshopt_decodeFilterExp(buffer: *anyopaque, count: usize, stride: usize) void;
+
+/// Decodes `EXT_meshopt_compression` buffer views into memory `gltf.free`
+/// releases, where accessors then read them.
+fn decodeMeshopt(data: *gltf.Data) !void {
+    const views = data.buffer_views orelse return;
+    for (views[0..data.buffer_views_count]) |*view| {
+        if (view.has_meshopt_compression == 0) continue;
+        const compression = view.meshopt_compression;
+        const buffer: [*]const u8 = @ptrCast(compression.buffer.data orelse return error.MissingBufferData);
+        const end = std.math.add(usize, compression.offset, compression.size) catch return error.InvalidGltf;
+        if (end > compression.buffer.size) return error.InvalidGltf;
+        const size = std.math.mul(usize, compression.count, compression.stride) catch return error.InvalidGltf;
+        if (size != view.size or size == 0) return error.InvalidGltf;
+        const output = parserAlloc(null, size) orelse return error.OutOfMemory;
+        view.data = output;
+        const source = buffer + compression.offset;
+        const failed = switch (compression.mode) {
+            .attributes => meshopt_decodeVertexBuffer(output, compression.count, compression.stride, source, compression.size),
+            .triangles => meshopt_decodeIndexBuffer(output, compression.count, compression.stride, source, compression.size),
+            .indices => meshopt_decodeIndexSequence(output, compression.count, compression.stride, source, compression.size),
+            .invalid => return error.InvalidGltf,
+        };
+        if (failed != 0) return error.InvalidGltf;
+        switch (compression.filter) {
+            .none => {},
+            .octahedral => meshopt_decodeFilterOct(output, compression.count, compression.stride),
+            .quaternion => meshopt_decodeFilterQuat(output, compression.count, compression.stride),
+            .exponential => meshopt_decodeFilterExp(output, compression.count, compression.stride),
+        }
+    }
+}
+
 const max_image_size = 16384;
 
-/// Decodes a model's PNG, JPEG or the like to RGBA8, refusing one larger than
-/// `max_image_size` before allocating for it.
-fn decodeBounded(encoded: []const u8) !zstbi.Image {
+/// `error.ImageTooLarge` for an image wider or taller than `max_image_size`,
+/// read from its header before anything is allocated for it.
+fn checkImageSize(encoded: []const u8) !void {
     var width: c_int = 0;
     var height: c_int = 0;
     var components: c_int = 0;
     const length = std.math.cast(c_int, encoded.len) orelse return error.ImageTooLarge;
     if (stbi_info_from_memory(encoded.ptr, length, &width, &height, &components) == 0) return error.InvalidImage;
     if (width > max_image_size or height > max_image_size) return error.ImageTooLarge;
+}
+
+/// Decodes a model's PNG, JPEG or the like to RGBA8, refusing one larger than
+/// `max_image_size` before allocating for it.
+fn decodeBounded(encoded: []const u8) !zstbi.Image {
+    try checkImageSize(encoded);
     return zstbi.Image.loadFromMemory(encoded, 4);
 }
 
@@ -649,7 +734,7 @@ fn decodeImageInner(job: *ImageJob) !void {
     } else return error.MissingImageData;
 
     if (ktx2.isKtx2(encoded)) {
-        const texture = try ktx2.read(job.gpa, encoded);
+        const texture = try ktx2.read(job.gpa, encoded, job.options.basis);
         errdefer job.gpa.free(texture.data);
         if (texture.faces != 1 or texture.layers != 1) return error.UnsupportedKtx2;
         switch (texture.format) {
@@ -659,7 +744,9 @@ fn decodeImageInner(job: *ImageJob) !void {
             .bc6h => job.output.block = .bc6h,
             .bc4 => job.output.one_channel = true,
             .bc5 => job.output.two_channel = true,
-            .rgba8, .rgba16f => return error.UnsupportedKtx2,
+            .astc4x4 => job.output.block = .astc4x4,
+            .rgba8 => job.output.block = .rgba8,
+            .rgba16f => return error.UnsupportedKtx2,
         }
         job.output.width = texture.width;
         job.output.height = texture.height;
@@ -791,6 +878,8 @@ pub const LoadOptions = struct {
     lods: LodOptions = .{},
     /// Store normal maps as BC5 instead of BC7 when compressing.
     normal_maps_bc5: bool = true,
+    /// What Basis Universal textures are transcoded to, by what the GPU reads.
+    basis: ktx2.BasisTarget = .bc,
 };
 
 const cache_magic = [4]u8{ 'R', 'T', 'E', 'X' };
@@ -1038,11 +1127,13 @@ pub const HdrImage = struct {
 
 /// Decodes a Radiance `.hdr` panorama. Requires `acquireLibraries`. `gpa` is
 /// used only while decoding; free the result with `deinit`.
-/// `error.NotAnHdrImage` for any other kind of file.
+/// `error.NotAnHdrImage` for any other kind of file, `error.ImageTooLarge`
+/// past `max_image_size`.
 pub fn loadHdr(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !HdrImage {
     const bytes = try readFile(gpa, io, path);
     defer gpa.free(bytes);
     if (!zstbi.isHdrFromMem(bytes)) return error.NotAnHdrImage;
+    try checkImageSize(bytes);
     var decoded = try zstbi.Image.loadFromMemory(bytes, 4);
     errdefer decoded.deinit();
     const texels: []const [4]f16 = @alignCast(std.mem.bytesAsSlice([4]f16, decoded.data));
@@ -1155,6 +1246,19 @@ fn loadMaterials(arena: std.mem.Allocator, data: *gltf.Data, model: *Model) !voi
         if (source.has_transmission != 0) material.transmission = source.transmission.transmission_factor;
         if (source.has_ior != 0) material.ior = source.ior.ior;
         if (source.has_volume != 0 and source.volume.thickness_factor > 0) material.thickness = source.volume.thickness_factor;
+        if (source.has_volume != 0 and source.volume.attentuation_distance > 0 and source.volume.attentuation_distance < 1e30) {
+            material.attenuation_color = source.volume.attentuation_color;
+            material.attenuation_distance = source.volume.attentuation_distance;
+        }
+        if (source.has_iridescence != 0) {
+            material.iridescence = source.iridescence.iridescence_factor;
+            material.iridescence_ior = source.iridescence.iridescence_ior;
+            material.iridescence_thickness = source.iridescence.iridescence_thickness_max;
+        }
+        if (source.has_specular != 0) {
+            material.reflectance_color = source.specular.specular_color_factor;
+            material.reflectance = source.specular.specular_factor;
+        }
         material.unlit = source.unlit != 0;
         if (source.has_anisotropy != 0) {
             material.anisotropy = source.anisotropy.anisotropy_strength;
@@ -2357,7 +2461,7 @@ test "Basis Universal textures are transcoded to BC7" {
     for ([_][]const u8{ "examples/assets/panel/panel_etc1s.ktx2", "examples/assets/panel/panel_uastc.ktx2" }) |path| {
         const bytes = try readFile(gpa, std.testing.io, path);
         defer gpa.free(bytes);
-        const texture = try ktx2.read(gpa, bytes);
+        const texture = try ktx2.read(gpa, bytes, .bc);
         defer gpa.free(texture.data);
         try std.testing.expectEqual(ktx2.Format.bc7, texture.format);
         try std.testing.expect(texture.srgb);
@@ -2379,7 +2483,7 @@ test "Basis Universal textures are transcoded to BC7" {
     std.mem.writeInt(u32, broken[20..24], 16, .little);
     std.mem.writeInt(u32, broken[24..28], 16, .little);
     std.mem.writeInt(u32, broken[36..40], 1, .little);
-    try std.testing.expectError(error.UnsupportedKtx2, ktx2.read(gpa, &broken));
+    try std.testing.expectError(error.UnsupportedKtx2, ktx2.read(gpa, &broken, .bc));
 }
 
 /// Deletes the oldest files (by write time) of an asset cache directory
@@ -2494,4 +2598,103 @@ test "a weighted joint outside its skin is refused" {
     try writeTestFile(io, path, json);
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
     try std.testing.expectError(error.InvalidGltf, load(std.testing.allocator, io, path, .{}));
+}
+
+test "Basis Universal textures are transcoded to ASTC or plain texels for GPUs without BC" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "examples/assets/panel/panel_etc1s.ktx2", "examples/assets/panel/panel_uastc.ktx2" }) |path| {
+        const bytes = try readFile(gpa, std.testing.io, path);
+        defer gpa.free(bytes);
+        const astc = try ktx2.read(gpa, bytes, .astc);
+        defer gpa.free(astc.data);
+        try std.testing.expectEqual(ktx2.Format.astc4x4, astc.format);
+        try std.testing.expect(astc.srgb);
+        var blocks: usize = 0;
+        for (0..9) |level| blocks += @as(usize, (@max(@as(u32, 480) >> @intCast(level), 1) + 3) / 4) * ((@max(@as(u32, 270) >> @intCast(level), 1) + 3) / 4);
+        try std.testing.expectEqual(blocks * 16, astc.data.len);
+        const plain = try ktx2.read(gpa, bytes, .rgba);
+        defer gpa.free(plain.data);
+        try std.testing.expectEqual(ktx2.Format.rgba8, plain.format);
+        var texels: usize = 0;
+        for (0..9) |level| texels += @as(usize, @max(@as(u32, 480) >> @intCast(level), 1)) * @max(@as(u32, 270) >> @intCast(level), 1);
+        try std.testing.expectEqual(texels * 4, plain.data.len);
+        var lightest: u8 = 0;
+        var darkest: u8 = 255;
+        for (0..480 * 270) |texel| {
+            lightest = @max(lightest, plain.data[texel * 4]);
+            darkest = @min(darkest, plain.data[texel * 4]);
+        }
+        try std.testing.expect(lightest - darkest > 64);
+    }
+}
+
+test "a required extension the loader lacks is refused" {
+    const io = std.testing.io;
+    acquireLibraries(io);
+    defer releaseLibraries(io);
+    const path = ".zig-cache/limn-test-draco.gltf";
+    try writeTestFile(io, path,
+        \\{"asset":{"version":"2.0"},"extensionsUsed":["KHR_draco_mesh_compression"],"extensionsRequired":["KHR_draco_mesh_compression"]}
+    );
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
+    try std.testing.expectError(error.UnsupportedExtension, load(std.testing.allocator, io, path, .{}));
+}
+
+extern fn meshopt_encodeVertexBuffer(buffer: [*]u8, buffer_size: usize, vertices: *const anyopaque, count: usize, size: usize) usize;
+extern fn meshopt_encodeIndexBuffer(buffer: [*]u8, buffer_size: usize, indices: [*]const u32, count: usize) usize;
+
+test "meshopt-compressed geometry loads the same as plain" {
+    const io = std.testing.io;
+    acquireLibraries(io);
+    defer releaseLibraries(io);
+    const positions = [12]f32{ 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0 };
+    const indices = [6]u32{ 0, 1, 2, 0, 2, 3 };
+    var plain: [72]u8 = undefined;
+    @memcpy(plain[0..48], std.mem.sliceAsBytes(&positions));
+    @memcpy(plain[48..72], std.mem.sliceAsBytes(&indices));
+    var compressed: [256]u8 = @splat(0);
+    const vertex_bytes = meshopt_encodeVertexBuffer(&compressed, 128, &positions, 4, 12);
+    const index_offset = std.mem.alignForward(usize, vertex_bytes, 4);
+    const index_bytes = meshopt_encodeIndexBuffer(compressed[index_offset..].ptr, 128, &indices, 6);
+    try std.testing.expect(vertex_bytes != 0 and index_bytes != 0);
+    const compressed_size = std.mem.alignForward(usize, index_offset + index_bytes, 4);
+    var plain_text: [128]u8 = undefined;
+    var compressed_text: [512]u8 = undefined;
+    const plain_data = std.base64.standard.Encoder.encode(&plain_text, &plain);
+    const compressed_data = std.base64.standard.Encoder.encode(&compressed_text, compressed[0..compressed_size]);
+    const head =
+        \\{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+        \\"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1}}]}}],
+        \\"accessors":[{{"bufferView":0,"componentType":5126,"count":4,"type":"VEC3","min":[0,0,0],"max":[1,1,0]}},
+        \\{{"bufferView":1,"componentType":5125,"count":6,"type":"SCALAR"}}],
+    ;
+    var text: [2048]u8 = undefined;
+    const plain_json = try std.fmt.bufPrint(&text, head ++
+        \\"bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":48}},{{"buffer":0,"byteOffset":48,"byteLength":24}}],
+        \\"buffers":[{{"byteLength":72,"uri":"data:application/octet-stream;base64,{s}"}}]}}
+    , .{plain_data});
+    const plain_path = ".zig-cache/limn-test-plain.gltf";
+    try writeTestFile(io, plain_path, plain_json);
+    defer std.Io.Dir.cwd().deleteFile(io, plain_path) catch {};
+    var other: [2048]u8 = undefined;
+    const compressed_json = try std.fmt.bufPrint(&other, head ++
+        \\"extensionsUsed":["EXT_meshopt_compression"],"extensionsRequired":["EXT_meshopt_compression"],
+        \\"bufferViews":[{{"buffer":1,"byteOffset":0,"byteLength":48,"byteStride":12,"extensions":{{"EXT_meshopt_compression":
+        \\{{"buffer":0,"byteOffset":0,"byteLength":{d},"byteStride":12,"count":4,"mode":"ATTRIBUTES"}}}}}},
+        \\{{"buffer":1,"byteOffset":48,"byteLength":24,"extensions":{{"EXT_meshopt_compression":
+        \\{{"buffer":0,"byteOffset":{d},"byteLength":{d},"byteStride":4,"count":6,"mode":"TRIANGLES"}}}}}}],
+        \\"buffers":[{{"byteLength":{d},"uri":"data:application/octet-stream;base64,{s}"}},
+        \\{{"byteLength":72,"extensions":{{"EXT_meshopt_compression":{{"fallback":true}}}}}}]}}
+    , .{ vertex_bytes, index_offset, index_bytes, compressed_size, compressed_data });
+    const compressed_path = ".zig-cache/limn-test-meshopt.gltf";
+    try writeTestFile(io, compressed_path, compressed_json);
+    defer std.Io.Dir.cwd().deleteFile(io, compressed_path) catch {};
+    var expected = try load(std.testing.allocator, io, plain_path, .{});
+    defer expected.deinit();
+    var actual = try load(std.testing.allocator, io, compressed_path, .{});
+    defer actual.deinit();
+    try std.testing.expectEqualDeep(expected.meshes[0].vertices, actual.meshes[0].vertices);
+    try std.testing.expectEqualSlices(u32, expected.meshes[0].indices, actual.meshes[0].indices);
 }

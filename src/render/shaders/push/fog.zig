@@ -10,6 +10,9 @@ pub const FogPush = extern struct {
     max_distance: f32,
     ambient: f32,
     step_count: i32,
+    /// 1 when the clustered local lights light the fog too.
+    local_lights: u32 = 0,
+    pad: u32 = 0,
 
     pub const references = .{ .frame = "FrameConstants" };
 };

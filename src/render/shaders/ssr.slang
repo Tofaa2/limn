@@ -80,7 +80,7 @@ float4 traceMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position
     if (result.a < 0.999) {
         Tracer tracer;
         tracer.frame = frame;
-        tracer.scene = trace_push.tlas;
+        tracer.scene = uint64_t(trace_push.tlas_low) | (uint64_t(trace_push.tlas_high) << 32);
         LitRay seen = tracePicture(tracer, origin, direction, trace_push.max_distance, 1.0 + roughness * 8.0);
         if (seen.met != RAY_MISS) {
             float3 radiance = throughFluids(frame, origin, direction, seen.distance, seen.radiance);

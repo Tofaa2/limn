@@ -6,6 +6,36 @@
 
 [[vk::push_constant]] FogPush fog_push;
 
+/// Light of the clustered local lights scattered toward the eye at
+/// `position`, unshadowed; `pixel` is in full-resolution pixels.
+float3 fogLocalLights(FrameConstants frame, float3 position, float3 direction, float2 pixel) {
+    float view_depth = -(mul(frame.view, float4(position, 1.0))).z;
+    uint2 tile = min(uint2(pixel * frame.inv_resolution * float2(CLUSTERS_X, CLUSTERS_Y)), uint2(CLUSTERS_X - 1u, CLUSTERS_Y - 1u));
+    float slice = log2(max(view_depth, 1e-4)) * frame.lights.cluster_z_scale + frame.lights.cluster_z_bias;
+    uint cluster = tile.x + tile.y * CLUSTERS_X + uint(clamp(slice, 0.0, float(CLUSTERS_Z - 1u))) * CLUSTERS_X * CLUSTERS_Y;
+    uint count = frame.lights.clusters.data[cluster].count;
+    uint listed = frame.lights.clusters.data[cluster].offset;
+    float3 total = float3(0.0);
+    for (uint i = 0u; i < count; i++) {
+        Light light = frame.lights.lights.data[frame.lights.light_indices[listed + i]];
+        if ((light.flags & LIGHT_DIRECTIONAL) != 0u) continue;
+        float3 to_light = light.position - position;
+        float distance_squared = dot(to_light, to_light);
+        float range_squared = light.range * light.range;
+        if (distance_squared > range_squared) continue;
+        float window = clamp(1.0 - (distance_squared * distance_squared) / (range_squared * range_squared), 0.0, 1.0);
+        float3 l = to_light * rsqrt(max(distance_squared, 1e-8));
+        float attenuation = window * window / max(distance_squared, max(light.source_radius * light.source_radius, 1e-2));
+        if ((light.flags & LIGHT_SPOT) != 0u) {
+            float cone = clamp(dot(-l, light.direction) * light.cone_scale + light.cone_offset, 0.0, 1.0);
+            attenuation *= cone * cone;
+        }
+        if ((light.flags & LIGHT_RECTANGLE) != 0u) attenuation *= clamp(dot(-l, light.direction), 0.0, 1.0);
+        total += light.color * (attenuation * henyeyGreenstein(dot(direction, l), fog_push.anisotropy));
+    }
+    return total;
+}
+
 [shader("fragment")]
 float4 fogMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position) : SV_Target {
     FrameConstants frame = fog_push.frame;
@@ -41,6 +71,7 @@ float4 fogMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_Position) 
             }
         }
         float3 light = sun * sunVisibility(frame, position) + ambient;
+        if (fog_push.local_lights != 0u && frame.lights.light_count != 0u) light += fogLocalLights(frame, position, direction, in_uv * frame.resolution);
         float step_transmittance = exp(-sigma * step_length);
         scattered += transmittance * light * (1.0 - step_transmittance);
         transmittance *= step_transmittance;

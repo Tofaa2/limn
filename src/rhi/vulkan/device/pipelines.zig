@@ -13,6 +13,8 @@ const vkFormat = device_module.vkFormat;
 
 /// `compileGraphicsPipeline` followed by `adoptPipeline`.
 pub fn createGraphicsPipeline(self: *Device, desc: types.GraphicsPipelineDesc) !types.Pipeline {
+    self.lockResources();
+    defer self.unlockResources();
     const compiled = try self.compileGraphicsPipeline(self.gpa, desc);
     return self.adoptPipeline(compiled, desc.name);
 }
@@ -22,6 +24,8 @@ pub const CompiledPipeline = struct { handle: u64, compute: bool = false };
 
 /// Registers a compiled pipeline. Render thread only.
 pub fn adoptPipeline(self: *Device, compiled: CompiledPipeline, label: [:0]const u8) !types.Pipeline {
+    self.lockResources();
+    defer self.unlockResources();
     const handle: vk.Pipeline = @enumFromInt(compiled.handle);
     errdefer self.vkd.destroyPipeline(handle, null);
     setName(self, .pipeline, compiled.handle, label);
@@ -194,6 +198,8 @@ pub fn compileGraphicsPipeline(self: *const Device, gpa: std.mem.Allocator, desc
 
 /// Compiles on the calling thread and registers the pipeline.
 pub fn createComputePipeline(self: *Device, desc: types.ComputePipelineDesc) !types.Pipeline {
+    self.lockResources();
+    defer self.unlockResources();
     const compiled = try self.compileComputePipeline(self.gpa, desc);
     return self.adoptPipeline(compiled, desc.name);
 }
@@ -234,6 +240,8 @@ fn specialization(values: []const u32, entries: *[max_constants]vk.Specializatio
 /// Deferred like `destroyBuffer`, so the frame that last draws with it
 /// may destroy it.
 pub fn destroyPipeline(self: *Device, pipeline: types.Pipeline) void {
+    self.lockResources();
+    defer self.unlockResources();
     const resource = self.pipelines.remove(pipeline) orelse return;
     retire(self, .{ .pipeline = resource.handle });
 }

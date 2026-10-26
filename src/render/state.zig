@@ -19,6 +19,7 @@ const text_layout = @import("text_layout.zig");
 const render = @import("renderer.zig");
 const features = @import("core/features.zig");
 const target_store = @import("core/targets.zig");
+const scene_pass = @import("scene_pass.zig");
 
 const Profiler = render.Profiler;
 const EffectResolution = render.EffectResolution;
@@ -88,6 +89,24 @@ pub const env_irradiance_size = 32;
 pub const stream_budget_bytes = 48 * 1024 * 1024;
 
 pub const Range = struct { offset: u32, count: u32 };
+
+/// What an entity took of its scene's entity slots, meshlet references and
+/// ray-tracing instances, and what it added to the scene's totals.
+pub const EntitySpan = struct {
+    layout_first: u32 = 0,
+    layout_count: u32 = 0,
+    ref_first: u32 = 0,
+    ref_count: u32 = 0,
+    tlas_first: u32 = 0,
+    tlas_count: u32 = 0,
+    triangles: u64 = 0,
+    joints: u32 = 0,
+    masked_refs: u32 = 0,
+    skinned: u32 = 0,
+    posed: u32 = 0,
+    /// The frame it was given back in.
+    freed_frame: u64 = 0,
+};
 
 /// First-fit range allocator over element indices with coalescing frees.
 pub const RangeAllocator = struct {
@@ -249,6 +268,8 @@ pub const FrameArena = struct {
     used: u64 = 0,
     /// Buffers outgrown this frame, kept until `reset`.
     outgrown: [16]?rhi.Buffer = @splat(null),
+    /// Held to hand out room, as views recording beside each other do.
+    mutex: std.Io.Mutex = .init,
 
     pub fn Allocation(comptime T: type) type {
         return struct {
@@ -283,6 +304,8 @@ pub const FrameArena = struct {
 
     /// Room for `count` values of `T`, valid until the next `reset`.
     pub fn alloc(self: *FrameArena, device: *rhi.Device, comptime T: type, count: usize) !Allocation(T) {
+        self.mutex.lockUncancelable(device.io);
+        defer self.mutex.unlock(device.io);
         const size = @sizeOf(T) * @max(count, 1);
         var offset = std.mem.alignForward(u64, self.cursor, 16);
         if (offset + size > self.capacity) {
@@ -356,6 +379,8 @@ pub const EnvironmentJob = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     path: []u8,
+    /// What Basis Universal cube maps are transcoded to.
+    basis: ktx2.BasisTarget = .bc,
     group: std.Io.Group = .init,
     done: std.atomic.Value(bool) = .init(false),
     image: ?gltf.HdrImage = null,
@@ -382,7 +407,7 @@ pub fn loadEnvironmentFile(job: *EnvironmentJob) !void {
         return;
     }
     defer job.gpa.free(bytes);
-    const cube = try ktx2.read(job.gpa, bytes);
+    const cube = try ktx2.read(job.gpa, bytes, job.basis);
     errdefer job.gpa.free(cube.data);
     if (cube.faces != 6 or cube.layers != 1) return error.NotACubeMap;
     if (cube.format != .rgba16f and cube.format != .bc6h) return error.UnsupportedTextureFormat;
@@ -492,8 +517,6 @@ pub const ModelEntry = struct {
     /// the last one goes.
     orphaned: bool = false,
     blas_pending: bool = false,
-    /// Frame the geometry was uploaded in; structures are built after it.
-    blas_frame: ?u64 = null,
     blas_job: ?rhi.Detached = null,
     /// Some of the model's structures wait to be replaced by smaller copies.
     blas_compacting: bool = false,
@@ -569,6 +592,8 @@ pub const EntityMark = struct {
     /// Its entries in the scene's layout.
     layout_first: u32 = 0,
     layout_count: u32 = 0,
+    /// Where it is in its scene's `entities`.
+    listed_at: u32 = 0,
     /// Distance moved in the last prepared frame.
     travelled: f32 = 0,
     bits: u32 = 0,
@@ -638,6 +663,12 @@ pub const SceneData = struct {
     /// their records must be rewritten.
     static_count: u32 = 0,
     static_version: u64 = 0,
+    /// The last `prepareLights` result, the frame it was made in and what it was
+    /// asked for; later views of the frame that ask the same share it.
+    lighting: ?scene_pass.Lighting = null,
+    lighting_frame: u64 = std.math.maxInt(u64),
+    lighting_shadows: bool = false,
+    lighting_traced: bool = false,
     /// Which lights `prepareLights` gave shadow atlas tiles, and the frame it
     /// chose them in.
     shadow_grants: std.ArrayList(bool) = .empty,
@@ -710,10 +741,39 @@ pub const SceneData = struct {
     static_tlas_uploaded: bool = false,
     layout_dirty: bool = true,
     layout_generation: u64 = 0,
+    /// This frame's deforming work for the scene, made by `prepareScene` and
+    /// recorded by its first view: skinning, bounds of skinned meshlets and
+    /// refits of dynamic BLASes, the next of which to refit first.
+    skin_jobs: std.ArrayList(SkinJob) = .empty,
+    skin_weights: std.ArrayList(f32) = .empty,
+    bounds_jobs: std.ArrayList(BoundsJob) = .empty,
+    blas_jobs: std.ArrayList(BlasJob) = .empty,
+    refit_cursor: usize = 0,
+    /// Free entity slots, meshlet references and ray-tracing instances below
+    /// the `entity_*_capacity`s.
+    instance_ranges: RangeAllocator = .{ .capacity = 0 },
+    ref_ranges: RangeAllocator = .{ .capacity = 0 },
+    tlas_ranges: RangeAllocator = .{ .capacity = 0 },
+    /// Entities to lay out, and spans to clear, before the next frame's
+    /// records, instead of laying out the whole scene again.
+    added: std.ArrayList(Entity) = .empty,
+    removed: std.ArrayList(EntitySpan) = .empty,
+    /// Cleared spans, free again once no frame in flight or pick names them.
+    quarantine: std.ArrayList(EntitySpan) = .empty,
     refs: ?rhi.Buffer = null,
     refs_capacity: u32 = 0,
     /// Meshlet references of entities; they precede instance groups'.
     entity_ref_count: u32 = 0,
+    /// Instance slots, meshlet references and ray-tracing instances kept
+    /// for entities; instance groups' start after them. They change only
+    /// when the layout is rebuilt.
+    /// Entity slots that hold an entity's instance.
+    live_instances: u32 = 0,
+    /// Meshlet references that belong to an entity.
+    live_refs: u32 = 0,
+    entity_capacity: u32 = 0,
+    entity_ref_capacity: u32 = 0,
+    entity_tlas_capacity: u32 = 0,
     masked_ref_count: u32 = 0,
     /// First reference and count for each instance of the instance groups,
     /// in instance record order.
@@ -942,6 +1002,8 @@ pub const ViewState = struct {
 
 pub const ViewData = struct {
     state: ?ViewState = null,
+    /// The scene's see-through draws in this view's back-to-front order.
+    transparent_order: std.ArrayList(TransparentDraw) = .empty,
     /// Display-referred picture of a view drawn into part of a target;
     /// copied into place once its draw lists are done.
     output: ?rhi.Texture = null,
@@ -966,6 +1028,7 @@ pub const ViewData = struct {
     feature_idle: [features.list.len]u32 = @splat(0),
 
     pub fn deinit(self: *ViewData, gpa: std.mem.Allocator, device: *rhi.Device) void {
+        self.transparent_order.deinit(gpa);
         self.kept.deinit(gpa, device);
         if (self.state) |*state| state.deinit(device);
         if (self.output) |texture| device.destroyTexture(texture);
@@ -1246,6 +1309,10 @@ pub const WaterState = struct {
     time_owed: f32 = 0,
     params: u64 = 0,
     params_frame: u64 = std.math.maxInt(u64),
+    /// `WaterDesc.ocean`: transformed rows and heights, made on first use.
+    ocean: ?[2]rhi.Buffer = null,
+    /// Seconds of ocean motion so far.
+    ocean_time: f32 = 0,
 };
 pub const FluidState = struct {
     time_owed: f32 = 0,
@@ -1335,7 +1402,8 @@ pub const InstanceSlot = struct {
     buffer: ?rhi.Buffer = null,
     capacity: u32 = 0,
     static_version: u64 = std.math.maxInt(u64),
-    entity_count: usize = 0,
+    /// `SceneData.entity_capacity` the instance groups' records were written at.
+    entity_base: usize = 0,
 };
 
 pub const EmitterData = struct {
@@ -1397,12 +1465,19 @@ pub const StreamFrustum = struct {
     }
 };
 
+/// What Basis Universal textures are transcoded to on this device: the
+/// block formats it reads, else plain texels.
+pub fn basisTarget(caps: rhi.Capabilities) ktx2.BasisTarget {
+    return if (caps.bc_textures) .bc else if (caps.astc_textures) .astc else .rgba;
+}
+
 pub fn blockFormat(block: gltf.Image.Block, one_channel: bool, two_channel: bool, srgb: bool) rhi.Format {
     return switch (block) {
         .bc1 => if (srgb) .bc1_srgb else .bc1_unorm,
         .bc3 => if (srgb) .bc3_srgb else .bc3_unorm,
         .bc6h => .bc6h_ufloat,
         .rgba8 => if (srgb) .rgba8_srgb else .rgba8_unorm,
+        .astc4x4 => if (srgb) .astc_4x4_srgb else .astc_4x4_unorm,
         .bc7 => if (one_channel) .bc4_unorm else if (two_channel) .bc5_unorm else if (srgb) .bc7_srgb else .bc7_unorm,
     };
 }

@@ -9,6 +9,7 @@ const render = @import("../renderer.zig");
 const gpu = @import("../gpu.zig");
 const math = @import("../../math.zig");
 const std = @import("std");
+const lights_feature = @import("lights.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const api = @import("../api.zig");
 const features = @import("../core/features.zig");
@@ -48,7 +49,8 @@ pub fn declare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
     if (p.tracing) return;
     const g = ctx.graph;
-    try g.add(.{ .name = "transparency", .stage = .transparent, .always = true, .scope = false }, ctx, transparency);
+    const light_reads = try lights_feature.reads(ctx);
+    try g.add(.{ .name = "transparency", .stage = .transparent, .always = true, .scope = false, .buffers = &light_reads }, ctx, transparency);
 }
 
 fn transparency(ctx: *ViewContext) !void {
@@ -64,6 +66,7 @@ pub fn copyScene(renderer: *Renderer, p: *const ScenePass, copy: rhi.Texture) !v
     cmd.pushConstants(fullscreen_push.CopyPush{ .frame = p.frame_address, .source_texture = renderer.device.textureIndex(p.view.hdr) });
     cmd.drawFullscreen();
     cmd.endRendering();
+    cmd.generateMips(copy);
 }
 
 /// Draws the scene's blended surfaces as `Settings.transparency.mode` selects.
@@ -159,10 +162,10 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.drawFullscreen();
             cmd.endRendering();
         } else {
-            renderer.internal.transparent_order.clearRetainingCapacity();
-            try renderer.internal.transparent_order.appendSlice(renderer.internal.gpa, scene.transparent.items);
-            for (renderer.internal.transparent_order.items) |*draw| draw.depth = -math.transformPoint(view_matrix, draw.center)[2];
-            std.mem.sort(TransparentDraw, renderer.internal.transparent_order.items, {}, struct {
+            p.view_data.transparent_order.clearRetainingCapacity();
+            try p.view_data.transparent_order.appendSlice(renderer.internal.gpa, scene.transparent.items);
+            for (p.view_data.transparent_order.items) |*draw| draw.depth = -math.transformPoint(view_matrix, draw.center)[2];
+            std.mem.sort(TransparentDraw, p.view_data.transparent_order.items, {}, struct {
                 fn farther(_: void, a: TransparentDraw, b: TransparentDraw) bool {
                     return a.depth > b.depth;
                 }
@@ -175,7 +178,7 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.bindPipeline(try renderer.internal.pipelines.of(forwardPipeline));
             cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
             var drawn_any = false;
-            for (renderer.internal.transparent_order.items) |draw| {
+            for (p.view_data.transparent_order.items) |draw| {
                 if (settings.transparency.layered_refraction and draw.transmissive and drawn_any) if (scene_copy) |copy| {
                     cmd.endRendering();
                     try copyScene(renderer, p, copy);
@@ -193,9 +196,12 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
     }
 }
 
-/// The scene before see-through surfaces, for them to refract.
+/// The scene before see-through surfaces, for them to refract, with blurred
+/// mips for rough ones.
+const scene_copy_mips = 6;
+
 pub fn sceneCopy(renderer: *Renderer, p: *const ScenePass) !rhi.Texture {
-    return p.keep(renderer, "scene behind glass", p.width, p.height, render.hdr_format);
+    return p.keepAs(renderer, .{ .name = "scene behind glass", .width = p.width, .height = p.height, .format = render.hdr_format, .mip_levels = @min(scene_copy_mips, std.math.log2_int(u32, @max(@min(p.width, p.height), 1)) + 1), .usage = .{ .sampled = true, .color_attachment = true } });
 }
 
 fn forwardPipeline(_: *rhi.Device) pipelines_module.Desc {

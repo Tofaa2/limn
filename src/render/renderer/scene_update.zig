@@ -34,6 +34,7 @@ const PrepareChunk = renderer_state.PrepareChunk;
 const LayoutEntry = renderer_state.LayoutEntry;
 const EntryInfo = renderer_state.EntryInfo;
 const EntityMark = renderer_state.EntityMark;
+const EntitySpan = renderer_state.EntitySpan;
 const EntityData = renderer_state.EntityData;
 const InstanceMove = renderer_state.InstanceMove;
 const InstanceRewrite = renderer_state.InstanceRewrite;
@@ -110,70 +111,30 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     scene.joint_count = 0;
     scene.triangle_count = 0;
     scene.masked_ref_count = 0;
+    scene.added.clearRetainingCapacity();
+    scene.removed.clearRetainingCapacity();
+    scene.quarantine.clearRetainingCapacity();
     for (scene.entities.items) |entity_handle| {
         const entity = self.entities.internal.table.get(entity_handle) orelse continue;
         const mark = &self.internal.entity_marks.items[entity_handle.index];
+        const span = &self.internal.entity_spans.items[entity_handle.index];
         mark.layout_first = @intCast(scene.layout.items.len);
         mark.layout_count = 0;
+        span.* = .{};
         if (!entity.visible) continue;
         const model = self.models.internal.table.get(entity.model) orelse continue;
         if (model.state != .ready or !model.geometry_resident) continue;
         try resolveEntity(self, entity, model);
-        const source = &model.source.?;
-        if (entity.node_world.len != 0 and source.instances.len != 0) {
-            try scene.posed.append(gpa, entity_handle);
-            scene.posed_nodes = @max(scene.posed_nodes, entity.node_world.len);
-        }
-        for (source.instances, 0..) |instance, index| {
-            const mesh = model.meshes[instance.mesh];
-            const instance_index: u32 = @intCast(scene.layout.items.len);
-            try scene.layout.append(gpa, .{ .entity = entity_handle, .model_instance = @intCast(index), .first_of_entity = index == 0 });
-            const bounds_of = source.meshes[instance.mesh];
-            const material = source.materials[bounds_of.material];
-            const skinned = entity.skin_offsets[index] != no_skin;
-            var info = EntryInfo{ .center = bounds_of.bounds_center, .radius = bounds_of.bounds_radius };
-            if (skinned) {
-                info.bits |= EntryInfo.skinned;
-                scene.skinned_entries += 1;
-            } else if (mesh.blas != null) {
-                info.tlas_slot = scene.rigid_tlas;
-                scene.rigid_tlas += 1;
-            }
-            if (skinned or (entity.node_world.len != 0 and model.node_moves[instance.node])) {
-                info.bits |= EntryInfo.posed;
-                scene.posed_entries += 1;
-            } else info.rest = &model.node_world[instance.node];
-            if (mesh.blend and !entity.rays_only) {
-                if (material.transmission > 0) scene.blended_transmissive = true;
-                try scene.blended.append(gpa, .{
-                    .instance = instance_index,
-                    .first_index = mesh.index_offset,
-                    .index_count = mesh.lod0_index_count,
-                    .center = .{ 0, 0, 0 },
-                    .transmissive = material.transmission > 0,
-                });
-            }
-            // A texture given through `Materials.setTextures` counts as well:
-            // only part of such a surface glows, which sampling it as a whole
-            // would overstate.
-            const emissive_image = bounds_of.material < model.material_images.len and model.material_images[bounds_of.material].emissive != null;
-            const glows = material.emissive_texture == null and !emissive_image and (material.emissive[0] > 0 or material.emissive[1] > 0 or material.emissive[2] > 0) and mesh.lod0_index_count >= 3 and !mesh.coarse;
-            if (glows and scene.glowing.items.len < max_glowing) {
-                try scene.glowing.append(gpa, .{ .instance = instance_index, .triangles = mesh.lod0_index_count / 3 });
-                if (!skinned) info.bits |= EntryInfo.glows;
-            }
-            try scene.entries.append(gpa, info);
-            mark.layout_count += 1;
-            scene.triangle_count += mesh.lod0_index_count / 3;
-            if (entity.skin_offsets[index] != no_skin) scene.joint_count += @intCast(source.skins[instance.skin.?].joints.len);
-            if (entity.rays_only) continue;
-            if (mesh.masked) scene.masked_ref_count += mesh.meshlet_count;
-            try self.internal.scratch_refs.ensureUnusedCapacity(gpa, mesh.meshlet_count);
-            for (0..mesh.meshlet_count) |meshlet| self.internal.scratch_refs.appendAssumeCapacity(.{
-                .instance = instance_index,
-                .meshlet = mesh.meshlet_offset + @as(u32, @intCast(meshlet)),
-            });
-        }
+        span.* = entityShape(entity, model);
+        span.layout_first = @intCast(scene.layout.items.len);
+        span.ref_first = @intCast(self.internal.scratch_refs.items.len);
+        span.tlas_first = scene.rigid_tlas;
+        _ = try scene.layout.addManyAsSlice(gpa, span.layout_count);
+        _ = try scene.entries.addManyAsSlice(gpa, span.layout_count);
+        const refs = try self.internal.scratch_refs.addManyAsSlice(gpa, span.ref_count);
+        try layEntity(self, scene, entity_handle, entity, model, span.*, refs);
+        scene.rigid_tlas += span.tlas_count;
+        mark.layout_count = span.layout_count;
     }
     const chunk_count = (scene.layout.items.len + prepare_batch - 1) / prepare_batch;
     try scene.spheres.resize(gpa, scene.layout.items.len);
@@ -181,10 +142,27 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     try scene.chunk_stale.resize(gpa, chunk_count);
     scene.static_count = 0;
     scene.entity_ref_count = @intCast(self.internal.scratch_refs.items.len);
+    scene.live_instances = @intCast(scene.layout.items.len);
+    scene.live_refs = scene.entity_ref_count;
+    const tlas_capacity = scene.entity_tlas_capacity;
+    scene.entity_capacity = reserve(scene.entity_capacity, scene.layout.items.len);
+    scene.entity_ref_capacity = reserve(scene.entity_ref_capacity, scene.entity_ref_count);
+    scene.entity_tlas_capacity = reserve(scene.entity_tlas_capacity, scene.rigid_tlas);
+    if (scene.entity_tlas_capacity != tlas_capacity) scene.static_tlas_uploaded = false;
+    scene.instance_ranges.free_ranges.clearRetainingCapacity();
+    scene.instance_ranges.top = @intCast(scene.layout.items.len);
+    scene.instance_ranges.capacity = scene.entity_capacity;
+    scene.ref_ranges.free_ranges.clearRetainingCapacity();
+    scene.ref_ranges.top = scene.entity_ref_count;
+    scene.ref_ranges.capacity = scene.entity_ref_capacity;
+    scene.tlas_ranges.free_ranges.clearRetainingCapacity();
+    scene.tlas_ranges.top = scene.rigid_tlas;
+    scene.tlas_ranges.capacity = scene.entity_tlas_capacity;
+    try self.internal.scratch_refs.appendNTimes(gpa, dead_ref, scene.entity_ref_capacity - scene.entity_ref_count);
     scene.static_ranges.clearRetainingCapacity();
     for (scene.groups.items) |group_handle| {
         const group = self.instances.internal.table.get(group_handle) orelse continue;
-        group.base = @as(u32, @intCast(scene.layout.items.len)) + scene.static_count;
+        group.base = scene.entity_capacity + scene.static_count;
         group.per_copy = 0;
         const model = self.models.internal.table.get(group.model) orelse continue;
         if (model.state != .ready or !model.geometry_resident) continue;
@@ -224,6 +202,282 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     scene.layout_dirty = false;
     scene.layout_version += 1;
     scene.layout_generation = self.internal.asset_generation;
+}
+
+/// Room kept for `needed` slots: what is kept already while it is enough and
+/// not four times too much, else half as much again.
+fn reserve(kept: u32, needed: usize) u32 {
+    if (needed <= kept and needed * 4 >= kept) return kept;
+    return @intCast(@max(needed + needed / 2, 64));
+}
+
+/// What fills entity slots, meshlet references and records no entity holds.
+const dead_ref = gpu.MeshletRef{ .instance = gpu.invalid_id, .meshlet = 0 };
+const dead_entry = LayoutEntry{ .entity = .invalid, .model_instance = 0, .first_of_entity = false };
+const dead_info = EntryInfo{ .center = .{ 0, 0, 0 }, .radius = 0 };
+const dead_record = gpu.Instance{
+    .transform = @splat(0),
+    .bounding_sphere = .{ 0, 0, 0, 0 },
+    .mesh = gpu.invalid_id,
+    .material = 0,
+    .vertex_offset = 0,
+    .previous_vertex_offset = 0,
+    .flags = 0,
+};
+/// Frames a cleared span waits before it is reused, so that a pick or frame
+/// still in flight cannot name the entity that takes it next.
+const quarantine_frames = rhi.frames_in_flight + 2;
+
+/// How many entity slots, meshlet references and ray-tracing instances a
+/// visible entity takes, and what it adds to its scene's totals. Its skins
+/// must be resolved.
+fn entityShape(entity: *const EntityData, model: *const ModelEntry) EntitySpan {
+    const source = &model.source.?;
+    var span = EntitySpan{};
+    for (source.instances, 0..) |instance, index| {
+        const mesh = model.meshes[instance.mesh];
+        const skinned = entity.skin_offsets[index] != no_skin;
+        span.layout_count += 1;
+        span.triangles += mesh.lod0_index_count / 3;
+        if (skinned) {
+            span.skinned += 1;
+            span.joints += @intCast(source.skins[instance.skin.?].joints.len);
+        } else if (mesh.blas != null) span.tlas_count += 1;
+        if (skinned or (entity.node_world.len != 0 and model.node_moves[instance.node])) span.posed += 1;
+        if (entity.rays_only) continue;
+        span.ref_count += mesh.meshlet_count;
+        if (mesh.masked) span.masked_refs += mesh.meshlet_count;
+    }
+    return span;
+}
+
+/// Writes a visible entity's layout entries and meshlet references at
+/// `span`'s offsets, adds it to the scene's lists and totals, and leaves its
+/// records to the caller. A texture given through `Materials.setTextures`
+/// keeps a mesh from counting as glowing: only part of such a surface glows,
+/// which sampling it as a whole would overstate.
+fn layEntity(self: *Renderer, scene: *SceneData, handle: Entity, entity: *const EntityData, model: *const ModelEntry, span: EntitySpan, refs: []gpu.MeshletRef) !void {
+    const gpa = self.internal.gpa;
+    const source = &model.source.?;
+    if (entity.node_world.len != 0 and source.instances.len != 0) {
+        try scene.posed.append(gpa, handle);
+        scene.posed_nodes = @max(scene.posed_nodes, entity.node_world.len);
+    }
+    var tlas_slot = span.tlas_first;
+    var ref_at: usize = 0;
+    for (source.instances, 0..) |instance, index| {
+        const mesh = model.meshes[instance.mesh];
+        const instance_index: u32 = span.layout_first + @as(u32, @intCast(index));
+        scene.layout.items[instance_index] = .{ .entity = handle, .model_instance = @intCast(index), .first_of_entity = index == 0 };
+        const bounds_of = source.meshes[instance.mesh];
+        const material = source.materials[bounds_of.material];
+        const skinned = entity.skin_offsets[index] != no_skin;
+        var info = EntryInfo{ .center = bounds_of.bounds_center, .radius = bounds_of.bounds_radius };
+        if (skinned) {
+            info.bits |= EntryInfo.skinned;
+        } else if (mesh.blas != null) {
+            info.tlas_slot = tlas_slot;
+            tlas_slot += 1;
+        }
+        if (skinned or (entity.node_world.len != 0 and model.node_moves[instance.node])) {
+            info.bits |= EntryInfo.posed;
+        } else info.rest = &model.node_world[instance.node];
+        if (mesh.blend and !entity.rays_only) {
+            if (material.transmission > 0) scene.blended_transmissive = true;
+            try scene.blended.append(gpa, .{
+                .instance = instance_index,
+                .first_index = mesh.index_offset,
+                .index_count = mesh.lod0_index_count,
+                .center = .{ 0, 0, 0 },
+                .transmissive = material.transmission > 0,
+            });
+        }
+        const emissive_image = bounds_of.material < model.material_images.len and model.material_images[bounds_of.material].emissive != null;
+        const glows = material.emissive_texture == null and !emissive_image and (material.emissive[0] > 0 or material.emissive[1] > 0 or material.emissive[2] > 0) and mesh.lod0_index_count >= 3 and !mesh.coarse;
+        if (glows and scene.glowing.items.len < max_glowing) {
+            try scene.glowing.append(gpa, .{ .instance = instance_index, .triangles = mesh.lod0_index_count / 3 });
+            if (!skinned) info.bits |= EntryInfo.glows;
+        }
+        scene.entries.items[instance_index] = info;
+        if (entity.rays_only) continue;
+        for (refs[ref_at..][0..mesh.meshlet_count], 0..) |*ref, meshlet| ref.* = .{
+            .instance = instance_index,
+            .meshlet = mesh.meshlet_offset + @as(u32, @intCast(meshlet)),
+        };
+        ref_at += mesh.meshlet_count;
+    }
+    scene.skinned_entries += span.skinned;
+    scene.posed_entries += span.posed;
+    scene.triangle_count += span.triangles;
+    scene.joint_count += span.joints;
+    scene.masked_ref_count += span.masked_refs;
+}
+
+/// Queues what an entity took of its scene to be cleared at the next
+/// prepared frame. Lays out the whole scene again when it cannot queue.
+pub fn forgetEntity(self: *Renderer, scene: *SceneData, span: EntitySpan) void {
+    if (span.layout_count == 0 and span.ref_count == 0 and span.tlas_count == 0) return;
+    scene.removed.append(self.internal.gpa, span) catch {
+        scene.layout_dirty = true;
+    };
+}
+
+/// Grows the layout's per-entry lists to `count` entries, the new ones dead.
+fn growLayout(self: *Renderer, scene: *SceneData, count: usize) !void {
+    const gpa = self.internal.gpa;
+    if (scene.layout.items.len >= count) return;
+    const old = scene.layout.items.len;
+    @memset(try scene.layout.addManyAsSlice(gpa, count - old), dead_entry);
+    @memset(try scene.entries.addManyAsSlice(gpa, count - old), dead_info);
+    try scene.spheres.resize(gpa, count);
+    @memset(scene.spheres.items[old..], .{ 0, 0, 0, 0 });
+    const chunk_count = (count + prepare_batch - 1) / prepare_batch;
+    const old_chunks = scene.chunk_stale.items.len;
+    try scene.chunk_bounds.resize(gpa, chunk_count);
+    try scene.chunk_stale.resize(gpa, chunk_count);
+    @memset(scene.chunk_stale.items[old_chunks..], true);
+}
+
+fn staleChunks(scene: *SceneData, first: u32, count: u32) void {
+    if (count == 0) return;
+    for (first / prepare_batch..(first + count - 1) / prepare_batch + 1) |chunk| scene.chunk_stale.items[chunk] = true;
+}
+
+/// Clears the spans of removed entities and lays out added ones in free
+/// slots, uploading only what they touch. False when the slots kept for
+/// entities run out, and the whole layout must be built again.
+fn applyStructure(self: *Renderer, scene: *SceneData) !bool {
+    const gpa = self.internal.gpa;
+    const device = self.device;
+    const frame = self.internal.frame_index;
+    const zone = Zone.start(self.options.profiler, "structure");
+    defer zone.stop();
+    var kept: usize = 0;
+    for (scene.quarantine.items) |span| {
+        if (frame < span.freed_frame + quarantine_frames) {
+            scene.quarantine.items[kept] = span;
+            kept += 1;
+            continue;
+        }
+        scene.instance_ranges.free(gpa, span.layout_first, span.layout_count);
+        scene.ref_ranges.free(gpa, span.ref_first, span.ref_count);
+        scene.tlas_ranges.free(gpa, span.tlas_first, span.tlas_count);
+    }
+    scene.quarantine.shrinkRetainingCapacity(kept);
+    const tlas_live = device.caps.ray_tracing and scene.tlas_instances != null and scene.records_valid;
+
+    if (scene.removed.items.len != 0) {
+        try scene.quarantine.ensureUnusedCapacity(gpa, scene.removed.items.len);
+        for (scene.removed.items) |removed| {
+            var span = removed;
+            const last = span.layout_first + span.layout_count;
+            if (last > scene.layout.items.len) return false;
+            for (scene.layout.items[span.layout_first..last], scene.entries.items[span.layout_first..last], scene.spheres.items[span.layout_first..last]) |*entry, *info, *sphere| {
+                if (sphere[3] > 0) noteMover(self, scene, sphere.*);
+                entry.* = dead_entry;
+                info.* = dead_info;
+                sphere.* = .{ 0, 0, 0, 0 };
+            }
+            staleChunks(scene, span.layout_first, span.layout_count);
+            if (span.ref_count != 0) {
+                self.internal.scratch_refs.clearRetainingCapacity();
+                try self.internal.scratch_refs.appendNTimes(gpa, dead_ref, span.ref_count);
+                try device.uploadBuffer(scene.refs.?, @as(u64, span.ref_first) * @sizeOf(gpu.MeshletRef), std.mem.sliceAsBytes(self.internal.scratch_refs.items));
+            }
+            if (span.tlas_count != 0 and tlas_live and span.tlas_first + span.tlas_count <= scene.tlas_instances_capacity) {
+                const zeros: [16]rhi.AccelerationInstance = @splat(std.mem.zeroes(rhi.AccelerationInstance));
+                var done: u32 = 0;
+                while (done < span.tlas_count) {
+                    const count = @min(span.tlas_count - done, zeros.len);
+                    try device.uploadBuffer(scene.tlas_instances.?, @as(u64, span.tlas_first + done) * @sizeOf(rhi.AccelerationInstance), std.mem.sliceAsBytes(zeros[0..count]));
+                    done += count;
+                }
+            }
+            scene.skinned_entries -|= span.skinned;
+            scene.posed_entries -|= span.posed;
+            scene.triangle_count -|= span.triangles;
+            scene.joint_count -|= span.joints;
+            scene.masked_ref_count -|= span.masked_refs;
+            scene.live_instances -|= span.layout_count;
+            scene.live_refs -|= span.ref_count;
+            span.freed_frame = frame;
+            scene.quarantine.appendAssumeCapacity(span);
+        }
+        const layout = scene.layout.items;
+        var blended: usize = 0;
+        scene.blended_transmissive = false;
+        for (scene.blended.items) |draw| if (layout[draw.instance].entity.isValid()) {
+            scene.blended.items[blended] = draw;
+            blended += 1;
+            if (draw.transmissive) scene.blended_transmissive = true;
+        };
+        scene.blended.shrinkRetainingCapacity(blended);
+        var glowing: usize = 0;
+        for (scene.glowing.items) |glow| if (layout[glow.instance].entity.isValid()) {
+            scene.glowing.items[glowing] = glow;
+            glowing += 1;
+        };
+        scene.glowing.shrinkRetainingCapacity(glowing);
+        var settling: usize = 0;
+        for (scene.settling.items) |pair| if (layout[pair[0]].entity.isValid()) {
+            scene.settling.items[settling] = pair;
+            settling += 1;
+        };
+        scene.settling.shrinkRetainingCapacity(settling);
+        var posed: usize = 0;
+        for (scene.posed.items) |handle| if (self.entities.internal.table.get(handle) != null and self.internal.entity_marks.items[handle.index].layout_count != 0) {
+            scene.posed.items[posed] = handle;
+            posed += 1;
+        };
+        scene.posed.shrinkRetainingCapacity(posed);
+        scene.removed.clearRetainingCapacity();
+        scene.tlas_content += 1;
+    }
+
+    for (scene.added.items) |handle| {
+        const entity = self.entities.internal.table.get(handle) orelse continue;
+        const mark = &self.internal.entity_marks.items[handle.index];
+        const owned = &self.internal.entity_spans.items[handle.index];
+        if (!entity.visible or owned.layout_count != 0 or self.scenes.internal.table.get(mark.scene) != scene) continue;
+        const model = self.models.internal.table.get(entity.model) orelse continue;
+        if (model.state != .ready or !model.geometry_resident) continue;
+        try resolveEntity(self, entity, model);
+        var span = entityShape(entity, model);
+        span.layout_first = scene.instance_ranges.alloc(span.layout_count) orelse return false;
+        span.ref_first = scene.ref_ranges.alloc(span.ref_count) orelse return false;
+        span.tlas_first = scene.tlas_ranges.alloc(span.tlas_count) orelse return false;
+        try growLayout(self, scene, span.layout_first + span.layout_count);
+        self.internal.scratch_refs.clearRetainingCapacity();
+        const refs = try self.internal.scratch_refs.addManyAsSlice(gpa, span.ref_count);
+        try layEntity(self, scene, handle, entity, model, span, refs);
+        if (span.ref_count != 0) try device.uploadBuffer(scene.refs.?, @as(u64, span.ref_first) * @sizeOf(gpu.MeshletRef), std.mem.sliceAsBytes(refs));
+        const source = &model.source.?;
+        const now = self.internal.entity_transforms.items[handle.index];
+        const node_world = if (entity.node_world.len != 0) entity.node_world else model.node_world;
+        for (source.instances, scene.entries.items[span.layout_first..][0..span.layout_count], span.layout_first..) |instance, info, index| {
+            if (info.bits & EntryInfo.skinned != 0) continue;
+            const transform = math.mul(now, node_world[instance.node]);
+            const sphere = worldSphere(info, transform);
+            scene.spheres.items[index] = sphere;
+            noteMover(self, scene, sphere);
+            if (info.tlas_slot == gpu.invalid_id or !tlas_live or info.tlas_slot >= scene.tlas_instances_capacity) continue;
+            const mesh = model.meshes[instance.mesh];
+            const placed = [1]rhi.AccelerationInstance{tlasInstance(device, mesh.blas.?, index, mesh.blend, transform)};
+            try device.uploadBuffer(scene.tlas_instances.?, @as(u64, info.tlas_slot) * @sizeOf(rhi.AccelerationInstance), std.mem.sliceAsBytes(&placed));
+        }
+        staleChunks(scene, span.layout_first, span.layout_count);
+        owned.* = span;
+        scene.live_instances += span.layout_count;
+        scene.live_refs += span.ref_count;
+        mark.layout_first = span.layout_first;
+        mark.layout_count = span.layout_count;
+        self.noteEdited(handle.index, mark, EntityMark.restyled);
+        scene.tlas_content += 1;
+    }
+    scene.added.clearRetainingCapacity();
+    scene.entity_ref_count = scene.ref_ranges.top;
+    scene.rigid_tlas = scene.tlas_ranges.top;
+    return true;
 }
 
 fn rigidRecord(self: *Renderer, entity: *const EntityData, model: *const ModelEntry, mesh_index: u32, transform: Mat4, still: bool, aimed: bool) gpu.Instance {
@@ -316,6 +570,11 @@ const PrepareWhole = struct {
         var chunk = PrepareChunk{};
         for (scene.layout.items[start..end], scene.entries.items[start..end], start..) |entry, *info, instance_index| {
             info.bits &= ~EntryInfo.moved;
+            if (!entry.entity.isValid()) {
+                prepare.records[instance_index] = dead_record;
+                prepare.previous[instance_index] = @splat(0);
+                continue;
+            }
             if (info.bits & EntryInfo.skinned != 0) continue;
             const entity = self.entities.internal.table.get(entry.entity).?;
             const model = self.models.internal.table.get(entity.model).?;
@@ -534,7 +793,7 @@ fn moveAcrossThreads(self: *Renderer, scene: *SceneData, changes: *Changes, room
 }
 
 /// Threads the per-frame scene work may use, the rendering thread included.
-fn workerThreads(self: *Renderer) usize {
+pub fn workerThreads(self: *Renderer) usize {
     return switch (self.options.worker_threads) {
         0 => @min(std.Thread.getCpuCount() catch 1, max_worker_threads),
         else => |asked| @min(asked, max_worker_threads),
@@ -559,11 +818,18 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
     const zone = Zone.start(self.options.profiler, "prepare scene");
     defer zone.stop();
     const device = self.device;
-    if (scene.layout_dirty or scene.layout_generation != self.internal.asset_generation) try rebuildLayout(self, scene);
+    scene.movers.clearRetainingCapacity();
+    scene.movers_overflow = false;
+    if (scene.layout_dirty or scene.layout_generation != self.internal.asset_generation) {
+        try rebuildLayout(self, scene);
+    } else if (scene.added.items.len != 0 or scene.removed.items.len != 0 or scene.quarantine.items.len != 0) {
+        if (!try applyStructure(self, scene)) try rebuildLayout(self, scene);
+    }
     const layout = scene.layout.items;
     const entries = scene.entries.items;
     const entity_count = layout.len;
-    const total = entity_count + scene.static_count;
+    const entity_base = scene.entity_capacity;
+    const total = entity_base + scene.static_count;
     const records = &scene.instance_slots[0];
     const group_rays = device.caps.ray_tracing and scene.static_count != 0 and scene.static_count <= self.options.ray_tracing.instance_limit;
     if (records.buffer == null or records.capacity < total) {
@@ -578,9 +844,10 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         records.static_version = std.math.maxInt(u64);
         scene.records_valid = false;
     }
-    if (try ensureBuffer(self, &scene.previous, &scene.previous_capacity, entity_count, @sizeOf([12]f32), "previous transforms", .{ .storage = true, .copy_dst = true }))
+    if (try ensureBuffer(self, &scene.previous, &scene.previous_capacity, entity_base, @sizeOf([12]f32), "previous transforms", .{ .storage = true, .copy_dst = true }))
         scene.records_valid = false;
-    const tlas_room = scene.rigid_tlas + (if (group_rays) scene.static_count else 0) + scene.skinned_entries;
+    const rigid_room = if (group_rays) scene.entity_tlas_capacity else scene.rigid_tlas;
+    const tlas_room = rigid_room + (if (group_rays) scene.static_count else 0) + scene.skinned_entries;
     if (try ensureBuffer(self, &scene.tlas_instances, &scene.tlas_instances_capacity, tlas_room, @sizeOf(rhi.AccelerationInstance), "ray tracing instances", .{ .storage = true, .copy_dst = true, .acceleration_input = true })) {
         scene.records_valid = false;
         scene.static_tlas_uploaded = false;
@@ -590,13 +857,11 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
     const whole = !scene.records_valid;
 
     const joints = try arena.alloc(device, Mat4, scene.joint_count);
-    self.internal.skin_jobs.clearRetainingCapacity();
-    self.internal.skin_weights.clearRetainingCapacity();
-    self.internal.bounds_jobs.clearRetainingCapacity();
-    self.internal.rays.blas_jobs.clearRetainingCapacity();
+    scene.skin_jobs.clearRetainingCapacity();
+    scene.skin_weights.clearRetainingCapacity();
+    scene.bounds_jobs.clearRetainingCapacity();
+    scene.blas_jobs.clearRetainingCapacity();
     try evaluatePoses(self, scene);
-    scene.movers.clearRetainingCapacity();
-    scene.movers_overflow = false;
     for (scene.hairs.items) |hair_handle| {
         const hair = self.hairs.internal.table.get(hair_handle) orelse continue;
         if (hair.simulation == null) continue;
@@ -604,7 +869,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         noteMover(self, scene, .{ center[0], center[1], center[2], hair.bounds[3] * math.maxScale(hair.desc.transform) * 1.6 });
     }
 
-    var update = scene_pass.SceneUpdate{ .whole = whole, .entity_count = @intCast(entity_count), .rigid_tlas = scene.rigid_tlas };
+    var update = scene_pass.SceneUpdate{ .whole = whole, .entity_count = @intCast(entity_count), .rigid_tlas = rigid_room };
     var staged_records: []gpu.Instance = &.{};
     var staged_previous: [][12]f32 = &.{};
     var changes = Changes{ .renderer = self, .scene = scene, .moves = &.{}, .rewrites = &.{} };
@@ -612,7 +877,8 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
     if (whole) {
         const staged = try arena.alloc(device, gpu.Instance, entity_count);
         const staged_before = try arena.alloc(device, [12]f32, entity_count);
-        const staged_tlas = try arena.alloc(device, rhi.AccelerationInstance, scene.rigid_tlas);
+        const staged_tlas = try arena.alloc(device, rhi.AccelerationInstance, rigid_room);
+        @memset(staged_tlas.items, std.mem.zeroes(rhi.AccelerationInstance));
         staged_records = staged.items;
         staged_previous = staged_before.items;
         update.records = .{ .buffer = staged.buffer, .offset = staged.offset };
@@ -812,12 +1078,12 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
             entity.bounds_offsets[model_instance] = gpu.invalid_id;
             if (own_bounds) {
                 entity.bounds_offsets[model_instance] = bounds_cursor;
-                try self.internal.bounds_jobs.append(self.internal.gpa, .{ .vertex_offset = current, .meshlet_offset = mesh.meshlet_offset, .meshlet_count = mesh.meshlet_count, .bounds_offset = bounds_cursor });
+                try scene.bounds_jobs.append(self.internal.gpa, .{ .vertex_offset = current, .meshlet_offset = mesh.meshlet_offset, .meshlet_count = mesh.meshlet_count, .bounds_offset = bounds_cursor });
                 bounds_cursor += mesh.meshlet_count;
             }
-            const weights_offset: u32 = @intCast(self.internal.skin_weights.items.len);
-            try self.internal.skin_weights.appendSlice(self.internal.gpa, morph_weights[0..mesh.morph_targets]);
-            try self.internal.skin_jobs.append(self.internal.gpa, .{
+            const weights_offset: u32 = @intCast(scene.skin_weights.items.len);
+            try scene.skin_weights.appendSlice(self.internal.gpa, morph_weights[0..mesh.morph_targets]);
+            try scene.skin_jobs.append(self.internal.gpa, .{
                 .source_offset = mesh.vertex_offset,
                 .destination_offset = current,
                 .skin_offset = mesh.skin_offset.?,
@@ -832,7 +1098,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
                 dynamic_geometry.vertex_offset = @as(u64, current) * @sizeOf(gpu.Vertex);
                 const slot_blas = &entity.skin_blas[model_instance];
                 if (slot_blas.* == null) slot_blas.* = try device.createBlas(.{ .geometries = &.{dynamic_geometry}, .dynamic = true });
-                try self.internal.rays.blas_jobs.append(self.internal.gpa, .{ .blas = slot_blas.*.?, .vertex_offset = current, .mesh = mesh });
+                try scene.blas_jobs.append(self.internal.gpa, .{ .blas = slot_blas.*.?, .vertex_offset = current, .mesh = mesh });
                 skinned_tlas.items[skinned_tlas_count] = tlasInstance(device, slot_blas.*.?, instance_index, false, now);
                 skinned_tlas_count += 1;
                 changes.tlas_changed = true;
@@ -906,7 +1172,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         const group = self.instances.internal.table.get(group_handle) orelse continue;
         if (group.driver != null) driven = true;
     }
-    if (driven or records.static_version != scene.static_version or records.entity_count != entity_count) {
+    if (driven or records.static_version != scene.static_version or records.entity_base != entity_base) {
         self.internal.scratch_instances.clearRetainingCapacity();
         self.internal.scratch_static_cull.clearRetainingCapacity();
         try self.internal.scratch_static_cull.ensureTotalCapacity(self.internal.gpa, scene.static_count);
@@ -979,7 +1245,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
                     if (mesh.blend) {
                         if (source.materials[source.meshes[instance.mesh].material].transmission > 0) scene.static_transmissive = true;
                         try scene.static_transparent.append(self.internal.gpa, .{
-                            .instance = @intCast(entity_count + self.internal.scratch_instances.items.len),
+                            .instance = @intCast(entity_base + self.internal.scratch_instances.items.len),
                             .first_index = mesh.index_offset,
                             .index_count = mesh.lod0_index_count,
                             .center = center,
@@ -992,7 +1258,7 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         }
         if (self.internal.scratch_instances.items.len != 0) try device.uploadBuffer(
             records.buffer.?,
-            @as(u64, entity_count) * @sizeOf(gpu.Instance),
+            @as(u64, entity_base) * @sizeOf(gpu.Instance),
             std.mem.sliceAsBytes(self.internal.scratch_instances.items),
         );
         if (self.internal.scratch_static_cull.items.len > scene.static_cull_capacity) {
@@ -1020,15 +1286,15 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
         }
         if (scene.impostor_count != 0) try device.uploadBuffer(scene.impostor_table.?, 0, std.mem.sliceAsBytes(self.internal.scratch_impostors.items));
         records.static_version = scene.static_version;
-        records.entity_count = entity_count;
+        records.entity_base = entity_base;
     }
     if (scene.static_transmissive) scene.transmissive = true;
     try scene.transparent.appendSlice(self.internal.gpa, scene.static_transparent.items);
-    var tlas_count = scene.rigid_tlas;
+    var tlas_count = rigid_room;
     if (group_rays) {
-        if (driven or scene.static_tlas_version != scene.static_version or scene.static_tlas_base != entity_count) {
+        if (driven or scene.static_tlas_version != scene.static_version or scene.static_tlas_base != entity_base) {
             scene.static_tlas.clearRetainingCapacity();
-            var record: u32 = @intCast(entity_count);
+            var record: u32 = entity_base;
             for (scene.groups.items) |group_handle| {
                 const group = self.instances.internal.table.get(group_handle) orelse continue;
                 if (group.per_copy == 0) continue;
@@ -1048,13 +1314,13 @@ pub fn prepareScene(self: *Renderer, scene: *SceneData, arena: *FrameArena) !Sce
                 }
             }
             scene.static_tlas_version = scene.static_version;
-            scene.static_tlas_base = entity_count;
+            scene.static_tlas_base = entity_base;
             scene.static_tlas_uploaded = false;
         }
         if (!scene.static_tlas_uploaded or whole) {
             if (scene.static_tlas.items.len != 0) try device.uploadBuffer(
                 scene.tlas_instances.?,
-                @as(u64, scene.rigid_tlas) * @sizeOf(rhi.AccelerationInstance),
+                @as(u64, rigid_room) * @sizeOf(rhi.AccelerationInstance),
                 std.mem.sliceAsBytes(scene.static_tlas.items),
             );
             scene.static_tlas_uploaded = true;
@@ -1134,6 +1400,7 @@ pub fn applySceneUpdate(self: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scene
 /// ranks the lights; later views keep its choice, as they share the atlas.
 pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, shadows: bool, camera_position: Vec3, traced_shadows: bool) !Lighting {
     const device = self.device;
+    if (scene.lighting) |made| if (scene.lighting_frame == self.internal.frame_index and scene.lighting_shadows == shadows and scene.lighting_traced == traced_shadows) return made;
     var fluid_lights: usize = 0;
     for (scene.fluids.items) |item| {
         if (self.fluids.internal.table.get(item)) |state| fluid_lights += @intFromBool(state.desc.light > 0);
@@ -1144,6 +1411,7 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
         .lights = lights.address,
         .tiles = tiles.address,
         .light_count = @intCast(scene.lights.items.len + fluid_lights),
+        .records = lights.items,
         .tile_count = 0,
         .tile_view_proj = undefined,
         .tile_views = undefined,
@@ -1256,6 +1524,10 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
         };
         fluid_slot += 1;
     }
+    scene.lighting = result;
+    scene.lighting_frame = self.internal.frame_index;
+    scene.lighting_shadows = shadows;
+    scene.lighting_traced = traced_shadows;
     return result;
 }
 

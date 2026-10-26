@@ -1,4 +1,4 @@
-//! Height fog lit by the sun and the sky.
+//! Height fog lit by the sun, the sky and, with `local_lights`, the local lights.
 const rhi = @import("../../rhi/rhi.zig");
 const pipelines_module = @import("../renderer/pipelines.zig");
 const fog_push = @import("../shaders/push/fog.zig");
@@ -26,6 +26,8 @@ pub const Settings = struct {
     resolution: api.EffectResolution = .half,
     /// Samples along each fog ray, 4..128.
     steps: u32 = 12,
+    /// Local lights light the fog too, without their shadows.
+    local_lights: bool = false,
 };
 
 pub fn preset(quality: api.Quality) ?Settings {
@@ -71,6 +73,7 @@ pub fn drawFog(renderer: *Renderer, p: *const ScenePass) !void {
         .max_distance = @max(filled(settings.shadows).distance, 1) * 2,
         .ambient = 1,
         .step_count = @intCast(std.math.clamp(filled(settings.fog).steps, 4, 128)),
+        .local_lights = @intFromBool(filled(settings.fog).local_lights),
     });
     cmd.drawFullscreen();
     cmd.endRendering();

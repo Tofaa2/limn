@@ -187,7 +187,6 @@ fn restoreGeometry(self: *Renderer, entry: *ModelEntry) !void {
             if (device.detached_queue != null) mesh.blas_building = made else mesh.blas = made;
         }
         entry.blas_pending = true;
-        entry.blas_frame = null;
         self.internal.rays.blas_pending += 1;
     }
     entry.geometry_resident = true;
@@ -307,6 +306,14 @@ fn wantModelTextures(
 
 /// Instances a camera drew a few frames ago; null when not known (no
 /// readback yet, or the scene's layout changed since).
+/// Texture bytes that keep the process under 90% of the memory budget the
+/// driver reports, given `resident_bytes` of textures now; 0 when it reports none.
+fn driverBudget(device: *rhi.Device, resident_bytes: u64) u64 {
+    const memory = device.memoryStats();
+    if (memory.budget_bytes == 0) return 0;
+    return @max((memory.budget_bytes / 10 * 9 -| memory.process_bytes) + resident_bytes, 1);
+}
+
 fn seenInstances(device: *rhi.Device, scene: *const SceneData, frame: rhi.Frame) ?[]const u32 {
     if (scene.layout_dirty) return null;
     const slot: usize = @intCast(frame.index % rhi.frames_in_flight);
@@ -416,6 +423,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
     var extra: u32 = 0;
     var resident_bytes: u64 = 0;
     var count: u32 = 0;
+    var budget = streaming.budget_bytes;
     while (true) : (extra += 1) {
         var wanted_bytes: u64 = 0;
         resident_bytes = 0;
@@ -428,7 +436,8 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
                 count += 1;
             }
         };
-        if (streaming.budget_bytes == 0 or wanted_bytes <= streaming.budget_bytes or extra == 16) break;
+        if (extra == 0 and budget == 0) budget = driverBudget(device, resident_bytes);
+        if (budget == 0 or wanted_bytes <= budget or extra == 16) break;
     }
 
     var pending: u32 = 0;
@@ -448,7 +457,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
                 const after = stream.bytesFrom(goal);
                 if (loading) {
                     stream.low_frames = 0;
-                    const fits = streaming.budget_bytes == 0 or resident_bytes - before + after <= streaming.budget_bytes;
+                    const fits = budget == 0 or resident_bytes - before + after <= budget;
                     if (upload_left == 0 or !fits) {
                         pending += 1;
                         continue;
@@ -456,7 +465,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
                     upload_left -|= after;
                 } else {
                     stream.low_frames += 1;
-                    const over = streaming.budget_bytes != 0 and resident_bytes > streaming.budget_bytes;
+                    const over = budget != 0 and resident_bytes > budget;
                     if (!over and stream.low_frames < streaming.evict_delay_frames) continue;
                     stream.low_frames = 0;
                 }

@@ -99,8 +99,20 @@ uint scrambled(uint value, uint seed) {
     return reversebits(value);
 }
 
-/// The next two numbers of this pixel's Owen-scrambled Sobol sequence, which
-/// cover the unit square evenly over the frames a pixel accumulates.
+/// Interleaves the low ten bits of `x` and `y`.
+uint morton(uint x, uint y) {
+    uint2 bits = uint2(x, y) & 1023u;
+    bits = (bits | (bits << 8u)) & 0x00ff00ffu;
+    bits = (bits | (bits << 4u)) & 0x0f0f0f0fu;
+    bits = (bits | (bits << 2u)) & 0x33333333u;
+    bits = (bits | (bits << 1u)) & 0x55555555u;
+    return bits.x | (bits.y << 1u);
+}
+
+/// The next two numbers of the Owen-scrambled Sobol sequence the pixels share,
+/// indexed by the pixel's Morton code then its sample: each pixel's numbers
+/// cover the unit square evenly over its frames, and neighbours' errors
+/// differ, which spreads the noise as blue noise (Ahmed and Wonka 2020).
 float2 randomPair() {
     uint seed = pcg(sequence_seed + sequence_dimension * 0x9e3779b9u);
     sequence_dimension++;
@@ -130,6 +142,12 @@ struct Surface {
     /// Index of refraction of a surface that bends what passes through it; 0
     /// for one that does not.
     float bend;
+    /// The ray enters what it met rather than leaving it.
+    bool entering;
+    /// Absorption per world unit inside, from the volume attenuation.
+    float3 absorb;
+    /// Reflectance where it is not metal.
+    float3 dielectric_f0;
 };
 
 Surface pathSurface(FrameConstants frame, TraceHit hit, float3 origin, float3 direction, float footprint) {
@@ -148,6 +166,9 @@ Surface pathSurface(FrameConstants frame, TraceHit hit, float3 origin, float3 di
     else if ((met.material_flags & MATERIAL_BLEND) != 0u) surface.through = clamp(1.0 - met.base_color.a * (1.0 - met.transmission), 0.0, 1.0);
     if ((met.instance_flags & INSTANCE_PROXY) != 0u) surface.through = 1.0;
     surface.bend = (met.material_flags & MATERIAL_BLEND) != 0u && met.transmission > 0.0 ? max(met.ior, 1.0) : 0.0;
+    surface.entering = !met.back_face;
+    surface.dielectric_f0 = met.dielectric_f0;
+    surface.absorb = met.attenuation.w > 0.0 ? -log(max(met.attenuation.rgb, float3(1e-4))) / met.attenuation.w : float3(0.0);
     return surface;
 }
 
@@ -184,7 +205,7 @@ float3 surfaceResponse(Surface surface, float3 view, float3 light, out float3 sh
     if (n_dot_l <= 0.0) return float3(0.0);
     float3 half_vector = normalize(view + light);
     float alpha = surface.roughness * surface.roughness;
-    float3 f0 = lerp(float3(0.04), surface.albedo, surface.metallic);
+    float3 f0 = lerp(surface.dielectric_f0, surface.albedo, surface.metallic);
     float3 fresnel = fresnelSchlick(max(dot(view, half_vector), 0.0), f0);
     float3 specular = mirrorLike(surface) ? float3(0.0) : fresnel * distributionGgx(max(dot(surface.normal, half_vector), 0.0), alpha) * visibilitySmithGgx(n_dot_l, n_dot_v, alpha);
     float3 diffuse = surface.albedo * (1.0 - surface.metallic) * (1.0 - fresnel) / PI;
@@ -366,6 +387,7 @@ float3 tracePath(FrameConstants frame, float3 origin, float3 direction, bool sca
     bool unaimed = true;
     float3 gathered = float3(0.0);
     float3 carried = float3(1.0);
+    float3 absorbing = float3(0.0);
     float cone_width = 0.0;
     float cone_angle = 2.0 / (abs(frame.proj[1][1]) * frame.resolution.y);
     for (uint bounce = 0u; bounce <= push.bounces; bounce++) {
@@ -376,11 +398,12 @@ float3 tracePath(FrameConstants frame, float3 origin, float3 direction, bool sca
             met = tracer.closest(origin, direction, 1e5, RAY_EVERYTHING, Cutouts.whole, hit);
             if (!met) break;
             surface = pathSurface(frame, hit, origin, direction, cone_width + cone_angle * hit.t);
-            if (surface.through < 1.0 || holes >= 16u) break;
+            if (surface.through < 1.0 || surface.bend > 0.0 || holes >= 16u) break;
             cone_width += cone_angle * hit.t;
             travelled += hit.t;
             origin = surface.position + direction * 0.002;
         }
+        if (met) carried *= exp(-absorbing * hit.t);
         if (awaiting_reach) {
             gloss_reach = met ? hit.t : 1000.0;
             awaiting_reach = false;
@@ -419,10 +442,16 @@ float3 tracePath(FrameConstants frame, float3 origin, float3 direction, bool sca
         if (chosen < let_through) {
             origin = surface.position + direction * 0.002;
             if (surface.bend > 0.0) {
-                float3 bent = refract(direction, surface.normal, 1.0 / surface.bend);
-                if (dot(bent, bent) > 0.0) direction = normalize(bent);
-                origin = surface.position - surface.flat_normal * 0.002;
-                carried *= lerp(float3(1.0), surface.albedo, 0.5);
+                float3 bent = refract(direction, surface.normal, surface.entering ? 1.0 / surface.bend : surface.bend);
+                if (dot(bent, bent) > 0.0) {
+                    direction = normalize(bent);
+                    origin = surface.position - surface.flat_normal * 0.002;
+                    if (surface.entering) carried *= surface.albedo;
+                    absorbing = surface.entering ? surface.absorb : float3(0.0);
+                } else {
+                    direction = reflect(direction, surface.normal);
+                    origin = surface.position + surface.flat_normal * 0.002;
+                }
             }
             continue;
         }
@@ -443,7 +472,7 @@ float3 tracePath(FrameConstants frame, float3 origin, float3 direction, bool sca
             first_color = glows ? float3(0.0) : max(surface.albedo, float3(0.03));
             first_facing = surface.normal;
             first_scatter = surface.albedo * (1.0 - surface.metallic);
-            first_reflect = reflectedOverall(lerp(float3(0.04), surface.albedo, surface.metallic), surface.roughness, max(dot(surface.normal, -direction), 0.0));
+            first_reflect = reflectedOverall(lerp(surface.dielectric_f0, surface.albedo, surface.metallic), surface.roughness, max(dot(surface.normal, -direction), 0.0));
             first_roughness = surface.roughness;
         }
         if (unaimed || !surface.even_glow) {
@@ -483,7 +512,7 @@ float3 tracePath(FrameConstants frame, float3 origin, float3 direction, bool sca
             }
         }
 
-        float3 f0 = lerp(float3(0.04), surface.albedo, surface.metallic);
+        float3 f0 = lerp(surface.dielectric_f0, surface.albedo, surface.metallic);
         float n_dot_v = max(dot(surface.normal, view), 1e-4);
         float3 fresnel_view = fresnelSchlick(n_dot_v, f0);
         float3 scattered = surface.albedo * (1.0 - surface.metallic);
@@ -562,7 +591,7 @@ Output tracePixel(float4 position, out Guides guides) {
 #endif
     int2 pixel = int2(fragment);
     random_state = pcg(uint(pixel.x) + pcg(uint(pixel.y) + pcg(push.gathered * 7919u + frame.frame_index)));
-    sequence_seed = pcg(uint(pixel.x) + pcg(uint(pixel.y)));
+    sequence_seed = 0x5bd1e995u;
     sequence_dimension = 0u;
     reservoir_kept = float4(0.0);
     reuse_toward = normalize(worldPositionFromDepth((float2(pixel) + 0.5) * frame.inv_resolution, 0.5, frame.inv_view_proj) - frame.camera_position);
@@ -576,7 +605,7 @@ Output tracePixel(float4 position, out Guides guides) {
     float3 guide = float3(0.0);
     uint samples = max(push.samples, 1u);
     for (uint index = 0u; index < samples; index++) {
-        sequence_index = frame.frame_index * samples + index;
+        sequence_index = (morton(uint(pixel.x), uint(pixel.y)) << 12u) | ((frame.frame_index * samples + index) & 4095u);
         float2 offset = float2(0.5);
         if (push.centered == 0u) offset = randomPair();
         float2 uv = (float2(pixel) + offset) * frame.inv_resolution;

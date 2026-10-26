@@ -134,7 +134,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     float2 ndc = in_uv * 2.0 - 1.0;
 
     if (id == INVALID_ID) {
-#ifdef CUSTOM_MATERIAL
+#if defined(CUSTOM_MATERIAL) || defined(SUBSURFACE)
         discard;
 #endif
         float4 world = mul(frame.inv_view_proj, float4(ndc, 1e-6, 1.0));
@@ -350,7 +350,8 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     surface.normal = normal;
     surface.view = view_direction;
     surface.diffuse_color = base_color.rgb * (1.0 - metallic);
-    surface.f0 = lerp(float3(0.04), base_color.rgb, metallic);
+    surface.f0 = lerp(dielectricF0(material), base_color.rgb, metallic);
+    if (material.iridescence.x > 0.0) surface.f0 = lerp(surface.f0, iridescentF0(dot(surface.normal, surface.view), material.iridescence.y, material.iridescence.z, surface.f0), material.iridescence.x);
     surface.roughness = roughness;
     surface.ao = ao;
     surface.bounce = float3(0.0);
@@ -429,14 +430,29 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     soft_history_slack = 0.05 * soft_history_depth + 2.0 * fwidth(soft_history_depth);
     soft_history_speed = length(result.motion * frame.resolution);
     if (instance.lightmap != INVALID_ID) gathered = float4(sampleTextureLod(instance.lightmap, frame.sampler_linear_clamp, raw1, 0.0).rgb, 1.0);
+#ifdef SUBSURFACE
+    if (surface.subsurface <= 0.0 || (material.flags & MATERIAL_UNLIT) != 0u) discard;
+    Surface without_diffuse = surface;
+    without_diffuse.diffuse_color = float3(0.0);
+    float3 lit = shadeSurface(frame, surface, fragment.xy, noise, gathered) - shadeSurface(frame, without_diffuse, fragment.xy, noise, gathered);
+#else
     float3 lit = (material.flags & MATERIAL_UNLIT) != 0u ? emissive : emissive + shadeSurface(frame, surface, fragment.xy, noise, gathered);
+#endif
     if ((SHADE_FEATURES & FEATURE_AERIAL) != 0u && frame.shading.aerial != 0.0 && frame.environment != 0u) {
         float3 air_through;
         float3 air;
         aerialHaze(frame, view_direction, length(world_position - eyePoint(frame, world_position)), air_through, air);
+#ifdef SUBSURFACE
+        lit *= air_through;
+#else
         lit = lit * air_through + air * (1.0 - air_through);
+#endif
     }
+#ifdef SUBSURFACE
+    result.color = float4(max(lit, float3(0.0)), surface.subsurface);
+#else
     result.color = float4(lit, soft_shadow_visibility);
+#endif
 #ifndef PLAIN
     result.reflection = float4(deferred_reflection.rgb, roughness);
     result.surface = float4(encodeNormal(normal), deferred_reflection.a, 1.0);

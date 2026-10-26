@@ -109,7 +109,7 @@ pub const Mesh = extern struct {
 
 /// `Material` in common.slang, one slot of the material buffer. Texture
 /// fields index the bindless texture table, `invalid_id` for none.
-/// 208 bytes. The size must stay a multiple of 16: shaders also read the
+/// 256 bytes. The size must stay a multiple of 16: shaders also read the
 /// buffer as 16-byte entries (`MATERIAL_WORDS` in common.slang).
 pub const Material = extern struct {
     /// Linear RGB and opacity, multiplied with the base color texture.
@@ -168,6 +168,12 @@ pub const Material = extern struct {
     texture_transforms: u32 = invalid_id,
     /// See `gltf.Material.sway`.
     sway: f32 = 0,
+    /// Attenuation color, then the distance it takes; 0 absorbs nothing.
+    attenuation: [4]f32 = .{ 1, 1, 1, 0 },
+    /// Color and strength scaling the 4% reflectance of non-metals.
+    reflectance: [4]f32 = .{ 1, 1, 1, 1 },
+    /// Thin film strength, index of refraction and thickness in nanometres.
+    iridescence: [4]f32 = .{ 0, 1.3, 400, 0 },
 };
 
 /// `Instance` in common.slang: one drawn copy of a mesh. Rebuilt each
@@ -301,16 +307,14 @@ pub const clusters_y = 9;
 pub const clusters_z = 24;
 /// Records in the buffer at `FrameConstants.lights.clusters`.
 pub const cluster_count = clusters_x * clusters_y * clusters_z;
-/// Most lights one cluster lists (`CLUSTER_CAPACITY` in common.slang); the
-/// rest are dropped. Count plus list fill 128 words.
-pub const cluster_capacity = 127;
 /// One bit per decal a cluster can hold, 32 to a word.
 pub const cluster_decal_words = 8;
 
-/// `Cluster` in common.slang, filled by `cluster.slang`. 544 bytes.
+/// `Cluster` in common.slang, filled by `cluster.slang`: where its lights are
+/// listed in the buffer at `FrameConstants.lights.light_indices`.
 pub const Cluster = extern struct {
+    offset: u32,
     count: u32,
-    lights: [cluster_capacity]u32,
     /// Bit i set: decal i reaches this cluster.
     decals: [cluster_decal_words]u32,
 };
@@ -388,11 +392,11 @@ pub const Exposure = extern struct {
 
 comptime {
     std.debug.assert(@sizeOf(Mesh) == 32);
-    std.debug.assert(@sizeOf(Material) == 208);
+    std.debug.assert(@sizeOf(Material) == 256);
     std.debug.assert(@sizeOf(Instance) == 116);
     std.debug.assert(@sizeOf(Light) == 80);
     std.debug.assert(@sizeOf(ShadowTile) == 80);
-    std.debug.assert(@sizeOf(Cluster) == 544);
+    std.debug.assert(@sizeOf(Cluster) == 40);
     std.debug.assert(@sizeOf(DrawCommand) == 20);
     std.debug.assert(@sizeOf(CullView) == 432 and @sizeOf(CullView) % 16 == 0);
 }
@@ -642,10 +646,18 @@ pub const Water = extern struct {
     /// Texture whose red channel says where there is water, or `invalid_id`.
     mask: u32 = invalid_id,
     ripples: [max_water_ripples]WaterRipple,
+    /// `ocean_cells` squared heights of the ocean tile, or 0.
+    ocean: u64 = 0,
+    /// Side of the tile in world units.
+    ocean_period: f32 = 1,
+    ocean_pad: f32 = 0,
 };
 
+/// Cells along each side of an ocean tile (`ocean.slang`).
+pub const ocean_cells = 128;
+
 comptime {
-    std.debug.assert(@sizeOf(Water) == 144 + max_water_ripples * 16);
+    std.debug.assert(@sizeOf(Water) == 160 + max_water_ripples * 16);
 }
 
 /// Textures a material can have, in the order shaders number them.

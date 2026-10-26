@@ -198,6 +198,7 @@ pub const HairSimulation = api.HairSimulation;
 pub const Water = api.Water;
 /// A height-simulated sheet of water; see `Renderer.waters.create`.
 pub const WaterDesc = api.WaterDesc;
+pub const Ocean = api.Ocean;
 /// Handle to a volume of particle-simulated liquid; see
 /// `Renderer.liquids.create`.
 pub const Liquid = api.Liquid;

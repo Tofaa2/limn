@@ -30,10 +30,6 @@ pub const Structures = struct {
     blas_pending: u32 = 0,
     /// Models with acceleration structures waiting for smaller copies.
     blas_compacting: u32 = 0,
-    /// Deformed-mesh acceleration structures to rebuild after skinning.
-    blas_jobs: std.ArrayList(BlasJob) = .empty,
-    /// Progress through the round of acceleration structure refits.
-    refit_cursor: usize = 0,
 
     pub fn init(storage: rhi.BufferUsage) Structures {
         return .{
@@ -51,7 +47,6 @@ pub const Structures = struct {
         self.bvh_nodes.deinit(renderer);
         self.bvh_items.deinit(renderer);
         self.mesh_boxes.deinit(renderer.internal.gpa);
-        self.blas_jobs.deinit(renderer.internal.gpa);
     }
 };
 
@@ -130,6 +125,10 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
         if (!entry.blas_pending) continue;
         const frame_now = frame_index orelse {
             if (entry.blas_job) |job| {
+                if (!device.detachedStarted(job)) {
+                    still_pending += 1;
+                    continue;
+                }
                 device.releaseDetached(job);
                 entry.blas_job = null;
             } else {
@@ -142,7 +141,7 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
             continue;
         };
         if (entry.blas_job) |job| {
-            if (!self.options.deterministic and !device.detachedDone(job)) {
+            if (!device.detachedStarted(job) or (!self.options.deterministic and !device.detachedDone(job))) {
                 still_pending += 1;
                 continue;
             }
@@ -161,16 +160,11 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
             continue;
         }
         still_pending += 1;
-        const carried = entry.blas_frame orelse {
-            entry.blas_frame = frame_now;
-            continue;
-        };
-        if (frame_now < carried + rhi.frames_in_flight) continue;
         if (self.internal.geometry_replaced) |replaced| if (frame_now <= replaced + rhi.frames_in_flight) continue;
         var encoder = (try device.beginDetached()).?;
         try geometry_feature.buildMeshBlases(self, &encoder, entry.meshes, buildingBlas);
         for (entry.meshes) |mesh| if (mesh.blas_building) |blas| try encoder.measureBlas(blas);
-        entry.blas_job = try device.submitDetached(encoder);
+        entry.blas_job = try device.submitDetached(encoder, frame_now);
     };
     self.internal.rays.blas_pending = still_pending;
     if (finished) self.internal.asset_generation += 1;
@@ -232,7 +226,6 @@ fn adoptBlas(self: *Renderer, entry: *ModelEntry) bool {
         any = true;
     };
     entry.blas_pending = false;
-    entry.blas_frame = null;
     markCompacting(self, entry);
     return any;
 }

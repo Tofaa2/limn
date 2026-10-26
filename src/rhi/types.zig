@@ -28,6 +28,10 @@ pub const NativeWindow = union(enum) {
     wayland: struct { display: *anyopaque, surface: *anyopaque },
     /// Win32 `HINSTANCE` (may be null) and `HWND`.
     win32: struct { instance: ?*anyopaque, window: *anyopaque },
+    /// A `CAMetalLayer*`, on macOS and iOS through MoltenVK.
+    metal: struct { layer: *anyopaque },
+    /// An Android `ANativeWindow*`.
+    android: struct { window: *anyopaque },
 };
 
 pub const Surface = struct {
@@ -53,6 +57,11 @@ pub const DeviceDesc = struct {
     ray_tracing: bool = true,
     /// Use mesh shaders when supported; check `Device.caps`.
     mesh_shaders: bool = true,
+    /// Use BC and ASTC texture formats when supported; check `Device.caps`.
+    block_formats: bool = true,
+    /// Read `SV_PrimitiveID` when supported; off, visibility is drawn the
+    /// way devices without it draw it. Check `Device.caps`.
+    primitive_id: bool = true,
     /// File the driver pipeline cache is persisted to.
     pipeline_cache_path: ?[]const u8 = null,
     /// Name objects and label passes for debuggers, without validation.
@@ -102,19 +111,24 @@ pub const Format = enum {
     bc3_unorm,
     bc3_srgb,
     bc6h_ufloat,
+    /// RGBA in 4x4 blocks of 16 bytes, as mobile GPUs read. Needs
+    /// `Capabilities.astc_textures`.
+    astc_4x4_unorm,
+    astc_4x4_srgb,
 
     pub fn isDepth(self: Format) bool {
         return self == .depth16_unorm or self == .depth32_float;
     }
 
     pub fn isSrgb(self: Format) bool {
-        return self == .rgba8_srgb or self == .bgra8_srgb or self == .bc7_srgb or self == .bc1_srgb or self == .bc3_srgb;
+        return self == .rgba8_srgb or self == .bgra8_srgb or self == .bc7_srgb or self == .bc1_srgb or self == .bc3_srgb or self == .astc_4x4_srgb;
     }
 
-    /// BC formats: sampled and uploaded, but not rendered to or read back.
+    /// BC and ASTC formats: sampled and uploaded, but not rendered to or read
+    /// back.
     pub fn isBlockCompressed(self: Format) bool {
         return switch (self) {
-            .bc7_unorm, .bc7_srgb, .bc5_unorm, .bc4_unorm, .bc1_unorm, .bc1_srgb, .bc3_unorm, .bc3_srgb, .bc6h_ufloat => true,
+            .bc7_unorm, .bc7_srgb, .bc5_unorm, .bc4_unorm, .bc1_unorm, .bc1_srgb, .bc3_unorm, .bc3_srgb, .bc6h_ufloat, .astc_4x4_unorm, .astc_4x4_srgb => true,
             else => false,
         };
     }
@@ -134,7 +148,7 @@ pub const Format = enum {
             .r32_float, .r32_uint, .b10g11r11_float, .a2b10g10r10_unorm, .depth32_float => 4,
             .rgba16_unorm, .rgba16_float => 8,
             .rgba32_float => 16,
-            .bc7_unorm, .bc7_srgb, .bc5_unorm, .bc4_unorm, .bc1_unorm, .bc1_srgb, .bc3_unorm, .bc3_srgb, .bc6h_ufloat => unreachable,
+            .bc7_unorm, .bc7_srgb, .bc5_unorm, .bc4_unorm, .bc1_unorm, .bc1_srgb, .bc3_unorm, .bc3_srgb, .bc6h_ufloat, .astc_4x4_unorm, .astc_4x4_srgb => unreachable,
         };
     }
 };
@@ -406,6 +420,48 @@ pub fn shadingRate(width: u32, height: u32) u8 {
     return @intCast((std.math.log2_int(u32, width) << 2) | std.math.log2_int(u32, height));
 }
 
+/// Ways work uses buffers, with the stages that use them, for
+/// `CommandEncoder.dependency`. A set of them: `.{ .compute_write = true }`.
+pub const BufferAccess = packed struct(u16) {
+    compute_read: bool = false,
+    compute_write: bool = false,
+    /// Vertex, fragment, task and mesh shaders.
+    graphics_read: bool = false,
+    graphics_write: bool = false,
+    indirect: bool = false,
+    index: bool = false,
+    vertex_input: bool = false,
+    transfer_read: bool = false,
+    transfer_write: bool = false,
+    /// Inputs and scratch of acceleration structure builds, and their output.
+    build_read: bool = false,
+    build_write: bool = false,
+    host_read: bool = false,
+    pad: u4 = 0,
+
+    pub fn merge(self: BufferAccess, other: BufferAccess) BufferAccess {
+        return @bitCast(@as(u16, @bitCast(self)) | @as(u16, @bitCast(other)));
+    }
+
+    pub fn empty(self: BufferAccess) bool {
+        return @as(u16, @bitCast(self)) == 0;
+    }
+
+    pub fn writes(self: BufferAccess) bool {
+        return self.compute_write or self.graphics_write or self.transfer_write or self.build_write;
+    }
+
+    /// Only the reading accesses of the set.
+    pub fn reads(self: BufferAccess) BufferAccess {
+        var result = self;
+        result.compute_write = false;
+        result.graphics_write = false;
+        result.transfer_write = false;
+        result.build_write = false;
+        return result;
+    }
+};
+
 /// Coarse buffer synchronization points; buffers are not tracked
 /// individually.
 pub const BufferSync = enum {
@@ -488,10 +544,18 @@ pub const Capabilities = struct {
     ray_tracing: bool = false,
     /// Task and mesh shaders.
     mesh_shaders: bool = false,
+    /// Fragment shaders can read `SV_PrimitiveID` (the `geometryShader`
+    /// feature); without it and mesh shaders, visibility draws pull their
+    /// indices in the vertex shader.
+    primitive_id: bool = false,
+    /// 64-bit integers in shaders, which ray tracing needs.
+    int64: bool = false,
     /// Shaders can read and write textures (`TextureUsage.storage`).
     storage_images: bool = false,
     /// BC texture formats.
     bc_textures: bool = false,
+    /// ASTC 4x4 texture formats (`textureCompressionASTC_LDR`).
+    astc_textures: bool = false,
     /// Pixels per shading rate texel each way; 0 when unsupported.
     shading_rate_tile: u32 = 0,
     /// `Device.createSharedTexture` works.
@@ -544,6 +608,12 @@ pub const MemoryStats = struct {
     reserved_bytes: u64,
     /// Bytes handed out to live resources.
     used_bytes: u64,
+    /// Device-local bytes the driver lets this process use, from
+    /// `VK_EXT_memory_budget`; 0 when the driver does not say.
+    budget_bytes: u64 = 0,
+    /// Device-local bytes the driver counts against this process; 0 when
+    /// `budget_bytes` is.
+    process_bytes: u64 = 0,
 };
 
 /// Positions are three floats at the start of each vertex.

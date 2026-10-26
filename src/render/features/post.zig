@@ -46,6 +46,16 @@ pub const Settings = struct {
     /// darker than this stay dark instead of being brightened further, which
     /// is what keeps a night looking like one.
     exposure_darkest: f32 = 0.002,
+    /// Share of the picture, darkest first, that automatic exposure leaves
+    /// out of its average, 0..1.
+    exposure_ignore_dark: f32 = 0,
+    /// Share of the picture, brightest first, that automatic exposure leaves
+    /// out, so a bright sky or lamp does not darken the rest, 0..1.
+    exposure_ignore_bright: f32 = 0,
+    /// Photographic exposure value at ISO 100; replaces automatic exposure and
+    /// `exposure_compensation`. Meant for lights in physical units (a sun of
+    /// about 100000 lux wants around 15).
+    exposure_ev100: ?f32 = null,
     /// Darkening toward the corners of the picture, 0..1.
     vignette: f32 = 0,
     /// Film grain strength, 0..1.
@@ -219,17 +229,19 @@ fn meter(frame: *Frame) !void {
     cmd.pushConstants(exposure_push.Push{
         .frame = ctx.frame_address,
         .source_texture = smallest,
-        .automatic = @intFromBool(settings.post.automatic_exposure),
-        .compensation = std.math.pow(f32, 2, settings.post.exposure_compensation),
+        .automatic = @intFromBool(settings.post.automatic_exposure and settings.post.exposure_ev100 == null),
+        .compensation = manualExposure(settings.post),
         .min_luminance = std.math.clamp(settings.post.exposure_darkest, 1e-5, 64),
         .max_luminance = 64,
         .speed = @max(settings.post.exposure_speed, 0.01),
         .reset = @intFromBool(view.exposure_reset),
         .depth_texture = smallest,
         .focus_speed = 1,
+        .ignore_dark = settings.post.exposure_ignore_dark,
+        .ignore_bright = settings.post.exposure_ignore_bright,
     });
     cmd.dispatch(1, 1, 1);
-    cmd.sync(.compute_to_all);
+    cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .graphics_read = true });
     view.exposure_reset = false;
 }
 
@@ -404,17 +416,19 @@ pub fn bloomAndExposure(renderer: *Renderer, p: *const ScenePass, resolved: rhi.
     cmd.pushConstants(exposure_push.Push{
         .frame = frame_address,
         .source_texture = device.textureIndex(bloom_chain[bloom_count - 1]),
-        .automatic = @intFromBool(settings.post.automatic_exposure),
-        .compensation = std.math.pow(f32, 2, settings.post.exposure_compensation),
+        .automatic = @intFromBool(settings.post.automatic_exposure and settings.post.exposure_ev100 == null),
+        .compensation = manualExposure(settings.post),
         .min_luminance = std.math.clamp(settings.post.exposure_darkest, 1e-5, 64),
         .max_luminance = 64,
         .speed = @max(settings.post.exposure_speed, 0.01),
         .reset = @intFromBool(view_data.exposure_reset),
         .depth_texture = device.textureIndex(view.depth),
         .focus_speed = @max(filled(settings.post.depth_of_field).autofocus_speed, 0.01),
+        .ignore_dark = settings.post.exposure_ignore_dark,
+        .ignore_bright = settings.post.exposure_ignore_bright,
     });
     cmd.dispatch(1, 1, 1);
-    cmd.sync(.compute_to_all);
+    cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .graphics_read = true });
     view_data.exposure_reset = false;
     cmd.endScope();
 
@@ -602,6 +616,13 @@ fn bloomDownPipeline(_: *rhi.Device) pipelines_module.Desc {
 
 fn bloomUpPipeline(_: *rhi.Device) pipelines_module.Desc {
     return pipelines_module.pass("bloom up", pipelines_module.shaderCode("bloom_up.frag.spv"), &.{.{ .format = pipelines_module.bloom_format, .blend = .additive }});
+}
+
+/// Exposure when automatic exposure is off: `exposure_ev100` as a camera
+/// would set it, else 2^`exposure_compensation`.
+fn manualExposure(post: Settings) f32 {
+    if (post.exposure_ev100) |ev| return 1.0 / (1.2 * std.math.pow(f32, 2, ev));
+    return std.math.pow(f32, 2, post.exposure_compensation);
 }
 
 fn exposurePipeline(_: *rhi.Device) pipelines_module.Desc {

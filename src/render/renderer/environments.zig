@@ -50,7 +50,7 @@ pub const Environments = struct {
         defer self.unlock();
         const job = try self.internal.gpa.create(EnvironmentJob);
         errdefer self.internal.gpa.destroy(job);
-        job.* = .{ .gpa = self.options.job_allocator orelse std.heap.smp_allocator, .io = self.internal.io, .path = try self.internal.gpa.dupe(u8, desc.path) };
+        job.* = .{ .gpa = self.options.job_allocator orelse std.heap.smp_allocator, .io = self.internal.io, .path = try self.internal.gpa.dupe(u8, desc.path), .basis = renderer_state.basisTarget(self.device.caps) };
         errdefer self.internal.gpa.free(job.path);
         const environment = try self.environments.internal.table.insert(.{ .job = job, .max_radiance = desc.max_radiance });
         job.group.concurrent(self.internal.io, runEnvironmentJob, .{job}) catch job.group.async(self.internal.io, runEnvironmentJob, .{job});
@@ -143,6 +143,7 @@ pub fn bakeSky(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.CommandEncod
         }
         const pass = entry.bake_step / 6;
         const face = entry.bake_step % 6;
+        const scattering = if (desc.multiple_scattering and face == 0) try bakeScattering(self, cmd, desc) else if (desc.multiple_scattering) self.internal.sky_scattering else null;
         var clouds = std.mem.zeroes(gpu.Clouds);
         if (pass == 0) if (entry.clouds) |layer| {
             clouds = layer;
@@ -162,6 +163,8 @@ pub fn bakeSky(self: *Renderer, entry: *EnvironmentEntry, cmd: *rhi.CommandEncod
             .to_moon = math.scale(math.normalize(desc.moon_direction), -1),
             .moon = @max(desc.moon, 0),
             .ozone = @max(desc.ozone, 0),
+            .scattering_texture = if (scattering) |texture| self.device.textureIndex(texture) else gpu.invalid_id,
+            .scattering_sampler = self.device.samplerIndex(self.internal.sampler_linear_clamp),
             .clouds = clouds,
         });
         cmd.drawFullscreen();
@@ -408,4 +411,36 @@ fn envIrradiancePipeline(_: *rhi.Device) pipelines_module.Desc {
 
 fn envPrefilterPipeline(_: *rhi.Device) pipelines_module.Desc {
     return pipelines_module.pass("env prefilter", pipelines_module.shaderCode("env_prefilter.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
+}
+
+/// Draws `SkyDesc.multiple_scattering`'s table for `desc` and returns it.
+fn bakeScattering(self: *Renderer, cmd: *rhi.CommandEncoder, desc: SkyDesc) !rhi.Texture {
+    const texture = self.internal.sky_scattering orelse made: {
+        const created = try self.device.createTexture(.{ .name = "sky scattering", .width = 32, .height = 32, .format = .rgba16_float, .usage = .{ .sampled = true, .color_attachment = true } });
+        self.internal.sky_scattering = created;
+        break :made created;
+    };
+    try cmd.beginRendering(.{ .color = &.{.{ .texture = texture, .load = .discard }} });
+    cmd.bindPipeline(try self.internal.pipelines.of(skyScatteringPipeline));
+    cmd.pushConstants(environment_push.SkyPush{
+        .to_sun = .{ 0, 1, 0 },
+        .face = 0,
+        .ground_color = desc.ground_color,
+        .turbidity = std.math.clamp(desc.turbidity, 1, 10),
+        .intensity = desc.intensity,
+        .max_radiance = 0,
+        .sun_disc = 0,
+        .stars = 0,
+        .to_moon = .{ 0, 1, 0 },
+        .moon = 0,
+        .ozone = @max(desc.ozone, 0),
+        .clouds = std.mem.zeroes(gpu.Clouds),
+    });
+    cmd.drawFullscreen();
+    cmd.endRendering();
+    return texture;
+}
+
+fn skyScatteringPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("sky scattering", pipelines_module.shaderCode("env_scattering.frag.spv"), &.{.{ .format = .rgba16_float }});
 }

@@ -13,6 +13,9 @@ pub const ShadingConstants = extern struct {
     aerial: f32 = 0,
     /// 1 when roughness is raised where normals vary within a pixel.
     specular_aa: u32 = 0,
+    /// 1 when subsurface light is spread on screen instead of softened here.
+    screen_subsurface: u32 = 0,
+    pad: u32 = 0,
 
     pub const references = .{ .decals = "Decals", .probes = "ReflectionProbes" };
 };

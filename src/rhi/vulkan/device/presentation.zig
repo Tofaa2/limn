@@ -10,6 +10,7 @@ const FrameGenerator = device_module.FrameGenerator;
 const frames_in_flight = device_module.frames_in_flight;
 const registerTexture = @import("textures.zig").registerTexture;
 const waitQueue = @import("frames.zig").waitQueue;
+const adapter = @import("adapter.zig");
 
 /// Format of the swapchain images.
 pub fn backbufferFormat(self: *Device) !types.Format {
@@ -358,4 +359,27 @@ pub fn destroySwapchain(self: *Device) void {
     swapchain.render_finished.deinit(self.gpa);
     if (swapchain.handle != .null_handle) self.vkd.destroySwapchainKHR(swapchain.handle, null);
     self.swapchain = null;
+}
+
+/// Replaces the window the device presents to, as on Android when an app
+/// comes back after its window went away; null drops it, and frames draw no
+/// backbuffer until a new one comes. The device must have been made with a
+/// surface, and the new window must be of a kind its instance enabled.
+pub fn setSurface(self: *Device, surface: ?types.Surface) !void {
+    if (!self.presents) return error.NoSurface;
+    std.debug.assert(!self.in_frame);
+    try waitQueue(self);
+    destroySwapchain(self);
+    if (self.surface != .null_handle) {
+        self.instance.destroySurfaceKHR(self.surface, null);
+        self.surface = .null_handle;
+    }
+    const next = surface orelse return;
+    self.surface = try adapter.createSurface(self.instance, next.window);
+    errdefer {
+        self.instance.destroySurfaceKHR(self.surface, null);
+        self.surface = .null_handle;
+    }
+    if ((try self.instance.getPhysicalDeviceSurfaceSupportKHR(self.physical, self.queue_family, self.surface)) != .true) return error.SurfaceUnsupported;
+    self.swapchain = .{ .requested_width = next.width, .requested_height = next.height, .vsync = next.vsync };
 }

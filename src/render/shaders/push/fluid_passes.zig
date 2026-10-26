@@ -60,7 +60,10 @@ pub const ProjectPush = extern struct {
 
 pub const SolidPush = extern struct {
     fluid: u64,
-    tlas: u64,
+    /// The scene's acceleration structure, as two halves so that shaders
+    /// that do not trace need no 64-bit integers.
+    tlas_low: u32,
+    tlas_high: u32,
 
     pub const references = .{ .fluid = "FluidRef" };
 };

@@ -47,8 +47,9 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
     _ = r;
 }
 
-/// Adds the feature's passes to a view of a scene. A path traced view leaves
-/// out those whose result the tracer replaces.
+/// `Shared` values this feature's `prepare` sets.
+pub const provides = .{"fluid_list"};
+
 /// Makes the list of fluids that shading reads, filled as fluids draw.
 pub fn prepare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
@@ -108,7 +109,7 @@ pub fn lightFluids(renderer: *Renderer, p: *const ScenePass, lighting: *const Li
             cmd.pushConstants(fluid_passes_push.LightPush{ .fluid = state.params, .lights = lighting.lights, .index = fluid_slot, .scale = state.desc.light * 8, .tall = std.math.clamp(state.desc.light_tall, 0, 1) });
             cmd.dispatch(1, 1, 1);
         }
-        if (bound) cmd.sync(.compute_to_all);
+        if (bound) cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .graphics_read = true });
     }
 }
 

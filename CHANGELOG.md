@@ -3,6 +3,27 @@
 ## 0.1.4 
 
 ### Added
+- `Settings.fog.local_lights`: the clustered local lights light the fog, unshadowed.
+- `SkyDesc.multiple_scattering`: multiple scattering from a table integrated over every direction (Hillaire 2020).
+- `WaterDesc.ocean`: open sea from Tessendorf's spectrum, an FFT-style transform of 128 by 128 waves; the `water` example takes `--ocean`.
+- `Settings.shading.subsurface_scattering` and `subsurface_radius`: separable screen-space subsurface scattering in place of wrap lighting.
+- `Settings.post.exposure_ev100`: manual exposure as a camera sets it.
+- `Material.iridescence`, `iridescence_ior` and `iridescence_thickness` (`KHR_materials_iridescence`), raster only.
+- `Material.reflectance_color` and `reflectance` (`KHR_materials_specular`).
+- `Material.attenuation_color` and `attenuation_distance` (`KHR_materials_volume`): light absorbed inside glass, raster and path traced.
+- `Settings.post.exposure_ignore_dark` and `exposure_ignore_bright`: histogram exposure that leaves out the darkest and brightest parts.
+- glTF `EXT_meshopt_compression`.
+- `Stats.gpu_memory_budget_bytes`, from `VK_EXT_memory_budget`.
+- `Renderer.setSurface`: a new window surface, or none, for Android pause and resume.
+- `NativeWindow.metal` and `.android` surfaces; portability enumeration for MoltenVK.
+- Basis textures transcode to ASTC 4x4 or RGBA where BC is missing; `Options.textures.block_formats`.
+- `Options.geometry.primitive_id`: visibility drawn from pulled vertices without `SV_PrimitiveID`.
+- `Pass.threaded`: a pass that may run beside other views' passes.
+- `rhi.Device.beginParallel` and `joinParallel`: encoders that record on several threads.
+- `zig build costs -- --threads N`.
+- `rhi.BufferAccess` and `rhi.CommandEncoder.dependency`: barriers for the stages that use a buffer.
+- Render graph passes declare the buffers they use (`PassDesc.buffers`); the graph puts the barriers between them.
+- `zig build costs` scenario for entities made and destroyed every frame, and GPU time of a pass per row.
 - `rhi.Device.failDevice`: a device that reports itself lost, for tests.
 - glTF and font validation (`-Dvalidate_input=false`).
 - NVIDIA DLSS: `Upscaler.dlss`.
@@ -66,6 +87,24 @@
 - `views.saveTarget`.
 
 ### Changed
+- Rough glass blurs what is behind it from a mip chain of the scene copy.
+- Path tracing spreads its noise as blue noise: pixels share one scrambled Sobol sequence in Morton order.
+- Virtual shadow maps filter across page edges by `Settings.shadows.softness`, like the cascades.
+- Rectangle lights that look large are shaded by linearly transformed cosines (Heitz 2016); close to a big panel the light is right instead of overestimated.
+- Sheen takes away the light it reflects (glTF albedo scaling) and its ambient part follows the lobe; velvet is darker.
+- Path-traced glass takes its base color once, on the way in.
+- Impostors blend the three nearest baked views instead of snapping to one.
+- glTF files that require an unsupported extension fail with `error.UnsupportedExtension`; Draco is named.
+- Texture streaming without a budget stays under 90% of the driver's memory budget.
+- Uploads stage in a shared ring buffer; one empty memory block per type is kept.
+- Memory objects of their own where the driver prefers them.
+- geometryShader and shaderInt64 are no longer required; int64 is needed only for ray tracing.
+- Views of different scenes record on several threads at once (`Options.worker_threads`).
+- Detached acceleration structure builds wait on the frame that uploads their geometry instead of counting frames, and no longer hold back freeing resources.
+- Barriers between passes name the stages that wait instead of waiting on every stage.
+- Particle emitters sort together: one barrier per sorting step instead of one per emitter.
+- Making, destroying, hiding and showing entities updates only their own slots, instead of laying the scene out again.
+- Light clusters list any number of lights, a cluster per workgroup.
 - `render` fails with `error.InvalidDeltaTime`, `error.InvalidCamera` or `error.InvalidTarget` for a bad frame, `Renderer.init` with `error.InvalidOptions`.
 - `entities.setTransforms` pairs the slices up to the shorter one.
 - Liquids with more than four sources fail with `error.TooManyLiquidSources`.
@@ -149,6 +188,12 @@
 
 
 ### Fixed
+- Headless runs could hang waiting for a ray tracing structure built in the same frame.
+- Path tracing: fully transmissive glass was skipped like a cutout; it now refracts.
+- Path tracing: rays leaving glass bend by the inverse ratio and reflect inside past the critical angle.
+- `.hdr` panoramas are size-checked before decoding.
+- Lights beyond 127 in one cluster were dropped.
+- Views of one scene converted its lights once each; they share them now.
 - The first layout change of a swapchain image did not wait for its acquire.
 - The bindless table asked for more descriptors than some devices allow.
 - Device teardown took quadratic time in the number of live resources.

@@ -12,6 +12,8 @@ pub const Push = extern struct {
     reset: u32,
     depth_texture: u32,
     focus_speed: f32,
+    ignore_dark: f32,
+    ignore_bright: f32,
 
     pub const references = .{ .frame = "FrameConstants" };
 };

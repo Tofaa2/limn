@@ -42,6 +42,9 @@ pub const SkyPush = extern struct {
     to_moon: [3]f32,
     moon: f32,
     ozone: f32,
+    /// `scatteringMain`'s table, or `invalid_id` for the approximate orders.
+    scattering_texture: u32 = 0xffffffff,
+    scattering_sampler: u32 = 0,
     clouds: clouds.Clouds,
 
     pub const references = .{ .clouds = "CloudData" };

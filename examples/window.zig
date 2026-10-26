@@ -66,6 +66,7 @@ pub const Window = struct {
     }
 
     fn native(self: Window) !gfx.rhi.NativeWindow {
+        if (comptime builtin.os.tag == .macos) return .{ .metal = .{ .layer = try metalLayer(glfw.glfwGetCocoaWindow(self.handle) orelse return error.NativeWindowUnavailable) } };
         if (comptime builtin.os.tag == .windows) return .{ .win32 = .{
             .instance = @ptrCast(glfw.GetModuleHandleW(null)),
             .window = @ptrCast(glfw.glfwGetWin32Window(self.handle) orelse return error.NativeWindowUnavailable),
@@ -87,6 +88,26 @@ pub const Window = struct {
         };
     }
 };
+
+/// Gives the content view of an `NSWindow` a `CAMetalLayer`, which MoltenVK
+/// presents to, through the Objective-C runtime.
+fn metalLayer(window: *anyopaque) !*anyopaque {
+    const objc = struct {
+        extern "objc" fn objc_getClass(name: [*:0]const u8) ?*anyopaque;
+        extern "objc" fn sel_registerName(name: [*:0]const u8) *anyopaque;
+        extern "objc" fn objc_msgSend() void;
+    };
+    const Send = *const fn (*anyopaque, *anyopaque) callconv(.c) ?*anyopaque;
+    const SendFlag = *const fn (*anyopaque, *anyopaque, bool) callconv(.c) void;
+    const SendObject = *const fn (*anyopaque, *anyopaque, *anyopaque) callconv(.c) void;
+    const send: Send = @ptrCast(&objc.objc_msgSend);
+    const view = send(window, objc.sel_registerName("contentView")) orelse return error.NativeWindowUnavailable;
+    const class = objc.objc_getClass("CAMetalLayer") orelse return error.NativeWindowUnavailable;
+    const layer = send(class, objc.sel_registerName("layer")) orelse return error.NativeWindowUnavailable;
+    @as(SendFlag, @ptrCast(&objc.objc_msgSend))(view, objc.sel_registerName("setWantsLayer:"), true);
+    @as(SendObject, @ptrCast(&objc.objc_msgSend))(view, objc.sel_registerName("setLayer:"), layer);
+    return layer;
+}
 
 /// CPU time of the renderer's zones, for `--timings`.
 const Zones = struct {

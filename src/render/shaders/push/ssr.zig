@@ -13,7 +13,10 @@ pub const TracePush = extern struct {
     step_count: i32,
     history_texture: u32,
     history_blend: f32,
-    tlas: u64,
+    /// The scene's acceleration structure, as two halves so that shaders
+    /// that do not trace need no 64-bit integers.
+    tlas_low: u32,
+    tlas_high: u32,
 
     pub const references = .{ .frame = "FrameConstants" };
 };

@@ -8,6 +8,7 @@ const gltf = @import("../../asset/gltf.zig");
 const gpu = @import("../gpu.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
+const scene_update = @import("scene_update.zig");
 const render = @import("../renderer.zig");
 const restyleEntity = render.restyleEntity;
 const transformOf = render.transformOf;
@@ -270,6 +271,7 @@ pub fn freeScene(self: *Renderer, scene: *SceneData) void {
     scene.fluids.deinit(self.internal.gpa);
     for (scene.waters.items) |water| if (self.waters.internal.table.remove(water)) |removed| {
         for (removed.state) |texture| self.device.destroyTexture(texture);
+        if (removed.ocean) |ocean| for (ocean) |buffer| self.device.destroyBuffer(buffer);
     };
     scene.waters.deinit(self.internal.gpa);
     for (scene.hairs.items) |hair| if (self.hairs.internal.table.remove(hair)) |removed| freeHair(self, removed);
@@ -314,6 +316,16 @@ pub fn freeScene(self: *Renderer, scene: *SceneData) void {
     if (scene.tlas_instances) |buffer| self.device.destroyBuffer(buffer);
     if (scene.refs) |buffer| self.device.destroyBuffer(buffer);
     scene.static_ranges.deinit(self.internal.gpa);
+    scene.instance_ranges.free_ranges.deinit(self.internal.gpa);
+    scene.ref_ranges.free_ranges.deinit(self.internal.gpa);
+    scene.tlas_ranges.free_ranges.deinit(self.internal.gpa);
+    scene.added.deinit(self.internal.gpa);
+    scene.removed.deinit(self.internal.gpa);
+    scene.quarantine.deinit(self.internal.gpa);
+    scene.skin_jobs.deinit(self.internal.gpa);
+    scene.skin_weights.deinit(self.internal.gpa);
+    scene.bounds_jobs.deinit(self.internal.gpa);
+    scene.blas_jobs.deinit(self.internal.gpa);
     if (scene.static_cull) |buffer| self.device.destroyBuffer(buffer);
     if (scene.impostor_table) |buffer| self.device.destroyBuffer(buffer);
     if (scene.impostor_list) |buffer| self.device.destroyBuffer(buffer);
@@ -367,8 +379,11 @@ pub const Entities = struct {
         try markEntity(self, entity, scene, desc.transform);
         errdefer self.internal.entity_marks.items[entity.index] = .{};
         try scene_data.entities.append(self.internal.gpa, entity);
+        self.internal.entity_marks.items[entity.index].listed_at = @intCast(scene_data.entities.items.len - 1);
         model.references += 1;
-        scene_data.layout_dirty = true;
+        scene_data.added.append(self.internal.gpa, entity) catch {
+            scene_data.layout_dirty = true;
+        };
         return entity;
     }
 
@@ -380,13 +395,20 @@ pub const Entities = struct {
         defer self.unlock();
         unlinkEntity(self, entity);
         const data = self.entities.internal.table.remove(entity) orelse return;
+        const listed_at = self.internal.entity_marks.items[entity.index].listed_at;
+        const span = self.internal.entity_spans.items[entity.index];
         self.internal.entity_marks.items[entity.index] = .{};
+        self.internal.entity_spans.items[entity.index] = .{};
         if (self.scenes.internal.table.get(data.scene)) |scene| {
-            for (scene.entities.items, 0..) |candidate, index| if (std.meta.eql(candidate, entity)) {
+            if (listed_at < scene.entities.items.len and std.meta.eql(scene.entities.items[listed_at], entity)) {
+                _ = scene.entities.swapRemove(listed_at);
+                if (listed_at < scene.entities.items.len) self.internal.entity_marks.items[scene.entities.items[listed_at].index].listed_at = listed_at;
+            } else for (scene.entities.items, 0..) |candidate, index| if (std.meta.eql(candidate, entity)) {
                 _ = scene.entities.orderedRemove(index);
+                for (scene.entities.items[index..], index..) |after, at| self.internal.entity_marks.items[after.index].listed_at = @intCast(at);
                 break;
             };
-            scene.layout_dirty = true;
+            scene_update.forgetEntity(self, scene, span);
         }
         releaseModel(self, data.model);
         freeEntityStorage(self, data);
@@ -508,7 +530,18 @@ pub const Entities = struct {
         if (data.visible == visible) return;
         data.visible = visible;
         data.history_frames = 0;
-        if (self.scenes.internal.table.get(data.scene)) |scene| scene.layout_dirty = true;
+        const scene = self.scenes.internal.table.get(data.scene) orelse return;
+        if (visible) {
+            scene.added.append(self.internal.gpa, entity) catch {
+                scene.layout_dirty = true;
+            };
+            return;
+        }
+        const mark = &self.internal.entity_marks.items[entity.index];
+        scene_update.forgetEntity(self, scene, self.internal.entity_spans.items[entity.index]);
+        self.internal.entity_spans.items[entity.index] = .{};
+        mark.layout_first = 0;
+        mark.layout_count = 0;
     }
 
     /// Sets the animation pose. Null returns the model to its rest pose.

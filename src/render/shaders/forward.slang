@@ -152,7 +152,8 @@ Output fragmentMain(
     surface.normal = normal;
     surface.view = normalize(eyePoint(frame, in_position) - in_position);
     surface.diffuse_color = base_color.rgb * (1.0 - metallic);
-    surface.f0 = lerp(float3(0.04), base_color.rgb, metallic);
+    surface.f0 = lerp(dielectricF0(material), base_color.rgb, metallic);
+    if (material.iridescence.x > 0.0) surface.f0 = lerp(surface.f0, iridescentF0(dot(surface.normal, surface.view), material.iridescence.y, material.iridescence.z, surface.f0), material.iridescence.x);
     surface.roughness = clamp(roughness, 0.045, 1.0);
     surface.ao = 1.0;
     surface.bounce = float3(0.0);
@@ -190,17 +191,12 @@ Output fragmentMain(
         float2 uv_behind = clamp(exit.xy / exit.w * 0.5 + 0.5, float2(0.0), float2(1.0));
         float3 behind = sampleTextureLod(fragment_push.scene_texture, frame.sampler_linear_clamp, uv_behind, 0.0).rgb;
         if (surface.roughness > 0.08) {
-            float spread = surface.roughness * surface.roughness * 0.06;
-            float spin = noise * 6.2831853;
-            for (int i = 0; i < 8; i++) {
-                float angle = float(i) * 2.39996323 + spin;
-                float2 tap = uv_behind + float2(cos(angle), sin(angle)) * (spread * sqrt((float(i) + 0.5) / 8.0)) * float2(frame.resolution.y / frame.resolution.x, 1.0);
-                behind += sampleTextureLod(fragment_push.scene_texture, frame.sampler_linear_clamp, clamp(tap, float2(0.0), float2(1.0)), 0.0).rgb;
-            }
-            behind /= 9.0;
+            float spread = surface.roughness * surface.roughness * 0.06 * frame.resolution.y;
+            behind = sampleTextureLod(fragment_push.scene_texture, frame.sampler_linear_clamp, uv_behind, clamp(log2(max(spread, 1.0)), 0.0, 5.0)).rgb;
         }
         float through = 1.0 - coverage;
-        color += behind * base_color.rgb * through;
+        float3 absorbed = material.attenuation.w > 0.0 ? pow(max(material.attenuation.rgb, float3(1e-4)), float3(material.thickness / material.attenuation.w)) : float3(1.0);
+        color += behind * base_color.rgb * absorbed * through;
         coverage += through;
     }
     if (frame.shading.aerial != 0.0 && frame.environment != 0u) {

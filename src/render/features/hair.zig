@@ -6,6 +6,7 @@ const gpu = @import("../gpu.zig");
 const math = @import("../../math.zig");
 const rhi = @import("../../rhi/rhi.zig");
 const std = @import("std");
+const lights_feature = @import("lights.zig");
 const render = @import("../renderer.zig");
 const features = @import("../core/features.zig");
 
@@ -21,7 +22,8 @@ pub fn declare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
     if (p.tracing) return;
     const g = ctx.graph;
-    try g.add(.{ .name = "hair", .stage = .transparent, .always = true, .scope = false }, ctx, drawHairPass);
+    const light_reads = try lights_feature.reads(ctx);
+    try g.add(.{ .name = "hair", .stage = .transparent, .always = true, .scope = false, .buffers = &light_reads }, ctx, drawHairPass);
 }
 
 fn drawHairPass(ctx: *ViewContext) !void {
@@ -93,13 +95,13 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
             hair.moving = .{ .points = .{ made[0].?, made[1].? }, .density = .{ made[2].?, made[3].? } };
         }
         const moving = &hair.moving.?;
-        if (!any) cmd.sync(.all_to_transfer);
+        if (!any) cmd.dependency(.{ .compute_read = true, .compute_write = true, .graphics_read = true }, .{ .transfer_write = true });
         any = true;
         cmd.fillBuffer(moving.density[1 - moving.current], 0, density_bytes, 0);
         if (moving.steps == 0) cmd.fillBuffer(moving.density[moving.current], 0, density_bytes, 0);
     }
     if (!any) return;
-    cmd.sync(.transfer_to_all);
+    cmd.dependency(.{ .transfer_write = true }, .{ .compute_read = true, .compute_write = true });
     cmd.beginScope("hair simulation");
     cmd.bindPipeline(try renderer.internal.pipelines.of(hairSimulationPipeline));
     for (p.scene.hairs.items) |handle| {
@@ -157,7 +159,7 @@ pub fn simulateHair(renderer: *Renderer, p: *const ScenePass, delta_time: f32) !
         moving.density_low = density_low;
         moving.density_cell = density_cell;
     }
-    cmd.sync(.compute_to_all);
+    cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .graphics_read = true, .vertex_input = true });
     cmd.endScope();
 }
 
@@ -240,7 +242,7 @@ const light_bytes = density_size * density_size * density_size * 4 * @sizeOf(f32
 fn lightHair(renderer: *Renderer, p: *const ScenePass) !void {
     const device = renderer.device;
     const cmd = p.cmd;
-    cmd.sync(.all_to_transfer);
+    cmd.dependency(.{ .compute_read = true, .compute_write = true, .graphics_read = true }, .{ .transfer_write = true });
     for (p.scene.hairs.items) |handle| {
         const hair = renderer.hairs.internal.table.get(handle) orelse continue;
         if (hair.shade == null) {
@@ -251,7 +253,7 @@ fn lightHair(renderer: *Renderer, p: *const ScenePass) !void {
         }
         cmd.fillBuffer(hair.shade.?.counts, 0, grid_bytes, 0);
     }
-    cmd.sync(.transfer_to_all);
+    cmd.dependency(.{ .transfer_write = true }, .{ .compute_read = true, .compute_write = true });
     cmd.bindPipeline(try renderer.internal.pipelines.of(hairCountPipeline));
     for (p.scene.hairs.items) |handle| {
         const hair = renderer.hairs.internal.table.get(handle) orelse continue;
@@ -269,7 +271,7 @@ fn lightHair(renderer: *Renderer, p: *const ScenePass) !void {
         });
         cmd.dispatch((point_count + 63) / 64, 1, 1);
     }
-    cmd.sync(.compute_to_all);
+    cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true });
     cmd.bindPipeline(try renderer.internal.pipelines.of(hairLightPipeline));
     for (p.scene.hairs.items) |handle| {
         const hair = renderer.hairs.internal.table.get(handle) orelse continue;
@@ -287,7 +289,7 @@ fn lightHair(renderer: *Renderer, p: *const ScenePass) !void {
         });
         cmd.dispatch((density_size * density_size * density_size + 63) / 64, 1, 1);
     }
-    cmd.sync(.compute_to_all);
+    cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .graphics_read = true });
 }
 
 /// Draws the scene's hair over the lit scene, writing depth.

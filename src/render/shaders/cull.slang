@@ -82,6 +82,7 @@ void meshletMain(uint3 id : SV_DispatchThreadID) {
     if (listed >= meshlet_push.entity_refs) ref_index = meshlet_push.candidates[listed - meshlet_push.entity_refs];
     FrameConstants frame = meshlet_push.frame;
     MeshletRef ref = frame.meshlet_refs.data[ref_index];
+    if (ref.instance == INVALID_ID) return;
     Instance instance = frame.instances.data[ref.instance];
     Mesh mesh = loadAligned<16>(frame.meshes.data + instance.mesh);
     Meshlet meshlet = loadAligned<16>(frame.meshlets.data + ref.meshlet);
@@ -174,6 +175,14 @@ void meshletMain(uint3 id : SV_DispatchThreadID) {
     uint slot;
     InterlockedAdd(meshlet_push.counts[bucket], 1u, slot);
     if (slot >= (bucket == 0u ? meshlet_push.bucket_capacity : meshlet_push.masked_capacity)) return;
+    if (meshlet_push.mesh_lists == 2u) {
+        uint at = (bucket * meshlet_push.bucket_capacity + slot) * 4u;
+        meshlet_push.lists[at] = meshlet.index_count;
+        meshlet_push.lists[at + 1u] = 1u;
+        meshlet_push.lists[at + 2u] = mesh.index_offset + meshlet.index_offset;
+        meshlet_push.lists[at + 3u] = ref_index;
+        return;
+    }
     if (meshlet_push.mesh_lists != 0u) {
         meshlet_push.lists[bucket * meshlet_push.bucket_capacity + slot] = ref_index;
         InterlockedMax(meshlet_push.mesh_draws[bucket].x, (slot + meshlets_per_task) / meshlets_per_task);
