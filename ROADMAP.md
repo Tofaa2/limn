@@ -28,6 +28,7 @@
 
 ### Platforms
 - Verified on Windows.
+- Verified on macOS (MoltenVK) and an Android device.
 - Verified on AMD and Intel GPUs.
 
 ## Later
@@ -35,4 +36,3 @@
 - One bloom and exposure path for scene and 2D views (now two).
 - Typed handles for detached work and compiled pipelines (now raw `u64`).
 - A single-pass depth pyramid for occlusion culling.
-- Light records kept on the GPU between frames, with only per-view flags uploaded.

@@ -614,7 +614,7 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass, state: *View) !bool {
     const frame_address = p.frame_address;
     var path_traced = false;
     if ((settings.path_tracing != null) and !debugging) trace: {
-        scene.trace_wanted = true;
+        @atomicStore(bool, &scene.trace_wanted, true, .monotonic);
         var where: u64 = 0;
         var instances_address: u64 = 0;
         var content: u64 = 0;
@@ -753,11 +753,11 @@ pub fn pathTrace(renderer: *Renderer, p: *const ScenePass, state: *View) !bool {
         }
         state.gathered = @min(state.gathered + 1, still_history);
         state.reusable = true;
-        renderer.internal.stats.path_traced_frames = state.gathered;
-        renderer.internal.stats.path_tracing_hardware = device.caps.ray_tracing;
+        @atomicStore(@TypeOf(renderer.internal.stats.path_traced_frames), &renderer.internal.stats.path_traced_frames, @intCast(state.gathered), .monotonic);
+        @atomicStore(bool, &renderer.internal.stats.path_tracing_hardware, device.caps.ray_tracing, .monotonic);
         path_traced = true;
     }
-    if ((settings.path_tracing != null) and !debugging and !path_traced) renderer.internal.path_trace_misses +%= 1;
+    if ((settings.path_tracing != null) and !debugging and !path_traced) _ = @atomicRmw(@TypeOf(renderer.internal.path_trace_misses), &renderer.internal.path_trace_misses, .Add, 1, .monotonic);
     return path_traced;
 }
 

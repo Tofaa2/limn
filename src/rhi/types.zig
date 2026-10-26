@@ -380,7 +380,6 @@ pub const TextureState = enum {
 /// `discard` leaves the contents undefined.
 pub const LoadOp = enum { load, clear, discard };
 
-/// Contents are always stored.
 pub const ColorAttachment = struct {
     texture: Texture,
     mip: u32 = 0,
@@ -389,6 +388,9 @@ pub const ColorAttachment = struct {
     clear: [4]f32 = .{ 0, 0, 0, 0 },
     /// Clear value for `*_uint` formats.
     clear_uint: [4]u32 = .{ 0, 0, 0, 0 },
+    /// False lets the driver skip writing the color back, for an attachment
+    /// nothing reads after the pass.
+    store: bool = true,
 };
 
 pub const DepthAttachment = struct {
@@ -400,7 +402,8 @@ pub const DepthAttachment = struct {
     clear: f32 = 0,
     /// False lets the driver skip writing depth back.
     store: bool = true,
-    /// Reserved; not read by the encoder.
+    /// The pass only tests against depth: nothing is written back, which
+    /// tile-based GPUs skip. Its pipelines must not write depth.
     read_only: bool = false,
 };
 
@@ -563,6 +566,8 @@ pub const Capabilities = struct {
     /// The GPU shares the CPU's memory; GPU-only buffers are mapped and
     /// written without staging.
     unified_memory: bool = false,
+    /// A second queue runs compute beside the frame (`Device.acquireAsync`).
+    async_compute: bool = false,
     /// The extensions NVIDIA's NGX asks for are enabled; see
     /// `DeviceDesc.nvidia_ngx`.
     nvidia_ngx: bool = false,
@@ -600,6 +605,9 @@ pub const AdapterInfo = struct {
     /// system memory.
     memory_bytes: u64,
     ray_tracing: bool,
+    /// A tile-based GPU, as phones and Apple silicon have: ARM Mali, Qualcomm
+    /// Adreno, Imagination PowerVR or Apple. Bandwidth is what it lacks.
+    tiled: bool = false,
 };
 
 /// Device memory managed by the RHI.

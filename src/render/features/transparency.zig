@@ -109,7 +109,7 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
                 const depth_before = peel.depth[(layer + 1) % 2];
                 try cmd.beginRendering(.{
                     .color = &.{.{ .texture = peel.layer, .load = .clear, .clear = .{ 0, 0, 0, 0 } }},
-                    .depth = .{ .texture = depth_now, .clear = 0 },
+                    .depth = .{ .texture = depth_now, .clear = 0, .store = layer + 1 < layers },
                 });
                 cmd.bindPipeline(try renderer.internal.pipelines.of(forwardPeelPipeline));
                 cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
@@ -143,7 +143,7 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
                     .{ .texture = view.motion, .load = .load },
                     .{ .texture = oit.reveal, .load = .clear, .clear = .{ 1, 1, 1, 1 } },
                 },
-                .depth = .{ .texture = view.depth, .load = .load },
+                .depth = .{ .texture = view.depth, .load = .load, .read_only = true },
             });
             cmd.bindPipeline(try renderer.internal.pipelines.of(forwardWeightedPipeline));
             cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
@@ -172,7 +172,7 @@ pub fn drawTransparency(renderer: *Renderer, p: *const ScenePass) !void {
             }.farther);
             const forward_target = rhi.RenderingDesc{
                 .color = &.{ .{ .texture = view.hdr, .load = .load }, .{ .texture = view.motion, .load = .load } },
-                .depth = .{ .texture = view.depth, .load = .load },
+                .depth = .{ .texture = view.depth, .load = .load, .read_only = true },
             };
             try cmd.beginRendering(forward_target);
             cmd.bindPipeline(try renderer.internal.pipelines.of(forwardPipeline));

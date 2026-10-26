@@ -121,17 +121,18 @@ float3 giGridIrradiance(FrameConstants frame, GiGrid grid, float3 position, floa
         float3 trilinear = lerp(1.0 - alpha, alpha, float3(offset));
         float weight = trilinear.x * trilinear.y * trilinear.z;
 
-        float3 to_probe = normalize(probe - position);
+        float3 toward = probe - position;
+        float3 to_probe = toward * rsqrt(max(dot(toward, toward), 1e-12));
         float facing = (dot(to_probe, normal) + 1.0) * 0.5;
         weight *= facing * facing + 0.2;
 
         float3 from_probe = biased - probe;
         float distance_to_probe = length(from_probe);
-        float2 moments = sampleTextureLod(grid.visibility, s, giProbeUv(stored, from_probe / distance_to_probe, GI_VISIBILITY_TEXELS, counts), 0.0).rg;
+        float2 moments = sampleTextureLod(grid.visibility, s, giProbeUv(stored, from_probe / max(distance_to_probe, 1e-6), GI_VISIBILITY_TEXELS, counts), 0.0).rg;
         if (distance_to_probe > moments.x) {
             float variance = abs(moments.x * moments.x - moments.y);
             float delta = distance_to_probe - moments.x;
-            float chebyshev = variance / (variance + delta * delta);
+            float chebyshev = variance / max(variance + delta * delta, 1e-12);
             weight *= max(chebyshev * chebyshev * chebyshev, 0.0);
         }
         weight = max(weight, 1e-6);

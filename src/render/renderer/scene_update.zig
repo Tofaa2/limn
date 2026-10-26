@@ -114,6 +114,7 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     scene.added.clearRetainingCapacity();
     scene.removed.clearRetainingCapacity();
     scene.quarantine.clearRetainingCapacity();
+    scene.entity_cull_items.clearRetainingCapacity();
     for (scene.entities.items) |entity_handle| {
         const entity = self.entities.internal.table.get(entity_handle) orelse continue;
         const mark = &self.internal.entity_marks.items[entity_handle.index];
@@ -149,6 +150,9 @@ fn rebuildLayout(self: *Renderer, scene: *SceneData) !void {
     scene.entity_ref_capacity = reserve(scene.entity_ref_capacity, scene.entity_ref_count);
     scene.entity_tlas_capacity = reserve(scene.entity_tlas_capacity, scene.rigid_tlas);
     if (scene.entity_tlas_capacity != tlas_capacity) scene.static_tlas_uploaded = false;
+    scene.entity_cull_items.shrinkRetainingCapacity(@min(scene.entity_cull_items.items.len, scene.entity_capacity));
+    scene.entity_cull_dirty = .{ 0, scene.entity_capacity };
+    try uploadEntityCull(self, scene);
     scene.instance_ranges.free_ranges.clearRetainingCapacity();
     scene.instance_ranges.top = @intCast(scene.layout.items.len);
     scene.instance_ranges.capacity = scene.entity_capacity;
@@ -299,6 +303,7 @@ fn layEntity(self: *Renderer, scene: *SceneData, handle: Entity, entity: *const 
             if (!skinned) info.bits |= EntryInfo.glows;
         }
         scene.entries.items[instance_index] = info;
+        try setEntityCull(self, scene, instance_index, if (entity.rays_only) .{ 0, 0 } else .{ span.ref_first + @as(u32, @intCast(ref_at)), mesh.meshlet_count });
         if (entity.rays_only) continue;
         for (refs[ref_at..][0..mesh.meshlet_count], 0..) |*ref, meshlet| ref.* = .{
             .instance = instance_index,
@@ -336,6 +341,34 @@ fn growLayout(self: *Renderer, scene: *SceneData, count: usize) !void {
     try scene.chunk_bounds.resize(gpa, chunk_count);
     try scene.chunk_stale.resize(gpa, chunk_count);
     @memset(scene.chunk_stale.items[old_chunks..], true);
+}
+
+/// Sets the meshlet references culling takes for entity slot `slot`, to be
+/// uploaded with the next `uploadEntityCull`.
+fn setEntityCull(self: *Renderer, scene: *SceneData, slot: u32, refs: [2]u32) !void {
+    const items = &scene.entity_cull_items;
+    if (items.items.len <= slot) try items.appendNTimes(self.internal.gpa, .{ 0, 0 }, slot + 1 - items.items.len);
+    items.items[slot] = refs;
+    scene.entity_cull_dirty = .{ @min(scene.entity_cull_dirty[0], slot), @max(scene.entity_cull_dirty[1], slot + 1) };
+}
+
+/// Uploads the entity slots changed since the last call, or all of them
+/// into a new buffer when the slots kept for entities outgrew it.
+fn uploadEntityCull(self: *Renderer, scene: *SceneData) !void {
+    const device = self.device;
+    if (scene.entity_cull_items.items.len < scene.entity_capacity) try scene.entity_cull_items.appendNTimes(self.internal.gpa, .{ 0, 0 }, scene.entity_capacity - scene.entity_cull_items.items.len);
+    const items = scene.entity_cull_items.items;
+    if (scene.entity_capacity > scene.entity_cull_capacity) {
+        if (scene.entity_cull) |old| device.destroyBuffer(old);
+        scene.entity_cull = null;
+        scene.entity_cull = try device.createBuffer(.{ .name = "entity cull", .size = @as(u64, scene.entity_capacity) * @sizeOf([2]u32), .usage = .{ .storage = true } });
+        scene.entity_cull_capacity = scene.entity_capacity;
+        scene.entity_cull_dirty = .{ 0, @intCast(items.len) };
+    }
+    const first, const end = scene.entity_cull_dirty;
+    scene.entity_cull_dirty = .{ std.math.maxInt(u32), 0 };
+    if (first >= end or scene.entity_cull == null) return;
+    try device.uploadBuffer(scene.entity_cull.?, @as(u64, first) * @sizeOf([2]u32), std.mem.sliceAsBytes(items[first..@min(end, items.len)]));
 }
 
 fn staleChunks(scene: *SceneData, first: u32, count: u32) void {
@@ -379,6 +412,7 @@ fn applyStructure(self: *Renderer, scene: *SceneData) !bool {
                 sphere.* = .{ 0, 0, 0, 0 };
             }
             staleChunks(scene, span.layout_first, span.layout_count);
+            for (span.layout_first..last) |slot| try setEntityCull(self, scene, @intCast(slot), .{ 0, 0 });
             if (span.ref_count != 0) {
                 self.internal.scratch_refs.clearRetainingCapacity();
                 try self.internal.scratch_refs.appendNTimes(gpa, dead_ref, span.ref_count);
@@ -477,6 +511,7 @@ fn applyStructure(self: *Renderer, scene: *SceneData) !bool {
     scene.added.clearRetainingCapacity();
     scene.entity_ref_count = scene.ref_ranges.top;
     scene.rigid_tlas = scene.tlas_ranges.top;
+    try uploadEntityCull(self, scene);
     return true;
 }
 
@@ -1405,13 +1440,13 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
     for (scene.fluids.items) |item| {
         if (self.fluids.internal.table.get(item)) |state| fluid_lights += @intFromBool(state.desc.light > 0);
     }
-    const lights = try arena.alloc(device, gpu.Light, scene.lights.items.len + fluid_lights);
+    try scene.light_next.resize(self.internal.gpa, scene.lights.items.len + fluid_lights);
+    const records = scene.light_next.items;
     const tiles = try arena.alloc(device, gpu.ShadowTile, max_local_shadow_views);
     var result = Lighting{
-        .lights = lights.address,
+        .lights = 0,
         .tiles = tiles.address,
-        .light_count = @intCast(scene.lights.items.len + fluid_lights),
-        .records = lights.items,
+        .light_count = @intCast(records.len),
         .tile_count = 0,
         .tile_view_proj = undefined,
         .tile_views = undefined,
@@ -1456,7 +1491,7 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
         scene.shadow_grants_traced = traced_shadows;
     }
     result.tiles_key = std.hash.Wyhash.hash(tiles_per_side, std.mem.sliceAsBytes(granted));
-    for (scene.lights.items, lights.items[0..scene.lights.items.len], granted) |light, *out, has_tiles| {
+    for (scene.lights.items, records[0..scene.lights.items.len], granted) |light, *out, has_tiles| {
         const direction = math.normalize(light.direction);
         const cos_outer = @cos(light.outer_angle);
         const cos_inner = @max(@cos(@min(light.inner_angle, light.outer_angle)), cos_outer + 1e-4);
@@ -1515,7 +1550,7 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
         if (state.desc.light <= 0) continue;
         const t = state.desc.transform;
         const height = math.length(.{ t[4], t[5], t[6] });
-        lights.items[fluid_slot] = .{
+        records[fluid_slot] = .{
             .position = .{ t[12], t[13], t[14] },
             .range = if (state.desc.light_range > 0) state.desc.light_range else height * 3,
             .color = .{ 0, 0, 0 },
@@ -1524,11 +1559,46 @@ pub fn prepareLights(self: *Renderer, scene: *SceneData, arena: *FrameArena, sha
         };
         fluid_slot += 1;
     }
+    result.lights = try uploadLights(self, scene);
+    result.records = scene.light_uploaded.items;
     scene.lighting = result;
     scene.lighting_frame = self.internal.frame_index;
     scene.lighting_shadows = shadows;
     scene.lighting_traced = traced_shadows;
     return result;
+}
+
+/// Uploads the span of `light_next` that differs from what the scene's
+/// light buffer holds, and returns the buffer's address; `light_uploaded`
+/// then holds this frame's records.
+fn uploadLights(self: *Renderer, scene: *SceneData) !u64 {
+    return uploadChanged(gpu.Light, self.device, "lights", &scene.light_buffer, &scene.light_capacity, &scene.light_uploaded, &scene.light_next);
+}
+
+/// Uploads the span of `next` that differs from `uploaded`, the copy of what
+/// `buffer` holds, growing the buffer when `next` outgrew it, then swaps the
+/// two lists and returns the buffer's address.
+pub fn uploadChanged(comptime T: type, device: *rhi.Device, name: [:0]const u8, buffer: *?rhi.Buffer, capacity: *u32, uploaded: *std.ArrayList(T), next: *std.ArrayList(T)) !u64 {
+    const records = next.items;
+    if (buffer.* == null or records.len > capacity.*) {
+        if (buffer.*) |old| device.destroyBuffer(old);
+        buffer.* = null;
+        const room: u32 = @intCast(@max(records.len + records.len / 2, 16));
+        buffer.* = try device.createBuffer(.{ .name = name, .size = @as(u64, room) * @sizeOf(T), .usage = .{ .storage = true } });
+        capacity.* = room;
+        uploaded.clearRetainingCapacity();
+    }
+    const old = uploaded.items;
+    var first: usize = records.len;
+    var end: usize = 0;
+    for (records, 0..) |record, index| {
+        if (index < old.len and std.meta.eql(record, old[index])) continue;
+        first = @min(first, index);
+        end = index + 1;
+    }
+    if (first < end) try device.uploadBuffer(buffer.*.?, @as(u64, first) * @sizeOf(T), std.mem.sliceAsBytes(records[first..end]));
+    std.mem.swap(std.ArrayList(T), uploaded, next);
+    return device.bufferAddress(buffer.*.?);
 }
 
 /// Closes gaps in the vertex and index pools: when a quarter or more of
@@ -1545,7 +1615,7 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
             var last_entry: ?*ModelEntry = null;
             var last_mesh: usize = 0;
             var last_end: u32 = 0;
-            for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+            for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
                 if (entry.state != .ready or !entry.geometry_resident or entry.geometry_coarse) continue;
                 for (entry.meshes, 0..) |mesh, index| {
                     const end = if (vertices) mesh.vertex_offset + mesh.vertex_count else mesh.index_offset + mesh.index_count;
@@ -1583,7 +1653,7 @@ pub fn compactGeometry(self: *Renderer, cmd: *rhi.CommandEncoder) !bool {
                 };
                 try self.internal.meshes.write(self.device, entry.mesh_base + @as(u32, @intCast(last_mesh)), std.mem.asBytes(&record));
             }
-            for (self.scenes.internal.table.slots.items) |*slot| if (slot.value) |*scene| {
+            for (0..self.scenes.internal.table.slotCount()) |slot_index| if (self.scenes.internal.table.slotAt(slot_index).value) |*scene| {
                 scene.static_version += 1;
                 scene.layout_dirty = true;
             };

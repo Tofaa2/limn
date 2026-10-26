@@ -462,6 +462,7 @@ pub const Graph = struct {
         }
         for (planned.passes()) |index| {
             const pass = &self.passes[index];
+            if (@intFromEnum(pass.stage) >= @intFromEnum(Stage.shadows)) try cmd.awaitAsync();
             const waits = self.bufferWaits(pass);
             if (pass.scope) cmd.beginScope(pass.name);
             for (self.linked(pass.reads)) |target| cmd.transition(self.texture(target), .shader_read);

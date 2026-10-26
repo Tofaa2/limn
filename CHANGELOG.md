@@ -3,6 +3,14 @@
 ## 0.1.4 
 
 ### Added
+- Builds fetch Slang, glslang, GLFW with its platform headers, the macOS SDK headers, MoltenVK and the Android NDK; `-Dtarget` cross-compiles from any host, `zig build cross` builds every target.
+- Android: `-Dtarget=aarch64-linux-android` packs each windowed example into a signed APK, without the Android SDK.
+- macOS: MoltenVK is shipped beside the examples and loaded when no Vulkan loader is installed.
+- `decals --scatter N`: thousands of decals at once.
+- `zig build checks -- <names>` runs only those checks; `--no-ray-tracing` for software drivers. `-Dtsan` builds `checks` and `costs` with the thread sanitizer, with `src/tsan.supp` for Mesa's driver.
+- `Options.async_compute` (`--async-compute` in the examples): liquids simulate on a second queue beside culling and visibility; `rhi.Device.planAsync`, `acquireAsync`, `CommandEncoder.awaitAsync`. Off by default: no faster on an RTX 4060 Ti.
+- `rhi.AdapterInfo.tiled`, for phone and Apple GPUs; `Quality.recommended` gives them `.low` (Apple `.medium`).
+- `rhi.ColorAttachment.store`; `DepthAttachment.read_only` stores nothing back.
 - `Settings.fog.local_lights`: the clustered local lights light the fog, unshadowed.
 - `SkyDesc.multiple_scattering`: multiple scattering from a table integrated over every direction (Hillaire 2020).
 - `WaterDesc.ocean`: open sea from Tessendorf's spectrum, an FFT-style transform of 128 by 128 waves; the `water` example takes `--ocean`.
@@ -87,6 +95,14 @@
 - `views.saveTarget`.
 
 ### Changed
+- DLSS and NRD build in by default only for the machine building, not for cross targets.
+- Entities are culled instance by instance before their meshlets, like instance groups.
+- Light and decal records stay on the GPU between frames; only those that changed are uploaded.
+- Decals have no limit: clusters list them like lights. `api.max_decals` and `error.TooManyDecals` are gone.
+- Views of one scene that draw into different targets record on separate threads; the ray scene is claimed while staging, and lightmaps and impostors bake in the first view only. Views that share a target, of one scene or not, stay on one thread: a later one could discard what an earlier one drew.
+- Fewer attachment loads and stores: the tonemap does not read a picture it covers, transparency only tests depth, and the last peeled layer's depth is not kept.
+- Cheaper shading: rectangle lights have a loop of their own, so the busy light loop keeps few registers; coats, sheen, grain and thin films, and rectangle lights, are left out of the shading pipeline when nothing uses them.
+- The subsurface pass shades once instead of twice: its variant leaves every specular term out.
 - Rough glass blurs what is behind it from a mip chain of the scene copy.
 - Path tracing spreads its noise as blue noise: pixels share one scrambled Sobol sequence in Morton order.
 - Virtual shadow maps filter across page edges by `Settings.shadows.softness`, like the cascades.
@@ -188,6 +204,11 @@
 
 
 ### Fixed
+- Irradiance probes no longer feed NaN into their weights where a probe sits on the surface or its depth moments are zero.
+- A full culling bucket no longer leaves its count above what was listed, which let task shaders read past the list.
+- Handle tables no longer move their slots as they grow: a pipeline or texture made on a worker thread could free the array the render thread was reading.
+- The bindless uint textures are declared without a format; fetching an R32_UINT view through Rgba32ui was undefined.
+- `Stats.gi_probes`, `particles` and the path tracing counters are written atomically, as views record on several threads.
 - Headless runs could hang waiting for a ray tracing structure built in the same frame.
 - Path tracing: fully transmissive glass was skipped like a cutout; it now refracts.
 - Path tracing: rays leaving glass bend by the inverse ratio and reflect inside past the critical angle.

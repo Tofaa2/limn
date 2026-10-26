@@ -12,7 +12,7 @@ const height = 180;
 const cache_dir = ".zig-cache/limn-checks";
 const fox_path = "examples/assets/world/Fox.glb";
 
-pub const std_options: std.Options = .{ .log_level = .info, .logFn = log };
+pub const std_options: std.Options = .{ .log_level = .info, .logFn = log, .enable_segfault_handler = !@import("builtin").sanitize_thread };
 
 /// Leaves out the model loads the out of memory check fails on purpose.
 fn log(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
@@ -489,7 +489,8 @@ const Checks = struct {
         for (&targets) |*target| target.* = try renderer.views.createTarget(width / 2, height / 2);
         defer for (targets) |target| renderer.views.destroyTarget(target);
         const settings = [4]gfx.Settings{ .{}, gfx.Settings.lightweight, .{ .shadows = .{ .virtual = true } }, .{ .reflections = null } };
-        var scenes: [2]gfx.Scene = undefined;
+        var scenes: [1]gfx.Scene = undefined;
+        var movers: [1]gfx.Entity = undefined;
         const sky = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.3, -0.6 } };
         const environment = try renderer.environments.createSky(sky);
         defer renderer.environments.destroy(environment);
@@ -499,6 +500,7 @@ const Checks = struct {
             renderer.scenes.setSun(scene.*, gfx.skySun(sky));
             _ = try renderer.entities.create(scene.*, .{ .model = self.box_model, .transform = math.identity });
         }
+        for (scenes, &movers) |scene, *mover| mover.* = try renderer.entities.create(scene, .{ .model = self.box_model, .transform = math.translation(.{ 1.5, 0, 0 }) });
         defer for (scenes) |scene| renderer.scenes.destroy(scene);
         try renderer.waitUntilLoaded();
         for ([_]u32{ 1, 0 }) |worker_threads| {
@@ -509,9 +511,13 @@ const Checks = struct {
             var descs: [8]gfx.ViewDesc = undefined;
             for (&descs, views, targets, 0..) |*desc, view, target, index| {
                 const angle: f32 = @floatFromInt(index % 4);
-                desc.* = .{ .view = view, .scene = scenes[index / 4], .camera = gfx.Camera.lookAt(.{ 4 * @sin(angle), 1.5, 4 * @cos(angle) }, .{ 0, 0.5, 0 }), .target = .{ .texture = target }, .settings = settings[index % 4] };
+                desc.* = .{ .view = view, .scene = scenes[0], .camera = gfx.Camera.lookAt(.{ 4 * @sin(angle), 1.5, 4 * @cos(angle) }, .{ 0, 0.5, 0 }), .target = .{ .texture = target }, .settings = settings[index % 4] };
             }
-            for (0..10) |_| _ = try renderer.render(.{ .views = &descs, .delta_time = 1.0 / 60.0 });
+            for (0..10) |step| {
+                const turn: f32 = @floatFromInt(step);
+                for (movers) |mover| renderer.entities.setTransform(mover, math.mul(math.rotationY(turn * 0.2), math.translation(.{ 1.5, 0, 0 })));
+                _ = try renderer.render(.{ .views = &descs, .delta_time = 1.0 / 60.0 });
+            }
             for (0..4) |index| {
                 const first = try renderer.device.readTexture(self.gpa, targets[index]);
                 defer self.gpa.free(first);
@@ -525,7 +531,7 @@ const Checks = struct {
             }
         }
         if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
-        std.log.info("parallel views: eight views on one thread and on several, every twin the same", .{});
+        std.log.info("parallel views: eight views of one scene with a moving box, on one thread and on several, every twin the same", .{});
     }
 
     /// A box and its mirror image through the plane x = 0, lit and seen from
@@ -1019,9 +1025,19 @@ const FailingAllocator = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    var names = try init.minimal.args.iterateAllocator(init.gpa);
+    defer names.deinit();
+    _ = names.skip();
+    var only: std.ArrayList([]const u8) = .empty;
+    defer only.deinit(init.gpa);
+    var ray_tracing = true;
+    while (names.next()) |name| {
+        if (std.mem.eql(u8, name, "--no-ray-tracing")) ray_tracing = false else try only.append(init.gpa, name);
+    }
     var failing = FailingAllocator{ .backing = init.gpa };
     const renderer = try gfx.Renderer.init(failing.allocator(), init.io, .{
         .application_name = "limn checks",
+        .ray_tracing = .{ .hardware = ray_tracing },
         .validation = true,
         .geometry = .{ .mesh_shaders = true },
         .job_allocator = failing.allocator(),
@@ -1059,36 +1075,17 @@ pub fn main(init: std.process.Init) !void {
     };
     try renderer.waitUntilLoaded();
     try checks.draw(8);
-    try checks.picking();
-    try checks.staleHandles();
-    try checks.staleDrawResources();
-    try checks.moves();
-    try checks.structure();
-    try checks.threads();
-    try checks.failedPass();
-    try checks.plainViewPasses();
-    try checks.scenePassReads();
-    try checks.placedLightsAndDecals();
-    try checks.lifecycle();
-    try checks.switchedOffMemory();
-    try checks.switchedOffCosts();
-    try checks.mirrored();
-    try checks.manyViews();
-    try checks.parallelViews();
-    try checks.resizing();
-    try checks.reloadWhileStreaming();
-    try checks.shaderReload();
-    try checks.streaming();
-    try checks.compaction();
-    try checks.sceneApi();
-    try checks.outOfMemory(40);
-    try checks.outOfGpuMemory(45);
+    inline for (.{ "picking", "staleHandles", "staleDrawResources", "moves", "structure", "threads", "failedPass", "plainViewPasses", "scenePassReads", "placedLightsAndDecals", "lifecycle", "switchedOffMemory", "switchedOffCosts", "mirrored", "manyViews", "parallelViews", "resizing", "reloadWhileStreaming", "shaderReload", "streaming", "compaction", "sceneApi" }) |name| {
+        if (wanted(only.items, name)) try @field(Checks, name)(&checks);
+    }
+    if (wanted(only.items, "outOfMemory")) try checks.outOfMemory(40);
+    if (wanted(only.items, "outOfGpuMemory")) try checks.outOfGpuMemory(45);
     try renderer.device.waitIdle();
     if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
-    try withoutFeatures(init.gpa, init.io);
-    try lostDevice(init.gpa, init.io);
-    try pulledDraws(init.gpa, init.io);
-    try withoutBlockFormats(init.gpa, init.io);
+    if (wanted(only.items, "withoutFeatures")) try withoutFeatures(init.gpa, init.io);
+    if (wanted(only.items, "lostDevice")) try lostDevice(init.gpa, init.io);
+    if (wanted(only.items, "pulledDraws")) try pulledDraws(init.gpa, init.io);
+    if (wanted(only.items, "withoutBlockFormats")) try withoutBlockFormats(init.gpa, init.io);
 }
 
 /// A second renderer with ray tracing, mesh shaders and shading variants
@@ -1227,4 +1224,15 @@ fn withoutBlockFormats(gpa: std.mem.Allocator, io: std.Io) !void {
         return error.TranscodedTexturesDiffer;
     }
     std.log.info("without block formats: Basis textures as plain texels, {d} pixels apart from BC7", .{apart});
+}
+
+/// Whether check `name` runs: every check does unless names are given on the
+/// command line (`zig build checks -- threads parallelViews`). `--no-ray-tracing`
+/// leaves hardware ray tracing off, for software drivers.
+fn wanted(only: []const []const u8, name: []const u8) bool {
+    if (only.len == 0) return true;
+    for (only) |given| {
+        if (std.mem.eql(u8, given, name)) return true;
+    }
+    return false;
 }

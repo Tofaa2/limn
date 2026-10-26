@@ -37,6 +37,10 @@ pub const CommandEncoder = struct {
     /// texture states are kept here instead of on the device, whose states
     /// stay as they were until `Device.joinParallel`.
     local: ?*LocalStates = null,
+    /// Which of the frame's `split_commands` `awaitAsync` goes on in, and the
+    /// ended command buffer it left behind.
+    split_slot: u8 = device_module.max_parallel,
+    before: vk.CommandBuffer = .null_handle,
 
     const max_owed = 64;
 
@@ -266,7 +270,7 @@ pub const CommandEncoder = struct {
                 .resolve_mode = .{},
                 .resolve_image_layout = .undefined,
                 .load_op = loadOp(attachment.load),
-                .store_op = .store,
+                .store_op = if (attachment.store) .store else .dont_care,
                 .clear_value = if (resource.info.format == .r32_uint or resource.info.format == .r8_uint)
                     .{ .color = .{ .uint_32 = attachment.clear_uint } }
                 else
@@ -284,7 +288,7 @@ pub const CommandEncoder = struct {
                 .resolve_mode = .{},
                 .resolve_image_layout = .undefined,
                 .load_op = loadOp(attachment.load),
-                .store_op = if (attachment.store) .store else .dont_care,
+                .store_op = if (attachment.read_only) .none else if (attachment.store) .store else .dont_care,
                 .clear_value = .{ .depth_stencil = .{ .depth = attachment.clear, .stencil = 0 } },
             };
         }
@@ -768,6 +772,41 @@ pub const CommandEncoder = struct {
 
     fn frameData(self: *CommandEncoder) ?*FrameData {
         return self.frame;
+    }
+
+    /// Marks where the frame starts to need this frame's async compute: what
+    /// is recorded from here on waits for it. Only the first call of an
+    /// encoder counts, and only in a frame that planned async work; the
+    /// earliest mark in submission order is where the wait goes.
+    pub fn awaitAsync(self: *CommandEncoder) !void {
+        const frame = self.frame orelse return;
+        const bit = @as(u16, 1) << @intCast(self.split_slot);
+        if (!frame.async_planned or self.before != .null_handle) return;
+        if (@atomicRmw(u16, &frame.split_taken, .Or, bit, .monotonic) & bit != 0) return;
+        std.debug.assert(!self.rendering);
+        const device = self.device;
+        const slot = &frame.split_commands[self.split_slot];
+        if (slot.* == .null_handle) {
+            const pool = if (self.split_slot < device_module.max_parallel) frame.worker_pools[self.split_slot] else frame.pool;
+            try device.vkd.allocateCommandBuffers(&.{ .command_pool = pool, .level = .primary, .command_buffer_count = 1 }, @ptrCast(slot));
+        }
+        try device.vkd.endCommandBuffer(self.command);
+        self.before = self.command;
+        try device.vkd.beginCommandBuffer(slot.*, &.{ .flags = .{ .one_time_submit_bit = true } });
+        self.command = slot.*;
+        self.bindGlobals();
+    }
+
+    /// Adds the encoder's ended command buffers to what its frame submits.
+    pub fn submitInto(self: *CommandEncoder, frame: *FrameData) void {
+        if (self.before != .null_handle) {
+            frame.submits[frame.submit_count] = self.before;
+            frame.submit_count += 1;
+            frame.wait_from = @min(frame.wait_from, frame.submit_count);
+            self.before = .null_handle;
+        }
+        frame.submits[frame.submit_count] = self.command;
+        frame.submit_count += 1;
     }
 };
 

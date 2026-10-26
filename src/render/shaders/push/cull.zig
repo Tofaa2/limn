@@ -16,12 +16,11 @@ pub const MeshletPush = extern struct {
     skin_bounds: u64,
     seen: u64,
     mark_seen: u32 = 0,
-    entity_refs: u32 = 0,
+    masked_capacity: u32 = 0,
     candidates: u64 = 0,
     dispatch: u64 = 0,
+    /// Per instance record, whether its instance was visible last frame.
     instance_visibility: u64 = 0,
-    entity_instances: u32 = 0,
-    masked_capacity: u32 = 0,
     seen_total: u32 = 0,
     mesh_lists: u32 = 0,
     mesh_draws: u64 = 0,
@@ -41,14 +40,17 @@ pub const InstancePush = extern struct {
     instance_count: u32,
     phase: u32,
     hiz_texture: u32,
-    entity_refs: u32,
+    /// Entity slots, culled before the `instance_count` instance groups'
+    /// instances; `visibility` and the dispatch cover both.
+    entity_count: u32,
     hiz_size: [2]f32,
     impostors: u64 = 0,
     impostor_list: u64 = 0,
     impostor_draw: u64 = 0,
+    entity_cull: u64 = 0,
     /// Nonzero for the camera's view, where small copies become impostors.
     impostor_view: u32 = 0,
     push_pad: u32 = 0,
 
-    pub const references = .{ .frame = "FrameConstants", .view = "CullView", .instances = "StaticCull*", .candidates = "uint*", .dispatch = "CullDispatch", .visibility = "uint*", .impostors = "Impostor*", .impostor_list = "uint*", .impostor_draw = "ImpostorDraw*" };
+    pub const references = .{ .frame = "FrameConstants", .view = "CullView", .instances = "StaticCull*", .candidates = "uint*", .dispatch = "CullDispatch", .visibility = "uint*", .impostors = "Impostor*", .impostor_list = "uint*", .impostor_draw = "ImpostorDraw*", .entity_cull = "uint2*" };
 };

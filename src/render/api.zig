@@ -75,7 +75,6 @@ pub const ShaderAssignment = descs.ShaderAssignment;
 pub const MaterialShader = descs.MaterialShader;
 pub const PickResult = descs.PickResult;
 pub const DecalDesc = descs.DecalDesc;
-pub const max_decals = descs.max_decals;
 pub const SkyDesc = descs.SkyDesc;
 pub const sky_sun_strength = descs.sky_sun_strength;
 pub const skySun = descs.skySun;

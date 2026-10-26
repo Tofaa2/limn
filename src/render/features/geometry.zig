@@ -98,7 +98,7 @@ fn deform(ctx: *ViewContext) !void {
 
 fn buildRayScene(ctx: *ViewContext) !void {
     const p = ctx.scene.?;
-    ray_scene.build(p.cmd, p.scene, p.scene_frame);
+    ray_scene.build(p.cmd, p.scene, p.scene_frame, p.builds_ray_scene);
 }
 
 fn cullPass(ctx: *ViewContext) !void {
@@ -227,10 +227,10 @@ pub fn fitCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total: 
         own.visibility_capacity = scene.refs_capacity;
         visibility_reset = true;
     }
-    if (scene.static_count > own.instance_visibility_capacity) {
+    if (instance_total > own.instance_visibility_capacity) {
         if (own.instance_visibility) |buffer| device.destroyBuffer(buffer);
         own.instance_visibility = null;
-        const capacity = scene.static_count + @min(scene.static_count / 2, cull_headroom);
+        const capacity = instance_total + @min(instance_total / 2, cull_headroom);
         own.instance_visibility = try device.createBuffer(.{
             .name = "instance visibility",
             .size = @as(u64, capacity) * @sizeOf(u32),
@@ -269,11 +269,10 @@ pub fn fitCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total: 
         renderer.internal.cull_views = views;
     }
 
-    const static_refs = scene.ref_count - scene.entity_ref_capacity;
-    if (static_refs > scene.candidate_capacity or views_wanted > scene.candidate_views) {
+    if (scene.ref_count > scene.candidate_capacity or views_wanted > scene.candidate_views) {
         if (scene.candidates) |buffer| device.destroyBuffer(buffer);
         scene.candidates = null;
-        const capacity = static_refs + @min(static_refs / 2, cull_headroom);
+        const capacity = scene.ref_count + @min(scene.ref_count / 2, cull_headroom);
         const views = @max(scene.candidate_views, views_wanted);
         scene.candidates = try device.createBuffer(.{
             .name = "cull candidates",
@@ -298,7 +297,7 @@ pub fn resetCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total
     cmd.dependency(.{ .compute_read = true, .compute_write = true, .graphics_read = true, .indirect = true, .transfer_read = true }, .{ .transfer_write = true });
     cmd.fillBuffer(renderer.internal.cull_counts, 0, view_count * 2 * @sizeOf(u32), 0);
     const dispatches = try p.arena.alloc(device, gpu.CullDispatch, view_count);
-    @memset(dispatches.items, .{ .x = (scene.entity_ref_count + 63) / 64 });
+    @memset(dispatches.items, .{ .x = 0 });
     cmd.copyBuffer(dispatches.buffer, renderer.internal.cull_dispatch, dispatches.offset, 0, view_count * @sizeOf(gpu.CullDispatch));
     if (scene.impostor_count != 0) {
         const draw = try p.arena.alloc(device, gpu.DrawIndirect, 1);
@@ -567,10 +566,8 @@ pub fn cullScene(renderer: *Renderer, p: *const ScenePass, sun: *const SunShadow
         .hiz_size = .{ @floatFromInt(own.hiz_width), @floatFromInt(own.hiz_height) },
         .skin_bounds = device.bufferAddress(scene.skin_bounds orelse renderer.internal.cull_counts),
         .seen = device.bufferAddress(scene.seen orelse renderer.internal.cull_counts),
-        .entity_refs = scene.entity_ref_count,
         .seen_total = scene.entity_capacity + scene.static_count,
         .instance_visibility = device.bufferAddress(own.instance_visibility orelse renderer.internal.cull_counts),
-        .entity_instances = scene.entity_capacity,
     };
     var culled: [view_count]bool = @splat(false);
     for (0..view_count) |index| {
@@ -595,31 +592,37 @@ pub fn cullViews(renderer: *Renderer, p: *const ScenePass, push: *CullPush, view
     const scene = p.scene;
     const candidates = if (scene.candidates) |buffer| device.bufferAddress(buffer) else 0;
     const dispatches = device.bufferAddress(renderer.internal.cull_dispatch);
-    if (scene.static_count != 0) if (scene.static_cull) |bounds| {
-        cmd.bindPipeline(try renderer.internal.pipelines.of(cullInstancesPipeline));
-        for (views, 0..) |wanted, index| {
-            if (!wanted) continue;
-            cmd.pushConstants(InstanceCullPush{
-                .frame = push.frame,
-                .view = views_address + index * @sizeOf(gpu.CullView),
-                .instances = device.bufferAddress(bounds),
-                .candidates = candidates + @as(u64, index) * scene.candidate_capacity * @sizeOf(u32),
-                .dispatch = dispatches + index * @sizeOf(gpu.CullDispatch),
-                .visibility = push.instance_visibility,
-                .instance_count = scene.static_count,
-                .phase = phases[index],
-                .hiz_texture = push.hiz_texture,
-                .entity_refs = scene.entity_ref_count,
-                .hiz_size = push.hiz_size,
-                .impostors = if (scene.impostor_table) |table| device.bufferAddress(table) else 0,
-                .impostor_list = if (scene.impostor_list) |list| device.bufferAddress(list) else 0,
-                .impostor_draw = device.bufferAddress(renderer.internal.impostor_draw),
-                .impostor_view = @intFromBool(scene.impostor_count != 0 and scene.impostor_list != null and (index == 0 or index == main_late_view)),
-            });
-            cmd.dispatch((scene.static_count + 63) / 64, 1, 1);
+    const statics = scene.static_count != 0 and scene.static_cull != null;
+    const entities = scene.entity_capacity != 0 and scene.entity_cull != null;
+    if (statics or entities) {
+        inline for (.{ .{ statics, cullInstancesPipeline, scene.static_count }, .{ entities, cullEntitiesPipeline, scene.entity_capacity } }) |pass| {
+            const wanted_pass, const pipeline, const slots = pass;
+            if (wanted_pass) cmd.bindPipeline(try renderer.internal.pipelines.of(pipeline));
+            for (views, 0..) |wanted, index| {
+                if (!wanted or !wanted_pass) continue;
+                cmd.pushConstants(InstanceCullPush{
+                    .frame = push.frame,
+                    .view = views_address + index * @sizeOf(gpu.CullView),
+                    .instances = if (scene.static_cull) |bounds| device.bufferAddress(bounds) else 0,
+                    .candidates = candidates + @as(u64, index) * scene.candidate_capacity * @sizeOf(u32),
+                    .dispatch = dispatches + index * @sizeOf(gpu.CullDispatch),
+                    .visibility = push.instance_visibility,
+                    .instance_count = scene.static_count,
+                    .phase = phases[index],
+                    .hiz_texture = push.hiz_texture,
+                    .entity_count = scene.entity_capacity,
+                    .entity_cull = if (scene.entity_cull) |buffer| device.bufferAddress(buffer) else 0,
+                    .hiz_size = push.hiz_size,
+                    .impostors = if (scene.impostor_table) |table| device.bufferAddress(table) else 0,
+                    .impostor_list = if (scene.impostor_list) |list| device.bufferAddress(list) else 0,
+                    .impostor_draw = device.bufferAddress(renderer.internal.impostor_draw),
+                    .impostor_view = @intFromBool(scene.impostor_count != 0 and scene.impostor_list != null and (index == 0 or index == main_late_view)),
+                });
+                cmd.dispatch((slots + 63) / 64, 1, 1);
+            }
         }
         cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true, .indirect = true });
-    };
+    }
     cmd.bindPipeline(try renderer.internal.pipelines.of(cullPipeline));
     for (views, 0..) |wanted, index| {
         if (!wanted) continue;
@@ -795,6 +798,10 @@ fn cullPipeline(_: *rhi.Device) pipelines_module.Desc {
 
 fn cullInstancesPipeline(_: *rhi.Device) pipelines_module.Desc {
     return .{ .compute = .{ .name = "cull instances", .shader = pipelines_module.shaderCode("cull_instances.comp.spv") } };
+}
+
+fn cullEntitiesPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "cull entities", .shader = pipelines_module.shaderCode("cull_entities.comp.spv") } };
 }
 
 fn hizPipeline(_: *rhi.Device) pipelines_module.Desc {

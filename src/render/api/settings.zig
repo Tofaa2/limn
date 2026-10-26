@@ -41,9 +41,11 @@ pub const Quality = enum {
     /// Everything on at full resolution: the `Settings` defaults.
     ultra,
 
-    /// A guess from the adapter's kind, ray tracing support and memory.
+    /// A guess from the adapter's kind, ray tracing support and memory. Phone
+    /// GPUs, which are tile-based, get `.low`; Apple's get `.medium`.
     pub fn recommended(adapter: rhi.AdapterInfo) Quality {
         const ultra_memory_bytes = 10 << 30;
+        if (adapter.tiled) return if (adapter.vendor_id == 0x106b) .medium else .low;
         return switch (adapter.kind) {
             .integrated, .software, .other => .low,
             .discrete, .virtual => if (!adapter.ray_tracing)
@@ -222,6 +224,7 @@ test "a quality level is recommended by the kind of GPU" {
     try std.testing.expectEqual(Quality.medium, Quality.recommended(.{ .kind = .discrete, .vendor_id = 0x1002, .memory_bytes = 8 * gibibyte, .ray_tracing = false }));
     try std.testing.expectEqual(Quality.high, Quality.recommended(.{ .kind = .discrete, .vendor_id = 0x10de, .memory_bytes = 8 * gibibyte, .ray_tracing = true }));
     try std.testing.expectEqual(Quality.ultra, Quality.recommended(.{ .kind = .discrete, .vendor_id = 0x10de, .memory_bytes = 16 * gibibyte, .ray_tracing = true }));
+    try std.testing.expectEqual(Quality.low, Quality.recommended(.{ .kind = .integrated, .vendor_id = 0x5143, .memory_bytes = 8 * gibibyte, .ray_tracing = true, .tiled = true }));
 }
 
 test "the ultra preset is the default settings" {

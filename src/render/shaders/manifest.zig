@@ -23,6 +23,7 @@ pub const renderer: []const Shader = &.{
     .{ .src = dir ++ "/instance_update.slang", .name = "instance_rewrites.comp.spv", .defines = &.{"REWRITE"}, .entry = "computeMain", .stage = "compute" },
     .{ .src = dir ++ "/cull.slang", .name = "cull.comp.spv", .entry = "meshletMain", .stage = "compute" },
     .{ .src = dir ++ "/cull.slang", .name = "cull_instances.comp.spv", .entry = "instanceMain", .stage = "compute" },
+    .{ .src = dir ++ "/cull.slang", .name = "cull_entities.comp.spv", .entry = "entityMain", .stage = "compute" },
     .{ .src = dir ++ "/visibility.slang", .name = "visibility.task.spv", .entry = "geometryTaskMain", .stage = "amplification" },
     .{ .src = dir ++ "/visibility.slang", .name = "visibility.mesh.spv", .entry = "geometryMeshMain", .stage = "mesh" },
     .{ .src = dir ++ "/hiz.slang", .name = "hiz.comp.spv", .defines = &.{"STORAGE_IMAGES"}, .entry = "computeMain", .stage = "compute" },

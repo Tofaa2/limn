@@ -77,13 +77,13 @@ float largestScale(float3x4 transform) {
 [numthreads(64, 1, 1)]
 void meshletMain(uint3 id : SV_DispatchThreadID) {
     uint listed = id.x;
-    if (listed >= meshlet_push.entity_refs + meshlet_push.dispatch.count) return;
-    uint ref_index = listed;
-    if (listed >= meshlet_push.entity_refs) ref_index = meshlet_push.candidates[listed - meshlet_push.entity_refs];
+    if (listed >= meshlet_push.dispatch.count) return;
+    uint ref_index = meshlet_push.candidates[listed];
     FrameConstants frame = meshlet_push.frame;
     MeshletRef ref = frame.meshlet_refs.data[ref_index];
     if (ref.instance == INVALID_ID) return;
     Instance instance = frame.instances.data[ref.instance];
+    if (instance.mesh == INVALID_ID) return;
     Mesh mesh = loadAligned<16>(frame.meshes.data + instance.mesh);
     Meshlet meshlet = loadAligned<16>(frame.meshlets.data + ref.meshlet);
     Material material = loadAligned<16>(frame.materials.data + instance.material);
@@ -122,8 +122,8 @@ void meshletMain(uint3 id : SV_DispatchThreadID) {
         if (skipped) return;
     }
     bool was_visible = meshlet_push.phase != PHASE_SINGLE && meshlet_push.visibility[ref_index] != 0u;
-    if (was_visible && meshlet_push.phase == PHASE_LATE && ref.instance >= meshlet_push.entity_instances)
-        was_visible = (meshlet_push.instance_visibility[ref.instance - meshlet_push.entity_instances] & 2u) != 0u;
+    if (was_visible && meshlet_push.phase == PHASE_LATE)
+        was_visible = (meshlet_push.instance_visibility[ref.instance] & 2u) != 0u;
     if (meshlet_push.phase == PHASE_EARLY && !was_visible) return;
 
     float3 center;
@@ -174,7 +174,10 @@ void meshletMain(uint3 id : SV_DispatchThreadID) {
     uint bucket = fading || mirrored || (material.flags & (MATERIAL_ALPHA_TEST | MATERIAL_DOUBLE_SIDED | MATERIAL_BLEND)) != 0u ? 1u : 0u;
     uint slot;
     InterlockedAdd(meshlet_push.counts[bucket], 1u, slot);
-    if (slot >= (bucket == 0u ? meshlet_push.bucket_capacity : meshlet_push.masked_capacity)) return;
+    if (slot >= (bucket == 0u ? meshlet_push.bucket_capacity : meshlet_push.masked_capacity)) {
+        InterlockedAdd(meshlet_push.counts[bucket], 0xffffffffu);
+        return;
+    }
     if (meshlet_push.mesh_lists == 2u) {
         uint at = (bucket * meshlet_push.bucket_capacity + slot) * 4u;
         meshlet_push.lists[at] = meshlet.index_count;
@@ -213,14 +216,12 @@ Occlusion instanceOcclusion() {
     return occlusion;
 }
 
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void instanceMain(uint3 id : SV_DispatchThreadID) {
-    uint index = id.x;
-    if (index >= instance_push.instance_count) return;
-    StaticCull instance = loadAligned<16>(instance_push.instances + index);
-    bool was_visible = instance_push.phase != PHASE_SINGLE && (instance_push.visibility[index] & 1u) != 0u;
-    if (instance_push.phase == PHASE_EARLY && !was_visible) return;
+/// Culls one instance by its bounding sphere in this view, `slot` being its
+/// instance record, and returns the meshlet references to list for it:
+/// first and count, none when culled or drawn as an impostor.
+uint2 cullInstance(uint slot, StaticCull instance) {
+    bool was_visible = instance_push.phase != PHASE_SINGLE && (instance_push.visibility[slot] & 1u) != 0u;
+    if (instance_push.phase == PHASE_EARLY && !was_visible) return uint2(0u, 0u);
 
     float3 center = instance.sphere.xyz;
     float radius = instance.sphere.w;
@@ -228,7 +229,7 @@ void instanceMain(uint3 id : SV_DispatchThreadID) {
     if (instance_push.impostor_view != 0u && instance.impostor != 0u) {
         float across = radius * abs(instance_push.view.p11) * instance_push.frame.resolution.y / (instance_push.view.far > 0.0 ? 1.0 : max(distance(instance_push.view.camera_position, center), instance_push.view.near));
         as_impostor = across < instance_push.impostors[instance.impostor - 1u].pixels;
-        if (as_impostor && instance_push.phase == PHASE_EARLY) return;
+        if (as_impostor && instance_push.phase == PHASE_EARLY) return uint2(0u, 0u);
     }
     bool visible = radius >= instance_push.view.min_radius;
     for (uint i = 0u; i < instance_push.view.plane_count; i++) {
@@ -237,18 +238,76 @@ void instanceMain(uint3 id : SV_DispatchThreadID) {
     }
     if (instance_push.phase == PHASE_LATE) {
         if (visible && occluded(instanceOcclusion(), center, radius)) visible = false;
-        instance_push.visibility[index] = (was_visible ? 2u : 0u) | (visible ? 1u : 0u);
+        instance_push.visibility[slot] = (was_visible ? 2u : 0u) | (visible ? 1u : 0u);
     }
-    if (!visible || instance.ref_count == 0u) return;
+    if (!visible || instance.ref_count == 0u) return uint2(0u, 0u);
     if (as_impostor) {
         uint listed;
         InterlockedAdd(instance_push.impostor_draw.instance_count, 1u, listed);
-        instance_push.impostor_list[listed] = index;
-        return;
+        instance_push.impostor_list[listed] = slot - instance_push.entity_count;
+        return uint2(0u, 0u);
     }
+    return uint2(instance.first_ref, instance.ref_count);
+}
 
-    uint first;
-    InterlockedAdd(instance_push.dispatch.count, instance.ref_count, first);
-    for (uint i = 0u; i < instance.ref_count; i++) instance_push.candidates[first + i] = instance.first_ref + i;
-    InterlockedMax(instance_push.dispatch.x, (instance_push.entity_refs + first + instance.ref_count + 63u) / 64u);
+/// Spans up to this long are listed by their own lane; longer ones by the
+/// whole wave, one span at a time.
+static const uint lane_span = 8u;
+
+/// Appends each lane's span of meshlet references to this view's
+/// candidates, with one atomic for the wave.
+void listRefs(uint2 refs) {
+    uint offset = WavePrefixSum(refs.y);
+    uint total = WaveActiveSum(refs.y);
+    if (total == 0u) return;
+    uint base = 0u;
+    if (WaveIsFirstLane()) InterlockedAdd(instance_push.dispatch.count, total, base);
+    base = WaveReadLaneFirst(base);
+    uint first = base + offset;
+    bool long_span = refs.y > lane_span;
+    if (!long_span) for (uint i = 0u; i < refs.y; i++) instance_push.candidates[first + i] = refs.x + i;
+    uint lane = WaveGetLaneIndex();
+    while (WaveActiveAnyTrue(long_span)) {
+        uint leader = WaveActiveMin(long_span ? lane : 0xffffffffu);
+        uint span_ref = WaveReadLaneAt(refs.x, leader);
+        uint span_at = WaveReadLaneAt(first, leader);
+        uint span_count = WaveReadLaneAt(refs.y, leader);
+        for (uint i = lane; i < span_count; i += WaveGetLaneCount()) instance_push.candidates[span_at + i] = span_ref + i;
+        if (lane == leader) long_span = false;
+    }
+    if (WaveIsFirstLane()) InterlockedMax(instance_push.dispatch.x, (base + total + 63u) / 64u);
+}
+
+/// Instance groups' instances, which come with their bounds.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void instanceMain(uint3 id : SV_DispatchThreadID) {
+    uint index = id.x;
+    uint2 refs = uint2(0u, 0u);
+    if (index < instance_push.instance_count) refs = cullInstance(instance_push.entity_count + index, loadAligned<16>(instance_push.instances + index));
+    listRefs(refs);
+}
+
+/// Entities' instances, bounded by their mesh and record as they are now.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void entityMain(uint3 id : SV_DispatchThreadID) {
+    uint index = id.x;
+    uint2 refs = uint2(0u, 0u);
+    if (index < instance_push.entity_count) {
+        uint2 span = instance_push.entity_cull[index];
+        Instance record = instance_push.frame.instances.data[index];
+        if (span.y != 0u && record.mesh != INVALID_ID) {
+            Mesh mesh = loadAligned<16>(instance_push.frame.meshes.data + record.mesh);
+            StaticCull instance;
+            bool skinned = (record.flags & INSTANCE_SKINNED) != 0u;
+            instance.sphere = skinned ? record.bounding_sphere : float4(mul(record.transform, float4(mesh.center, 1.0)), mesh.radius * largestScale(record.transform));
+            instance.first_ref = span.x;
+            instance.ref_count = span.y;
+            instance.impostor = 0u;
+            instance.pad = 0u;
+            refs = cullInstance(index, instance);
+        }
+    }
+    listRefs(refs);
 }

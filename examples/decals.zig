@@ -5,7 +5,8 @@
 //!
 //!   A/D      orbit the camera, Space pauses the moving mark
 //!
-//! `--frames N`, `--screenshot file.png`.
+//! `--frames N`, `--screenshot file.png`; `--scatter N` adds N small marks
+//! across the floor.
 const std = @import("std");
 const gfx = @import("limn");
 const math = gfx.math;
@@ -52,6 +53,16 @@ fn project(position: math.Vec3, turn_y: f32, tilt_x: f32, extent: [2]f32, depth:
 }
 
 pub fn main(init: std.process.Init) !void {
+    var scatter: usize = 0;
+    {
+        var arguments = try init.minimal.args.iterateAllocator(init.gpa);
+        defer arguments.deinit();
+        while (arguments.next()) |argument| {
+            if (std.mem.eql(u8, argument, "--scatter")) scatter = try std.fmt.parseInt(usize, arguments.next() orelse return error.MissingArgument, 10);
+        }
+    }
+    const decals = try init.gpa.alloc(gfx.DecalDesc, 16 + scatter);
+    defer init.gpa.free(decals);
     var stage = try Stage.create(init, "Limn decals", .{});
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
@@ -95,7 +106,6 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE)) moving = !moving;
         if (moving) clock += tick.dt;
 
-        var decals: [16]gfx.DecalDesc = undefined;
         var count: usize = 0;
         for (0..5) |index| {
             decals[count] = .{ .transform = project(.{ (@as(f32, @floatFromInt(index)) - 2) * 3.2, 0, 3.2 }, std.math.pi * 0.5, down, .{ 1.0, 1.6 }, 0.5), .image = arrow_image, .color = .{ 0.95, 0.9, 0.75, 0.95 } };
@@ -110,6 +120,16 @@ pub fn main(init: std.process.Init) !void {
         const mark = math.Vec3{ @sin(clock * 0.6) * 6, 0, @cos(clock * 0.6) * 3.5 - 0.5 };
         decals[count] = .{ .transform = project(mark, clock, down, .{ 1.8, 1.8 }, 3.0), .image = ring_image, .color = .{ 1.0, 0.75, 0.1, 1 }, .emissive = 2 };
         count += 1;
+        const side = @max(std.math.sqrt(scatter), 1);
+        for (0..scatter) |index| {
+            const across: f32 = @floatFromInt(index % side);
+            const along: f32 = @floatFromInt(index / side);
+            const spacing = 16.0 / @as(f32, @floatFromInt(side));
+            const at = math.Vec3{ -8 + (across + 0.5) * spacing, 0, -6 + (along + 0.5) * spacing };
+            const hue: f32 = @floatFromInt(index % 7);
+            decals[count] = .{ .transform = project(at, hue, down, .{ spacing * 0.7, spacing * 0.7 }, 0.3), .image = ring_image, .color = .{ 0.3 + hue * 0.1, 0.9 - hue * 0.1, 0.5, 0.9 } };
+            count += 1;
+        }
         try renderer.scenes.setDecals(scene, decals[0..count]);
 
         list.clear();

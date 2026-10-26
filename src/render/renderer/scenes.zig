@@ -35,7 +35,6 @@ const LightDesc = api.LightDesc;
 const EntityDesc = api.EntityDesc;
 const EntityInfo = api.EntityInfo;
 const DecalDesc = api.DecalDesc;
-const max_decals = api.max_decals;
 const hdr_format = renderer_state.hdr_format;
 const ModelEntry = renderer_state.ModelEntry;
 const SceneData = renderer_state.SceneData;
@@ -100,7 +99,6 @@ pub const Scenes = struct {
         self.lock();
         defer self.unlock();
         const data = self.scenes.internal.table.get(scene) orelse return;
-        if (decals.len > max_decals) return error.TooManyDecals;
         self.decals.internal.forget(data);
         data.decals.clearRetainingCapacity();
         try data.decals.appendSlice(self.internal.gpa, decals);
@@ -161,8 +159,7 @@ pub const Scenes = struct {
     }
 
     /// Replaces the scene's lights. Handles from `Renderer.lights` for this
-    /// scene stop resolving. Each cell of the view's light grid holds at most
-    /// 127; where more reach one cell, the rest do not light it.
+    /// scene stop resolving.
     pub fn setLights(scenes: *Scenes, scene: Scene, lights: []const LightDesc) !void {
         const self = scenes.renderer();
         self.lock();
@@ -327,6 +324,14 @@ pub fn freeScene(self: *Renderer, scene: *SceneData) void {
     scene.bounds_jobs.deinit(self.internal.gpa);
     scene.blas_jobs.deinit(self.internal.gpa);
     if (scene.static_cull) |buffer| self.device.destroyBuffer(buffer);
+    if (scene.entity_cull) |buffer| self.device.destroyBuffer(buffer);
+    if (scene.light_buffer) |buffer| self.device.destroyBuffer(buffer);
+    scene.light_uploaded.deinit(self.internal.gpa);
+    scene.light_next.deinit(self.internal.gpa);
+    if (scene.decal_buffer) |buffer| self.device.destroyBuffer(buffer);
+    scene.decal_uploaded.deinit(self.internal.gpa);
+    scene.decal_next.deinit(self.internal.gpa);
+    scene.entity_cull_items.deinit(self.internal.gpa);
     if (scene.impostor_table) |buffer| self.device.destroyBuffer(buffer);
     if (scene.impostor_list) |buffer| self.device.destroyBuffer(buffer);
     if (scene.candidates) |buffer| self.device.destroyBuffer(buffer);

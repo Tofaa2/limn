@@ -10,6 +10,135 @@ const slang_arguments = [_][]const u8{ "-profile", "spirv_1_5", "-target", "spir
 
 const shader_dir = "src/render/shaders";
 
+/// What `zig build cross` builds for; Android gets APKs.
+const cross_targets = [_][]const u8{ "x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-windows-gnu", "x86_64-macos", "aarch64-macos", "aarch64-linux-android" };
+
+/// A program the build runs on the machine doing the build: one the package
+/// manager fetched or built, or one found on PATH.
+const Tool = union(enum) {
+    path: std.Build.LazyPath,
+    system: []const u8,
+
+    /// A run step that starts the tool, named for the work it does.
+    fn command(self: Tool, b: *std.Build, label: []const u8) *std.Build.Step.Run {
+        return switch (self) {
+            .path => |path| run: {
+                const run = std.Build.Step.Run.create(b, b.fmt("compile {s}", .{label}));
+                run.addFileArg(path);
+                break :run run;
+            },
+            .system => |name| b.addSystemCommand(&.{name}),
+        };
+    }
+};
+
+/// The prebuilt Slang compiler for the build machine, or null while it is
+/// being fetched. Hosts Slang ships no build for use `slangc` on PATH.
+fn slangCompiler(b: *std.Build) ?Tool {
+    const host = b.graph.host.result;
+    const package: []const u8 = switch (host.os.tag) {
+        .linux => switch (host.cpu.arch) {
+            .x86_64 => "slang_linux_x86_64",
+            .aarch64 => "slang_linux_aarch64",
+            else => return .{ .system = "slangc" },
+        },
+        .macos => switch (host.cpu.arch) {
+            .x86_64 => "slang_macos_x86_64",
+            .aarch64 => "slang_macos_aarch64",
+            else => return .{ .system = "slangc" },
+        },
+        .windows => switch (host.cpu.arch) {
+            .x86_64 => "slang_windows_x86_64",
+            .aarch64 => "slang_windows_aarch64",
+            else => return .{ .system = "slangc" },
+        },
+        else => return .{ .system = "slangc" },
+    };
+    const slang = b.lazyDependency(package, .{}) orelse return null;
+    return .{ .path = slang.path(if (host.os.tag == .windows) "bin/slangc.exe" else "bin/slangc") };
+}
+
+/// glslang's command-line compiler built from source for the build machine,
+/// without the HLSL front end or SPIR-V optimizer; null while it is being
+/// fetched.
+fn glslangCompiler(b: *std.Build) ?Tool {
+    const source = b.lazyDependency("glslang", .{}) orelse return null;
+    const module = b.createModule(.{ .target = b.graph.host, .optimize = .ReleaseFast, .link_libcpp = true });
+    const generated = b.addWriteFiles();
+    _ = generated.add("glslang/build_info.h",
+        \\#pragma once
+        \\#define GLSLANG_VERSION_MAJOR 16
+        \\#define GLSLANG_VERSION_MINOR 4
+        \\#define GLSLANG_VERSION_PATCH 0
+        \\#define GLSLANG_VERSION_FLAVOR ""
+        \\#define GLSLANG_VERSION_GREATER_THAN(major, minor, patch) ((GLSLANG_VERSION_MAJOR) > (major) || ((major) == GLSLANG_VERSION_MAJOR && ((GLSLANG_VERSION_MINOR) > (minor) || ((minor) == GLSLANG_VERSION_MINOR && (GLSLANG_VERSION_PATCH) > (patch)))))
+        \\#define GLSLANG_VERSION_GREATER_OR_EQUAL_TO(major, minor, patch) ((GLSLANG_VERSION_MAJOR) > (major) || ((major) == GLSLANG_VERSION_MAJOR && ((GLSLANG_VERSION_MINOR) > (minor) || ((minor) == GLSLANG_VERSION_MINOR && (GLSLANG_VERSION_PATCH >= (patch))))))
+        \\#define GLSLANG_VERSION_LESS_THAN(major, minor, patch) ((GLSLANG_VERSION_MAJOR) < (major) || ((major) == GLSLANG_VERSION_MAJOR && ((GLSLANG_VERSION_MINOR) < (minor) || ((minor) == GLSLANG_VERSION_MINOR && (GLSLANG_VERSION_PATCH) < (patch)))))
+        \\#define GLSLANG_VERSION_LESS_OR_EQUAL_TO(major, minor, patch) ((GLSLANG_VERSION_MAJOR) < (major) || ((major) == GLSLANG_VERSION_MAJOR && ((GLSLANG_VERSION_MINOR) < (minor) || ((minor) == GLSLANG_VERSION_MINOR && (GLSLANG_VERSION_PATCH <= (patch))))))
+        \\
+    );
+    _ = generated.add("glslang/glsl_intrinsic_header.h",
+        \\#pragma once
+        \\#include <string>
+        \\std::string getIntrinsic(const char* const*, int) { return ""; }
+        \\
+    );
+    module.addIncludePath(generated.getDirectory());
+    module.addIncludePath(source.path(""));
+    module.addIncludePath(source.path("External"));
+    const windows = b.graph.host.result.os.tag == .windows;
+    module.addCSourceFiles(.{
+        .root = source.path(""),
+        .files = &(glslang_sources ++ [_][]const u8{if (windows) "glslang/OSDependent/Windows/ossource.cpp" else "glslang/OSDependent/Unix/ossource.cpp"}),
+        .flags = &.{ "-std=c++17", "-w", "-DENABLE_SPIRV", "-DENABLE_OPT=0", "-fno-exceptions", "-fno-rtti" },
+    });
+    const exe = b.addExecutable(.{ .name = "glslang", .root_module = module });
+    return .{ .path = exe.getEmittedBin() };
+}
+
+const glslang_sources = [_][]const u8{
+    "glslang/GenericCodeGen/CodeGen.cpp",
+    "glslang/GenericCodeGen/Link.cpp",
+    "glslang/MachineIndependent/glslang_tab.cpp",
+    "glslang/MachineIndependent/attribute.cpp",
+    "glslang/MachineIndependent/Constant.cpp",
+    "glslang/MachineIndependent/iomapper.cpp",
+    "glslang/MachineIndependent/InfoSink.cpp",
+    "glslang/MachineIndependent/Initialize.cpp",
+    "glslang/MachineIndependent/IntermTraverse.cpp",
+    "glslang/MachineIndependent/Intermediate.cpp",
+    "glslang/MachineIndependent/ParseContextBase.cpp",
+    "glslang/MachineIndependent/ParseHelper.cpp",
+    "glslang/MachineIndependent/PoolAlloc.cpp",
+    "glslang/MachineIndependent/RemoveTree.cpp",
+    "glslang/MachineIndependent/Scan.cpp",
+    "glslang/MachineIndependent/ShaderLang.cpp",
+    "glslang/MachineIndependent/SpirvIntrinsics.cpp",
+    "glslang/MachineIndependent/SymbolTable.cpp",
+    "glslang/MachineIndependent/Versions.cpp",
+    "glslang/MachineIndependent/intermOut.cpp",
+    "glslang/MachineIndependent/limits.cpp",
+    "glslang/MachineIndependent/linkValidate.cpp",
+    "glslang/MachineIndependent/parseConst.cpp",
+    "glslang/MachineIndependent/reflection.cpp",
+    "glslang/MachineIndependent/preprocessor/Pp.cpp",
+    "glslang/MachineIndependent/preprocessor/PpAtom.cpp",
+    "glslang/MachineIndependent/preprocessor/PpContext.cpp",
+    "glslang/MachineIndependent/preprocessor/PpScanner.cpp",
+    "glslang/MachineIndependent/preprocessor/PpTokens.cpp",
+    "glslang/MachineIndependent/propagateNoContraction.cpp",
+    "glslang/ResourceLimits/ResourceLimits.cpp",
+    "SPIRV/GlslangToSpv.cpp",
+    "SPIRV/InReadableOrder.cpp",
+    "SPIRV/Logger.cpp",
+    "SPIRV/SpvBuilder.cpp",
+    "SPIRV/SpvPostProcess.cpp",
+    "SPIRV/doc.cpp",
+    "SPIRV/SpvTools.cpp",
+    "SPIRV/disassemble.cpp",
+    "StandAlone/StandAlone.cpp",
+};
+
 const Example = struct {
     name: []const u8,
     root: []const u8,
@@ -237,22 +366,27 @@ const examples: []const Example = &.{
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const thread_sanitizer = b.option(bool, "tsan", "Build with the thread sanitizer (for the threaded stress test)") orelse false;
+    const thread_sanitizer = b.option(bool, "tsan", "Build with the thread sanitizer, with -Dtarget=x86_64-linux-gnu; NVIDIA drivers make threads it cannot see, so run `checks` on Mesa (VK_DRIVER_FILES=.../lvp_icd.x86_64.json)") orelse false;
+    const android = target.result.abi.isAndroid();
+    if (android and !useAndroidNdk(b, target)) return;
     const vulkan_headers = b.dependency("vulkan_headers", .{});
     const vulkan_include = vulkan_headers.path("include");
     const vulkan = b.lazyDependency("vulkan", .{
         .registry = vulkan_headers.path("registry/vk.xml"),
     }) orelse return;
 
+    const system_tools = b.option(bool, "system_tools", "Run slangc and glslangValidator from PATH instead of fetched builds (default: false)") orelse false;
+    const slangc: Tool = if (system_tools) .{ .system = "slangc" } else slangCompiler(b) orelse return;
+    const native_target = target.result.os.tag == b.graph.host.result.os.tag and target.result.cpu.arch == b.graph.host.result.cpu.arch and target.result.abi == b.graph.host.result.abi;
     const asset_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseFast else optimize;
     const validate_input = b.option(bool, "validate_input", "Check asset files before trusting them, and in Debug keep safety checks in the texture and font parsers (default: true)") orelse true;
     const parser_optimize: std.builtin.OptimizeMode = if (optimize == .Debug and validate_input) .ReleaseSafe else asset_optimize;
-    const fidelityfx = b.option(bool, "fidelityfx", "Build AMD's FidelityFX SDK in, for FSR 2 and FSR 3 upscaling (default: true)") orelse true;
+    const fidelityfx = b.option(bool, "fidelityfx", "Build AMD's FidelityFX SDK in, for FSR 2 and FSR 3 upscaling (default: true, false with -Dtsan)") orelse !thread_sanitizer;
     const features = b.addOptions();
     features.addOption(bool, "fidelityfx", fidelityfx);
     const dlss_sdk = b.option([]const u8, "dlss_sdk", "Where NVIDIA's DLSS SDK is (default: dlss_sdk, which `zig build dlss-sdk` fetches)") orelse b.pathFromRoot(dlss_sdk_default);
     const dlss_found = if (b.build_root.handle.access(b.graph.io, b.pathResolve(&.{ dlss_sdk, "include", "nvsdk_ngx.h" }), .{})) |_| true else |_| false;
-    const dlss = b.option(bool, "dlss", "Build NVIDIA DLSS upscaling and ray reconstruction in (default: true where the SDK is found)") orelse dlss_found;
+    const dlss = b.option(bool, "dlss", "Build NVIDIA DLSS upscaling and ray reconstruction in (default: true where the SDK is found)") orelse (dlss_found and native_target and dlssSupported(target) and !thread_sanitizer);
     const nixos = if (b.build_root.handle.access(b.graph.io, nixos_drivers, .{})) |_| true else |_| false;
     if (dlss and !dlss_found) std.debug.panic("no DLSS SDK at {s}; run `zig build dlss-sdk` or pass -Ddlss_sdk", .{dlss_sdk});
     features.addOption(bool, "dlss", dlss);
@@ -264,7 +398,7 @@ pub fn build(b: *std.Build) void {
     features.addOption(bool, "dlss_logging", b.option(bool, "dlss_logging", "Let DLSS write its log (default: false)") orelse false);
     const nrd_sdk = b.option([]const u8, "nrd_sdk", "Where NVIDIA's NRD SDK is, built (default: nrd_sdk, which `zig build nrd-sdk` fetches and builds)") orelse b.pathFromRoot(nrd_sdk_default);
     const nrd_found = if (b.build_root.handle.access(b.graph.io, b.pathResolve(&.{ nrd_sdk, "_Bin", "libNRD.a" }), .{})) |_| true else |_| false;
-    const nrd = b.option(bool, "nrd", "Build NVIDIA's NRD denoiser in, for path tracing (default: true where the SDK is found)") orelse nrd_found;
+    const nrd = b.option(bool, "nrd", "Build NVIDIA's NRD denoiser in, for path tracing (default: true where the SDK is found)") orelse (nrd_found and native_target and !thread_sanitizer);
     if (nrd and !nrd_found) std.debug.panic("no built NRD SDK at {s}; run `zig build nrd-sdk` or pass -Dnrd_sdk", .{nrd_sdk});
     features.addOption(bool, "nrd", nrd);
     const fetch_nrd = b.addSystemCommand(&.{ "git", "clone", "--depth", "1", "--branch", nrd_sdk_version, "--recurse-submodules", "--shallow-submodules", "https://github.com/NVIDIA-RTX/NRD", b.pathFromRoot(nrd_sdk_default) });
@@ -357,7 +491,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    addShaders(b, renderer, manifest.renderer, shaders_step, generated_dir, spirv_readonly);
+    addShaders(b, renderer, manifest.renderer, shaders_step, generated_dir, spirv_readonly, slangc);
     const shader_reload = b.option(bool, "shader_reload", "Keep the shader source paths in the library for `shaders.reload` (default: Debug only)") orelse (optimize == .Debug);
     const shader_options = b.addOptions();
     var shader_names: [manifest.renderer.len][]const u8 = undefined;
@@ -385,9 +519,13 @@ pub fn build(b: *std.Build) void {
     shader_options.addOption([]const u8, "include_dir", if (shader_reload) b.pathFromRoot(shader_dir) else "");
     if (shader_reload) shader_options.addOptionPath("generated_dir", generated_dir) else shader_options.addOption([]const u8, "generated_dir", "");
     shader_options.addOption(bool, "reload", shader_reload);
+    switch (slangc) {
+        .path => |path| shader_options.addOptionPath("slangc", path),
+        .system => |name| shader_options.addOption([]const u8, "slangc", name),
+    }
     renderer.addOptions("shader_sources", shader_options);
     renderer.addImport("build_features", features_module);
-    if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk);
+    if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk, if (system_tools) .{ .system = "glslangValidator" } else glslangCompiler(b) orelse return);
     if (dlss) addDlss(b, renderer, target, asset_optimize, vulkan_include, dlss_sdk);
     if (nrd) addNrd(b, renderer, target, asset_optimize, vulkan_include, nrd_sdk);
 
@@ -421,29 +559,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = texture_codec })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = font_baker })).step);
 
-    const glfw = b.addTranslateC(.{
-        .root_source_file = b.path("examples/glfw_native.h"),
-        .target = target,
-        .optimize = optimize,
+    const glfw_module = if (android) b.createModule(.{ .root_source_file = b.path("examples/android/glfw.zig"), .target = target, .optimize = optimize }) else glfw: {
+        const glfw_source = b.lazyDependency("glfw", .{}) orelse return;
+        const glfw = b.addTranslateC(.{
+            .root_source_file = b.path("examples/glfw_native.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        glfw.addSystemIncludePath(glfw_source.path("include"));
+        const module = glfw.createModule();
+        if (!addGlfw(b, module, target, glfw_source)) return;
+        break :glfw module;
+    };
+    const apk_packer = b.addExecutable(.{
+        .name = "apk",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/apk.zig"), .target = b.graph.host, .optimize = .ReleaseSafe }),
     });
-    glfw.addSystemIncludePath(vulkan_include);
-    glfw.addSystemIncludePath(volk.path(""));
-    const glfw_source = if (target.result.os.tag == .windows) (b.lazyDependency("glfw", .{}) orelse return) else null;
-    if (glfw_source) |source| {
-        glfw.addSystemIncludePath(source.path("include"));
-    } else glfw.linkSystemLibrary("glfw", .{});
-    const glfw_module = glfw.createModule();
-    if (glfw_source) |source| {
-        const files = [_][]const u8{ "context.c", "init.c", "input.c", "monitor.c", "platform.c", "vulkan.c", "window.c", "egl_context.c", "osmesa_context.c", "null_init.c", "null_monitor.c", "null_window.c", "null_joystick.c", "win32_init.c", "win32_joystick.c", "win32_module.c", "win32_monitor.c", "win32_thread.c", "win32_time.c", "win32_window.c", "wgl_context.c" };
-        glfw_module.addIncludePath(source.path("include"));
-        glfw_module.link_libc = true;
-        glfw_module.addCSourceFiles(.{ .root = source.path("src"), .files = &files, .flags = &.{"-D_GLFW_WIN32"} });
-        for ([_][]const u8{ "gdi32", "user32", "shell32" }) |system| glfw_module.linkSystemLibrary(system, .{});
-    }
-    if (target.result.os.tag == .macos) {
-        glfw_module.linkFramework("QuartzCore", .{});
-        glfw_module.linkSystemLibrary("objc", .{});
-    }
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = apk_packer.root_module })).step);
     const window_module = b.createModule(.{
         .root_source_file = b.path("examples/window.zig"),
         .target = target,
@@ -451,6 +583,13 @@ pub fn build(b: *std.Build) void {
     });
     window_module.addImport("limn", renderer);
     window_module.addImport("glfw", glfw_module);
+    var moltenvk_dir: ?[]const u8 = null;
+    if (target.result.os.tag == .macos) {
+        const moltenvk = b.lazyDependency("moltenvk", .{}) orelse return;
+        const dylib = moltenvk.path("MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib");
+        b.getInstallStep().dependOn(&b.addInstallBinFile(dylib, "libMoltenVK.dylib").step);
+        moltenvk_dir = moltenvk.path("MoltenVK/dynamic/dylib/macOS").getPath(b);
+    }
 
     var example_exes: std.StringHashMapUnmanaged(*std.Build.Step.Compile) = .empty;
     var particles_example: ?*std.Build.Step.Compile = null;
@@ -477,13 +616,18 @@ pub fn build(b: *std.Build) void {
             module.addImport("glfw", glfw_module);
             module.addImport("window", window_module);
         }
-        addShaders(b, module, example.shaders, shaders_step, generated_dir, spirv_readonly);
+        addShaders(b, module, example.shaders, shaders_step, generated_dir, spirv_readonly, slangc);
+        if (android) {
+            if (example.windowed) if (addAndroidExample(b, example, module, glfw_module, target, optimize, apk_packer)) |packed_apk| b.getInstallStep().dependOn(packed_apk);
+            continue;
+        }
         const exe = b.addExecutable(.{ .name = example.name, .root_module = module, .use_llvm = true });
         example_exes.put(b.allocator, example.name, exe) catch @panic("OOM");
         b.installArtifact(exe);
         check_step.dependOn(&exe.step);
         const run = b.addRunArtifact(exe);
         if (dlss and nixos) run.setEnvironmentVariable("LD_LIBRARY_PATH", b.fmt("{s}:{s}", .{ b.graph.environ_map.get("LD_LIBRARY_PATH") orelse "", nixos_drivers }));
+        if (moltenvk_dir) |dir| run.setEnvironmentVariable("DYLD_LIBRARY_PATH", dir);
         if (b.args) |args| run.addArgs(args);
         b.step(example.name, example.description).dependOn(&run.step);
         if (std.mem.eql(u8, example.name, "meadow")) b.step("run", example.description).dependOn(&run.step);
@@ -503,11 +647,20 @@ pub fn build(b: *std.Build) void {
     }
 
     const format_check = b.addSystemCommand(&.{
-        "zig", "fmt", "--check", "build.zig", "src", "examples",
+        b.graph.zig_exe, "fmt", "--check", "build.zig", "src", "examples",
     });
     const verify_step = b.step("verify", "Check formatting, run tests and render the examples with validation enabled");
     verify_step.dependOn(&format_check.step);
     verify_step.dependOn(test_step);
+    const cross_step = b.step("cross", "Build the library and examples for every target, into zig-out/cross/<target>, without running them");
+    var previous_cross: ?*std.Build.Step = null;
+    for (cross_targets) |cross_target| {
+        const cross = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "install", b.fmt("-Dtarget={s}", .{cross_target}), "--prefix", b.pathFromRoot(b.fmt("zig-out/cross/{s}", .{cross_target})) });
+        cross.has_side_effects = true;
+        if (previous_cross) |previous| cross.step.dependOn(previous);
+        previous_cross = &cross.step;
+        cross_step.dependOn(&cross.step);
+    }
     const checks_module = b.createModule(.{
         .root_source_file = b.path("src/checks.zig"),
         .target = target,
@@ -516,23 +669,30 @@ pub fn build(b: *std.Build) void {
     });
     checks_module.addImport("limn", renderer);
     const checks = b.addExecutable(.{ .name = "checks", .root_module = checks_module, .use_llvm = true });
+    checks.rdynamic = thread_sanitizer;
     check_step.dependOn(&checks.step);
     const run_checks = b.addRunArtifact(checks);
     run_checks.has_side_effects = true;
+    if (b.args) |args| run_checks.addArgs(args);
+    if (thread_sanitizer) run_checks.setEnvironmentVariable("TSAN_OPTIONS", b.fmt("suppressions={s}", .{b.pathFromRoot("src/tsan.supp")}));
     b.step("checks", "Check picking, shader reloading, streaming and running out of memory, without a window").dependOn(&run_checks.step);
     verify_step.dependOn(&run_checks.step);
     const costs_module = b.createModule(.{
         .root_source_file = b.path("src/costs.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = thread_sanitizer,
     });
     costs_module.addImport("limn", renderer);
     const costs = b.addExecutable(.{ .name = "costs", .root_module = costs_module, .use_llvm = true });
+    costs.rdynamic = thread_sanitizer;
     check_step.dependOn(&costs.step);
     const run_costs = b.addRunArtifact(costs);
     run_costs.has_side_effects = true;
+    if (thread_sanitizer) run_costs.setEnvironmentVariable("TSAN_OPTIONS", b.fmt("suppressions={s}", .{b.pathFromRoot("src/tsan.supp")}));
     if (b.args) |args| run_costs.addArgs(args);
     b.step("costs", "Print what frames record as 2D and 3D scenes grow, without a window").dependOn(&run_costs.step);
+    if (android) return applyAndroidLibc(b);
     const verify_particles = b.addRunArtifact(particles_example.?);
     verify_particles.has_side_effects = true;
     verify_particles.addArgs(&.{ "--frames", "90", "--screenshot" });
@@ -703,7 +863,7 @@ const ffx_effects = [_]FfxEffect{
 
 /// Builds the FidelityFX SDK and the renderer's wrapper round it, and links
 /// `renderer` with them. The shader permutations that are asked for are
-/// compiled with glslc and packed into the SDK's headers by
+/// compiled with glslang and packed into the SDK's headers by
 /// src/ffx_permutations.zig.
 fn addFidelityFx(
     b: *std.Build,
@@ -712,6 +872,7 @@ fn addFidelityFx(
     optimize: std.builtin.OptimizeMode,
     vulkan_include: std.Build.LazyPath,
     volk: *std.Build.Dependency,
+    glslang: Tool,
 ) void {
     const library = b.addLibrary(.{
         .name = "renderer_fidelityfx",
@@ -742,13 +903,13 @@ fn addFidelityFx(
                     generate.addArg("-");
                     continue;
                 }
-                const compile = b.addSystemCommand(&.{ "glslc", "-fshader-stage=compute", "--target-env=vulkan1.2", "-Os", "-g", "-DFFX_GLSL=1", "-DFFX_GPU=1", "-DFFX_HALF=0" });
+                const compile = glslang.command(b, b.fmt("{s}_{d}", .{ pass, combination }));
+                compile.addArgs(&.{ "-V", "-S", "comp", "--target-env", "vulkan1.2", "-g", "-DFFX_GLSL=1", "-DFFX_GPU=1", "-DFFX_HALF=0" });
                 for (effect.fixed) |fixed| compile.addArg(b.fmt("-D{s}_{s}", .{ effect.prefix, fixed }));
                 for (option_names, 0..) |name, bit| compile.addArg(b.fmt("-D{s}={d}", .{ name, (combination >> @intCast(bit)) & 1 }));
                 compile.addPrefixedDirectoryArg("-I", gpu);
                 compile.addPrefixedDirectoryArg("-I", gpu.path(b, effect.name));
-                compile.addArg("-MD");
-                compile.addArg("-MF");
+                compile.addArg("--depfile");
                 _ = compile.addDepFileOutputArg(b.fmt("{s}_{d}.d", .{ pass, combination }));
                 compile.addFileArg(b.path(b.fmt("{s}/src/backends/vk/shaders/{s}/{s}.glsl", .{ ffx_root, effect.name, pass })));
                 compile.addArg("-o");
@@ -800,6 +961,193 @@ const nrd_sdk_version = "v4.9.4";
 /// DLSS needs them on the library path of what it runs in.
 const nixos_drivers = "/run/opengl-driver/lib";
 const dlss_sdk_version = "v310.9.1";
+
+/// Builds GLFW from source into `module` for `target`, with the platform
+/// headers and macOS frameworks fetched rather than taken from the system.
+/// On Linux it has both X11 and Wayland, and loads their libraries at run
+/// time. Returns false while a dependency is being fetched.
+fn addGlfw(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, source: *std.Build.Dependency) bool {
+    module.link_libc = true;
+    module.addIncludePath(source.path("include"));
+    const common = [_][]const u8{ "context.c", "init.c", "input.c", "monitor.c", "platform.c", "vulkan.c", "window.c", "egl_context.c", "osmesa_context.c", "null_init.c", "null_monitor.c", "null_window.c", "null_joystick.c" };
+    module.addCSourceFiles(.{ .root = source.path("src"), .files = &common, .flags = &.{"-w"} });
+    switch (target.result.os.tag) {
+        .windows => {
+            const files = [_][]const u8{ "win32_init.c", "win32_joystick.c", "win32_module.c", "win32_monitor.c", "win32_thread.c", "win32_time.c", "win32_window.c", "wgl_context.c" };
+            module.addCSourceFiles(.{ .root = source.path("src"), .files = &files, .flags = &.{"-w"} });
+            module.addCMacro("_GLFW_WIN32", "1");
+            for ([_][]const u8{ "gdi32", "user32", "shell32" }) |system| module.linkSystemLibrary(system, .{});
+        },
+        .macos => {
+            const sdk = b.lazyDependency("xcode_frameworks", .{}) orelse return false;
+            module.addSystemFrameworkPath(sdk.path("Frameworks"));
+            module.addSystemIncludePath(sdk.path("include"));
+            module.addLibraryPath(sdk.path("lib"));
+            module.addCMacro("_GLFW_COCOA", "1");
+            module.addCMacro("__kernel_ptr_semantics", "");
+            const files = [_][]const u8{ "cocoa_time.c", "posix_module.c", "posix_thread.c", "cocoa_init.m", "cocoa_joystick.m", "cocoa_monitor.m", "cocoa_window.m", "nsgl_context.m" };
+            module.addCSourceFiles(.{ .root = source.path("src"), .files = &files, .flags = &.{"-w"} });
+            module.linkSystemLibrary("objc", .{});
+            for ([_][]const u8{ "Cocoa", "IOKit", "CoreFoundation", "QuartzCore", "AppKit", "CoreGraphics", "CoreServices", "Foundation", "ApplicationServices", "CFNetwork", "ColorSync", "CoreText", "ImageIO" }) |framework| module.linkFramework(framework, .{});
+        },
+        else => {
+            const x11 = b.lazyDependency("x11_headers", .{}) orelse return false;
+            const wayland = b.lazyDependency("wayland_headers", .{}) orelse return false;
+            module.addSystemIncludePath(x11.path(""));
+            module.addSystemIncludePath(wayland.path("wayland"));
+            module.addSystemIncludePath(wayland.path("wayland-protocols"));
+            module.addCMacro("_GLFW_X11", "1");
+            module.addCMacro("_GLFW_WAYLAND", "1");
+            module.addCMacro("HAVE_MEMFD_CREATE", "1");
+            const files = [_][]const u8{ "linux_joystick.c", "posix_module.c", "posix_poll.c", "posix_thread.c", "posix_time.c", "xkb_unicode.c", "glx_context.c", "x11_init.c", "x11_monitor.c", "x11_window.c", "wl_init.c", "wl_monitor.c", "wl_window.c" };
+            module.addCSourceFiles(.{ .root = source.path("src"), .files = &files, .flags = &.{ "-w", "-Wno-implicit-function-declaration" } });
+        },
+    }
+    return true;
+}
+
+/// The Android API level builds target: Android 10.
+const android_api = 29;
+/// The most asset bytes an APK is packed with; the Bistro scene is left out.
+const android_asset_limit = 1 << 30;
+
+/// Writes a libc file for the fetched NDK's Bionic sysroot for `target`,
+/// which `applyAndroidLibc` hands to the Android compilations. Returns
+/// false while the NDK is being fetched.
+fn useAndroidNdk(b: *std.Build, target: std.Build.ResolvedTarget) bool {
+    const ndk = b.lazyDependency("android_ndk", .{}) orelse return false;
+    const sysroot = ndk.path("toolchains/llvm/prebuilt/linux-x86_64/sysroot").getPath(b);
+    const triple = switch (target.result.cpu.arch) {
+        .x86_64 => "x86_64-linux-android",
+        else => "aarch64-linux-android",
+    };
+    const text = b.fmt("include_dir={s}/usr/include\nsys_include_dir={s}/usr/include/{s}\ncrt_dir={s}/usr/lib/{s}/{d}\nmsvc_lib_dir=\nkernel32_lib_dir=\ngcc_dir=\n", .{ sysroot, sysroot, triple, sysroot, triple, android_api });
+    const path = b.cache_root.join(b.allocator, &.{ "android", b.fmt("{s}.libc", .{triple}) }) catch @panic("OOM");
+    b.cache_root.handle.createDirPath(b.graph.io, "android") catch |err| std.debug.panic("cannot write the Android libc file: {t}", .{err});
+    b.cache_root.handle.writeFile(b.graph.io, .{ .sub_path = b.fmt("android/{s}.libc", .{triple}), .data = text }) catch |err| std.debug.panic("cannot write the Android libc file: {t}", .{err});
+    android_libc = path;
+    android_libraries = b.fmt("{s}/usr/lib/{s}/{d}", .{ sysroot, triple, android_api });
+    return true;
+}
+
+/// The libc file `useAndroidNdk` wrote, and where the NDK keeps the system
+/// libraries, for `applyAndroidLibc`.
+var android_libc: []const u8 = "";
+var android_libraries: []const u8 = "";
+
+/// Gives every Android compilation the build can reach, its packages'
+/// included, the NDK's libc; tools built for the build machine keep its own.
+fn applyAndroidLibc(b: *std.Build) void {
+    var seen: std.AutoHashMapUnmanaged(*std.Build.Step, void) = .empty;
+    for (b.top_level_steps.values()) |top| visitAndroidLibc(b, &top.step, &seen);
+}
+
+fn visitAndroidLibc(b: *std.Build, step: *std.Build.Step, seen: *std.AutoHashMapUnmanaged(*std.Build.Step, void)) void {
+    if ((seen.getOrPut(b.allocator, step) catch @panic("OOM")).found_existing) return;
+    if (step.cast(std.Build.Step.Compile)) |compile| {
+        if (compile.rootModuleTarget().abi.isAndroid()) {
+            compile.setLibCFile(.{ .cwd_relative = android_libc });
+            compile.root_module.addLibraryPath(.{ .cwd_relative = android_libraries });
+        }
+        var modules: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+        visitModule(b, compile.root_module, &modules, seen);
+    }
+    for (step.dependencies.items) |dependency| visitAndroidLibc(b, dependency, seen);
+}
+
+fn visitModule(b: *std.Build, module: *std.Build.Module, modules: *std.AutoHashMapUnmanaged(*std.Build.Module, void), seen: *std.AutoHashMapUnmanaged(*std.Build.Step, void)) void {
+    if ((modules.getOrPut(b.allocator, module) catch @panic("OOM")).found_existing) return;
+    if (module.resolved_target) |resolved| if (resolved.result.abi.isAndroid()) {
+        module.pic = true;
+    };
+    for (module.link_objects.items) |object| switch (object) {
+        .other_step => |other| visitAndroidLibc(b, &other.step, seen),
+        else => {},
+    };
+    for (module.import_table.values()) |imported| visitModule(b, imported, modules, seen);
+}
+
+/// Wraps a windowed example as an Android `NativeActivity` and packs it,
+/// with the assets its source names, into zig-out/apk/<name>.apk. Null for
+/// an example whose assets would make the package over `android_asset_limit`.
+fn addAndroidExample(b: *std.Build, example: Example, module: *std.Build.Module, glfw_module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, packer: *std.Build.Step.Compile) ?*std.Build.Step {
+    const assets = exampleAssets(b, example);
+    var bytes: u64 = 0;
+    for (assets) |asset| bytes += if (b.build_root.handle.statFile(b.graph.io, asset, .{})) |stat| stat.size else |_| 0;
+    if (bytes > android_asset_limit) return null;
+    const host = b.createModule(.{ .root_source_file = b.path("examples/android/host.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    host.addImport("example", module);
+    host.addImport("glfw", glfw_module);
+    for ([_][]const u8{ "android", "log", "dl" }) |system| host.linkSystemLibrary(system, .{});
+    const library = b.addLibrary(.{ .name = "main", .linkage = .dynamic, .root_module = host, .use_llvm = true });
+    const pack = b.addRunArtifact(packer);
+    const apk = pack.addOutputFileArg(b.fmt("{s}.apk", .{example.name}));
+    pack.addArgs(&.{ b.fmt("org.limn.{s}", .{example.name}), b.fmt("limn {s}", .{example.name}) });
+    if (target.result.cpu.arch == .x86_64) pack.addPrefixedFileArg("x86_64:", library.getEmittedBin()) else pack.addFileArg(library.getEmittedBin());
+    for (assets) |asset| {
+        pack.addArg(b.fmt("assets/{s}", .{asset}));
+        pack.addFileArg(b.path(asset));
+    }
+    const install = b.addInstallFile(apk, b.fmt("apk/{s}.apk", .{example.name}));
+    return &install.step;
+}
+
+/// The files under examples/assets that an example's source, or a source
+/// file next to it that it imports, names; a named directory gives all of
+/// its files, and so does the folder of a named `.gltf`, for its buffers and
+/// images.
+fn exampleAssets(b: *std.Build, example: Example) []const []const u8 {
+    const io = b.graph.io;
+    var assets: std.ArrayList([]const u8) = .empty;
+    var sources: std.ArrayList([]const u8) = .empty;
+    sources.appendSlice(b.allocator, &.{ example.root, "examples/window.zig" }) catch @panic("OOM");
+    var read: usize = 0;
+    while (read < sources.items.len) : (read += 1) {
+        const text = b.build_root.handle.readFileAlloc(io, sources.items[read], b.allocator, .unlimited) catch continue;
+        var quoted = std.mem.splitScalar(u8, text, '"');
+        var inside = false;
+        while (quoted.next()) |piece| : (inside = !inside) {
+            if (!inside) continue;
+            if (std.mem.endsWith(u8, piece, ".zig") and std.mem.indexOfScalar(u8, piece, '/') == null) {
+                const local = b.fmt("examples/{s}", .{piece});
+                for (sources.items) |known| {
+                    if (std.mem.eql(u8, known, local)) break;
+                } else sources.append(b.allocator, local) catch @panic("OOM");
+                continue;
+            }
+            if (!std.mem.startsWith(u8, piece, "examples/assets/")) continue;
+            const folder = if (std.mem.endsWith(u8, piece, ".gltf")) piece[0 .. std.mem.lastIndexOfScalar(u8, piece, '/').? + 1] else piece;
+            if (!std.mem.endsWith(u8, folder, "/")) {
+                appendNew(b, &assets, piece);
+                continue;
+            }
+            var directory = b.build_root.handle.openDir(io, folder, .{ .iterate = true }) catch continue;
+            defer directory.close(io);
+            var walker = directory.walk(b.allocator) catch @panic("OOM");
+            defer walker.deinit();
+            while (walker.next(io) catch null) |entry| {
+                if (entry.kind == .file) appendNew(b, &assets, b.fmt("{s}{s}", .{ folder, entry.path }));
+            }
+        }
+    }
+    return assets.items;
+}
+
+fn appendNew(b: *std.Build, list: *std.ArrayList([]const u8), item: []const u8) void {
+    for (list.items) |known| {
+        if (std.mem.eql(u8, known, item)) return;
+    }
+    list.append(b.allocator, item) catch @panic("OOM");
+}
+
+/// Whether the DLSS SDK has libraries for `target`.
+fn dlssSupported(target: std.Build.ResolvedTarget) bool {
+    return switch (target.result.os.tag) {
+        .windows => target.result.cpu.arch == .x86_64,
+        .linux => target.result.abi != .android and (target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .aarch64),
+        else => false,
+    };
+}
 
 /// Where the DLSS SDK keeps its libraries for `target`.
 fn dlssLibraries(target: std.Build.ResolvedTarget) []const u8 {
@@ -895,9 +1243,9 @@ fn volkModule(
 /// shader opts out, and exposes the SPIR-V to `module` as an anonymous
 /// import. Included files are tracked through a depfile, so editing a shared
 /// header rebuilds exactly the shaders that use it.
-fn addShaders(b: *std.Build, module: *std.Build.Module, shaders: []const Shader, shaders_step: *std.Build.Step, generated_dir: std.Build.LazyPath, spirv_readonly: *std.Build.Step.Compile) void {
+fn addShaders(b: *std.Build, module: *std.Build.Module, shaders: []const Shader, shaders_step: *std.Build.Step, generated_dir: std.Build.LazyPath, spirv_readonly: *std.Build.Step.Compile, slangc: Tool) void {
     for (shaders) |shader| {
-        const command = b.addSystemCommand(&.{"slangc"});
+        const command = slangc.command(b, shader.name);
         command.addFileArg(b.path(shader.src));
         command.addArgs(&slang_arguments);
         command.addArgs(&.{ "-stage", shader.stage, "-entry", shader.entry });
