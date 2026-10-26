@@ -27,20 +27,26 @@ pub fn Handle(comptime Tag: type) type {
 /// Growable table of `T` addressed by `Handle(Tag)`. Freed slots are reused
 /// with a new generation, so stale handles stop resolving; the generation is
 /// 40 bits, so a slot would need 2^40 reuses to repeat one. Up to 2^24 - 1
-/// values. Not thread safe.
+/// values. Slots live in chunks that never move, so `get` may run on any
+/// thread beside an `insert`; changes need one writer at a time.
 pub fn HandleTable(comptime T: type, comptime Tag: type) type {
     return struct {
         const Self = @This();
         pub const Id = Handle(Tag);
-        const Slot = struct {
+        pub const Slot = struct {
             generation: u40 = 1,
             next_free: u24 = none,
             value: ?T = null,
         };
         const none = std.math.maxInt(u24);
+        /// Slots in the first chunk; each next one holds twice as many.
+        const first_chunk = 64;
+        const chunk_count = 19;
 
         allocator: std.mem.Allocator,
-        slots: std.ArrayList(Slot) = .empty,
+        chunks: [chunk_count]?[*]Slot = @splat(null),
+        /// Slots in use, published after the slot is written.
+        len: std.atomic.Value(u32) = .init(0),
         free_head: u24 = none,
         /// No live value sits below this slot; where `popAny` starts.
         pop_from: u24 = 0,
@@ -52,41 +58,64 @@ pub fn HandleTable(comptime T: type, comptime Tag: type) type {
 
         /// Values still stored are dropped without cleanup.
         pub fn deinit(self: *Self) void {
-            self.slots.deinit(self.allocator);
+            for (self.chunks, 0..) |chunk, index| {
+                if (chunk) |slots| self.allocator.free(slots[0 .. @as(usize, first_chunk) << @intCast(index)]);
+            }
             self.* = undefined;
         }
 
-        /// May grow the slot array, invalidating pointers from `get`. Fails
+        fn place(index: u32) struct { chunk: usize, offset: usize } {
+            const chunk = std.math.log2_int(u32, index / first_chunk + 1);
+            return .{ .chunk = chunk, .offset = index - first_chunk * ((@as(u32, 1) << chunk) - 1) };
+        }
+
+        /// Slots so far, live or free; for walking every slot with `slotAt`.
+        pub fn slotCount(self: *const Self) usize {
+            return self.len.load(.acquire);
+        }
+
+        /// Slot `index`, below `slotCount`.
+        pub fn slotAt(self: *const Self, index: usize) *Slot {
+            const at = place(@intCast(index));
+            return &self.chunks[at.chunk].?[at.offset];
+        }
+
+        /// Pointers from `get` stay valid until the value is removed. Fails
         /// with `error.HandleTableFull` or `error.OutOfMemory`.
         pub fn insert(self: *Self, value: T) !Id {
             if (self.free_head != none) {
                 const index = self.free_head;
-                const slot = &self.slots.items[index];
+                const slot = self.slotAt(index);
                 self.free_head = slot.next_free;
                 self.pop_from = @min(self.pop_from, index);
                 slot.next_free = none;
                 slot.value = value;
                 return .{ .index = index, .generation = slot.generation };
             }
-            if (self.slots.items.len >= none) return error.HandleTableFull;
-            const index: u24 = @intCast(self.slots.items.len);
-            try self.slots.append(self.allocator, .{ .value = value });
-            return .{ .index = index, .generation = 1 };
+            const count = self.len.raw;
+            if (count >= none) return error.HandleTableFull;
+            const at = place(count);
+            if (self.chunks[at.chunk] == null) {
+                const slots = try self.allocator.alloc(Slot, @as(usize, first_chunk) << @intCast(at.chunk));
+                self.chunks[at.chunk] = slots.ptr;
+            }
+            self.chunks[at.chunk].?[at.offset] = .{ .value = value };
+            self.len.store(count + 1, .release);
+            return .{ .index = @intCast(count), .generation = 1 };
         }
 
-        /// Null if `id` is invalid, stale or out of range. The pointer is
-        /// valid until the next `insert` or the value's removal.
-        pub fn get(self: *Self, id: Id) ?*T {
-            if (id.index >= self.slots.items.len) return null;
-            const slot = &self.slots.items[id.index];
+        /// Null if `id` is invalid, stale or out of range.
+        pub fn get(self: *const Self, id: Id) ?*T {
+            if (id.index >= self.slotCount()) return null;
+            const slot = self.slotAt(id.index);
             if (slot.generation != id.generation) return null;
             return if (slot.value) |*value| value else null;
         }
 
         /// Removes and returns the value, or null if `id` does not resolve.
         pub fn remove(self: *Self, id: Id) ?T {
-            if (id.index >= self.slots.items.len) return null;
-            const slot = &self.slots.items[id.index];
+            if (id.index >= self.slotCount()) return null;
+            const slot = self.slotAt(id.index);
             if (slot.generation != id.generation) return null;
             const value = slot.value orelse return null;
             slot.value = null;
@@ -100,12 +129,14 @@ pub fn HandleTable(comptime T: type, comptime Tag: type) type {
         /// Removes and returns the live value in the lowest slot, or null
         /// when empty. Emptying a table this way visits each slot once.
         pub fn popAny(self: *Self) ?T {
-            for (self.slots.items[self.pop_from..], self.pop_from..) |slot, index| {
+            const count = self.slotCount();
+            for (self.pop_from..count) |index| {
+                const slot = self.slotAt(index);
                 if (slot.value == null) continue;
                 self.pop_from = @intCast(index);
                 return self.remove(.{ .index = @intCast(index), .generation = slot.generation });
             }
-            self.pop_from = @intCast(self.slots.items.len);
+            self.pop_from = @intCast(count);
             return null;
         }
 
@@ -113,9 +144,10 @@ pub fn HandleTable(comptime T: type, comptime Tag: type) type {
         pub fn handlesAlloc(self: *const Self, allocator: std.mem.Allocator) ![]Id {
             var result: std.ArrayList(Id) = .empty;
             errdefer result.deinit(allocator);
-            for (self.slots.items, 0..) |slot, index| if (slot.value != null) {
-                try result.append(allocator, .{ .index = @intCast(index), .generation = slot.generation });
-            };
+            for (0..self.slotCount()) |index| {
+                const slot = self.slotAt(index);
+                if (slot.value != null) try result.append(allocator, .{ .index = @intCast(index), .generation = slot.generation });
+            }
             return result.toOwnedSlice(allocator);
         }
     };
@@ -181,4 +213,16 @@ test "popAny finds values inserted below where it left off" {
     try std.testing.expectEqual(@as(?u8, 3), table.popAny());
     try std.testing.expectEqual(@as(?u8, 2), table.popAny());
     try std.testing.expectEqual(@as(?u8, null), table.popAny());
+}
+
+test "values keep their place while the table grows" {
+    const Tag = enum { texture };
+    var table = HandleTable(u32, Tag).init(std.testing.allocator);
+    defer table.deinit();
+    const first = try table.insert(7);
+    const kept = table.get(first).?;
+    for (0..5000) |value| _ = try table.insert(@intCast(value));
+    try std.testing.expectEqual(kept, table.get(first).?);
+    try std.testing.expectEqual(@as(usize, 5001), table.slotCount());
+    try std.testing.expectEqual(@as(u32, 4999), table.slotAt(5000).value.?);
 }

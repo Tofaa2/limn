@@ -254,8 +254,8 @@ pub fn forgetTarget(self: *Renderer, target: rhi.Texture) void {
 
 /// Gives materials set to `image` their own textures back.
 fn forgetMaterialImage(self: *Renderer, image: Image) void {
-    for (self.models.internal.table.slots.items) |*slot| {
-        const entry = if (slot.value) |*value| value else continue;
+    for (0..self.models.internal.table.slotCount()) |slot_index| {
+        const entry = if (self.models.internal.table.slotAt(slot_index).value) |*value| value else continue;
         for (entry.material_images, 0..) |*textures, index| {
             var used = false;
             inline for (@typeInfo(MaterialTextures).@"struct".fields) |field| {

@@ -25,6 +25,7 @@ pub fn declare(ctx: *ViewContext) !void {
 
 fn impostorPictures(ctx: *ViewContext) !void {
     const p = ctx.scene.?;
+    if (!p.fresh_scene) return;
     try bakeImpostors(ctx.renderer, p);
 }
 

@@ -31,7 +31,7 @@ pub fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
     const near_enough = if (streaming.coarse_distance > 0) @min(streaming.distance, streaming.coarse_distance * 0.9) else streaming.distance;
     const zone = Zone.start(self.options.profiler, "geometry streaming");
     defer zone.stop();
-    for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+    for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
         entry.stream_distance = std.math.inf(f32);
     };
     for (desc.views) |view_desc| {
@@ -64,7 +64,7 @@ pub fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
     var released: u32 = 0;
     var released_bytes: u64 = 0;
     var coarse_models: u32 = 0;
-    for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+    for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
         if (entry.state != .ready) continue;
         const source = &entry.source.?;
         var bytes: u64 = 0;
@@ -113,7 +113,7 @@ pub fn updateGeometryStreaming(self: *Renderer, desc: FrameDesc) !void {
     self.internal.stats.geometry_models_released = released;
     self.internal.stats.geometry_bytes_released = released_bytes;
     self.internal.stats.geometry_models_coarse = coarse_models;
-    if (changed) for (self.scenes.internal.table.slots.items) |*slot| if (slot.value) |*scene| {
+    if (changed) for (0..self.scenes.internal.table.slotCount()) |slot_index| if (self.scenes.internal.table.slotAt(slot_index).value) |*scene| {
         scene.layout_dirty = true;
     };
 }
@@ -330,7 +330,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
     const zone = Zone.start(self.options.profiler, "texture streaming");
     defer zone.stop();
     const device = self.device;
-    for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+    for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
         for (entry.streams) |*stream| stream.wanted = stream.floor;
     };
     for (desc.views) |view_desc| {
@@ -428,7 +428,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
         var wanted_bytes: u64 = 0;
         resident_bytes = 0;
         count = 0;
-        for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+        for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
             for (entry.streams) |*stream| {
                 if (stream.data.len == 0) continue;
                 wanted_bytes += stream.bytesFrom(@min(stream.wanted + extra, stream.floor));
@@ -443,7 +443,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
     var pending: u32 = 0;
     var upload_left = streaming.upload_bytes_per_frame;
     for ([_]bool{ false, true }) |loading| {
-        for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+        for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
             if (entry.state != .ready) continue;
             for (entry.streams, 0..) |*stream, index| {
                 if (stream.data.len == 0) continue;
@@ -478,7 +478,7 @@ pub fn updateTextureStreaming(self: *Renderer, frame: rhi.Frame, desc: FrameDesc
             }
         };
     }
-    for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+    for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
         if (!entry.materials_stale) continue;
         entry.materials_stale = false;
         for (entry.source.?.materials, 0..) |material, index| {

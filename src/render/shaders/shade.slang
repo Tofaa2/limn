@@ -351,7 +351,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     surface.view = view_direction;
     surface.diffuse_color = base_color.rgb * (1.0 - metallic);
     surface.f0 = lerp(dielectricF0(material), base_color.rgb, metallic);
-    if (material.iridescence.x > 0.0) surface.f0 = lerp(surface.f0, iridescentF0(dot(surface.normal, surface.view), material.iridescence.y, material.iridescence.z, surface.f0), material.iridescence.x);
+    if ((SHADE_FEATURES & FEATURE_MATERIAL_LOBES) != 0u && material.iridescence.x > 0.0) surface.f0 = lerp(surface.f0, iridescentF0(dot(surface.normal, surface.view), material.iridescence.y, material.iridescence.z, surface.f0), material.iridescence.x);
     surface.roughness = roughness;
     surface.ao = ao;
     surface.bounce = float3(0.0);
@@ -370,6 +370,11 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
         float3 along_v = cross(normal, along_u) * (tangent_object.w < 0.0 ? -1.0 : 1.0);
         surface.grain = normalize(along_u * cos(material.anisotropy_rotation) + along_v * sin(material.anisotropy_rotation));
         surface.anisotropy = material.anisotropy;
+    }
+    if ((SHADE_FEATURES & FEATURE_MATERIAL_LOBES) == 0u) {
+        surface.clearcoat = 0.0;
+        surface.sheen_color = float3(0.0);
+        surface.anisotropy = 0.0;
     }
     float noise = interleavedGradientNoise(fragment.xy, frame.frame_index);
 
@@ -432,9 +437,7 @@ ShadeOutput fragmentMain([[vk::location(0)]] float2 in_uv, float4 fragment : SV_
     if (instance.lightmap != INVALID_ID) gathered = float4(sampleTextureLod(instance.lightmap, frame.sampler_linear_clamp, raw1, 0.0).rgb, 1.0);
 #ifdef SUBSURFACE
     if (surface.subsurface <= 0.0 || (material.flags & MATERIAL_UNLIT) != 0u) discard;
-    Surface without_diffuse = surface;
-    without_diffuse.diffuse_color = float3(0.0);
-    float3 lit = shadeSurface(frame, surface, fragment.xy, noise, gathered) - shadeSurface(frame, without_diffuse, fragment.xy, noise, gathered);
+    float3 lit = shadeSurface(frame, surface, fragment.xy, noise, gathered);
 #else
     float3 lit = (material.flags & MATERIAL_UNLIT) != 0u ? emissive : emissive + shadeSurface(frame, surface, fragment.xy, noise, gathered);
 #endif

@@ -11,6 +11,7 @@ const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
 const gpu = @import("../gpu.zig");
 const std = @import("std");
+const scene_update = @import("../renderer/scene_update.zig");
 const lights_feature = @import("lights.zig");
 const global_illumination_feature = @import("global_illumination.zig");
 const api = @import("../api.zig");
@@ -146,13 +147,12 @@ pub fn reflectionProbeList(renderer: *Renderer, p: *const ScenePass) !ProbeList 
     return .{ .address = probe_list, .count = probe_count };
 }
 
-/// Uploads the scene's decals and returns the address.
+/// Writes the scene's decal records, uploading those that changed since
+/// the last frame, and returns their address.
 pub fn writeDecals(renderer: *Renderer, p: *const ScenePass) !u64 {
-    const device = renderer.device;
-    const arena = p.arena;
     const scene = p.scene;
-    const decals = try arena.alloc(device, gpu.Decal, scene.decals.items.len);
-    for (scene.decals.items, decals.items) |decal, *out| out.* = .{
+    try scene.decal_next.resize(renderer.internal.gpa, scene.decals.items.len);
+    for (scene.decals.items, scene.decal_next.items) |decal, *out| out.* = .{
         .world_to_decal = math.inverse(decal.transform),
         .color = decal.color,
         .image = renderer.images.indexOf(decal.image),
@@ -161,9 +161,15 @@ pub fn writeDecals(renderer: *Renderer, p: *const ScenePass) !u64 {
         .roughness = decal.roughness orelse -1,
         .normal_image = renderer.images.indexOf(decal.normal_image),
         .normal_strength = decal.normal_strength,
-        .bounds = .{ decal.transform[12], decal.transform[13], decal.transform[14], 0.5 * @sqrt(math.dot(decal.transform[0..3].*, decal.transform[0..3].*) + math.dot(decal.transform[4..7].*, decal.transform[4..7].*) + math.dot(decal.transform[8..11].*, decal.transform[8..11].*)) },
+        .bounds = decalBounds(decal.transform),
     };
-    return decals.address;
+    return scene_update.uploadChanged(gpu.Decal, renderer.device, "decals", &scene.decal_buffer, &scene.decal_capacity, &scene.decal_uploaded, &scene.decal_next);
+}
+
+/// The sphere a decal's box fits in: its center, and half its diagonal.
+pub fn decalBounds(transform: math.Mat4) [4]f32 {
+    const half = 0.5 * @sqrt(math.dot(transform[0..3].*, transform[0..3].*) + math.dot(transform[4..7].*, transform[4..7].*) + math.dot(transform[8..11].*, transform[8..11].*));
+    return .{ transform[12], transform[13], transform[14], half };
 }
 
 /// The shading pipeline for a view: the exact feature set if built, else a
@@ -276,15 +282,16 @@ pub fn shadeScene(renderer: *Renderer, p: *const ScenePass, lighting: *const Lig
     if (lighting.light_count != 0) {
         shade_features |= gpu.shade_features.local_lights;
         if (shadow_tlas != 0) shade_features |= gpu.shade_features.traced_light_shadows;
-        for (scene.lights.items) |light| if (light.source_radius > 0) {
-            shade_features |= gpu.shade_features.sized_lights;
-            break;
-        };
+        for (scene.lights.items) |light| {
+            if (light.source_radius > 0) shade_features |= gpu.shade_features.sized_lights;
+            if (light.kind == .rectangle) shade_features |= gpu.shade_features.rect_lights;
+        }
     }
     if (constants.fluids.shadows != 0) shade_features |= gpu.shade_features.fluid_shadows;
     if (constants.clouds.shadows != 0) shade_features |= gpu.shade_features.cloud_shadows;
     if (scene.decals.items.len != 0) shade_features |= gpu.shade_features.decals;
     if (renderer.internal.texture_transform_users != 0) shade_features |= gpu.shade_features.texture_transforms;
+    if (renderer.internal.lobe_users != 0 or custom_shaders != 0) shade_features |= gpu.shade_features.material_lobes;
     if (colored_shadows) shade_features |= gpu.shade_features.colored_shadows;
     if (global_illumination_feature.probes(settings.global_illumination).probe_relocation) shade_features |= gpu.shade_features.gi_relocation;
     if (settings.shading.aerial_perspective > 0) shade_features |= gpu.shade_features.aerial;

@@ -64,10 +64,11 @@ while (running) {
 
 ## Build
 
-Requires Zig 0.16, a Vulkan 1.3 driver and `slangc` (and `glslc` for the FidelityFX SDK). The Vulkan headers and
-loader are fetched by the build; the examples also need GLFW, which is
-fetched on Windows and linked from the system elsewhere. `flake.nix`
-provides everything. The example assets are stored with Git LFS: run
+Requires Zig 0.16 and a Vulkan 1.3 driver. Everything else is fetched by
+the build: Slang, glslang, GLFW and its platform headers, the macOS SDK
+headers, MoltenVK and the Android NDK, so `-Dtarget` cross-compiles from
+any host (`-Dsystem_tools` uses `slangc` and `glslangValidator` from PATH
+instead). The example assets are stored with Git LFS: run
 `git lfs install` before cloning, or `git lfs pull` afterwards.
 
 ```sh
@@ -77,7 +78,12 @@ zig build test       # unit tests
 zig build checks     # picking, reloading, streaming and out of memory, without a window
 zig build verify     # formatting, tests, and the examples under Vulkan validation
 zig build docs       # API reference in zig-out/docs
+zig build cross      # every desktop target and Android, into zig-out/cross
 ```
+
+For `-Dtarget=aarch64-linux-android` each example becomes an APK in
+`zig-out/apk`, signed with a fixed debug key: `adb install` it. macOS
+builds put `libMoltenVK.dylib` beside the examples.
 
 Add `-Doptimize=ReleaseFast` for full speed. Every example takes `--frames N`
 and `--screenshot file.png`, and lists its keys at the top of its source

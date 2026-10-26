@@ -46,7 +46,6 @@ bool reaches(ClusterBounds bounds, float3 center, float range) {
 static const uint group_size = 64u;
 static const uint most_waves = group_size;
 groupshared uint wave_hits[most_waves];
-groupshared uint decal_masks[CLUSTER_DECAL_WORDS];
 groupshared uint list_start;
 
 bool lightReaches(FrameConstants frame, ClusterBounds bounds, uint index) {
@@ -74,10 +73,16 @@ uint groupPrefix(bool hit, uint lane, out uint total) {
     return before + in_wave;
 }
 
-/// One group per cluster. Its lanes test 64 lights at a time: a first round
-/// counts the lights that reach the cluster, one atomic takes room for its
-/// list, and a second round writes them in light order, so that shading adds
-/// them up the same way every frame. Decals are kept as bits.
+bool decalReaches(FrameConstants frame, ClusterBounds bounds, uint index) {
+    if (index >= frame.shading.decal_count) return false;
+    float4 decal = frame.shading.decals.data[index].bounds;
+    return reaches(bounds, mul(frame.view, float4(decal.xyz, 1.0)).xyz, decal.w);
+}
+
+/// One group per cluster. Its lanes test 64 lights, then 64 decals, at a
+/// time: a first round counts those that reach the cluster, one atomic takes
+/// room for its lists, and a second round writes them in index order, so
+/// that shading adds them up the same way every frame.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void computeMain(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
@@ -87,37 +92,48 @@ void computeMain(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
     uint3 cell = uint3(index % CLUSTERS_X, (index / CLUSTERS_X) % CLUSTERS_Y, index / (CLUSTERS_X * CLUSTERS_Y));
     ClusterBounds bounds = clusterBounds(frame, cell);
     uint light_count = frame.lights.light_count;
+    uint decal_count = frame.shading.decal_count;
 
-    uint count = 0u;
+    uint lights = 0u;
     for (uint first = 0u; first < light_count; first += group_size) {
         uint batch;
         groupPrefix(lightReaches(frame, bounds, first + lane), lane, batch);
-        count += batch;
+        lights += batch;
+    }
+    uint decals = 0u;
+    for (uint first = 0u; first < decal_count; first += group_size) {
+        uint batch;
+        groupPrefix(decalReaches(frame, bounds, first + lane), lane, batch);
+        decals += batch;
     }
     if (lane == 0u) {
         uint start;
-        InterlockedAdd(push.cursors[0], count, start);
+        InterlockedAdd(push.cursors[0], lights + decals, start);
         list_start = start;
-        frame.lights.clusters.data[index].offset = min(start, push.capacity);
-        frame.lights.clusters.data[index].count = start >= push.capacity ? 0u : min(count, push.capacity - start);
+        uint room = start >= push.capacity ? 0u : push.capacity - start;
+        Cluster cluster;
+        cluster.offset = min(start, push.capacity);
+        cluster.count = min(lights, room);
+        cluster.decal_offset = cluster.offset + cluster.count;
+        cluster.decal_count = min(decals, room - cluster.count);
+        frame.lights.clusters.data[index] = cluster;
     }
-    if (lane < CLUSTER_DECAL_WORDS) decal_masks[lane] = 0u;
     GroupMemoryBarrierWithGroupSync();
     uint start = list_start;
-    uint end = min(start + count, push.capacity);
+    uint end = min(start + lights + decals, push.capacity);
     uint written = 0u;
-    for (uint first = 0u; first < light_count; first += group_size) {
+    for (uint first = 0u; first < (lights == 0u ? 0u : light_count); first += group_size) {
         bool hit = lightReaches(frame, bounds, first + lane);
         uint batch;
         uint at = start + written + groupPrefix(hit, lane, batch);
         if (hit && at < end) frame.lights.light_indices[at] = first + lane;
         written += batch;
     }
-
-    for (uint i = lane; i < min(frame.shading.decal_count, CLUSTER_DECAL_WORDS * 32u); i += group_size) {
-        float4 decal = frame.shading.decals.data[i].bounds;
-        if (reaches(bounds, mul(frame.view, float4(decal.xyz, 1.0)).xyz, decal.w)) InterlockedOr(decal_masks[i >> 5u], 1u << (i & 31u));
+    for (uint first = 0u; first < (decals == 0u ? 0u : decal_count); first += group_size) {
+        bool hit = decalReaches(frame, bounds, first + lane);
+        uint batch;
+        uint at = start + written + groupPrefix(hit, lane, batch);
+        if (hit && at < end) frame.lights.light_indices[at] = first + lane;
+        written += batch;
     }
-    GroupMemoryBarrierWithGroupSync();
-    if (lane < CLUSTER_DECAL_WORDS) frame.lights.clusters.data[index].decals[lane] = decal_masks[lane];
 }

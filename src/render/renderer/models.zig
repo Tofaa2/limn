@@ -363,6 +363,11 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
     }
 
     entry.material_base = try self.materials.internal.pool.alloc(self, @intCast(source.materials.len));
+    const lobed = for (source.materials) |material| {
+        if (material.clearcoat > 0 or material.anisotropy != 0 or material.iridescence > 0 or material.sheen_color[0] > 0 or material.sheen_color[1] > 0 or material.sheen_color[2] > 0) break true;
+    } else false;
+    if (lobed and !entry.lobed) self.internal.lobe_users += 1;
+    entry.lobed = entry.lobed or lobed;
     var transform_count: u32 = 0;
     for (source.materials) |material| {
         if (material.hasOwnTransforms()) transform_count += 1;
@@ -716,6 +721,10 @@ pub fn freeModel(self: *Renderer, entry: *ModelEntry) void {
             self.materials.internal.pool.free(self, entry.transform_base, entry.transform_count * gpu.texture_transform_slots);
             self.internal.texture_transform_users -= 1;
             entry.transform_count = 0;
+        }
+        if (entry.lobed) {
+            self.internal.lobe_users -= 1;
+            entry.lobed = false;
         }
         if (entry.meshes.len != 0) self.internal.meshes.free(self, entry.mesh_base, @intCast(source.meshes.len));
         if (entry.state == .ready) {

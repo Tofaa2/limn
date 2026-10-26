@@ -248,7 +248,7 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
         total += emitter.capacity;
     }
     cmd.endRendering();
-    renderer.internal.stats.particles = total + mesh_total;
+    @atomicStore(@TypeOf(renderer.internal.stats.particles), &renderer.internal.stats.particles, @intCast(total + mesh_total), .monotonic);
 }
 
 fn particleSimPipeline(_: *rhi.Device) pipelines_module.Desc {

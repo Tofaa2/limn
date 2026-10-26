@@ -23,6 +23,7 @@ pub fn declare(ctx: *ViewContext) !void {
 
 fn lightmaps(ctx: *ViewContext) !void {
     const p = ctx.scene.?;
+    if (!p.fresh_scene) return;
     try bakeLightmaps(ctx.renderer, p);
 }
 

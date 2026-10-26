@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const vk = @import("vulkan");
 const c = @import("volk");
 const dispatch = @import("dispatch.zig");
@@ -7,14 +8,28 @@ var references: usize = 0;
 var mutex: std.Io.Mutex = .init;
 
 /// Loads the Vulkan library through volk on first use and counts a
-/// reference; pair with `release`. Thread-safe. Fails with
-/// `error.VulkanLoaderUnavailable`.
+/// reference; pair with `release`. On macOS without a Vulkan loader it
+/// falls back to a MoltenVK shipped beside the executable. Thread-safe.
+/// Fails with `error.VulkanLoaderUnavailable`.
 pub fn acquire(io: std.Io) !void {
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
-    if (references == 0 and c.volkInitialize() != c.VK_SUCCESS)
+    if (references == 0 and c.volkInitialize() != c.VK_SUCCESS and !bundledMoltenVk())
         return error.VulkanLoaderUnavailable;
     references += 1;
+}
+
+/// Points volk at `libMoltenVK.dylib` next to the executable, or in an app
+/// bundle's Frameworks. MoltenVK is then the whole of Vulkan, without layers.
+fn bundledMoltenVk() bool {
+    if (comptime builtin.os.tag != .macos) return false;
+    for ([_][*:0]const u8{ "@executable_path/libMoltenVK.dylib", "@executable_path/../Frameworks/libMoltenVK.dylib" }) |path| {
+        const library = std.c.dlopen(path, .{ .LAZY = true }) orelse continue;
+        const entry = std.c.dlsym(library, "vkGetInstanceProcAddr") orelse continue;
+        c.volkInitializeCustom(@ptrCast(@alignCast(entry)));
+        return true;
+    }
+    return false;
 }
 
 /// Drops a reference; the last one unloads the library.

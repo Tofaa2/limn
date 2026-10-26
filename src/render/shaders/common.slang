@@ -2,7 +2,7 @@
 #define COMMON_SLANG
 
 [[vk::binding(0, 0)]] Texture2D textures_2d[];
-[[vk::binding(0, 0)]] Texture2D<uint4> textures_2d_uint[];
+[[vk::binding(0, 0)]] [[vk::image_format("unknown")]] Texture2D<uint4> textures_2d_uint[];
 [[vk::binding(0, 0)]] TextureCube textures_cube[];
 [[vk::binding(0, 0)]] Texture2DArray textures_2d_array[];
 [[vk::binding(1, 0)]] SamplerState samplers[];
@@ -420,12 +420,11 @@ struct Lights { Light* data; };
 static const uint CLUSTERS_X = 16u;
 static const uint CLUSTERS_Y = 9u;
 static const uint CLUSTERS_Z = 24u;
-static const uint CLUSTER_DECAL_WORDS = 8u;
-
 struct Cluster {
     uint offset;
     uint count;
-    uint decals[CLUSTER_DECAL_WORDS];
+    uint decal_offset;
+    uint decal_count;
 };
 struct Clusters { Cluster* data; };
 struct ShadowTile {

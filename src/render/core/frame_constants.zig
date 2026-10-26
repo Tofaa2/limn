@@ -26,6 +26,10 @@ pub const features = struct {
     pub const gi_relocation: u32 = 256;
     /// Distance haze (`FrameConstants.shading.aerial`).
     pub const aerial: u32 = 512;
+    /// Rectangle lights, by linearly transformed cosines.
+    pub const rect_lights: u32 = 1024;
+    /// Coats, sheen, grain and thin films (`Internal.lobe_users`).
+    pub const material_lobes: u32 = 2048;
 };
 
 pub const shadows = @import("../features/constants/shadows.zig");

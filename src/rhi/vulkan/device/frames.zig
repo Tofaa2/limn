@@ -73,7 +73,12 @@ pub fn startFrame(self: *Device) !Frame {
     }
     try self.vkd.resetCommandPool(frame.pool, .{});
     for (frame.worker_pools) |pool| if (pool != .null_handle) try self.vkd.resetCommandPool(pool, .{});
+    if (frame.async_pool != .null_handle) try self.vkd.resetCommandPool(frame.async_pool, .{});
     frame.submit_count = 0;
+    frame.async_planned = false;
+    frame.async_recorded = false;
+    frame.wait_from = std.math.maxInt(u32);
+    frame.split_taken = 0;
     try self.vkd.beginCommandBuffer(frame.command, &.{ .flags = .{ .one_time_submit_bit = true } });
     frame.scope_count = 0;
     self.vkd.cmdResetQueryPool(frame.command, frame.query_pool, 0, max_timing_scopes * 2);
@@ -101,8 +106,7 @@ pub fn submitFrame(self: *Device) !void {
         self.encoder.transition(self.swapchain.?.textures.items[self.swapchain.?.image_index], .present);
     }
     try self.vkd.endCommandBuffer(self.encoder.command);
-    frame.submits[frame.submit_count] = self.encoder.command;
-    frame.submit_count += 1;
+    self.encoder.submitInto(frame);
     self.in_frame = false;
 
     try self.vkd.resetFences(&.{frame.fence});
@@ -110,9 +114,9 @@ pub fn submitFrame(self: *Device) !void {
         self.vkd.destroyFence(frame.fence, null);
         frame.fence = signaled;
     } else |_| {};
-    var command_infos: [max_parallel + 2]vk.CommandBufferSubmitInfo = undefined;
+    var command_infos: [2 * max_parallel + 4]vk.CommandBufferSubmitInfo = undefined;
     for (frame.submits[0..frame.submit_count], command_infos[0..frame.submit_count]) |command, *info| info.* = .{ .command_buffer = command, .device_mask = 0 };
-    var wait_info: [2]vk.SemaphoreSubmitInfo = undefined;
+    var wait_info: [3]vk.SemaphoreSubmitInfo = undefined;
     var signal_info: [3]vk.SemaphoreSubmitInfo = undefined;
     var semaphore_count: u32 = 0;
     if (self.swapchain) |*swapchain| {
@@ -131,16 +135,38 @@ pub fn submitFrame(self: *Device) !void {
         }
     }
     signal_info[semaphore_count] = .{ .semaphore = self.frame_timeline, .value = self.frame_number + 1, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
+    var wait_count = semaphore_count;
+    var first_waiting: u32 = 0;
     self.queue_mutex.lockUncancelable(self.io);
     defer self.queue_mutex.unlock(self.io);
-    try self.vkd.queueSubmit2(self.queue, &.{.{
-        .wait_semaphore_info_count = semaphore_count,
-        .p_wait_semaphore_infos = &wait_info,
-        .command_buffer_info_count = frame.submit_count,
+    if (frame.async_recorded) {
+        try self.vkd.endCommandBuffer(frame.async_command);
+        const after_previous = vk.SemaphoreSubmitInfo{ .semaphore = self.frame_timeline, .value = self.frame_number, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
+        const done = vk.SemaphoreSubmitInfo{ .semaphore = self.async_timeline, .value = self.frame_number + 1, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
+        try self.vkd.queueSubmit2(self.async_queue.?, &.{.{
+            .wait_semaphore_info_count = 1,
+            .p_wait_semaphore_infos = @ptrCast(&after_previous),
+            .command_buffer_info_count = 1,
+            .p_command_buffer_infos = &.{.{ .command_buffer = frame.async_command, .device_mask = 0 }},
+            .signal_semaphore_info_count = 1,
+            .p_signal_semaphore_infos = @ptrCast(&done),
+        }}, .null_handle);
+        wait_info[wait_count] = .{ .semaphore = self.async_timeline, .value = self.frame_number + 1, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
+        wait_count += 1;
+        first_waiting = @min(frame.wait_from, frame.submit_count - 1);
+    }
+    const batches = [2]vk.SubmitInfo2{ .{
+        .command_buffer_info_count = first_waiting,
         .p_command_buffer_infos = &command_infos,
+    }, .{
+        .wait_semaphore_info_count = wait_count,
+        .p_wait_semaphore_infos = &wait_info,
+        .command_buffer_info_count = frame.submit_count - first_waiting,
+        .p_command_buffer_infos = command_infos[first_waiting..].ptr,
         .signal_semaphore_info_count = semaphore_count + 1,
         .p_signal_semaphore_infos = &signal_info,
-    }}, frame.fence);
+    } };
+    try self.vkd.queueSubmit2(self.queue, if (first_waiting == 0) batches[1..] else &batches, frame.fence);
     if (self.swapchain) |*swapchain| swapchain.present_pending = true;
     frame.submitted = true;
     self.frame_number += 1;
@@ -422,7 +448,7 @@ pub fn reportFault(self: *Device) void {
         var buffer_name: []const u8 = "no buffer";
         var offset: u64 = 0;
         var below: ?device_module.BufferResource = null;
-        for (self.buffers.slots.items) |slot| if (slot.value) |resource| {
+        for (0..self.buffers.slotCount()) |slot_index| if (self.buffers.slotAt(slot_index).value) |resource| {
             if (resource.address <= entry.reported_address and (below == null or resource.address > below.?.address)) below = resource;
             if (entry.reported_address < resource.address or entry.reported_address >= resource.address + resource.size) continue;
             buffer_name = std.mem.sliceTo(&resource.name, 0);
@@ -443,9 +469,6 @@ pub fn beginParallel(self: *Device, count: u32) ![]CommandEncoder {
     std.debug.assert(self.in_frame and self.parallel_count == 0 and count != 0 and count <= max_parallel);
     const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
     self.encoder.settle();
-    try self.textures.slots.ensureUnusedCapacity(self.textures.allocator, parallel_room);
-    try self.buffers.slots.ensureUnusedCapacity(self.buffers.allocator, parallel_room);
-    try self.pipelines.slots.ensureUnusedCapacity(self.pipelines.allocator, parallel_room);
     for (0..count) |index| {
         if (frame.worker_pools[index] == .null_handle) {
             const pool = try self.vkd.createCommandPool(&.{ .queue_family_index = self.queue_family }, null);
@@ -455,8 +478,7 @@ pub fn beginParallel(self: *Device, count: u32) ![]CommandEncoder {
         }
     }
     try self.vkd.endCommandBuffer(self.encoder.command);
-    frame.submits[frame.submit_count] = self.encoder.command;
-    frame.submit_count += 1;
+    self.encoder.submitInto(frame);
     for (0..count) |index| {
         try self.vkd.beginCommandBuffer(frame.worker_commands[index], &.{ .flags = .{ .one_time_submit_bit = true } });
         if (index >= self.parallel_made) {
@@ -465,16 +487,12 @@ pub fn beginParallel(self: *Device, count: u32) ![]CommandEncoder {
         }
         self.parallel_states[index].entries.clearRetainingCapacity();
         self.parallel_states[index].failed = false;
-        self.parallel[index] = .{ .device = self, .command = frame.worker_commands[index], .frame = frame, .local = &self.parallel_states[index] };
+        self.parallel[index] = .{ .device = self, .command = frame.worker_commands[index], .frame = frame, .local = &self.parallel_states[index], .split_slot = @intCast(index) };
         self.parallel[index].bindGlobals();
         self.parallel_count += 1;
     }
     return self.parallel[0..count];
 }
-
-/// Resources each kind of handle table has room for, without growing, while
-/// encoders record beside each other.
-const parallel_room = 4096;
 
 /// Ends the encoders `beginParallel` gave, in order. Before each one goes
 /// what moves the textures it used from the states the ones before left to
@@ -501,12 +519,47 @@ pub fn joinParallel(self: *Device) !void {
         };
         inline for (std.meta.fields(types.Work)) |field| @field(self.encoder.work, field.name) += @field(encoder.work, field.name);
         try self.vkd.endCommandBuffer(encoder.command);
-        frame.submits[frame.submit_count] = encoder.command;
-        frame.submit_count += 1;
+        encoder.submitInto(frame);
     }
     if (frame.tail == .null_handle) try self.vkd.allocateCommandBuffers(&.{ .command_pool = frame.pool, .level = .primary, .command_buffer_count = 1 }, @ptrCast(&frame.tail));
     try self.vkd.beginCommandBuffer(frame.tail, &.{ .flags = .{ .one_time_submit_bit = true } });
     self.encoder.command = frame.tail;
     self.encoder.bindGlobals();
     if (failed) return error.OutOfMemory;
+}
+
+/// Says, while the frame is being planned, that it will record async
+/// compute: encoders then wait for it from their first `awaitAsync`. Does
+/// nothing without an async queue.
+pub fn planAsync(self: *Device) void {
+    std.debug.assert(self.in_frame);
+    if (self.async_queue == null) return;
+    self.frames[@intCast(self.frame_number % frames_in_flight)].async_planned = true;
+}
+
+/// The frame's encoder for the async queue, held by the caller until
+/// `releaseAsync`; null when the frame planned none. Its work runs once the
+/// previous frame is done, beside this frame's work before its first
+/// `awaitAsync`. Only buffers and pipelines; no texture transitions.
+pub fn acquireAsync(self: *Device) !?*CommandEncoder {
+    const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
+    if (!frame.async_planned) return null;
+    self.async_mutex.lockUncancelable(self.io);
+    errdefer self.async_mutex.unlock(self.io);
+    if (!frame.async_recorded) {
+        if (frame.async_pool == .null_handle) {
+            frame.async_pool = try self.vkd.createCommandPool(&.{ .queue_family_index = self.queue_family }, null);
+            try self.vkd.allocateCommandBuffers(&.{ .command_pool = frame.async_pool, .level = .primary, .command_buffer_count = 1 }, @ptrCast(&frame.async_command));
+        }
+        try self.vkd.beginCommandBuffer(frame.async_command, &.{ .flags = .{ .one_time_submit_bit = true } });
+        self.async_encoder = .{ .device = self, .command = frame.async_command, .frame = null };
+        self.async_encoder.bindGlobals();
+        frame.async_recorded = true;
+    }
+    return &self.async_encoder;
+}
+
+/// Lets go of the encoder `acquireAsync` gave.
+pub fn releaseAsync(self: *Device) void {
+    self.async_mutex.unlock(self.io);
 }

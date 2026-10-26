@@ -503,6 +503,9 @@ pub const ModelEntry = struct {
     /// First material buffer slot of this model's per-texture transforms.
     transform_base: u32 = 0,
     transform_count: u32 = 0,
+    /// A material has a coat, sheen, grain or thin film, which shading then
+    /// keeps code for (`Internal.lobe_users`).
+    lobed: bool = false,
     /// Parents-before-children node order and rest-pose world matrices.
     order: []u32 = &.{},
     /// The part of `order` a posed entity needs: nodes an animation can
@@ -665,6 +668,18 @@ pub const SceneData = struct {
     static_version: u64 = 0,
     /// The last `prepareLights` result, the frame it was made in and what it was
     /// asked for; later views of the frame that ask the same share it.
+    /// The scene's light records, kept on the GPU between frames; only those
+    /// that changed since `light_uploaded` are uploaded. `light_next` is
+    /// where the frame's records are built.
+    light_buffer: ?rhi.Buffer = null,
+    light_capacity: u32 = 0,
+    light_uploaded: std.ArrayList(gpu.Light) = .empty,
+    light_next: std.ArrayList(gpu.Light) = .empty,
+    /// The scene's decal records, kept the same way as its lights'.
+    decal_buffer: ?rhi.Buffer = null,
+    decal_capacity: u32 = 0,
+    decal_uploaded: std.ArrayList(gpu.Decal) = .empty,
+    decal_next: std.ArrayList(gpu.Decal) = .empty,
     lighting: ?scene_pass.Lighting = null,
     lighting_frame: u64 = std.math.maxInt(u64),
     lighting_shadows: bool = false,
@@ -780,6 +795,13 @@ pub const SceneData = struct {
     static_ranges: std.ArrayList([2]u32) = .empty,
     static_cull: ?rhi.Buffer = null,
     static_cull_capacity: u32 = 0,
+    /// First meshlet reference and count of each entity slot, which culling
+    /// tests entity by entity before their meshlets; `entity_cull_items` is
+    /// the CPU copy and `entity_cull_dirty` the slots changed since upload.
+    entity_cull: ?rhi.Buffer = null,
+    entity_cull_capacity: u32 = 0,
+    entity_cull_items: std.ArrayList([2]u32) = .empty,
+    entity_cull_dirty: [2]u32 = .{ std.math.maxInt(u32), 0 },
     /// One `gpu.Impostor` per instance group that has one, their count, and
     /// the copies culling chose to draw as impostors in the current view.
     impostor_table: ?rhi.Buffer = null,

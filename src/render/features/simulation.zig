@@ -34,6 +34,8 @@ const ViewContext = features.ViewContext;
 pub fn declare(ctx: *ViewContext) !void {
     if (ctx.scene == null) return;
     const g = ctx.graph;
+    const p = ctx.scene.?;
+    if (ctx.renderer.options.async_compute and p.shared.fresh_scene and p.scene.liquids.items.len != 0) ctx.device.planAsync();
     try g.add(.{ .name = "simulation", .stage = .prepare, .always = true, .scope = false }, ctx, simulate);
     try g.add(.{ .name = "particle simulation", .stage = .prepare, .always = true, .scope = false }, ctx, stepParticles);
 }
@@ -43,7 +45,12 @@ fn simulate(ctx: *ViewContext) !void {
     const c = p.shared;
     if (c.fresh_scene) try simulateFluids(ctx.renderer, p.cmd, p.scene, c.arena, c.delta_time);
     if (c.fresh_scene) try simulateWater(ctx.renderer, p.cmd, p.scene, c.arena, c.delta_time);
-    if (c.fresh_scene) try simulateLiquids(ctx.renderer, p.cmd, p.scene, c.arena, c.delta_time);
+    if (c.fresh_scene) {
+        if (try ctx.device.acquireAsync()) |beside| {
+            defer ctx.device.releaseAsync();
+            try simulateLiquids(ctx.renderer, beside, p.scene, c.arena, c.delta_time);
+        } else try simulateLiquids(ctx.renderer, p.cmd, p.scene, c.arena, c.delta_time);
+    }
     if (c.fresh_scene) try hair_feature.simulateHair(ctx.renderer, p, c.delta_time);
     c.fluid_list.* = fluids_feature.shadowingFluids(ctx.renderer, p);
     try fluids_feature.lightFluids(ctx.renderer, p, c.lighting);

@@ -10,6 +10,8 @@ const scene_pass = @import("../scene_pass.zig");
 const ray_scene = @import("../scene/ray_scene.zig");
 const renderer_state = @import("../state.zig");
 const gpu = @import("../gpu.zig");
+const api = @import("../api.zig");
+const shading = @import("shading.zig");
 const std = @import("std");
 
 const cluster_far = renderer_state.cluster_far;
@@ -30,7 +32,7 @@ pub fn prepare(ctx: *ViewContext) !void {
     const lighting = try ctx.make(scene_pass.Lighting);
     lighting.* = try prepareLights(renderer, p.scene, p.arena, settings.shadows != null, p.desc.camera.position, traced);
     p.shared.lighting = lighting;
-    const room = listRoom(lighting.records, p.view_matrix, p.proj_unjittered);
+    const room = listRoom(lighting.records, p.scene.decals.items, p.view_matrix, p.proj_unjittered);
     const wanted: u32 = @intCast(@min(@max(room, 1), std.math.maxInt(u32) / 4));
     if (renderer.internal.cluster_lights == null or renderer.internal.cluster_lights_capacity < wanted) {
         if (renderer.internal.cluster_lights) |old| ctx.device.destroyBuffer(old);
@@ -50,48 +52,53 @@ pub fn prepare(ctx: *ViewContext) !void {
     c.lights.ltc_table = ctx.device.textureIndex(renderer.internal.ltc_table);
 }
 
-/// Most cluster list entries the lights can take: for each light, the
+/// Most cluster list entries the lights and decals can take: for each, the
 /// clusters its view-space box overlaps, one cluster wider all round. What
 /// `cluster.slang` lists is never more.
-fn listRoom(lights: []const gpu.Light, view: Mat4, proj: Mat4) u64 {
-    const z_bias = -@log2(cluster_near) * renderer_state.cluster_z_scale;
+fn listRoom(lights: []const gpu.Light, decals: []const api.DecalDesc, view: Mat4, proj: Mat4) u64 {
     var total: u64 = 0;
     for (lights) |light| {
-        if (light.flags & gpu.light_directional != 0) {
-            total += gpu.cluster_count;
-            continue;
-        }
-        const center = math.transformPoint(view, light.position);
-        const range = light.range;
-        if (-center[2] + range <= 0) continue;
-        const near_depth = @max(-center[2] - range, 1e-4);
-        const slices = [2]f32{ @log2(near_depth) * renderer_state.cluster_z_scale + z_bias, @log2(-center[2] + range) * renderer_state.cluster_z_scale + z_bias };
-        const z_cells = cellSpan(slices[0], slices[1], gpu.clusters_z);
-        var low: [2]f32 = .{ std.math.inf(f32), std.math.inf(f32) };
-        var high: [2]f32 = .{ -std.math.inf(f32), -std.math.inf(f32) };
-        var whole = false;
-        for (0..8) |corner| {
-            const at = math.Vec4{
-                center[0] + (if (corner & 1 != 0) range else -range),
-                center[1] + (if (corner & 2 != 0) range else -range),
-                center[2] + (if (corner & 4 != 0) range else -range),
-                1,
-            };
-            const clip = math.transformVec4(proj, at);
-            if (clip[3] <= 1e-4) {
-                whole = true;
-                break;
-            }
-            for (0..2) |axis| {
-                low[axis] = @min(low[axis], clip[axis] / clip[3]);
-                high[axis] = @max(high[axis], clip[axis] / clip[3]);
-            }
-        }
-        const x_cells: u64 = if (whole) gpu.clusters_x else cellSpan((low[0] * 0.5 + 0.5) * gpu.clusters_x, (high[0] * 0.5 + 0.5) * gpu.clusters_x, gpu.clusters_x);
-        const y_cells: u64 = if (whole) gpu.clusters_y else cellSpan((low[1] * 0.5 + 0.5) * gpu.clusters_y, (high[1] * 0.5 + 0.5) * gpu.clusters_y, gpu.clusters_y);
-        total += x_cells * y_cells * z_cells;
+        total += if (light.flags & gpu.light_directional != 0) gpu.cluster_count else sphereRoom(light.position, light.range, view, proj);
+    }
+    for (decals) |decal| {
+        const bounds = shading.decalBounds(decal.transform);
+        total += sphereRoom(bounds[0..3].*, bounds[3], view, proj);
     }
     return total;
+}
+
+/// The clusters a sphere's view-space box overlaps, one cluster wider all
+/// round.
+fn sphereRoom(position: math.Vec3, range: f32, view: Mat4, proj: Mat4) u64 {
+    const z_bias = -@log2(cluster_near) * renderer_state.cluster_z_scale;
+    const center = math.transformPoint(view, position);
+    if (-center[2] + range <= 0) return 0;
+    const near_depth = @max(-center[2] - range, 1e-4);
+    const slices = [2]f32{ @log2(near_depth) * renderer_state.cluster_z_scale + z_bias, @log2(-center[2] + range) * renderer_state.cluster_z_scale + z_bias };
+    const z_cells = cellSpan(slices[0], slices[1], gpu.clusters_z);
+    var low: [2]f32 = .{ std.math.inf(f32), std.math.inf(f32) };
+    var high: [2]f32 = .{ -std.math.inf(f32), -std.math.inf(f32) };
+    var whole = false;
+    for (0..8) |corner| {
+        const at = math.Vec4{
+            center[0] + (if (corner & 1 != 0) range else -range),
+            center[1] + (if (corner & 2 != 0) range else -range),
+            center[2] + (if (corner & 4 != 0) range else -range),
+            1,
+        };
+        const clip = math.transformVec4(proj, at);
+        if (clip[3] <= 1e-4) {
+            whole = true;
+            break;
+        }
+        for (0..2) |axis| {
+            low[axis] = @min(low[axis], clip[axis] / clip[3]);
+            high[axis] = @max(high[axis], clip[axis] / clip[3]);
+        }
+    }
+    const x_cells: u64 = if (whole) gpu.clusters_x else cellSpan((low[0] * 0.5 + 0.5) * gpu.clusters_x, (high[0] * 0.5 + 0.5) * gpu.clusters_x, gpu.clusters_x);
+    const y_cells: u64 = if (whole) gpu.clusters_y else cellSpan((low[1] * 0.5 + 0.5) * gpu.clusters_y, (high[1] * 0.5 + 0.5) * gpu.clusters_y, gpu.clusters_y);
+    return x_cells * y_cells * z_cells;
 }
 
 /// Cells from the one `from` falls in to the one `to` falls in, widened by

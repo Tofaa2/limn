@@ -10,15 +10,13 @@ const Renderer = render.Renderer;
 const Scene = api.Scene;
 
 /// Lights of scenes, one at a time.
-pub const Lights = Placed(api.LightDesc, api.LightTag, "lights", "light_handles", "lights", null);
+pub const Lights = Placed(api.LightDesc, api.LightTag, "lights", "light_handles", "lights");
 /// Decals of scenes, one at a time.
-pub const Decals = Placed(api.DecalDesc, api.DecalTag, "decals", "decal_handles", "decals", api.max_decals);
+pub const Decals = Placed(api.DecalDesc, api.DecalTag, "decals", "decal_handles", "decals");
 
 /// A namespace of `Item`s kept in each scene's list `list`, with the handle
 /// of each in the scene's list `handles`; `field` is its name in `Renderer`.
-/// A scene holds at most `limit`, past which `create` fails with
-/// `error.TooManyDecals`; only decals have a limit.
-fn Placed(comptime Item: type, comptime Tag: type, comptime list: []const u8, comptime handles: []const u8, comptime field: []const u8, comptime limit: ?usize) type {
+fn Placed(comptime Item: type, comptime Tag: type, comptime list: []const u8, comptime handles: []const u8, comptime field: []const u8) type {
     return struct {
         const Self = @This();
         pub const Id = handle.Handle(Tag);
@@ -56,7 +54,6 @@ fn Placed(comptime Item: type, comptime Tag: type, comptime list: []const u8, co
             const data = owner.scenes.internal.table.get(scene) orelse return error.InvalidScene;
             const items = &@field(data, list);
             const ids = &@field(data, handles);
-            if (limit) |most| if (items.items.len >= most) return error.TooManyDecals;
             try pad(owner, data);
             try items.ensureUnusedCapacity(owner.internal.gpa, 1);
             try ids.ensureUnusedCapacity(owner.internal.gpa, 1);

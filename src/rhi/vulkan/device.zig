@@ -220,8 +220,20 @@ pub const FrameData = struct {
     worker_pools: [max_parallel]vk.CommandPool = @splat(.null_handle),
     worker_commands: [max_parallel]vk.CommandBuffer = @splat(.null_handle),
     tail: vk.CommandBuffer = .null_handle,
-    submits: [max_parallel + 2]vk.CommandBuffer = undefined,
+    submits: [2 * max_parallel + 4]vk.CommandBuffer = undefined,
     submit_count: u32 = 0,
+    /// Second command buffers for encoders cut by `awaitAsync`: one per
+    /// worker pool, then the frame pool's.
+    split_commands: [max_parallel + 1]vk.CommandBuffer = @splat(.null_handle),
+    /// Async compute this frame: planned while staging, recorded into
+    /// `async_command`, and waited for from submit `wait_from` on.
+    async_planned: bool = false,
+    async_recorded: bool = false,
+    async_pool: vk.CommandPool = .null_handle,
+    async_command: vk.CommandBuffer = .null_handle,
+    wait_from: u32 = std.math.maxInt(u32),
+    /// The `split_commands` used this frame, one bit each.
+    split_taken: u16 = 0,
 };
 
 /// Most encoders `Device.beginParallel` gives at once.
@@ -368,6 +380,14 @@ pub const Device = struct {
     /// `n + 1` when it is done, and the detached jobs count up.
     frame_timeline: vk.Semaphore = .null_handle,
     detached_timeline: vk.Semaphore = .null_handle,
+    /// A third queue of the graphics family for compute that overlaps the
+    /// frame (`acquireAsync`), its timeline (frame `n` signals `n + 1`) and
+    /// its encoder, held under `async_mutex` while it records. Null with a
+    /// family of fewer queues.
+    async_queue: ?vk.Queue = null,
+    async_timeline: vk.Semaphore = .null_handle,
+    async_encoder: CommandEncoder = undefined,
+    async_mutex: std.Io.Mutex = .init,
     detached_signaled: u64 = 0,
     /// Encoders recording beside each other between `beginParallel` and
     /// `joinParallel`, and their texture states.
@@ -558,7 +578,7 @@ pub const Device = struct {
         const selected = try selectPhysicalDevice(gpa, self.instance, self.surface, desc.preferred_device);
         self.physical = selected.physical;
         self.queue_family = selected.queue_family;
-        const queue_count: u32 = @min(selected.queue_count, 2);
+        const queue_count: u32 = @min(selected.queue_count, 3);
         self.properties = selected.properties;
         if (self.properties.limits.max_push_constants_size < push_constant_size) return error.NoSuitableDevice;
         const limits = self.properties.limits;
@@ -672,7 +692,7 @@ pub const Device = struct {
                 .shader_storage_image_read_without_format = if (self.caps.storage_images) .true else .false,
             },
         };
-        const queue_priorities = [2]f32{ 1, 0.5 };
+        const queue_priorities = [3]f32{ 1, 0.5, 1 };
         self.caps.shared_textures = builtin.os.tag == .linux and try deviceExtensionListed(gpa, self.instance, self.physical, vk.extensions.khr_external_memory_fd.name);
         var extensions = ExtensionList{};
         if (self.caps.shading_rate_tile != 0) extensions.add(&.{vk.extensions.khr_fragment_shading_rate.name});
@@ -704,9 +724,11 @@ pub const Device = struct {
         errdefer self.vkd.destroyDevice(null);
         self.queue = self.vkd.getDeviceQueue(self.queue_family, 0);
         self.detached_queue = if (queue_count > 1) self.vkd.getDeviceQueue(self.queue_family, 1) else null;
+        self.async_queue = if (queue_count > 2) self.vkd.getDeviceQueue(self.queue_family, 2) else null;
         const shared_memory = self.properties.device_type == .integrated_gpu or self.properties.device_type == .cpu;
         self.allocator = memory.Allocator.init(gpa, self.vkd, self.instance.getPhysicalDeviceMemoryProperties(self.physical), shared_memory);
         self.caps.unified_memory = self.allocator.unified;
+        self.caps.async_compute = self.async_queue != null;
         errdefer self.allocator.deinit();
 
         self.buffers = .init(gpa);
@@ -783,6 +805,8 @@ pub const Device = struct {
         errdefer self.vkd.destroySemaphore(self.frame_timeline, null);
         self.detached_timeline = try self.vkd.createSemaphore(&.{ .p_next = &timeline_type }, null);
         errdefer self.vkd.destroySemaphore(self.detached_timeline, null);
+        self.async_timeline = try self.vkd.createSemaphore(&.{ .p_next = &timeline_type }, null);
+        errdefer self.vkd.destroySemaphore(self.async_timeline, null);
         self.immediate_pool = try self.vkd.createCommandPool(&.{ .queue_family_index = self.queue_family }, null);
         errdefer self.vkd.destroyCommandPool(self.immediate_pool, null);
         if (self.detached_queue != null)
@@ -849,6 +873,7 @@ pub const Device = struct {
         for (&self.frames) |*frame| destroyFrame(self, frame);
         self.vkd.destroyCommandPool(self.immediate_pool, null);
         self.vkd.destroySemaphore(self.frame_timeline, null);
+        self.vkd.destroySemaphore(self.async_timeline, null);
         self.vkd.destroySemaphore(self.detached_timeline, null);
         if (self.detached_pool != .null_handle) self.vkd.destroyCommandPool(self.detached_pool, null);
         self.vkd.destroyPipelineCache(self.pipeline_cache, null);
@@ -913,6 +938,10 @@ pub const Device = struct {
             .vendor_id = self.properties.vendor_id,
             .memory_bytes = memory_bytes,
             .ray_tracing = self.caps.ray_tracing,
+            .tiled = switch (self.properties.vendor_id) {
+                0x13b5, 0x5143, 0x1010, 0x106b => true,
+                else => false,
+            },
         };
     }
 
@@ -1006,6 +1035,9 @@ pub const Device = struct {
     pub const endImmediate = frames_module.endImmediate;
     pub const beginParallel = frames_module.beginParallel;
     pub const joinParallel = frames_module.joinParallel;
+    pub const planAsync = frames_module.planAsync;
+    pub const acquireAsync = frames_module.acquireAsync;
+    pub const releaseAsync = frames_module.releaseAsync;
 
     /// Takes `resource_mutex` unless this thread holds it already.
     pub fn lockResources(self: *Device) void {
@@ -1186,6 +1218,7 @@ fn destroyFrame(self: *Device, frame: *FrameData) void {
     self.vkd.destroySemaphore(frame.image_available, null);
     self.vkd.destroySemaphore(frame.generated_available, null);
     self.vkd.destroyFence(frame.fence, null);
+    if (frame.async_pool != .null_handle) self.vkd.destroyCommandPool(frame.async_pool, null);
     for (frame.worker_pools) |pool| if (pool != .null_handle) self.vkd.destroyCommandPool(pool, null);
     self.vkd.destroyCommandPool(frame.pool, null);
 }

@@ -550,7 +550,7 @@ pub fn updateGi(
         volume.offsets_valid = true;
     } else volume.offsets_valid = false;
     volume.frames +|= 1;
-    renderer.internal.stats.gi_probes = probe_count;
+    @atomicStore(@TypeOf(renderer.internal.stats.gi_probes), &renderer.internal.stats.gi_probes, @intCast(probe_count), .monotonic);
 }
 
 fn giGatherPipeline(_: *rhi.Device) pipelines_module.Desc {

@@ -276,7 +276,7 @@ fn upload(ctx: *ViewContext, list: *const draw_list.DrawList, batch: *const draw
         result = .{ .vertices = vertices.address, .indices = indices.address, .quads = quads.address };
     }
     try canvas.internal.uploads.append(self.internal.gpa, result);
-    self.internal.stats.draw_list_triangles += @intCast(batch.indices.items.len / 3 + batch.quads.items.len * 2);
+    _ = @atomicRmw(@TypeOf(self.internal.stats.draw_list_triangles), &self.internal.stats.draw_list_triangles, .Add, @intCast(batch.indices.items.len / 3 + batch.quads.items.len * 2), .monotonic);
     return @intCast(canvas.internal.uploads.items.len - 1);
 }
 

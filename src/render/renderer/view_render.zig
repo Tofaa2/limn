@@ -455,6 +455,7 @@ fn renderScene(
     };
 
     try ray_scene.prepare(self, scene, scene_frame, ray_scene.wanted(self, scene, ctx.rays), fresh_scene);
+    pass.builds_ray_scene = ray_scene.claim(scene, scene_frame);
     const constants = try arena.alloc(device, gpu.FrameConstants, 1);
     ctx.constants.* = .{
         .view = view_matrix,
@@ -542,6 +543,7 @@ fn renderScene(
     const tracer = features.viewState(view_data, path_tracing_feature);
     pass.tracing = settings.path_tracing != null and !debugging and tracer != null and tracer.?.traced;
     try features.prepare(ctx);
+    try cmd.flushUploads();
     try features.declare(ctx);
     constants.items[0] = ctx.constants.*;
     try g.stage(self.internal.gpa, device, &self.internal.target_pool, self.internal.frame_index);
@@ -592,8 +594,9 @@ pub fn renderViews(self: *Renderer, frame: rhi.Frame, views: []const ViewDesc, d
 
 /// Cuts the views into at most `most` runs of consecutive views, as even as
 /// it can, returning how many; `bounds` gets where each starts and, last,
-/// the end. A cut never falls between views of one scene, whose passes hand
-/// each other what they work out while they record.
+/// the end. Views of one scene may be cut apart: what their passes share is
+/// settled while staging, and the encoders run in view order. Views drawing
+/// into the same target are not.
 fn splitRuns(staged: []const StagedView, most: usize, bounds: *[rhi.max_parallel + 1]usize) usize {
     var cuts: [rhi.max_parallel]usize = undefined;
     var cut_count: usize = 0;
@@ -614,12 +617,13 @@ fn splitRuns(staged: []const StagedView, most: usize, bounds: *[rhi.max_parallel
     return cut_count + 1;
 }
 
-/// Whether no scene and no draw list is in views both before `at` and from
-/// `at` on: recording a draw list keeps what it uploads in the list.
+/// Whether no draw list and no target is in views both before `at` and from
+/// `at` on: recording a draw list keeps what it uploads in the list, and an
+/// encoder only learns what another left in a target once both are done.
 fn cuttable(staged: []const StagedView, at: usize) bool {
     for (staged[0..at]) |before| {
         for (staged[at..]) |after| {
-            if (before.scene != null and after.scene == before.scene) return false;
+            if (std.meta.eql(before.target, after.target)) return false;
             for (before.desc.draw_lists) |mine| for (after.desc.draw_lists) |theirs| {
                 if (mine.list == theirs.list) return false;
             };

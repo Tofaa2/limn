@@ -195,9 +195,17 @@ pub fn declareFlat(ctx: *ViewContext, hdr: Target) !void {
         .name = "tonemap",
         .stage = .tonemap,
         .reads = if (chain) &.{ hdr, levels[0] } else &.{hdr},
-        .color = &.{.{ .target = g.slot(.picture).?, .load = ctx.output.load, .clear = ctx.output.clear }},
+        .color = &.{.{ .target = g.slot(.picture).?, .load = if (coversOutput(ctx)) .discard else ctx.output.load, .clear = ctx.output.clear }},
     }, frame, tonemap);
     ctx.output.load = .load;
+}
+
+/// Whether the view draws all of its output texture, which the tonemap then
+/// overwrites without reading what was there.
+fn coversOutput(ctx: *const ViewContext) bool {
+    const info = ctx.device.textureInfo(ctx.output.texture);
+    const region = ctx.output.region;
+    return region.x == 0 and region.y == 0 and region.width == info.width and region.height == info.height;
 }
 
 fn texel(ctx: *ViewContext, target: Target) [2]f32 {

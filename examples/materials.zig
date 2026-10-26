@@ -5,7 +5,8 @@
 //!   E        switch between the studio and a computed sky
 //!   A/D      orbit the camera
 //!
-//! `--frames N`, `--screenshot file.png`.
+//! `--frames N`, `--screenshot file.png`; `--subsurface` turns on screen-space
+//! subsurface scattering for the wax.
 const std = @import("std");
 const gfx = @import("limn");
 const math = gfx.math;
@@ -18,6 +19,14 @@ const rows = 4;
 const spacing = 1.35;
 
 pub fn main(init: std.process.Init) !void {
+    var subsurface = false;
+    {
+        var arguments = try init.minimal.args.iterateAllocator(init.gpa);
+        defer arguments.deinit();
+        while (arguments.next()) |argument| {
+            if (std.mem.eql(u8, argument, "--subsurface")) subsurface = true;
+        }
+    }
     var stage = try Stage.create(init, "Limn materials", .{});
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
@@ -104,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
                 .camera = gfx.Camera.lookAt(eye, .{ 0.6, 2.2, 0 }),
                 .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadows = .{ .distance = 30 } },
+                .settings = .{ .shadows = .{ .distance = 30 }, .shading = .{ .subsurface_scattering = subsurface } },
             }},
             .delta_time = tick.dt,
         }));

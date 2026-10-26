@@ -307,16 +307,14 @@ pub const clusters_y = 9;
 pub const clusters_z = 24;
 /// Records in the buffer at `FrameConstants.lights.clusters`.
 pub const cluster_count = clusters_x * clusters_y * clusters_z;
-/// One bit per decal a cluster can hold, 32 to a word.
-pub const cluster_decal_words = 8;
-
-/// `Cluster` in common.slang, filled by `cluster.slang`: where its lights are
-/// listed in the buffer at `FrameConstants.lights.light_indices`.
+/// `Cluster` in common.slang, filled by `cluster.slang`: where its lights,
+/// then its decals, are listed in the buffer at
+/// `FrameConstants.lights.light_indices`, each in index order.
 pub const Cluster = extern struct {
     offset: u32,
     count: u32,
-    /// Bit i set: decal i reaches this cluster.
-    decals: [cluster_decal_words]u32,
+    decal_offset: u32,
+    decal_count: u32,
 };
 
 /// Written by `cull.slang` per visible meshlet. Layout is Vulkan's
@@ -396,7 +394,7 @@ comptime {
     std.debug.assert(@sizeOf(Instance) == 116);
     std.debug.assert(@sizeOf(Light) == 80);
     std.debug.assert(@sizeOf(ShadowTile) == 80);
-    std.debug.assert(@sizeOf(Cluster) == 40);
+    std.debug.assert(@sizeOf(Cluster) == 16);
     std.debug.assert(@sizeOf(DrawCommand) == 20);
     std.debug.assert(@sizeOf(CullView) == 432 and @sizeOf(CullView) % 16 == 0);
 }

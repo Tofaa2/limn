@@ -115,6 +115,9 @@ pub const ScenePass = struct {
     /// True for the first view to draw the scene this frame, which also does
     /// the per-scene work.
     fresh_scene: bool,
+    /// True for the view that rebuilds the scene's ray tracing structure
+    /// this frame (`ray_scene.claim`).
+    builds_ray_scene: bool = false,
     view_data: *ViewData,
     view: *ViewState,
     /// Size the scene is rendered at.

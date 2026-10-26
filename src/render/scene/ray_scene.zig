@@ -81,16 +81,24 @@ pub fn prepare(renderer: *Renderer, scene: *SceneData, scene_frame: SceneFrame, 
     scene.tlas = try device.createTlas(.{ .max_instances = scene.tlas_capacity });
 }
 
-/// Rebuilds the structure if its instances changed since it was last built.
-/// After the frame's animated meshes are rebuilt and before anything traces.
-pub fn build(cmd: *rhi.CommandEncoder, scene: *SceneData, scene_frame: SceneFrame) void {
+/// Whether the view being staged is the one that rebuilds the structure for
+/// this frame's instances: the first to ask once they changed. The
+/// structure counts as built from then on, so every view of the scene,
+/// recorded on any thread, sees it as current; the GPU builds it first.
+pub fn claim(scene: *SceneData, scene_frame: SceneFrame) bool {
+    if (!ready(scene, scene_frame) or scene.tlas_hash == scene_frame.tlas_hash) return false;
+    scene.tlas_hash = scene_frame.tlas_hash;
+    return true;
+}
+
+/// Rebuilds the structure for the view that `claim`ed it. After the
+/// frame's animated meshes are rebuilt and before anything traces.
+pub fn build(cmd: *rhi.CommandEncoder, scene: *SceneData, scene_frame: SceneFrame, claimed: bool) void {
+    if (!claimed) return;
     const tlas = scene.tlas orelse return;
-    if (scene_frame.tlas_count == 0 or scene_frame.tlas_count > scene.tlas_capacity) return;
-    if (scene.tlas_hash == scene_frame.tlas_hash) return;
     cmd.beginScope("ray scene");
     defer cmd.endScope();
     cmd.buildTlas(tlas, scene_frame.tlas_instances, scene_frame.tlas_count);
-    scene.tlas_hash = scene_frame.tlas_hash;
 }
 
 /// The structure, once it holds this frame's instances.
@@ -121,7 +129,7 @@ pub fn buildPendingBlas(self: *Renderer, cmd: *rhi.CommandEncoder, frame_index: 
     const device = self.device;
     var still_pending: u32 = 0;
     var finished = false;
-    for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+    for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
         if (!entry.blas_pending) continue;
         const frame_now = frame_index orelse {
             if (entry.blas_job) |job| {
@@ -187,7 +195,7 @@ fn compactBuiltBlas(self: *Renderer, cmd: *rhi.CommandEncoder) !void {
     const device = self.device;
     var budget: u32 = compactions_per_frame;
     var replaced = false;
-    for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+    for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
         if (!entry.blas_compacting or entry.blas_pending) continue;
         var waiting = false;
         for (entry.meshes) |*mesh| {

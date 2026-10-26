@@ -511,9 +511,6 @@ pub const DecalDesc = struct {
     angle_fade: f32 = 0.2,
 };
 
-/// Most decals a scene can hold.
-pub const max_decals = gpu.cluster_decal_words * 32;
-
 /// A procedural clear sky; see `Renderer.environments.createSky`.
 pub const SkyDesc = struct {
     /// Direction the sun's light travels, as in `SunDesc.direction`.

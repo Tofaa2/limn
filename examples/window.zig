@@ -66,14 +66,11 @@ pub const Window = struct {
     }
 
     fn native(self: Window) !gfx.rhi.NativeWindow {
+        if (comptime builtin.abi.isAndroid()) return .{ .android = .{ .window = glfw.androidWindow() orelse return error.NativeWindowUnavailable } };
         if (comptime builtin.os.tag == .macos) return .{ .metal = .{ .layer = try metalLayer(glfw.glfwGetCocoaWindow(self.handle) orelse return error.NativeWindowUnavailable) } };
         if (comptime builtin.os.tag == .windows) return .{ .win32 = .{
             .instance = @ptrCast(glfw.GetModuleHandleW(null)),
             .window = @ptrCast(glfw.glfwGetWin32Window(self.handle) orelse return error.NativeWindowUnavailable),
-        } };
-        if (comptime !@hasDecl(glfw, "glfwGetPlatform")) return .{ .xlib = .{
-            .display = @ptrCast(glfw.glfwGetX11Display() orelse return error.NativeWindowUnavailable),
-            .window = @intCast(glfw.glfwGetX11Window(self.handle)),
         } };
         return switch (glfw.glfwGetPlatform()) {
             glfw.GLFW_PLATFORM_X11 => .{ .xlib = .{
@@ -173,6 +170,7 @@ pub fn frameLimit(init: std.process.Init) !?u64 {
 ///                        window does; finds what depends on the frame rate
 ///   --memory N           print GPU memory and resident memory every N
 ///                        frames, to find what grows in long runs
+///   --async-compute      simulate liquids on a second GPU queue
 pub const Stage = struct {
     init: std.process.Init,
     window: ?Window,
@@ -231,6 +229,7 @@ pub const Stage = struct {
         var timings = false;
         var uneven = false;
         var memory_every: u64 = 0;
+        var async_compute = false;
         var args = try init.minimal.args.iterateAllocator(init.gpa);
         defer args.deinit();
         _ = args.skip();
@@ -251,6 +250,8 @@ pub const Stage = struct {
                 timings = true;
             } else if (std.mem.eql(u8, arg, "--uneven-frames")) {
                 uneven = true;
+            } else if (std.mem.eql(u8, arg, "--async-compute")) {
+                async_compute = true;
             } else if (std.mem.eql(u8, arg, "--memory")) {
                 memory_every = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArgument, 10);
             } else if (std.mem.startsWith(u8, arg, "--")) {
@@ -267,6 +268,7 @@ pub const Stage = struct {
         if (screenshot != null or validation) renderer_options.validation = true;
         if (screenshot != null) renderer_options.deterministic = true;
         if (debug_names) renderer_options.debug_names = true;
+        if (async_compute) renderer_options.async_compute = true;
         if (renderer_options.cache.pipelines == null) renderer_options.cache.pipelines = "zig-out/pipeline.cache";
         if (timings and renderer_options.profiler == null) {
             zones.io = init.io;
@@ -294,6 +296,7 @@ pub const Stage = struct {
         if (self.window) |window| {
             if (window.shouldClose() or window.keyDown(glfw.GLFW_KEY_ESCAPE)) return null;
             window.pollEvents();
+            if (comptime builtin.abi.isAndroid()) if (!self.followSurface(window)) return null;
             const now = window.time();
             tick.dt = @floatCast(@min(now - self.last, 0.1));
             self.last = now;
@@ -303,6 +306,25 @@ pub const Stage = struct {
         self.time += tick.dt;
         tick.time = self.time;
         return tick;
+    }
+
+    /// On Android, lets go of a window the activity is losing, waits for
+    /// the next and presents to that. False if the activity ends first.
+    fn followSurface(self: *Stage, window: Window) bool {
+        switch (glfw.surfaceChange()) {
+            .none => return true,
+            .gained => {},
+            .lost => {
+                self.renderer.setSurface(null) catch |err| std.log.err("could not drop the window: {t}", .{err});
+                if (!glfw.surfaceReleased()) return false;
+            },
+        }
+        const next = window.surface(false) catch return false;
+        self.renderer.setSurface(next) catch |err| {
+            std.log.err("could not present to the new window: {t}", .{err});
+            return false;
+        };
+        return true;
     }
 
     pub fn keyDown(self: *const Stage, key: c_int) bool {
@@ -360,7 +382,7 @@ pub const Stage = struct {
 
     fn logMemory(self: *Stage) void {
         const frame_stats = self.renderer.stats();
-        const peak = std.posix.getrusage(std.posix.rusage.SELF).maxrss;
+        const peak = if (comptime builtin.os.tag == .windows) 0 else std.posix.getrusage(std.posix.rusage.SELF).maxrss;
         var statm: [128]u8 = undefined;
         const resident: u64 = if (std.Io.Dir.cwd().readFile(self.init.io, "/proc/self/statm", &statm)) |text| blk: {
             var fields = std.mem.tokenizeScalar(u8, text, ' ');

@@ -111,7 +111,7 @@ pub fn freeProbe(self: *Renderer, probe: *ProbeData) void {
 /// Captures the first waiting probe, one face per frame, and filters the
 /// result into its reflection cube.
 pub fn captureProbes(self: *Renderer, frame: rhi.Frame, delta_time: f32, arena: *FrameArena) !void {
-    for (self.reflection_probes.internal.table.slots.items) |*slot| if (slot.value) |*probe| {
+    for (0..self.reflection_probes.internal.table.slotCount()) |slot_index| if (self.reflection_probes.internal.table.slotAt(slot_index).value) |*probe| {
         if (!probe.dirty and probe.face == 0) continue;
         if (!probe.captured and probe.face == 0 and probe.waited < probe.desc.settle_frames) {
             probe.waited += 1;

@@ -192,6 +192,9 @@ pub const Internal = struct {
     /// This frame's animated entities.
     /// Count of loaded models with per-texture UV transforms.
     texture_transform_users: u32 = 0,
+    /// Loaded models with a material that has a coat, sheen, grain or thin
+    /// film; with none, shading leaves those lobes out.
+    lobe_users: u32 = 0,
     pose_scratch: [max_worker_threads]std.ArrayList(animation.Local) = @splat(.empty),
     prepare_chunks: std.ArrayList(renderer_state.PrepareChunk) = .empty,
     /// Short-lived render targets, lent to the passes of every view.
@@ -641,11 +644,11 @@ pub const Renderer = struct {
     }
 
     fn anyJobFinished(self: *Renderer) bool {
-        for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+        for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
             if (entry.state != .loading) continue;
             if (entry.job == null or entry.job.?.done.load(.acquire)) return true;
         };
-        for (self.environments.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+        for (0..self.environments.internal.table.slotCount()) |slot_index| if (self.environments.internal.table.slotAt(slot_index).value) |*entry| {
             if (entry.state == .loading and entry.job.?.done.load(.acquire)) return true;
         };
         return false;
@@ -659,7 +662,7 @@ pub const Renderer = struct {
         if (self.internal.loading_count == 0) return false;
         var budget = budget_bytes;
         var progressed = false;
-        for (self.models.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+        for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
             if (entry.state != .loading) continue;
             if (entry.job) |job| if (!job.done.load(.acquire)) continue;
             progressed = true;
@@ -676,7 +679,7 @@ pub const Renderer = struct {
             }
             if (budget == 0) break;
         };
-        for (self.environments.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+        for (0..self.environments.internal.table.slotCount()) |slot_index| if (self.environments.internal.table.slotAt(slot_index).value) |*entry| {
             if (entry.state != .loading or entry.job == null or !entry.job.?.done.load(.acquire)) continue;
             progressed = true;
             finalizeEnvironment(self, entry, cmd) catch |err| {
@@ -896,7 +899,7 @@ pub const Renderer = struct {
         try updateGeometryStreaming(self, desc);
         if (self.internal.skies_dirty) {
             self.internal.skies_dirty = false;
-            for (self.environments.internal.table.slots.items) |*slot| if (slot.value) |*entry| {
+            for (0..self.environments.internal.table.slotCount()) |slot_index| if (self.environments.internal.table.slotAt(slot_index).value) |*entry| {
                 if (entry.sky_desc == null) {
                     if (entry.sky_dirty) try bakeLoadedClouds(self, entry, cmd);
                 } else if (entry.sky_dirty or entry.bake_step != 0) try bakeSky(self, entry, cmd, false);
