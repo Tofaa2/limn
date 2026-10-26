@@ -106,6 +106,7 @@ Apache-2.0; see [`LICENSE`](LICENSE). Bundled work keeps its own terms:
 - FidelityFX Denoiser, reflection part (MIT): `src/third_party/ffx_denoiser`
 - FidelityFX Super Resolution 1 (MIT): `src/third_party/ffx_fsr1`
 - FidelityFX SDK 1.1.4, for Super Resolution 2 and 3 (MIT): `src/third_party/ffx_sdk`
+- Linearly transformed cosine tables (BSD-style, Heitz et al. 2016): `src/third_party/ltc`
 - DejaVu Sans, the built-in font: `src/render/fonts/LICENSE`
 - Example models, environments and fonts, some for non-commercial use only: `examples/assets/README.md`
 

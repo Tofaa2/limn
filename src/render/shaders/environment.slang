@@ -122,6 +122,76 @@ bool hitsPlanet(float3 origin, float3 direction) {
     return discriminant > 0.0 && -b - sqrt(discriminant) > 0.0;
 }
 
+
+/// Sunlight left after the path from `point` to the sun; 0 behind the planet.
+float3 toSun(float3 point, float3 sun, float mie_strength, float3 ozone) {
+    if (hitsPlanet(point, sun)) return float3(0.0);
+    const int light_steps = 6;
+    float light_step = sphereExit(point, sun, ATMOSPHERE_RADIUS) / float(light_steps);
+    float rayleigh = 0.0;
+    float mie = 0.0;
+    float absorbed = 0.0;
+    for (int j = 0; j < light_steps; j++) {
+        float height = max(length(point + sun * (light_step * (float(j) + 0.5))) - PLANET_RADIUS, 0.0);
+        rayleigh += exp(-height / RAYLEIGH_HEIGHT) * light_step;
+        mie += exp(-height / MIE_HEIGHT) * light_step;
+        absorbed += ozoneDensity(height) * light_step;
+    }
+    return exp(-(RAYLEIGH * rayleigh + mie_strength * 1.1 * mie + ozone * absorbed));
+}
+
+/// Light scattered two or more times at a height (v) with the sun at a
+/// cosine (u) above the horizon, per unit of sunlight and of the local
+/// scattering coefficient (Hillaire 2020): the second order over every
+/// direction, then the infinite series of further orders in closed form.
+[shader("fragment")]
+float4 scatteringMain([[vk::location(0)]] float2 in_uv) : SV_Target {
+    float height = max(in_uv.y * (ATMOSPHERE_RADIUS - PLANET_RADIUS), 1.0);
+    float mu = in_uv.x * 2.0 - 1.0;
+    float3 origin = float3(0.0, PLANET_RADIUS + height, 0.0);
+    float3 sun = float3(sqrt(max(1.0 - mu * mu, 0.0)), mu, 0.0);
+    float mie_strength = MIE * sky_push.turbidity;
+    float3 ozone = OZONE * sky_push.ozone;
+    const int directions = 64;
+    const int steps = 20;
+    float3 second = float3(0.0);
+    float3 transfer = float3(0.0);
+    for (int d = 0; d < directions; d++) {
+        float z = 1.0 - (2.0 * float(d) + 1.0) / float(directions);
+        float turn = float(d) * 2.39996323;
+        float across = sqrt(max(1.0 - z * z, 0.0));
+        float3 ray = float3(across * cos(turn), z, across * sin(turn));
+        float reach = sphereExit(origin, ray, ATMOSPHERE_RADIUS);
+        float b = dot(origin, ray);
+        float c = dot(origin, origin) - PLANET_RADIUS * PLANET_RADIUS;
+        float discriminant = b * b - c;
+        if (discriminant > 0.0 && -b - sqrt(discriminant) > 0.0) reach = -b - sqrt(discriminant);
+        float step_length = reach / float(steps);
+        float3 through = float3(1.0);
+        for (int s = 0; s < steps; s++) {
+            float3 point = origin + ray * (step_length * (float(s) + 0.5));
+            float point_height = max(length(point) - PLANET_RADIUS, 0.0);
+            float3 scattering = RAYLEIGH * exp(-point_height / RAYLEIGH_HEIGHT) + mie_strength * exp(-point_height / MIE_HEIGHT);
+            float3 extinction = RAYLEIGH * exp(-point_height / RAYLEIGH_HEIGHT) + mie_strength * 1.1 * exp(-point_height / MIE_HEIGHT) + ozone * ozoneDensity(point_height);
+            float3 kept = exp(-extinction * step_length);
+            float3 share = (1.0 - kept) / max(extinction, float3(1e-12));
+            second += through * scattering * toSun(point, sun, mie_strength, ozone) * share / (4.0 * PI);
+            transfer += through * scattering * share;
+            through *= kept;
+        }
+    }
+    second /= float(directions);
+    transfer /= float(directions);
+    return float4(second / max(1.0 - transfer, float3(1e-3)), 1.0);
+}
+
+/// `scatteringMain`'s table at a point of the atmosphere.
+float3 multipleScattering(float3 point, float3 sun) {
+    float height = clamp(length(point) - PLANET_RADIUS, 0.0, ATMOSPHERE_RADIUS - PLANET_RADIUS);
+    float2 uv = float2(dot(normalize(point), sun) * 0.5 + 0.5, height / (ATMOSPHERE_RADIUS - PLANET_RADIUS));
+    uv = uv * (31.0 / 32.0) + 0.5 / 32.0;
+    return sampleTextureLod(sky_push.scattering_texture, sky_push.scattering_sampler, uv, 0.0).rgb;
+}
 [shader("fragment")]
 float4 skyMain([[vk::location(0)]] float2 in_uv) : SV_Target {
     float3 direction = cubeDirection(sky_push.face, in_uv);
@@ -141,7 +211,8 @@ float4 skyMain([[vk::location(0)]] float2 in_uv) : SV_Target {
     float3 sum_mie = float3(0.0);
     float3 sum_multiple = float3(0.0);
     float3 overhead_glow = float3(0.0);
-    {
+    bool physical = sky_push.scattering_texture != INVALID_ID;
+    if (!physical) {
         const int column_steps = 12;
         float column_step = (ATMOSPHERE_RADIUS - PLANET_RADIUS) / float(column_steps);
         float up_mu = sun.y;
@@ -179,7 +250,7 @@ float4 skyMain([[vk::location(0)]] float2 in_uv) : SV_Target {
         if (hitsPlanet(point, sun)) {
             float3 scatter_at = RAYLEIGH * exp(-height / RAYLEIGH_HEIGHT) + mie_strength * exp(-height / MIE_HEIGHT);
             float3 view_only = exp(-(RAYLEIGH * depth_rayleigh + mie_strength * 1.1 * depth_mie + ozone * depth_ozone));
-            sum_multiple += view_only * scatter_at * step_length * overhead_glow;
+            sum_multiple += view_only * scatter_at * step_length * (physical ? multipleScattering(point, sun) * (4.0 * PI) : overhead_glow);
             continue;
         }
         float light_step = sphereExit(point, sun, ATMOSPHERE_RADIUS) / float(light_steps);
@@ -196,8 +267,13 @@ float4 skyMain([[vk::location(0)]] float2 in_uv) : SV_Target {
         sum_rayleigh += attenuation * density_rayleigh;
         sum_mie += attenuation * density_mie;
         float3 scatter_here = RAYLEIGH * exp(-height / RAYLEIGH_HEIGHT) + mie_strength * exp(-height / MIE_HEIGHT);
-        float3 again = 1.0 - exp(-scatter_here * RAYLEIGH_HEIGHT);
-        sum_multiple += attenuation * scatter_here * step_length * again / (1.0 - again);
+        if (physical) {
+            float3 view_only = exp(-(RAYLEIGH * depth_rayleigh + mie_strength * 1.1 * depth_mie + ozone * depth_ozone));
+            sum_multiple += view_only * scatter_here * step_length * multipleScattering(point, sun) * (4.0 * PI);
+        } else {
+            float3 again = 1.0 - exp(-scatter_here * RAYLEIGH_HEIGHT);
+            sum_multiple += attenuation * scatter_here * step_length * again / (1.0 - again);
+        }
     }
     float mu = dot(ray, sun);
     float phase_rayleigh = 3.0 / (16.0 * PI) * (1.0 + mu * mu);

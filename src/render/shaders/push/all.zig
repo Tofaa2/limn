@@ -6,6 +6,8 @@ pub const files = .{
     .{ "canvas", @import("canvas.zig") },
     .{ "cloud_passes", @import("cloud_passes.zig") },
     .{ "cluster", @import("cluster.zig") },
+    .{ "ocean", @import("ocean.zig") },
+    .{ "subsurface", @import("subsurface.zig") },
     .{ "cull", @import("cull.zig") },
     .{ "dof", @import("dof.zig") },
     .{ "edge_antialiasing", @import("edge_antialiasing.zig") },

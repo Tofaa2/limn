@@ -31,6 +31,36 @@ pub const Allocation = struct {
     block_index: ?u32,
 };
 
+/// The resource a memory object of its own is made for, where the driver
+/// prefers or requires one.
+pub const Owner = union(enum) { none, buffer: vk.Buffer, image: vk.Image };
+
+/// What a resource needs from `Allocator.allocate`.
+pub const Needs = struct {
+    requirements: vk.MemoryRequirements,
+    owner: Owner = .none,
+};
+
+/// A buffer's requirements and the driver's dedicated-allocation hint.
+pub fn bufferNeeds(device: Device, buffer: vk.Buffer) Needs {
+    var dedicated: vk.MemoryDedicatedRequirements = .{ .prefers_dedicated_allocation = .false, .requires_dedicated_allocation = .false };
+    var result: vk.MemoryRequirements2 = .{ .p_next = &dedicated, .memory_requirements = undefined };
+    device.getBufferMemoryRequirements2(&.{ .buffer = buffer }, &result);
+    return .{ .requirements = result.memory_requirements, .owner = if (wantsOwn(dedicated)) .{ .buffer = buffer } else .none };
+}
+
+/// An image's requirements and the driver's dedicated-allocation hint.
+pub fn imageNeeds(device: Device, image: vk.Image) Needs {
+    var dedicated: vk.MemoryDedicatedRequirements = .{ .prefers_dedicated_allocation = .false, .requires_dedicated_allocation = .false };
+    var result: vk.MemoryRequirements2 = .{ .p_next = &dedicated, .memory_requirements = undefined };
+    device.getImageMemoryRequirements2(&.{ .image = image }, &result);
+    return .{ .requirements = result.memory_requirements, .owner = if (wantsOwn(dedicated)) .{ .image = image } else .none };
+}
+
+fn wantsOwn(dedicated: vk.MemoryDedicatedRequirements) bool {
+    return dedicated.prefers_dedicated_allocation == .true or dedicated.requires_dedicated_allocation == .true;
+}
+
 const Range = struct { offset: u64, size: u64 };
 
 const Block = struct {
@@ -105,10 +135,12 @@ pub const Allocator = struct {
         self.* = undefined;
     }
 
-    /// Host-visible classes come back mapped. Fails with
+    /// Host-visible classes come back mapped. A memory object of its own is
+    /// made for large requests and where `needs.owner` is set. Fails with
     /// `error.MemoryTypeUnavailable`, `error.MapMemoryFailed` or the driver's
     /// out-of-memory errors.
-    pub fn allocate(self: *Allocator, requirements: vk.MemoryRequirements, class: Class, kind: Kind) !Allocation {
+    pub fn allocate(self: *Allocator, needs: Needs, class: Class, kind: Kind) !Allocation {
+        const requirements = needs.requirements;
         if (self.fail_after) |*remaining| {
             if (remaining.* == 0) {
                 self.fail_after = null;
@@ -125,8 +157,8 @@ pub const Allocator = struct {
         self.used_bytes += requirements.size;
         errdefer self.used_bytes -= requirements.size;
 
-        if (requirements.size >= block_size / 4) {
-            const memory = try self.allocateMemory(requirements.size, memory_type);
+        if (requirements.size >= block_size / 4 or needs.owner != .none) {
+            const memory = try self.allocateMemory(requirements.size, memory_type, needs.owner);
             errdefer self.device.freeMemory(memory, null);
             const pointer: ?[*]u8 = if (mapped)
                 @ptrCast((try self.device.mapMemory(memory, 0, requirements.size, .{})) orelse return error.MapMemoryFailed)
@@ -151,7 +183,7 @@ pub const Allocator = struct {
             index = @intCast(candidate);
             break;
         };
-        const memory = try self.allocateMemory(block_size, memory_type);
+        const memory = try self.allocateMemory(block_size, memory_type, .none);
         errdefer self.device.freeMemory(memory, null);
         var new_block = Block{
             .memory = memory,
@@ -175,7 +207,8 @@ pub const Allocator = struct {
     }
 
     /// The bound resource must already be destroyed. An emptied block is
-    /// returned to the driver at once.
+    /// returned to the driver unless it is the only empty one of its kind,
+    /// so a resource made and destroyed every frame does not churn blocks.
     pub fn free(self: *Allocator, allocation: Allocation) void {
         self.used_bytes -= allocation.size;
         if (allocation.block_index) |index| {
@@ -183,6 +216,11 @@ pub const Allocator = struct {
             std.debug.assert(block.active and block.live_allocations != 0);
             block.live_allocations -= 1;
             if (block.live_allocations == 0) {
+                if (!self.hasSpare(index)) {
+                    block.cursor = 0;
+                    block.free_ranges.clearRetainingCapacity();
+                    return;
+                }
                 if (block.mapped != null) self.device.unmapMemory(block.memory);
                 self.device.freeMemory(block.memory, null);
                 block.free_ranges.deinit(self.allocator);
@@ -236,10 +274,12 @@ pub const Allocator = struct {
     }
 
     /// A device-local memory object of its own that another device can import.
-    pub fn allocateExported(self: *Allocator, requirements: vk.MemoryRequirements, handle_types: vk.ExternalMemoryHandleTypeFlags) !Allocation {
+    pub fn allocateExported(self: *Allocator, needs: Needs, handle_types: vk.ExternalMemoryHandleTypeFlags) !Allocation {
+        const requirements = needs.requirements;
         const memory_type = self.findMemoryType(requirements.memory_type_bits, .gpu) orelse
             return error.MemoryTypeUnavailable;
-        const exported = vk.ExportMemoryAllocateInfo{ .handle_types = handle_types };
+        var dedicated = dedicatedInfo(needs.owner);
+        const exported = vk.ExportMemoryAllocateInfo{ .p_next = if (needs.owner != .none) &dedicated else null, .handle_types = handle_types };
         const memory = try self.device.allocateMemory(&.{
             .p_next = &exported,
             .allocation_size = requirements.size,
@@ -251,13 +291,24 @@ pub const Allocator = struct {
         return .{ .memory = memory, .offset = 0, .size = requirements.size, .mapped = null, .block_index = null };
     }
 
-    fn allocateMemory(self: *Allocator, size: u64, memory_type: u32) !vk.DeviceMemory {
-        const flags = vk.MemoryAllocateFlagsInfo{ .flags = .{ .device_address_bit = true }, .device_mask = 0 };
+    fn allocateMemory(self: *Allocator, size: u64, memory_type: u32, owner: Owner) !vk.DeviceMemory {
+        var dedicated = dedicatedInfo(owner);
+        const flags = vk.MemoryAllocateFlagsInfo{ .p_next = if (owner != .none) &dedicated else null, .flags = .{ .device_address_bit = true }, .device_mask = 0 };
         return self.device.allocateMemory(&.{
             .p_next = &flags,
             .allocation_size = size,
             .memory_type_index = memory_type,
         }, null);
+    }
+
+    /// Another empty block of the same kind is held, so `blocks[index]` may go.
+    fn hasSpare(self: *const Allocator, index: u32) bool {
+        const emptied = self.blocks.items[index];
+        for (self.blocks.items, 0..) |block, candidate| {
+            if (candidate == index or !block.active or block.live_allocations != 0) continue;
+            if (block.memory_type == emptied.memory_type and block.kind == emptied.kind and (block.mapped != null) == (emptied.mapped != null)) return true;
+        }
+        return false;
     }
 
     fn findShared(self: *const Allocator, allowed_types: u32) ?u32 {
@@ -287,6 +338,14 @@ pub const Allocator = struct {
         return null;
     }
 };
+
+fn dedicatedInfo(owner: Owner) vk.MemoryDedicatedAllocateInfo {
+    return switch (owner) {
+        .none => .{},
+        .buffer => |buffer| .{ .buffer = buffer },
+        .image => |image| .{ .image = image },
+    };
+}
 
 fn blockAllocation(block: *const Block, block_index: u32, offset: u64, size: u64) Allocation {
     return .{

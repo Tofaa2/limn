@@ -22,19 +22,43 @@ void computeMain() {
         state.exposure = push.compensation;
         return;
     }
+    const int bins = 64;
+    const float lowest = -16.0;
+    const float stops_per_bin = 24.0 / float(bins);
+    float weights[bins];
+    float logs[bins];
+    for (int b = 0; b < bins; b++) {
+        weights[b] = 0.0;
+        logs[b] = 0.0;
+    }
     int2 size = int2(textureSize(push.source_texture));
-    float total = 0.0;
     float weight_total = 0.0;
     for (int y = 0; y < size.y; y++) {
         for (int x = 0; x < size.x; x++) {
             float3 color = fetchTexel(push.source_texture, int2(x, y)).rgb;
             float2 centered = (float2(x, y) + 0.5) / float2(size) * 2.0 - 1.0;
             float weight = 1.0 - 0.6 * clamp(dot(centered, centered), 0.0, 1.0);
-            total += log2(max(luminance(color), 1e-5)) * weight;
+            float level = log2(max(luminance(color), 1e-5));
+            int bin = clamp(int((level - lowest) / stops_per_bin), 0, bins - 1);
+            weights[bin] += weight;
+            logs[bin] += level * weight;
             weight_total += weight;
         }
     }
-    float average = clamp(exp2(total / max(weight_total, 1e-5)), push.min_luminance, push.max_luminance);
+    float skip = weight_total * clamp(push.ignore_dark, 0.0, 0.99);
+    float keep = weight_total * max(1.0 - clamp(push.ignore_bright, 0.0, 0.99) - clamp(push.ignore_dark, 0.0, 0.99), 0.01);
+    float total = 0.0;
+    float kept = 0.0;
+    for (int b = 0; b < bins && kept < keep; b++) {
+        float weight = weights[b];
+        if (weight <= 0.0) continue;
+        float skipped = min(skip, weight);
+        skip -= skipped;
+        float taken = min(weight - skipped, keep - kept);
+        total += logs[b] / weight * taken;
+        kept += taken;
+    }
+    float average = clamp(exp2(total / max(kept, 1e-5)), push.min_luminance, push.max_luminance);
     float previous = state.average_luminance;
     if (push.reset != 0u || !(previous > 0.0)) previous = average;
     float rate = average > previous ? push.speed * 1.6 : push.speed;

@@ -19,6 +19,8 @@ const vkFormat = device_module.vkFormat;
 /// of 16384 bindless slots. Fails with `error.InvalidTextureDesc` or
 /// `error.BindlessTableFull`; format support is not checked.
 pub fn createTexture(self: *Device, desc: types.TextureDesc) !types.Texture {
+    self.lockResources();
+    defer self.unlockResources();
     if (desc.width == 0 or desc.height == 0 or desc.mip_levels == 0 or desc.mip_levels > max_mip_levels)
         return error.InvalidTextureDesc;
     const volume = desc.kind == .@"3d";
@@ -52,7 +54,7 @@ pub fn createTexture(self: *Device, desc: types.TextureDesc) !types.Texture {
     }, null);
     setName(self, .image, @intFromEnum(image), desc.name);
     errdefer self.vkd.destroyImage(image, null);
-    const allocation = try self.allocator.allocate(self.vkd.getImageMemoryRequirements(image), .gpu, .image);
+    const allocation = try self.allocator.allocate(memory.imageNeeds(self.vkd, image), .gpu, .image);
     errdefer self.allocator.free(allocation);
     try self.vkd.bindImageMemory(image, allocation.memory, allocation.offset);
     return registerTexture(self, image, allocation, .{
@@ -130,6 +132,8 @@ pub fn registerTexture(
 /// Deferred like `destroyBuffer`, including the bindless slot. Backbuffers
 /// must not be destroyed.
 pub fn destroyTexture(self: *Device, texture: types.Texture) void {
+    self.lockResources();
+    defer self.unlockResources();
     if (self.uploads.items.len != 0) cancelUploads(self, null, texture);
     var resource = self.textures.remove(texture) orelse return;
     for (resource.sub_views.items) |sub| retire(self, .{ .view = sub.view });
@@ -168,6 +172,8 @@ pub fn textureIndex(self: *Device, texture: types.Texture) u32 {
 /// (`storage_3d`). Needs `TextureUsage.storage`; what is indexed must be
 /// in `TextureState.storage` while the shader runs.
 pub fn storageIndex(self: *Device, texture: types.Texture, mip: u32, layer: u32) !u32 {
+    self.lockResources();
+    defer self.unlockResources();
     const resource = self.textureResource(texture);
     for (resource.storage_slots.items) |storage| if (storage.mip == mip and storage.layer == layer) return storage.slot;
     const volume = resource.info.kind == .@"3d";
@@ -195,6 +201,8 @@ pub fn storageIndex(self: *Device, texture: types.Texture, mip: u32, layer: u32)
 /// of whole textures (`storage_2d_array` in common.slang). As
 /// `storageIndex` otherwise.
 pub fn storageArrayIndex(self: *Device, texture: types.Texture, mip: u32) !u32 {
+    self.lockResources();
+    defer self.unlockResources();
     return storageIndex(self, texture, mip, device_module.all_layers);
 }
 
@@ -222,6 +230,8 @@ fn layersView(self: *Device, texture: types.Texture, mip: u32) !vk.ImageView {
 
 /// View of a single mip/layer, used as a render attachment.
 pub fn subView(self: *Device, texture: types.Texture, mip: u32, layer: u32) !vk.ImageView {
+    self.lockResources();
+    defer self.unlockResources();
     const resource = self.textureResource(texture);
     if (resource.info.mip_levels == 1 and resource.info.layers == 1) return resource.view;
     for (resource.sub_views.items) |sub| if (sub.mip == mip and sub.layer == layer) return sub.view;
@@ -245,17 +255,20 @@ pub fn subView(self: *Device, texture: types.Texture, mip: u32, layer: u32) !vk.
 
 /// Stages tightly packed pixel data for one mip of one layer.
 pub fn uploadTexture(self: *Device, texture: types.Texture, mip: u32, layer: u32, data: []const u8) !void {
+    self.lockResources();
+    defer self.unlockResources();
     const info = self.textureInfo(texture);
     const width = @max(info.width >> @intCast(mip), 1);
     const height = @max(info.height >> @intCast(mip), 1);
     if (data.len != info.format.dataSize(width, height)) return error.InvalidTextureData;
     const staging = try createStaging(self, data);
-    errdefer self.destroyBuffer(staging);
+    errdefer if (staging.owned(self)) self.destroyBuffer(staging.buffer);
     try self.uploads.append(self.gpa, .{ .texture = .{
-        .staging = staging,
+        .staging = staging.buffer,
         .destination = texture,
         .mip = mip,
         .layer = layer,
+        .offset = staging.offset,
     } });
     self.pending_upload_bytes += data.len;
 }
@@ -263,6 +276,8 @@ pub fn uploadTexture(self: *Device, texture: types.Texture, mip: u32, layer: u32
 /// Stages tightly packed pixel data for a rectangle of one mip of one layer;
 /// the rest of the level keeps what it holds.
 pub fn uploadTextureRegion(self: *Device, texture: types.Texture, mip: u32, layer: u32, region: [4]u32, data: []const u8) !void {
+    self.lockResources();
+    defer self.unlockResources();
     const info = self.textureInfo(texture);
     if (mip >= info.mip_levels or layer >= info.layers) return error.InvalidTextureData;
     const width = @max(info.width >> @intCast(mip), 1);
@@ -271,12 +286,13 @@ pub fn uploadTextureRegion(self: *Device, texture: types.Texture, mip: u32, laye
     if (region[2] == 0 or region[3] == 0 or region[0] >= width or region[1] >= height or region[2] > width - region[0] or region[3] > height - region[1]) return error.InvalidTextureData;
     if (data.len != info.format.dataSize(region[2], region[3])) return error.InvalidTextureData;
     const staging = try createStaging(self, data);
-    errdefer self.destroyBuffer(staging);
+    errdefer if (staging.owned(self)) self.destroyBuffer(staging.buffer);
     try self.uploads.append(self.gpa, .{ .texture = .{
-        .staging = staging,
+        .staging = staging.buffer,
         .destination = texture,
         .mip = mip,
         .layer = layer,
+        .offset = staging.offset,
         .region = region,
     } });
     self.pending_upload_bytes += data.len;
@@ -285,6 +301,8 @@ pub fn uploadTextureRegion(self: *Device, texture: types.Texture, mip: u32, laye
 /// Stages consecutive mips of one layer, from `first_mip`, packed back to
 /// back in `data`.
 pub fn uploadTextureLevels(self: *Device, texture: types.Texture, first_mip: u32, layer: u32, data: []const u8) !void {
+    self.lockResources();
+    defer self.unlockResources();
     const info = self.textureInfo(texture);
     var total: usize = 0;
     var count: u32 = 0;
@@ -294,17 +312,17 @@ pub fn uploadTextureLevels(self: *Device, texture: types.Texture, first_mip: u32
     }
     if (total != data.len or count == 0) return error.InvalidTextureData;
     const staging = try createStaging(self, data);
-    errdefer self.destroyBuffer(staging);
+    errdefer if (staging.owned(self)) self.destroyBuffer(staging.buffer);
     try self.uploads.ensureUnusedCapacity(self.gpa, count);
     var offset: u64 = 0;
     for (0..count) |index| {
         const mip = first_mip + @as(u32, @intCast(index));
         self.uploads.appendAssumeCapacity(.{ .texture = .{
-            .staging = staging,
+            .staging = staging.buffer,
             .destination = texture,
             .mip = mip,
             .layer = layer,
-            .offset = offset,
+            .offset = staging.offset + offset,
             .last = index + 1 == count,
         } });
         offset += info.format.dataSize(@max(info.width >> @intCast(mip), 1), @max(info.height >> @intCast(mip), 1));
@@ -344,6 +362,8 @@ pub fn readTexture(self: *Device, gpa: std.mem.Allocator, texture: types.Texture
 
 /// Takes one of 256 bindless slots; `error.BindlessTableFull` beyond that.
 pub fn createSampler(self: *Device, desc: types.SamplerDesc) !types.Sampler {
+    self.lockResources();
+    defer self.unlockResources();
     const anisotropy = std.math.clamp(desc.max_anisotropy, 1, self.properties.limits.max_sampler_anisotropy);
     const handle = try self.vkd.createSampler(&.{
         .mag_filter = vkFilter(desc.mag_filter),
@@ -381,6 +401,8 @@ pub fn createSampler(self: *Device, desc: types.SamplerDesc) !types.Sampler {
 
 /// Deferred like `destroyBuffer`.
 pub fn destroySampler(self: *Device, sampler: types.Sampler) void {
+    self.lockResources();
+    defer self.unlockResources();
     const resource = self.samplers.remove(sampler) orelse return;
     retire(self, .{ .sampler = resource.handle });
     retire(self, .{ .sampler_slot = resource.bindless_index });
@@ -422,6 +444,8 @@ pub fn vkCompareOp(op: types.CompareOp) vk.CompareOp {
 /// `exportTexture`. One mip, one layer, `error.SharedTexturesUnavailable`
 /// where `Capabilities.shared_textures` is false.
 pub fn createSharedTexture(self: *Device, desc: types.TextureDesc) !types.Texture {
+    self.lockResources();
+    defer self.unlockResources();
     if (!self.caps.shared_textures) return error.SharedTexturesUnavailable;
     if (desc.width == 0 or desc.height == 0 or desc.mip_levels != 1 or desc.layers != 1 or desc.kind != .@"2d")
         return error.InvalidTextureDesc;
@@ -448,7 +472,7 @@ pub fn createSharedTexture(self: *Device, desc: types.TextureDesc) !types.Textur
     }, null);
     setName(self, .image, @intFromEnum(image), desc.name);
     errdefer self.vkd.destroyImage(image, null);
-    const allocation = try self.allocator.allocateExported(self.vkd.getImageMemoryRequirements(image), handle_types);
+    const allocation = try self.allocator.allocateExported(memory.imageNeeds(self.vkd, image), handle_types);
     errdefer self.allocator.free(allocation);
     try self.vkd.bindImageMemory(image, allocation.memory, 0);
     return registerTexture(self, image, allocation, .{

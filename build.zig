@@ -316,6 +316,11 @@ pub fn build(b: *std.Build) void {
             "-Dmeshopt_simplifyScale=rnd_meshopt_simplifyScale",
         },
     });
+    simplifier.root_module.addCSourceFiles(.{
+        .root = zmesh.path("libs/meshoptimizer"),
+        .files = &.{ "vertexcodec.cpp", "indexcodec.cpp", "vertexfilter.cpp" },
+        .flags = &.{ "-fno-exceptions", "-fno-rtti" },
+    });
     renderer.linkLibrary(simplifier);
     const basis = b.addLibrary(.{
         .name = "renderer_basis",
@@ -434,6 +439,10 @@ pub fn build(b: *std.Build) void {
         glfw_module.link_libc = true;
         glfw_module.addCSourceFiles(.{ .root = source.path("src"), .files = &files, .flags = &.{"-D_GLFW_WIN32"} });
         for ([_][]const u8{ "gdi32", "user32", "shell32" }) |system| glfw_module.linkSystemLibrary(system, .{});
+    }
+    if (target.result.os.tag == .macos) {
+        glfw_module.linkFramework("QuartzCore", .{});
+        glfw_module.linkSystemLibrary("objc", .{});
     }
     const window_module = b.createModule(.{
         .root_source_file = b.path("examples/window.zig"),

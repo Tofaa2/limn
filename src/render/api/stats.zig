@@ -114,6 +114,9 @@ pub const Stats = struct {
     models_loading: u32 = 0,
     /// GPU memory allocated by the device, in bytes.
     gpu_memory_bytes: u64 = 0,
+    /// Device-local memory the driver lets this process use; 0 when it does
+    /// not say. Texture streaming without a budget of its own stays under 90%.
+    gpu_memory_budget_bytes: u64 = 0,
     /// Built-in pipelines built so far.
     pipelines: u32 = 0,
     /// Textures under `Options.textures.streaming`, the GPU memory they

@@ -7,6 +7,8 @@
 #elif defined(__linux__)
 #define GLFW_EXPOSE_NATIVE_X11
 #define GLFW_EXPOSE_NATIVE_WAYLAND
+#elif defined(__APPLE__)
+#define GLFW_EXPOSE_NATIVE_COCOA
 #endif
 
 #include <GLFW/glfw3native.h>

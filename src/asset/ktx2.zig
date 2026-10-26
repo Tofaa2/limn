@@ -7,7 +7,12 @@ pub const identifier = [12]u8{ 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, '\r', '
 
 /// BC formats are 4x4 blocks of 16 bytes (8 for `bc1` and `bc4`); `rgba8` is 4
 /// bytes a texel, `rgba16f` 8. `bc6h` is unsigned.
-pub const Format = enum { bc7, rgba8, bc1, bc3, bc4, bc5, bc6h, rgba16f };
+pub const Format = enum { bc7, rgba8, bc1, bc3, bc4, bc5, bc6h, rgba16f, astc4x4 };
+
+/// What Basis Universal textures are transcoded to: BC7 (BC6H for HDR), ASTC
+/// 4x4 (RGBA16F for HDR), or plain RGBA8 (RGBA16F), for GPUs without the
+/// block formats before it.
+pub const BasisTarget = enum { bc, astc, rgba };
 
 pub const Texture = struct {
     /// Size of the largest level, in texels.
@@ -33,6 +38,8 @@ const max_bytes = 1 << 32;
 const vk_r8g8b8a8_unorm = 37;
 const vk_r8g8b8a8_srgb = 43;
 const vk_r16g16b16a16_sfloat = 97;
+const vk_astc_4x4_unorm = 157;
+const vk_astc_4x4_srgb = 158;
 const vk_bc7_unorm = 145;
 const vk_bc7_srgb = 146;
 const vk_bc1_rgba_unorm = 133;
@@ -52,14 +59,14 @@ pub fn isKtx2(bytes: []const u8) bool {
 
 fn levelBytes(format: Format, width: u32, height: u32) usize {
     return switch (format) {
-        .bc7, .bc3, .bc5, .bc6h => @as(usize, (width + 3) / 4) * ((height + 3) / 4) * 16,
+        .bc7, .bc3, .bc5, .bc6h, .astc4x4 => @as(usize, (width + 3) / 4) * ((height + 3) / 4) * 16,
         .bc1, .bc4 => @as(usize, (width + 3) / 4) * ((height + 3) / 4) * 8,
         .rgba8 => @as(usize, width) * height * 4,
         .rgba16f => @as(usize, width) * height * 8,
     };
 }
 
-pub fn read(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
+pub fn read(gpa: std.mem.Allocator, bytes: []const u8, basis: BasisTarget) !Texture {
     if (!isKtx2(bytes) or bytes.len < 80) return error.InvalidKtx2;
     const vk_format = std.mem.readInt(u32, bytes[12..16], .little);
     const width = std.mem.readInt(u32, bytes[20..24], .little);
@@ -74,7 +81,7 @@ pub fn read(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     if (depth > 1) return error.UnsupportedKtx2;
     if ((faces != 1 and faces != 6) or layers > 2048) return error.InvalidKtx2;
     if (faces == 6 and width != height) return error.InvalidKtx2;
-    if (vk_format == 0) return readBasis(gpa, bytes);
+    if (vk_format == 0) return readBasis(gpa, bytes, basis);
     const images: usize = layers * faces;
     const format: Format, const srgb: bool = switch (vk_format) {
         vk_bc7_unorm => .{ .bc7, false },
@@ -89,6 +96,8 @@ pub fn read(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
         vk_bc5_unorm => .{ .bc5, false },
         vk_bc6h_ufloat => .{ .bc6h, false },
         vk_r16g16b16a16_sfloat => .{ .rgba16f, false },
+        vk_astc_4x4_unorm => .{ .astc4x4, false },
+        vk_astc_4x4_srgb => .{ .astc4x4, true },
         else => return error.UnsupportedKtx2,
     };
     if (scheme != 0 and scheme != 2) return error.UnsupportedKtx2;
@@ -130,11 +139,11 @@ pub fn read(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
 }
 
 extern fn rnd_basis_open(data: [*]const u8, size: u32, info: *[8]u32) ?*anyopaque;
-extern fn rnd_basis_level(handle: *anyopaque, level: u32, layer: u32, face: u32, out: [*]u8, blocks: u32, hdr: c_int) c_int;
+extern fn rnd_basis_level(handle: *anyopaque, level: u32, layer: u32, face: u32, out: [*]u8, units: u32, target: c_int) c_int;
 extern fn rnd_basis_close(handle: *anyopaque) void;
 
-/// Transcodes a Basis Universal KTX2 file to BC7, or BC6H for HDR.
-fn readBasis(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
+/// Transcodes a Basis Universal KTX2 file to `basis`'s formats.
+fn readBasis(gpa: std.mem.Allocator, bytes: []const u8, basis: BasisTarget) !Texture {
     if (bytes.len > std.math.maxInt(u32)) return error.UnsupportedKtx2;
     var info: [8]u32 = undefined;
     const handle = rnd_basis_open(bytes.ptr, @intCast(bytes.len), &info) orelse return error.UnsupportedKtx2;
@@ -149,7 +158,18 @@ fn readBasis(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     if (levels > std.math.log2_int(u32, @max(width, height)) + 1) return error.InvalidKtx2;
     if ((faces != 1 and faces != 6) or layers > 2048) return error.InvalidKtx2;
     if (faces == 6 and width != height) return error.InvalidKtx2;
-    const format: Format = if (hdr) .bc6h else .bc7;
+    const format: Format = if (hdr) (if (basis == .bc) .bc6h else .rgba16f) else switch (basis) {
+        .bc => .bc7,
+        .astc => .astc4x4,
+        .rgba => .rgba8,
+    };
+    const target: c_int = switch (format) {
+        .bc6h => 1,
+        .astc4x4 => 2,
+        .rgba8 => 3,
+        .rgba16f => 4,
+        else => 0,
+    };
     var total: usize = 0;
     for (0..levels) |level| total += layers * faces * levelBytes(format, @max(width >> @intCast(level), 1), @max(height >> @intCast(level), 1));
     if (total > max_bytes) return error.UnsupportedKtx2;
@@ -157,9 +177,12 @@ fn readBasis(gpa: std.mem.Allocator, bytes: []const u8) !Texture {
     errdefer gpa.free(data);
     var cursor: usize = 0;
     for (0..levels) |level| {
-        const size = levelBytes(format, @max(width >> @intCast(level), 1), @max(height >> @intCast(level), 1));
+        const level_width = @max(width >> @intCast(level), 1);
+        const level_height = @max(height >> @intCast(level), 1);
+        const size = levelBytes(format, level_width, level_height);
+        const units: u32 = if (format == .rgba8 or format == .rgba16f) level_width * level_height else @intCast(size / 16);
         for (0..layers) |layer| for (0..faces) |face| {
-            if (rnd_basis_level(handle, @intCast(level), @intCast(layer), @intCast(face), data[cursor..].ptr, @intCast(size / 16), @intFromBool(hdr)) == 0)
+            if (rnd_basis_level(handle, @intCast(level), @intCast(layer), @intCast(face), data[cursor..].ptr, units, target) == 0)
                 return error.InvalidKtx2;
             cursor += size;
         };
@@ -228,6 +251,7 @@ pub fn write(gpa: std.mem.Allocator, texture: Texture) ![]u8 {
         .bc6h => vk_bc6h_ufloat,
         .rgba16f => vk_r16g16b16a16_sfloat,
         .rgba8 => if (texture.srgb) vk_r8g8b8a8_srgb else vk_r8g8b8a8_unorm,
+        .astc4x4 => if (texture.srgb) vk_astc_4x4_srgb else vk_astc_4x4_unorm,
     };
     std.mem.writeInt(u32, out[12..16], vk_format, .little);
     std.mem.writeInt(u32, out[16..20], if (texture.format == .rgba16f) 2 else 1, .little);
@@ -272,7 +296,7 @@ test "a texture survives being written and read back" {
     const file = try write(std.testing.allocator, original);
     defer std.testing.allocator.free(file);
     try std.testing.expect(isKtx2(file));
-    const copy = try read(std.testing.allocator, file);
+    const copy = try read(std.testing.allocator, file, .bc);
     defer std.testing.allocator.free(copy.data);
     try std.testing.expectEqual(@as(u32, 8), copy.width);
     try std.testing.expectEqual(Format.bc7, copy.format);
@@ -280,7 +304,7 @@ test "a texture survives being written and read back" {
     try std.testing.expectEqual(@as(u32, 3), copy.levels);
     try std.testing.expectEqualSlices(u8, &data, copy.data);
 
-    try std.testing.expectError(error.InvalidKtx2, read(std.testing.allocator, file[0..40]));
+    try std.testing.expectError(error.InvalidKtx2, read(std.testing.allocator, file[0..40], .bc));
 }
 
 test "the other block formats are read with their own block sizes" {
@@ -290,7 +314,7 @@ test "the other block formats are read with their own block sizes" {
         const payload = data[0 .. 16 * case[1]];
         const file = try write(std.testing.allocator, .{ .width = 16, .height = 16, .format = case[0], .srgb = false, .levels = 1, .data = payload });
         defer std.testing.allocator.free(file);
-        const copy = try read(std.testing.allocator, file);
+        const copy = try read(std.testing.allocator, file, .bc);
         defer std.testing.allocator.free(copy.data);
         try std.testing.expectEqual(case[0], copy.format);
         try std.testing.expectEqualSlices(u8, payload, copy.data);
@@ -303,7 +327,7 @@ test "cube maps and arrays keep every face and layer of every level" {
     {
         const file = try write(std.testing.allocator, .{ .width = 4, .height = 4, .format = .rgba16f, .srgb = false, .levels = 2, .faces = 6, .data = &cube });
         defer std.testing.allocator.free(file);
-        const copy = try read(std.testing.allocator, file);
+        const copy = try read(std.testing.allocator, file, .bc);
         defer std.testing.allocator.free(copy.data);
         try std.testing.expectEqual(Format.rgba16f, copy.format);
         try std.testing.expectEqual(@as(u32, 6), copy.faces);
@@ -314,7 +338,7 @@ test "cube maps and arrays keep every face and layer of every level" {
     for (&array, 0..) |*byte, index| byte.* = @truncate(index * 5 + 1);
     const file = try write(std.testing.allocator, .{ .width = 8, .height = 8, .format = .rgba8, .srgb = true, .levels = 1, .layers = 3, .data = &array });
     defer std.testing.allocator.free(file);
-    const copy = try read(std.testing.allocator, file);
+    const copy = try read(std.testing.allocator, file, .bc);
     defer std.testing.allocator.free(copy.data);
     try std.testing.expectEqual(@as(u32, 3), copy.layers);
     try std.testing.expectEqual(@as(u32, 1), copy.faces);
@@ -328,9 +352,9 @@ test "a header that claims more than the file holds is refused" {
     const header = file[0..104];
     var damaged = header.*;
     std.mem.writeInt(u32, damaged[40..44], 9, .little);
-    try std.testing.expectError(error.InvalidKtx2, read(std.testing.allocator, &damaged));
+    try std.testing.expectError(error.InvalidKtx2, read(std.testing.allocator, &damaged, .bc));
     damaged = header.*;
     std.mem.writeInt(u32, damaged[20..24], 16384, .little);
     std.mem.writeInt(u32, damaged[24..28], 16384, .little);
-    try std.testing.expectError(error.InvalidKtx2, read(std.testing.allocator, &damaged));
+    try std.testing.expectError(error.InvalidKtx2, read(std.testing.allocator, &damaged, .bc));
 }

@@ -2,6 +2,7 @@
 const std = @import("std");
 const types = @import("../../types.zig");
 const device_module = @import("../device.zig");
+const memory = @import("../memory.zig");
 
 const Device = device_module.Device;
 const BufferResource = device_module.BufferResource;
@@ -14,6 +15,8 @@ const setName = @import("objects.zig").setName;
 /// The address is fixed and host-visible kinds are mapped; contents start
 /// undefined. Fails with `error.InvalidBufferSize` for a size of 0.
 pub fn createBuffer(self: *Device, desc: types.BufferDesc) !types.Buffer {
+    self.lockResources();
+    defer self.unlockResources();
     if (desc.size == 0) return error.InvalidBufferSize;
     const handle = try self.vkd.createBuffer(&.{
         .size = desc.size,
@@ -32,7 +35,7 @@ pub fn createBuffer(self: *Device, desc: types.BufferDesc) !types.Buffer {
     }, null);
     setName(self, .buffer, @intFromEnum(handle), desc.name);
     errdefer self.vkd.destroyBuffer(handle, null);
-    const allocation = try self.allocator.allocate(self.vkd.getBufferMemoryRequirements(handle), switch (desc.memory) {
+    const allocation = try self.allocator.allocate(memory.bufferNeeds(self.vkd, handle), switch (desc.memory) {
         .gpu => .gpu,
         .cpu_to_gpu => .cpu_to_gpu,
         .gpu_to_cpu => .gpu_to_cpu,
@@ -53,6 +56,8 @@ pub fn createBuffer(self: *Device, desc: types.BufferDesc) !types.Buffer {
 
 /// Drops queued uploads that target a resource being destroyed.
 pub fn cancelUploads(self: *Device, buffer: ?types.Buffer, texture: ?types.Texture) void {
+    self.lockResources();
+    defer self.unlockResources();
     var orphaned: [16]types.Buffer = undefined;
     var orphan_count: usize = orphaned.len;
     while (orphan_count == orphaned.len) {
@@ -75,7 +80,7 @@ fn cancelSomeUploads(self: *Device, buffer: ?types.Buffer, texture: ?types.Textu
             .copy => |copy| if (buffer != null and sameHandle(copy.destination, buffer.?)) copy.source else null,
         };
         if (staging) |value| if (orphan_count < orphaned.len) {
-            if (value.isValid()) {
+            if (value.isValid() and !sameHandle(value, self.staging_ring)) {
                 orphaned[orphan_count] = value;
                 orphan_count += 1;
             }
@@ -92,6 +97,8 @@ fn cancelSomeUploads(self: *Device, buffer: ?types.Buffer, texture: ?types.Textu
 /// `frames_in_flight` more frames, or by the next `waitIdle`,
 /// `flushUploadsBlocking` or `endImmediate`. Stale handles are ignored.
 pub fn destroyBuffer(self: *Device, buffer: types.Buffer) void {
+    self.lockResources();
+    defer self.unlockResources();
     if (self.uploads.items.len != 0) cancelUploads(self, buffer, null);
     const resource = self.buffers.remove(buffer) orelse return;
     retire(self, .{ .buffer = .{ .handle = resource.handle, .allocation = resource.allocation } });
@@ -129,6 +136,8 @@ pub fn mappedSlice(self: *Device, comptime T: type, buffer: types.Buffer) []T {
 /// Host-visible buffers are written immediately; device-local ones are
 /// staged and copied at the start of the next frame or `flushUploads`.
 pub fn uploadBuffer(self: *Device, buffer: types.Buffer, offset: u64, data: []const u8) !void {
+    self.lockResources();
+    defer self.unlockResources();
     if (data.len == 0) return;
     const resource = self.bufferResource(buffer);
     if (offset + data.len > resource.size) return error.UploadOutOfBounds;
@@ -137,9 +146,10 @@ pub fn uploadBuffer(self: *Device, buffer: types.Buffer, offset: u64, data: []co
         return;
     }
     const staging = try createStaging(self, data);
-    errdefer self.destroyBuffer(staging);
+    errdefer if (staging.owned(self)) self.destroyBuffer(staging.buffer);
     try self.uploads.append(self.gpa, .{ .buffer = .{
-        .staging = staging,
+        .staging = staging.buffer,
+        .staging_offset = staging.offset,
         .destination = buffer,
         .offset = offset,
         .size = data.len,

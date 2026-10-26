@@ -183,6 +183,18 @@ fn overrideShaders(names: []const []const u8, codes: []const []u8) !void {
 
 /// Shader code by name: what `shaders.reload` last compiled, or else what
 /// was built into the program.
+/// Meshlet draws pull their indices in the vertex shader, which hands the
+/// fragment shader the triangle: the device has neither mesh shaders nor
+/// `SV_PrimitiveID`.
+pub fn pulledDraws(device: *const rhi.Device) bool {
+    return !device.caps.mesh_shaders and !device.caps.primitive_id;
+}
+
+/// The vertex shader of meshlet draws, for `pulledDraws` or not.
+pub fn visibilityVertex(device: *const rhi.Device) []const u8 {
+    return if (pulledDraws(device)) shaderCode("visibility_pulled.vert.spv") else shaderCode("visibility.vert.spv");
+}
+
 pub fn shaderCode(comptime name: []const u8) []const u8 {
     if (!overridden.load(.acquire)) return @embedFile(name);
     lockOverrides();
@@ -222,7 +234,7 @@ pub const shadow_depth = rhi.DepthState{
 pub fn shadowPipeline(device: *rhi.Device) Desc {
     return .{ .graphics = .{
         .name = "shadow",
-        .vertex = shaderCode("visibility.vert.spv"),
+        .vertex = visibilityVertex(device),
         .mesh = if (device.caps.mesh_shaders) shaderCode("visibility.mesh.spv") else null,
         .task = if (device.caps.mesh_shaders) shaderCode("visibility.task.spv") else null,
         .depth = shadow_depth,
@@ -233,7 +245,7 @@ pub fn shadowPipeline(device: *rhi.Device) Desc {
 pub fn shadowMaskedPipeline(device: *rhi.Device) Desc {
     return .{ .graphics = .{
         .name = "shadow masked",
-        .vertex = shaderCode("visibility.vert.spv"),
+        .vertex = visibilityVertex(device),
         .mesh = if (device.caps.mesh_shaders) shaderCode("visibility.mesh.spv") else null,
         .task = if (device.caps.mesh_shaders) shaderCode("visibility.task.spv") else null,
         .fragment = shaderCode("shadow_masked.frag.spv"),

@@ -59,6 +59,7 @@ pub const ImpostorDesc = descs.ImpostorDesc;
 pub const HairDesc = descs.HairDesc;
 pub const HairSimulation = descs.HairSimulation;
 pub const WaterDesc = descs.WaterDesc;
+pub const Ocean = descs.Ocean;
 pub const FluidWalls = descs.FluidWalls;
 pub const FluidSource = descs.FluidSource;
 pub const FluidObstacle = descs.FluidObstacle;

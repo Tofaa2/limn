@@ -150,6 +150,10 @@ pub fn fitMaps(renderer: *Renderer, view_data: *render.ViewData, enabled: bool, 
     return own;
 }
 
+/// `Shared` values this feature's `prepare` sets, and those it reads.
+pub const provides = .{ "sun", "local_shadows", "shadow_tlas", "colored_shadows" };
+pub const uses = .{"lighting"};
+
 /// Makes the view's sun shadow maps and picks the cascades to redraw, then
 /// plans the local light shadows this frame draws.
 pub fn prepare(ctx: *ViewContext) !void {
@@ -394,21 +398,21 @@ pub fn planLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *con
         for (0..lighting.tile_count) |tile| renderer.internal.local_tile_had_mover[tile] = scene_frame.any_moving;
     }
     const draw_local_shadows = any_tile_dirty and scene.ref_count != 0 and !local_shadows_current;
+    if (draw_local_shadows) {
+        renderer.internal.local_shadow_scene = scene_handle;
+        renderer.internal.local_shadow_frame = renderer.internal.frame_index;
+        renderer.internal.local_shadow_key = shadow_key;
+    }
     return .{ .draw = draw_local_shadows, .same_atlas = same_atlas, .key = shadow_key, .tile_dirty = tile_dirty };
 }
 
 /// Draws the changed tiles of the local shadow atlas.
 pub fn drawLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *const Lighting, local: *const LocalShadows) !void {
     const cmd = p.cmd;
-    const scene_handle = p.scene_handle;
     const scene = p.scene;
     const frame_address = p.frame_address;
     const same_atlas = local.same_atlas;
-    const shadow_key = local.key;
     const tile_dirty = local.tile_dirty;
-    renderer.internal.local_shadow_scene = scene_handle;
-    renderer.internal.local_shadow_frame = renderer.internal.frame_index;
-    renderer.internal.local_shadow_key = shadow_key;
     cmd.beginScope("local shadows");
     try cmd.beginRendering(.{ .depth = .{ .texture = renderer.internal.local_shadow_map, .load = if (same_atlas) .load else .clear, .clear = 0 } });
     cmd.bindIndexBuffer(renderer.internal.indices.get(), 0, .uint32);
@@ -437,7 +441,7 @@ pub fn drawLocalShadows(renderer: *Renderer, p: *const ScenePass, lighting: *con
 fn localShadowPipeline(device: *rhi.Device) pipelines_module.Desc {
     return .{ .graphics = .{
         .name = "local shadow",
-        .vertex = pipelines_module.shaderCode("visibility.vert.spv"),
+        .vertex = pipelines_module.visibilityVertex(device),
         .mesh = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.mesh.spv") else null,
         .task = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.task.spv") else null,
         .depth = pipelines_module.local_shadow_depth,
@@ -448,7 +452,7 @@ fn localShadowPipeline(device: *rhi.Device) pipelines_module.Desc {
 fn localShadowMaskedPipeline(device: *rhi.Device) pipelines_module.Desc {
     return .{ .graphics = .{
         .name = "local shadow masked",
-        .vertex = pipelines_module.shaderCode("visibility.vert.spv"),
+        .vertex = pipelines_module.visibilityVertex(device),
         .mesh = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.mesh.spv") else null,
         .task = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.task.spv") else null,
         .fragment = pipelines_module.shaderCode("shadow_masked.frag.spv"),
@@ -460,7 +464,7 @@ fn localShadowMaskedPipeline(device: *rhi.Device) pipelines_module.Desc {
 fn shadowColorPipeline(device: *rhi.Device) pipelines_module.Desc {
     return .{ .graphics = .{
         .name = "shadow tint",
-        .vertex = pipelines_module.shaderCode("visibility.vert.spv"),
+        .vertex = pipelines_module.visibilityVertex(device),
         .mesh = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.mesh.spv") else null,
         .task = if (device.caps.mesh_shaders) pipelines_module.shaderCode("visibility.task.spv") else null,
         .fragment = pipelines_module.shaderCode("shadow_color.frag.spv"),

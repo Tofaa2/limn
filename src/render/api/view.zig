@@ -122,6 +122,11 @@ pub const Pass = struct {
     /// moves. While it does, every cascade and atlas tile is redrawn each
     /// frame, also those that would otherwise be kept.
     moving: bool = true,
+    /// `run` may be called on another thread while passes of other views
+    /// run, when a frame's views of different scenes are recorded at once;
+    /// set it when `run` touches nothing but what its view gives it. A frame
+    /// with a pass that does not set it records its views one by one.
+    threaded: bool = false,
     context: ?*anyopaque = null,
     run: *const fn (context: ?*anyopaque, pass: PassContext) anyerror!void,
 };

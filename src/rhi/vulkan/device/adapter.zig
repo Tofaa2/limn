@@ -70,8 +70,6 @@ fn supportsRequiredFeatures(instance: dispatch.Instance, physical: vk.PhysicalDe
         features.features.depth_bias_clamp == .true and
         features.features.independent_blend == .true and
         features.features.image_cube_array == .true and
-        features.features.shader_int_64 == .true and
-        features.features.geometry_shader == .true and
         features.features.shader_clip_distance == .true and
         features11.shader_draw_parameters == .true and
         features12.descriptor_indexing == .true and
@@ -101,6 +99,8 @@ pub fn createSurface(instance: dispatch.Instance, window: types.NativeWindow) !v
             .hinstance = @ptrCast(native.instance),
             .hwnd = @ptrCast(native.window),
         }, null),
+        .metal => |native| instance.createMetalSurfaceEXT(&.{ .p_layer = @ptrCast(native.layer) }, null),
+        .android => |native| instance.createAndroidSurfaceKHR(&.{ .window = @ptrCast(native.window) }, null),
     };
 }
 

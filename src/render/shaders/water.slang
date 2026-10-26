@@ -28,11 +28,27 @@ struct WaterData {
     float detail;
     uint mask;
     WaterRipple ripples[16];
+    float* ocean;
+    float ocean_period;
+    float ocean_pad;
 };
 
 typedef WaterData* WaterRef;
 
+/// Height of the ocean tile at world `at`, filtered between its cells.
+float oceanHeight(WaterRef water, float2 at) {
+    float2 cell = at / water.ocean_period * 128.0 - 0.5;
+    int2 base = int2(floor(cell));
+    float2 t = cell - floor(cell);
+    float a = water.ocean[(base.y & 127) * 128 + (base.x & 127)];
+    float b = water.ocean[(base.y & 127) * 128 + ((base.x + 1) & 127)];
+    float c = water.ocean[((base.y + 1) & 127) * 128 + (base.x & 127)];
+    float d = water.ocean[((base.y + 1) & 127) * 128 + ((base.x + 1) & 127)];
+    return lerp(lerp(a, b, t.x), lerp(c, d, t.x), t.y);
+}
+
 float waterSwell(WaterRef water, float2 at, float time) {
+    if (water.ocean != nullptr) return oceanHeight(water, at);
     float amplitude = water.swell;
     if (amplitude <= 0.0) return 0.0;
     float k = 6.2831853 / max(water.swell_length, 1e-3);

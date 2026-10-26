@@ -152,6 +152,22 @@ pub const Downgrades = struct {
     }
 };
 
+comptime {
+    var provided: []const []const u8 = &.{};
+    for (list) |Feature| {
+        if (@hasDecl(Feature, "uses")) for (Feature.uses) |name| {
+            if (!@hasField(scene_pass.Shared, name)) @compileError(@typeName(Feature) ++ " uses " ++ name ++ ", which is not a field of Shared");
+            for (provided) |given| {
+                if (std.mem.eql(u8, given, name)) break;
+            } else @compileError(@typeName(Feature) ++ " uses " ++ name ++ " in prepare, but no feature before it in the list provides it");
+        };
+        if (@hasDecl(Feature, "provides")) for (Feature.provides) |name| {
+            if (!@hasField(scene_pass.Shared, name)) @compileError(@typeName(Feature) ++ " provides " ++ name ++ ", which is not a field of Shared");
+            provided = provided ++ .{name};
+        };
+    }
+}
+
 /// Runs each feature's `prepare`, in list order, for a view of a scene:
 /// what passes of other features read and the feature's own frame
 /// constants are set there, before any feature declares its passes.

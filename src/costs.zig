@@ -32,6 +32,8 @@ const Bench = struct {
         cpu_ms: f32,
         /// Most allocations in one measured frame.
         allocations: usize,
+        /// GPU time of the scenario's `scope` in the last measured frame.
+        scope_ms: f32 = 0,
     };
 
     const Scenario = struct {
@@ -39,6 +41,8 @@ const Bench = struct {
         unit: []const u8,
         sizes: []const u32,
         build: *const fn (bench: *Bench, scene: ?gfx.Scene, size: u32) anyerror!Setup,
+        /// A GPU scope whose time each row also prints.
+        scope: ?[]const u8 = null,
     };
 
     const Setup = struct {
@@ -49,6 +53,11 @@ const Bench = struct {
         /// Rect count the list is cleared and drawn again with every frame.
         rebuild: ?u32 = null,
         scene: bool = true,
+        /// Entities made every frame, and those made the frame before destroyed.
+        churn: u32 = 0,
+        /// Views after the first draw scenes of their own, each with the
+        /// first scene's boxes.
+        scene_per_view: bool = false,
     };
 
     fn run(bench: *Bench, scenario: Scenario) !void {
@@ -57,7 +66,9 @@ const Bench = struct {
         var previous: ?Row = null;
         for (scenario.sizes) |size| {
             const row = try bench.measure(scenario, size);
-            std.debug.print("{d:>7} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>9} {d:>10} {d:>7.3} {d:>6}\n", .{
+            var scope_buffer: [64]u8 = undefined;
+            const scope_text = if (scenario.scope) |name| std.fmt.bufPrint(&scope_buffer, "  {s} {d:.3} ms", .{ name, row.scope_ms }) catch "" else "";
+            std.debug.print("{d:>7} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>6} {d:>9} {d:>10} {d:>7.3} {d:>6}{s}\n", .{
                 row.size,
                 row.work.render_passes,
                 row.work.draws,
@@ -73,6 +84,7 @@ const Bench = struct {
                 row.frame_data_bytes,
                 row.cpu_ms,
                 row.allocations,
+                scope_text,
             });
             if (previous) |before| if (row.size > before.size) {
                 const added: f64 = @floatFromInt(row.size - before.size);
@@ -111,11 +123,23 @@ const Bench = struct {
         const setup = try scenario.build(bench, scene, size);
         try renderer.waitUntilLoaded();
 
+        var own_scenes: [8]?gfx.Scene = @splat(null);
+        defer for (own_scenes) |made| if (made) |own| renderer.scenes.destroy(own);
+        if (setup.scene_per_view) for (own_scenes[1..setup.views]) |*own| {
+            own.* = try renderer.scenes.create();
+            renderer.scenes.setSun(own.*.?, .{ .direction = .{ -0.4, -0.8, -0.3 }, .color = .{ 1, 1, 1 }, .intensity = 4 });
+            bench.gpa.free(try bench.spawnBoxes(own.*.?, 100));
+        };
+        try renderer.waitUntilLoaded();
         var targets: [8]gfx.rhi.Texture = undefined;
         for (targets[1..setup.views]) |*target| target.* = try renderer.views.createTarget(width / 2, height / 2);
         defer for (targets[1..setup.views]) |target| renderer.views.destroyTarget(target);
         targets[0] = bench.target;
 
+        const churned = try bench.gpa.alloc(?gfx.Entity, setup.churn);
+        defer bench.gpa.free(churned);
+        @memset(churned, null);
+        defer for (churned) |entity| if (entity) |made| renderer.entities.destroy(made);
         var cpu: [measured_frames]f32 = undefined;
         var allocations: usize = 0;
         var last: gfx.Stats = undefined;
@@ -129,12 +153,16 @@ const Bench = struct {
                 const along: f32 = @floatFromInt(index);
                 renderer.entities.setTransform(entity, math.translation(gridPoint(@intCast(index), @intCast(setup.moving.len), @sin(time + along))));
             }
+            for (churned, 0..) |*entity, index| {
+                if (entity.*) |old| renderer.entities.destroy(old);
+                entity.* = try renderer.entities.create(scene, .{ .model = bench.box, .transform = math.translation(gridPoint(@intCast(index), setup.churn, 3)) });
+            }
             var views: [8]gfx.ViewDesc = undefined;
             for (views[0..setup.views], targets[0..setup.views], 0..) |*view, target, index| {
                 const angle: f32 = @as(f32, @floatFromInt(index)) * 0.7;
                 view.* = .{
                     .view = if (index == 0) null else bench.extra_views[index - 1],
-                    .scene = if (setup.scene) scene else null,
+                    .scene = if (!setup.scene) null else if (own_scenes[index]) |own| own else scene,
                     .camera = gfx.Camera.lookAt(.{ 30 * @sin(angle), 18, 30 * @cos(angle) }, .{ 0, 0, 0 }),
                     .target = .{ .texture = target },
                     .settings = setup.settings,
@@ -155,10 +183,14 @@ const Bench = struct {
                 std.debug.print("        {s}{s:<24} passes {d} draws {d}+{d} dispatches {d} barriers {d}/{d} binds {d} push {d} transfers {d} builds {d}\n", .{ "                "[0..@min(timing.depth * 2, 16)], timing.name, work.render_passes, work.draws, work.indirect_draws, work.dispatches, work.barriers, work.image_barriers, work.pipeline_binds, work.push_constants, work.transfers, work.builds });
             }
         }
+        var scope_ms: f32 = 0;
+        if (scenario.scope) |name| for (renderer.device.passTimings()) |timing| {
+            if (std.mem.eql(u8, timing.name, name)) scope_ms += timing.milliseconds;
+        };
         try renderer.device.waitIdle();
         std.mem.sort(f32, &cpu, {}, std.sort.asc(f32));
         bench.gpa.free(setup.moving);
-        return .{ .size = size, .work = last.commands, .frame_data_bytes = last.frame_data_bytes, .cpu_ms = cpu[measured_frames / 2], .allocations = allocations };
+        return .{ .size = size, .work = last.commands, .frame_data_bytes = last.frame_data_bytes, .cpu_ms = cpu[measured_frames / 2], .allocations = allocations, .scope_ms = scope_ms };
     }
 
     fn spawnBoxes(bench: *Bench, scene: gfx.Scene, count: u32) ![]gfx.Entity {
@@ -315,9 +347,22 @@ fn fullLights(bench: *Bench, scene: ?gfx.Scene, size: u32) !Bench.Setup {
     return .{ .settings = .{}, .moving = try bench.gpa.alloc(gfx.Entity, 0) };
 }
 
+fn churning(bench: *Bench, scene: ?gfx.Scene, size: u32) !Bench.Setup {
+    var setup = try still(bench, scene, size);
+    setup.churn = 10;
+    return setup;
+}
+
 fn manyViews(bench: *Bench, scene: ?gfx.Scene, size: u32) !Bench.Setup {
     bench.gpa.free(try bench.spawnBoxes(scene.?, 100));
     return .{ .views = size, .moving = try bench.gpa.alloc(gfx.Entity, 0) };
+}
+
+fn sceneViews(bench: *Bench, scene: ?gfx.Scene, size: u32) !Bench.Setup {
+    var setup = try manyViews(bench, scene, size);
+    setup.settings = .{};
+    setup.scene_per_view = true;
+    return setup;
 }
 
 fn manyViewsFull(bench: *Bench, scene: ?gfx.Scene, size: u32) !Bench.Setup {
@@ -341,10 +386,12 @@ const scenarios = [_]Bench.Scenario{
     .{ .name = "lightweight 3D, still", .unit = "entity", .sizes = &.{ 1, 100, 1000, 10000 }, .build = still },
     .{ .name = "lightweight 3D, all moving", .unit = "entity", .sizes = &.{ 1, 100, 1000, 10000 }, .build = allMoving },
     .{ .name = "lightweight 3D, ten moving", .unit = "entity", .sizes = &.{ 10, 100, 1000, 10000 }, .build = tenMoving },
+    .{ .name = "lightweight 3D, ten made and destroyed a frame", .unit = "entity", .sizes = &.{ 100, 1000, 10000, 100000 }, .build = churning },
     .{ .name = "lightweight 3D, instance group", .unit = "instance", .sizes = &.{ 1, 100, 1000, 10000 }, .build = instanced },
     .{ .name = "lightweight 3D, views (100 boxes)", .unit = "view", .sizes = &.{ 1, 2, 4, 8 }, .build = manyViews },
     .{ .name = "everything on, still", .unit = "entity", .sizes = &.{ 1, 100, 1000, 10000 }, .build = fullStill },
-    .{ .name = "everything on, lights (100 boxes)", .unit = "light", .sizes = &.{ 0, 8, 64, 256 }, .build = fullLights },
+    .{ .name = "everything on, lights (100 boxes)", .unit = "light", .sizes = &.{ 0, 64, 256, 1024, 4096 }, .build = fullLights, .scope = "light clusters" },
+    .{ .name = "everything on, views of scenes of their own (100 boxes each)", .unit = "view", .sizes = &.{ 1, 2, 4, 8 }, .build = sceneViews },
     .{ .name = "everything on, views (100 boxes)", .unit = "view", .sizes = &.{ 1, 2, 4, 8 }, .build = manyViewsFull },
 };
 
@@ -352,12 +399,15 @@ pub fn main(init: std.process.Init) !void {
     var only: ?[]const u8 = null;
     var device: ?[]const u8 = null;
     var show_passes = false;
+    var threads: u32 = 0;
     var args = try init.minimal.args.iterateAllocator(init.gpa);
     defer args.deinit();
     _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--passes")) {
             show_passes = true;
+        } else if (std.mem.eql(u8, arg, "--threads")) {
+            threads = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--device")) {
             device = try init.gpa.dupe(u8, args.next() orelse return error.MissingArgument);
         } else only = try init.gpa.dupe(u8, arg);
@@ -366,7 +416,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (device) |name| init.gpa.free(name);
 
     var counting = CountingAllocator{ .backing = init.gpa };
-    const renderer = try gfx.Renderer.init(counting.allocator(), init.io, .{ .application_name = "limn costs", .deterministic = true, .job_allocator = counting.allocator(), .preferred_device = device });
+    const renderer = try gfx.Renderer.init(counting.allocator(), init.io, .{ .application_name = "limn costs", .deterministic = true, .job_allocator = counting.allocator(), .preferred_device = device, .worker_threads = threads });
     defer renderer.deinit();
     std.debug.print("{s} GPU, unified memory {}\n", .{ @tagName(renderer.device.adapterInfo().kind), renderer.device.caps.unified_memory });
     const target = try renderer.views.createTarget(width, height);

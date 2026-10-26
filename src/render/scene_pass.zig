@@ -2,6 +2,7 @@
 //! Internal to the renderer.
 const cull_push = @import("shaders/push/cull.zig");
 const visibility_push = @import("shaders/push/visibility.zig");
+const std = @import("std");
 const rhi = @import("../rhi/rhi.zig");
 const math = @import("../math.zig");
 const gpu = @import("gpu.zig");
@@ -63,8 +64,17 @@ pub const SceneFrame = struct {
     bounds: [2]Vec3,
 };
 
+/// What `Shared` holds until the feature that provides a value sets it: no
+/// sun shadows, lights or local shadows.
+pub const no_sun = SunShadows{ .enabled = false, .colored = false, .map = rhi.Texture.invalid, .cascades = std.mem.zeroes(Cascades), .count = 0, .update = @splat(false) };
+pub const no_lighting = Lighting{ .lights = 0, .tiles = 0, .light_count = 0, .tile_count = 0, .tile_view_proj = std.mem.zeroes([max_local_shadow_views]Mat4), .tile_views = std.mem.zeroes([max_local_shadow_views]gpu.CullView) };
+pub const no_local_shadows = LocalShadows{ .draw = false, .same_atlas = false, .key = 0, .tile_dirty = @splat(false) };
+
 /// What the features of one view of a scene hand each other while its frame
 /// is put together and drawn.
+/// Values a feature's `prepare` sets for later ones are named by its
+/// `provides`; a feature whose `prepare` reads one names it in `uses`, and
+/// `core/features.zig` checks that an earlier feature provides it.
 pub const Shared = struct {
     frame: rhi.Frame,
     arena: *FrameArena,
@@ -87,6 +97,8 @@ pub const Shared = struct {
     path_traced: bool = false,
     resolved: *rhi.Texture,
     bloom_count: usize = 0,
+    /// The pick this view answers, taken from the renderer while it is planned.
+    pick: ?@import("state.zig").PickRequest = null,
 };
 
 /// State shared by the passes of one view of a scene.
@@ -215,6 +227,8 @@ pub const InstanceCullPush = cull_push.InstancePush;
 /// to them; made by `prepareLights`.
 pub const Lighting = struct {
     lights: u64,
+    /// The same records, as the CPU wrote them this frame.
+    records: []const gpu.Light = &.{},
     tiles: u64,
     light_count: u32,
     /// Hash of which lights were given shadow tiles.

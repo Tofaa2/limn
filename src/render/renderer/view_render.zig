@@ -83,12 +83,77 @@ const Composite = struct {
     }
 };
 
-pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_time: f32, arena: *FrameArena) !void {
+/// A view planned for this frame by `stageView`, and everything its passes
+/// point at until `recordView` and `finishView` are done with it.
+pub const StagedView = struct {
+    desc: ViewDesc = undefined,
+    graph: Graph = undefined,
+    scratch_bytes: [16 << 10]u8 align(16) = undefined,
+    scratch: std.heap.FixedBufferAllocator = undefined,
+    constants: gpu.FrameConstants = undefined,
+    ctx: ViewContext = undefined,
+    composite: Composite = undefined,
+    pass: ScenePass = undefined,
+    shared: scene_pass.Shared = undefined,
+    culling: scene_pass.CullState = undefined,
+    resolved: rhi.Texture = .invalid,
+    no_fluids: gpu.FluidList = .{},
+    /// What the view draws into, and whether it ends back in `shader_read`.
+    target: rhi.Texture = undefined,
+    sampled_target: bool = false,
+    /// The view's own state, which `finishView` brings up to date.
+    view_data: ?*ViewData = null,
+    /// Set for a view of a scene.
+    scene: ?*SceneData = null,
+    first_view: bool = false,
+    view_proj_unjittered: math.Mat4 = undefined,
+    jitter: [2]f32 = .{ 0, 0 },
+
+    /// Points the view's passes at `cmd` for `recordView`.
+    pub fn recordInto(self: *StagedView, cmd: *rhi.CommandEncoder) void {
+        self.ctx.cmd = cmd;
+        if (self.scene != null) self.pass.cmd = cmd;
+    }
+};
+
+/// Records a staged view's passes.
+pub fn recordView(staged: *StagedView) !void {
+    try staged.graph.record(staged.ctx.cmd);
+    if (staged.sampled_target) staged.ctx.cmd.transition(staged.target, .shader_read);
+}
+
+/// Brings a recorded view's state and the frame's statistics up to date.
+pub fn finishView(self: *Renderer, staged: *StagedView) void {
+    const device = self.device;
+    const view_data = staged.view_data orelse return;
+    if (staged.scene) |scene| {
+        if (features.viewState(view_data, path_tracing_feature)) |state| state.traced = staged.shared.path_traced;
+        view_data.previous_view_proj = staged.view_proj_unjittered;
+        view_data.previous_jitter = staged.jitter;
+        view_data.frames += 1;
+        view_data.camera_known = true;
+        if (staged.first_view) {
+            self.internal.stats.instances = scene.live_instances + scene.static_count;
+            self.internal.stats.meshlets = scene.live_refs + (scene.ref_count - scene.entity_ref_capacity);
+            self.internal.stats.triangles = scene.triangle_count;
+            self.internal.stats.skinned_vertices = scene.prepared.skinned_vertices;
+        }
+    }
+    view_data.kept.collect(device, self.internal.frame_index);
+    features.collectViewStates(view_data, device);
+}
+
+/// Plans a view of this frame into `staged`: checks it, prepares its scene
+/// and features and builds its graph, leaving the recording of its passes
+/// to `recordView`.
+pub fn stageView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_time: f32, arena: *FrameArena, staged: *StagedView) !void {
     const view_zone = Zone.start(self.options.profiler, "render view");
     defer view_zone.stop();
     const device = self.device;
     const cmd = frame.cmd;
-    var desc = requested;
+    staged.* = .{};
+    staged.desc = requested;
+    const desc = &staged.desc;
     var resolving = features.Resolve{
         .caps = device.caps,
         .scene = desc.scene != null,
@@ -124,26 +189,27 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
     }
     const load: rhi.LoadOp = if (written) .load else .clear;
 
-    var graph: Graph = undefined;
-    graph.clear();
-    var scratch_bytes: [16 << 10]u8 align(16) = undefined;
-    var scratch = std.heap.FixedBufferAllocator.init(&scratch_bytes);
-    var constants: gpu.FrameConstants = undefined;
-    var ctx = ViewContext{
+    staged.graph.clear();
+    const graph = &staged.graph;
+    staged.scratch = std.heap.FixedBufferAllocator.init(&staged.scratch_bytes);
+    staged.target = target;
+    staged.sampled_target = desc.target == .texture;
+    staged.ctx = ViewContext{
         .renderer = self,
         .device = device,
         .cmd = cmd,
         .arena = arena,
-        .graph = &graph,
-        .scratch = scratch.allocator(),
-        .desc = &desc,
+        .graph = graph,
+        .scratch = staged.scratch.allocator(),
+        .desc = desc,
         .settings = &desc.settings,
         .view = null,
         .output = .{ .texture = target, .format = info.format, .region = region, .load = load, .clear = desc.clear_color },
-        .constants = &constants,
+        .constants = &staged.constants,
         .frame_address = 0,
         .rays = resolving.rays,
     };
+    const ctx = &staged.ctx;
 
     if (desc.scene) |scene_handle| {
         try ensureSceneResources(self, cmd);
@@ -182,32 +248,32 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
         const picture = try graph.import(color);
         graph.publish(.picture, picture);
         graph.want(picture);
-        var composite = Composite{ .ctx = &ctx, .picture = color, .format = info.format, .region = region };
+        staged.composite = Composite{ .ctx = ctx, .picture = color, .format = info.format, .region = region };
         if (!whole) try graph.add(.{
             .name = "view composite",
             .stage = .present,
             .reads = &.{picture},
             .color = &.{.{ .target = try graph.import(target), .load = load, .clear = desc.clear_color }},
             .always = true,
-        }, &composite, Composite.run);
+        }, &staged.composite, Composite.run);
         const render_scale = std.math.clamp(desc.settings.resolution.scale, 0.25, 2);
         const internal_width: u32 = @max(@as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(region.width)) * render_scale))), 1);
         const internal_height: u32 = @max(@as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(region.height)) * render_scale))), 1);
-        try renderScene(self, &ctx, frame, scene_handle, scene, view, color, internal_width, internal_height, region.width, region.height, delta_time);
-        view.kept.collect(device, self.internal.frame_index);
-        features.collectViewStates(view, device);
+        try renderScene(self, ctx, frame, scene_handle, scene, view, color, internal_width, internal_height, region.width, region.height, delta_time, staged);
+        staged.view_data = view;
     } else {
         const picture = try graph.import(target);
         graph.publish(.picture, picture);
         graph.want(picture);
-        if (canvas.lit(&desc)) {
+        if (canvas.lit(desc)) {
             const view = self.views.internal.table.get(desc.view orelse self.internal.main_view) orelse return error.InvalidView;
             if (view.last_frame == self.internal.frame_index) return error.ViewUsedTwice;
             if (view.last_frame +% 1 != self.internal.frame_index) view.exposure_reset = true;
             view.last_frame = self.internal.frame_index;
             ctx.view = view;
             const frame_constants = try arena.alloc(device, gpu.FrameConstants, 1);
-            constants = std.mem.zeroes(gpu.FrameConstants);
+            const constants = &staged.constants;
+            constants.* = std.mem.zeroes(gpu.FrameConstants);
             constants.resolution = .{ @floatFromInt(region.width), @floatFromInt(region.height) };
             constants.inv_resolution = .{ 1.0 / @as(f32, @floatFromInt(region.width)), 1.0 / @as(f32, @floatFromInt(region.height)) };
             constants.near = desc.camera.near;
@@ -222,22 +288,20 @@ pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_
             ctx.frame_address = frame_constants.address;
             const hdr = try graph.transient(.{ .name = "hdr", .width = region.width, .height = region.height, .format = hdr_format, .usage = .{ .sampled = true, .color_attachment = true } });
             graph.publish(.hdr, hdr);
-            try post.declareFlat(&ctx, hdr);
-            try features.declare(&ctx);
-            frame_constants.items[0] = constants;
-            try graph.execute(self.internal.gpa, device, cmd, &self.internal.target_pool, self.internal.frame_index);
-            view.kept.collect(device, self.internal.frame_index);
-            features.collectViewStates(view, device);
+            try post.declareFlat(ctx, hdr);
+            try features.declare(ctx);
+            frame_constants.items[0] = constants.*;
+            try graph.stage(self.internal.gpa, device, &self.internal.target_pool, self.internal.frame_index);
+            staged.view_data = view;
         } else {
             if (desc.passes.len != 0 and ctx.output.load == .clear) {
-                try graph.add(.{ .name = "clear", .stage = .prepare, .color = &.{.{ .target = picture, .load = .clear, .clear = ctx.output.clear }}, .always = true, .scope = false }, &ctx, cleared);
+                try graph.add(.{ .name = "clear", .stage = .prepare, .color = &.{.{ .target = picture, .load = .clear, .clear = ctx.output.clear }}, .always = true, .scope = false }, ctx, cleared);
                 ctx.output.load = .load;
             }
-            try features.declare(&ctx);
-            try graph.execute(self.internal.gpa, device, cmd, &self.internal.target_pool, self.internal.frame_index);
+            try features.declare(ctx);
+            try graph.stage(self.internal.gpa, device, &self.internal.target_pool, self.internal.frame_index);
         }
     }
-    if (desc.target == .texture) cmd.transition(target, .shader_read);
 }
 
 fn cleared(_: *ViewContext) !void {}
@@ -258,6 +322,7 @@ fn renderScene(
     output_width: u32,
     output_height: u32,
     delta_time: f32,
+    staged: *StagedView,
 ) !void {
     const device = self.device;
     const cmd = frame.cmd;
@@ -334,16 +399,16 @@ fn renderScene(
     const sun_enabled = scene.sun.intensity > 0 and math.dot(sun_travel, sun_travel) > 0.5;
     const shadows_enabled = (settings.shadows != null) and sun_enabled and scene.ref_count != 0;
     const has_geometry = scene.ref_count != 0;
-    const instance_total: u32 = @as(u32, @intCast(scene.layout.items.len)) + scene.static_count;
+    const instance_total: u32 = scene.entity_capacity + scene.static_count;
     const mark_seen = has_geometry and instance_total != 0 and
         (if (self.options.textures.streaming) |streaming| streaming.skip_occluded else false);
     const lod_scale: f32 = if (settings.geometry.lod_error_pixels > 0)
         @abs(proj_unjittered[5]) * @as(f32, @floatFromInt(height)) * 0.5 / settings.geometry.lod_error_pixels * vantage.scale
     else
         0;
-    var culling: scene_pass.CullState = undefined;
-    var resolved: rhi.Texture = undefined;
-    var pass = ScenePass{
+    staged.culling = std.mem.zeroes(scene_pass.CullState);
+    staged.resolved = rhi.Texture.invalid;
+    staged.pass = ScenePass{
         .frame = frame,
         .cmd = cmd,
         .arena = arena,
@@ -380,9 +445,10 @@ fn renderScene(
         .lod = .{ vantage.position[0], vantage.position[1], vantage.position[2], lod_scale },
         .lod_band = if (lod_scale > 0) 1 + std.math.clamp(settings.geometry.lod_cross_fade, 0, 1) else 1,
         .sun_shadows = shadows_enabled,
-        .culling = &culling,
-        .resolved = &resolved,
+        .culling = &staged.culling,
+        .resolved = &staged.resolved,
     };
+    const pass = &staged.pass;
     const environment: ?*EnvironmentEntry = blk: {
         const entry = self.environments.internal.table.get(scene.environment orelse break :blk null) orelse break :blk null;
         break :blk if (entry.state == .ready) entry else null;
@@ -435,7 +501,7 @@ fn renderScene(
     };
     pass.frame_address = constants.address;
     ctx.frame_address = constants.address;
-    ctx.scene = &pass;
+    ctx.scene = pass;
     ctx.output.depth = view.depth;
     const g = ctx.graph;
     g.publish(.depth, try g.import(view.depth));
@@ -451,50 +517,139 @@ fn renderScene(
         self.internal.stats.instances_drawn = counted[view_count * 2];
     }
 
-    var shared = scene_pass.Shared{
+    staged.no_fluids = .{};
+    staged.shared = scene_pass.Shared{
         .frame = frame,
         .arena = arena,
         .delta_time = delta_time,
-        .sun = undefined,
-        .lighting = undefined,
-        .local_shadows = undefined,
+        .sun = &scene_pass.no_sun,
+        .lighting = &scene_pass.no_lighting,
+        .local_shadows = &scene_pass.no_local_shadows,
         .gi = null,
         .shadow_tlas = 0,
         .colored_shadows = false,
         .cloud_address = 0,
-        .fluid_list = undefined,
+        .fluid_list = &staged.no_fluids,
         .shadows_enabled = shadows_enabled,
         .first_view = first_view,
         .fresh_scene = fresh_scene,
         .instance_total = instance_total,
         .count_readback = count_readback,
-        .culling = &culling,
-        .resolved = &resolved,
+        .culling = &staged.culling,
+        .resolved = &staged.resolved,
     };
-    pass.shared = &shared;
+    pass.shared = &staged.shared;
     const tracer = features.viewState(view_data, path_tracing_feature);
     pass.tracing = settings.path_tracing != null and !debugging and tracer != null and tracer.?.traced;
     try features.prepare(ctx);
     try features.declare(ctx);
     constants.items[0] = ctx.constants.*;
-    try g.execute(self.internal.gpa, device, cmd, &self.internal.target_pool, self.internal.frame_index);
-    if (features.viewState(view_data, path_tracing_feature)) |state| state.traced = shared.path_traced;
-
-    view_data.previous_view_proj = view_proj_unjittered;
-    view_data.previous_jitter = jitter;
-    view_data.frames += 1;
+    try g.stage(self.internal.gpa, device, &self.internal.target_pool, self.internal.frame_index);
     view_data.last_frame = self.internal.frame_index;
-    view_data.camera_known = true;
-    if (first_view) {
-        self.internal.stats.instances = instance_total;
-        self.internal.stats.meshlets = scene.ref_count;
-        self.internal.stats.triangles = scene.triangle_count;
-        self.internal.stats.skinned_vertices = scene_frame.skinned_vertices;
-    }
+    staged.scene = scene;
+    staged.first_view = first_view;
+    staged.view_proj_unjittered = view_proj_unjittered;
+    staged.jitter = jitter;
 }
 
 /// How this renderer path traces, if it can.
 pub fn pathTracingSupport(renderer: *const Renderer) api.PathTracingSupport {
     if (renderer.device.caps.ray_tracing) return .hardware;
     return if (renderer.options.ray_tracing.software_path_tracing) .shader else .unavailable;
+}
+
+/// Stages, records and finishes one view on the frame's encoder.
+pub fn renderView(self: *Renderer, frame: rhi.Frame, requested: ViewDesc, delta_time: f32, arena: *FrameArena) !void {
+    const staged = try self.internal.gpa.create(StagedView);
+    defer self.internal.gpa.destroy(staged);
+    try stageView(self, frame, requested, delta_time, arena, staged);
+    staged.recordInto(frame.cmd);
+    try recordView(staged);
+    finishView(self, staged);
+}
+
+/// Stages the views of a frame in order and records them, a run of
+/// consecutive views per thread when there are several views and
+/// `Options.worker_threads` allows more than one, then finishes them.
+pub fn renderViews(self: *Renderer, frame: rhi.Frame, views: []const ViewDesc, delta_time: f32, arena: *FrameArena) !void {
+    try self.internal.staged_views.resize(self.internal.gpa, views.len);
+    const staged = self.internal.staged_views.items;
+    for (views, staged) |desc, *slot| try stageView(self, frame, desc, delta_time, arena, slot);
+    var threads = @min(@import("scene_update.zig").workerThreads(self), rhi.max_parallel);
+    for (views) |desc| for (desc.passes) |pass| {
+        if (!pass.threaded) threads = 1;
+    };
+    var runs: [rhi.max_parallel + 1]usize = undefined;
+    const run_count = splitRuns(staged, threads, &runs);
+    if (run_count < 2) {
+        for (staged) |*slot| {
+            slot.recordInto(frame.cmd);
+            try recordView(slot);
+        }
+    } else try recordInParallel(self, staged, runs[0 .. run_count + 1]);
+    for (staged) |*slot| finishView(self, slot);
+}
+
+/// Cuts the views into at most `most` runs of consecutive views, as even as
+/// it can, returning how many; `bounds` gets where each starts and, last,
+/// the end. A cut never falls between views of one scene, whose passes hand
+/// each other what they work out while they record.
+fn splitRuns(staged: []const StagedView, most: usize, bounds: *[rhi.max_parallel + 1]usize) usize {
+    var cuts: [rhi.max_parallel]usize = undefined;
+    var cut_count: usize = 0;
+    var start: usize = 0;
+    var at: usize = 1;
+    while (at < staged.len and cut_count + 1 < most) : (at += 1) {
+        const left = staged.len - start;
+        const runs_left = most - cut_count;
+        if (at - start < (left + runs_left - 1) / runs_left) continue;
+        if (!cuttable(staged, at)) continue;
+        cuts[cut_count] = at;
+        cut_count += 1;
+        start = at;
+    }
+    bounds[0] = 0;
+    for (cuts[0..cut_count], 1..) |cut, index| bounds[index] = cut;
+    bounds[cut_count + 1] = staged.len;
+    return cut_count + 1;
+}
+
+/// Whether no scene and no draw list is in views both before `at` and from
+/// `at` on: recording a draw list keeps what it uploads in the list.
+fn cuttable(staged: []const StagedView, at: usize) bool {
+    for (staged[0..at]) |before| {
+        for (staged[at..]) |after| {
+            if (before.scene != null and after.scene == before.scene) return false;
+            for (before.desc.draw_lists) |mine| for (after.desc.draw_lists) |theirs| {
+                if (mine.list == theirs.list) return false;
+            };
+        }
+    }
+    return true;
+}
+
+fn recordInParallel(self: *Renderer, staged: []StagedView, bounds: []const usize) !void {
+    const threads = bounds.len - 1;
+    const encoders = try self.device.beginParallel(@intCast(threads));
+    var failures: [rhi.max_parallel]?anyerror = @splat(null);
+    var group: std.Io.Group = .init;
+    for (1..threads) |index| {
+        const chunk = staged[bounds[index]..bounds[index + 1]];
+        group.concurrent(self.internal.io, recordRun, .{ chunk, &encoders[index], &failures[index] }) catch recordRun(chunk, &encoders[index], &failures[index]);
+    }
+    recordRun(staged[bounds[0]..bounds[1]], &encoders[0], &failures[0]);
+    group.await(self.internal.io) catch {};
+    try self.device.joinParallel();
+    for (failures[0..threads]) |failure| if (failure) |err| return err;
+}
+
+/// Records consecutive staged views into one encoder, on any thread.
+fn recordRun(run: []StagedView, encoder: *rhi.CommandEncoder, failure: *?anyerror) void {
+    for (run) |*slot| {
+        slot.recordInto(encoder);
+        recordView(slot) catch |err| {
+            failure.* = err;
+            return;
+        };
+    }
 }

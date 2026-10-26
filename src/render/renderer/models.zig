@@ -71,6 +71,7 @@ pub const Models = struct {
             .path = try self.internal.gpa.dupe(u8, path),
             .options = .{
                 .compress_textures = self.options.textures.compression == .bc7 and self.device.caps.bc_textures,
+                .basis = renderer_state.basisTarget(self.device.caps),
                 .normal_maps_bc5 = self.options.textures.normal_maps_bc5,
                 .raw_mips = self.options.textures.streaming != null,
                 .lods = lodOptions(self),
@@ -527,7 +528,6 @@ pub fn finalizeModel(self: *Renderer, entry: *ModelEntry, budget: *u64) !bool {
             if (device.detached_queue != null) mesh.blas_building = made else mesh.blas = made;
         }
         entry.blas_pending = true;
-        entry.blas_frame = null;
         self.internal.rays.blas_pending += 1;
     }
     entry.state = .ready;
@@ -556,7 +556,7 @@ pub fn buildSceneTree(self: *Renderer, scene: *SceneData, entities: []const gpu.
         if (record.mesh >= self.internal.rays.mesh_boxes.items.len or self.internal.rays.mesh_boxes.items[record.mesh] == null) continue;
         try placed.append(gpa, .{ .transform = gpu.expand(record.transform), .mesh = record.mesh, .instance = @intCast(index) });
     }
-    var record: u32 = @intCast(entities.len);
+    var record: u32 = scene.entity_capacity;
     for (scene.groups.items) |group_handle| {
         const group = self.instances.internal.table.get(group_handle) orelse continue;
         if (group.per_copy == 0) continue;

@@ -2,6 +2,7 @@
 const pipelines_module = @import("../renderer/pipelines.zig");
 const liquid_push = @import("../shaders/push/liquid.zig");
 const water_passes_push = @import("../shaders/push/water_passes.zig");
+const ocean_push = @import("../shaders/push/ocean.zig");
 const fluid_passes_push = @import("../shaders/push/fluid_passes.zig");
 const render = @import("../renderer.zig");
 const restyleEntity = render.restyleEntity;
@@ -11,6 +12,7 @@ const hair_feature = @import("hair.zig");
 const particles_feature = @import("particles.zig");
 const fluids_feature = @import("fluids.zig");
 const gpu = @import("../gpu.zig");
+const WaterState = @import("../state.zig").WaterState;
 const rhi = @import("../../rhi/rhi.zig");
 const std = @import("std");
 const math = @import("../../math.zig");
@@ -262,9 +264,9 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             records.items[step] = record;
         }
         const stride = @sizeOf(gpu.Liquid);
-        cmd.sync(.all_to_transfer);
+        cmd.dependency(.{ .compute_read = true, .graphics_read = true }, .{ .transfer_write = true });
         cmd.copyBuffer(records.buffer, state.params_buffer, records.offset, 0, records.items.len * stride);
-        cmd.sync(.transfer_to_all);
+        cmd.dependency(.{ .transfer_write = true }, .{ .compute_read = true });
         const params_address = device.bufferAddress(state.params_buffer);
         for (0..steps) |step| {
             const live = records.items[step].live;
@@ -275,18 +277,18 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             push.flip = 0;
             cmd.pushConstants(push);
             cmd.dispatch(groups, 1, 1);
-            cmd.sync(.all_to_transfer);
+            cmd.dependency(.{ .compute_read = true, .compute_write = true }, .{ .transfer_write = true });
             cmd.fillBuffer(state.counts, 0, @as(u64, state.cell_count) * @sizeOf(u32), 0);
-            cmd.sync(.transfer_to_all);
+            cmd.dependency(.{ .transfer_write = true }, .{ .compute_read = true, .compute_write = true });
             push.mode = 1;
             cmd.pushConstants(push);
             cmd.dispatch(groups, 1, 1);
-            cmd.sync(.compute_to_all);
+            cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true });
             if (renderer.options.deterministic) {
                 push.mode = 6;
                 cmd.pushConstants(push);
                 cmd.dispatch((state.cell_count + 63) / 64, 1, 1);
-                cmd.sync(.compute_to_all);
+                cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true });
             }
             var flip: u32 = 0;
             for (0..std.math.clamp(desc.iterations, 1, 8)) |_| {
@@ -294,29 +296,29 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
                 push.mode = 2;
                 cmd.pushConstants(push);
                 cmd.dispatch(groups, 1, 1);
-                cmd.sync(.compute_to_all);
+                cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true });
                 push.mode = 3;
                 cmd.pushConstants(push);
                 cmd.dispatch(groups, 1, 1);
-                cmd.sync(.compute_to_all);
+                cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true });
                 flip ^= 1;
             }
             push.flip = flip;
             push.mode = 4;
             cmd.pushConstants(push);
             cmd.dispatch(groups, 1, 1);
-            cmd.sync(.compute_to_all);
+            cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true });
             push.mode = 5;
             cmd.pushConstants(push);
             cmd.dispatch(groups, 1, 1);
-            cmd.sync(.compute_to_all);
+            cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true });
         }
         if (steps != 0 and state.live != 0) {
             push.liquid = params_address + (steps - 1) * stride;
             push.mode = 7;
             cmd.pushConstants(push);
             cmd.dispatch((state.live + 63) / 64, 1, 1);
-            cmd.sync(.compute_to_all);
+            cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .graphics_read = true, .vertex_input = true, .indirect = true });
         }
         state.params = params_address + (records.items.len - 1) * stride;
         state.params_frame = renderer.internal.frame_index;
@@ -411,6 +413,7 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             }
             emitter.desc = spray;
         };
+        const ocean_heights: u64 = if (desc.ocean) |ocean| try runOcean(renderer, cmd, state, ocean, delta_time * desc.time_scale) else 0;
         var record = gpu.Water{
             .transform = t,
             .size = .{ @intCast(state.size[0]), @intCast(state.size[1]) },
@@ -431,6 +434,8 @@ pub fn simulateWater(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
             .detail = std.math.clamp(desc.ripple_detail, 0, 2),
             .mask = renderer.images.indexOf(desc.mask),
             .ripples = state.ripples,
+            .ocean = ocean_heights,
+            .ocean_period = if (desc.ocean) |ocean| @max(ocean.period, 0.01) else 1,
         };
         if (steps > 0) state.ripple_count = 0;
         const params = try arena.alloc(device, gpu.Water, steps + 1);
@@ -550,7 +555,7 @@ pub fn simulateFluids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sce
                 state.mask_key = mask_key;
                 try cmd.beginRendering(.{ .color = &.{.{ .texture = state.solid, .load = .discard }} });
                 cmd.bindPipeline(if (scene_tlas != 0) try renderer.internal.pipelines.of(fluidSolidTracedPipeline) else try renderer.internal.pipelines.of(fluidSolidPipeline));
-                cmd.pushConstants(fluid_passes_push.SolidPush{ .fluid = address, .tlas = scene_tlas });
+                cmd.pushConstants(fluid_passes_push.SolidPush{ .fluid = address, .tlas_low = @truncate(scene_tlas), .tlas_high = @truncate(scene_tlas >> 32) });
                 cmd.drawFullscreen();
                 cmd.endRendering();
             }
@@ -687,4 +692,71 @@ fn fluidSolidTracedPipeline(device: *rhi.Device) pipelines_module.Desc {
 
 fn fluidCarryPipeline(_: *rhi.Device) pipelines_module.Desc {
     return pipelines_module.pass("fluid carry", pipelines_module.shaderCode("fluid_carry.frag.spv"), &.{ .{ .format = .rgba16_float }, .{ .format = .rgba16_float } });
+}
+
+/// Advances `state`'s ocean by `seconds` and returns the address of its heights.
+fn runOcean(renderer: *Renderer, cmd: *rhi.CommandEncoder, state: *WaterState, ocean: render.Ocean, seconds: f32) !u64 {
+    const device = renderer.device;
+    const cells = gpu.ocean_cells;
+    const buffers = state.ocean orelse made: {
+        const rows = try device.createBuffer(.{ .name = "ocean rows", .size = cells * cells * 8, .usage = .{ .storage = true } });
+        errdefer device.destroyBuffer(rows);
+        const heights = try device.createBuffer(.{ .name = "ocean heights", .size = cells * cells * 4, .usage = .{ .storage = true } });
+        state.ocean = .{ rows, heights };
+        break :made state.ocean.?;
+    };
+    state.ocean_time += seconds;
+    const wind = @max(ocean.wind_speed, 0.1);
+    const along = @sqrt(ocean.wind_direction[0] * ocean.wind_direction[0] + ocean.wind_direction[1] * ocean.wind_direction[1]);
+    const direction: [2]f32 = if (along > 1e-6) .{ ocean.wind_direction[0] / along, ocean.wind_direction[1] / along } else .{ 1, 0 };
+    const period = @max(ocean.period, 0.01);
+    const wanted_rms = 0.21 * wind * wind / 9.81 / 4 * @max(ocean.height, 0);
+    const push = ocean_push.Push{
+        .rows = device.bufferAddress(buffers[0]),
+        .heights = device.bufferAddress(buffers[1]),
+        .time = state.ocean_time,
+        .period = period,
+        .scale = wanted_rms / @max(spectrumRms(wind, direction, period), 1e-12),
+        .wind_speed = wind,
+        .wind_direction = direction,
+    };
+    cmd.beginScope("ocean");
+    defer cmd.endScope();
+    cmd.bindPipeline(try renderer.internal.pipelines.of(oceanRowsPipeline));
+    cmd.pushConstants(push);
+    cmd.dispatch(cells, 1, 1);
+    cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true });
+    cmd.bindPipeline(try renderer.internal.pipelines.of(oceanColumnsPipeline));
+    cmd.pushConstants(push);
+    cmd.dispatch(cells, 1, 1);
+    cmd.dependency(.{ .compute_write = true }, .{ .graphics_read = true, .compute_read = true });
+    return push.heights;
+}
+
+/// Root mean square height of the spectrum `ocean.slang` makes with unit
+/// scale, so the scale can give the height the wind raises.
+fn spectrumRms(wind: f32, direction: [2]f32, period: f32) f32 {
+    const cells = gpu.ocean_cells;
+    const reach = wind * wind / 9.81;
+    const small = reach * 0.001;
+    var total: f64 = 0;
+    for (0..cells) |y| for (0..cells) |x| {
+        const k = [2]f32{
+            (@as(f32, @floatFromInt(x)) - cells / 2) * 2 * std.math.pi / period,
+            (@as(f32, @floatFromInt(y)) - cells / 2) * 2 * std.math.pi / period,
+        };
+        const k2 = k[0] * k[0] + k[1] * k[1];
+        if (k2 < 1e-8) continue;
+        const toward = (k[0] * direction[0] + k[1] * direction[1]) / @sqrt(k2);
+        total += @exp(-1 / (k2 * reach * reach)) / (k2 * k2) * toward * toward * @exp(-k2 * small * small);
+    };
+    return @floatCast(@sqrt(total));
+}
+
+fn oceanRowsPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "ocean rows", .shader = pipelines_module.shaderCode("ocean_rows.comp.spv") } };
+}
+
+fn oceanColumnsPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "ocean columns", .shader = pipelines_module.shaderCode("ocean_columns.comp.spv") } };
 }

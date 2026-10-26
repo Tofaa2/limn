@@ -84,33 +84,72 @@ float cascadeShadow(FrameConstants frame, float3 world_position, float3 normal, 
     return lit;
 }
 
-float virtualShadow(FrameConstants frame, float3 world_position, float3 normal, float n_dot_l) {
+/// The page `virtualTap` looked up last, so taps in it skip the page table.
+static uint vsm_seen_level = 0xffffffffu;
+static int2 vsm_seen_page = int2(0);
+static float2 vsm_seen_corner = float2(-1.0);
+
+/// One comparison tap of the virtual shadow map at `point` of `level`, from
+/// whichever page holds it; -1 where that page is not drawn.
+float virtualTap(FrameConstants frame, VsmData* vsm, uint level, float2 point, float depth) {
+    int2 page;
+    float2 within;
+    if (!vsmLocate(vsm, level, point, page, within)) return -1.0;
+    if (level != vsm_seen_level || any(page != vsm_seen_page)) {
+        VsmPage entry = vsm.pages[vsmSlot(level, page)];
+        bool drawn = entry.key == vsmKey(page) && entry.place != 0u && (entry.flags & VSM_READY) != 0u;
+        vsm_seen_level = level;
+        vsm_seen_page = page;
+        vsm_seen_corner = drawn ? float2(float((entry.place - 1u) % uint(vsm_atlas_pages)), float((entry.place - 1u) / uint(vsm_atlas_pages))) : float2(-1.0);
+    }
+    if (vsm_seen_corner.x < 0.0) return -1.0;
+    float2 corner = vsm_seen_corner;
+    float2 inside = clamp(within, float2(0.5 / vsm_page_texels), float2(1.0 - 0.5 / vsm_page_texels));
+    return textures_2d[NonUniformResourceIndex(vsm.atlas_texture)].SampleCmpLevelZero(samplers_shadow[NonUniformResourceIndex(frame.shadows.shadow_sampler)], (corner + inside) / float(vsm_atlas_pages), depth);
+}
+
+/// Taps spread over `Settings.shadows.softness`, crossing page edges; -1
+/// where the page under the point is not drawn.
+float virtualShadow(FrameConstants frame, float3 world_position, float3 normal, float n_dot_l, float noise) {
     VsmData* vsm = frame.shadows.vsm.data;
     float2 unmoved = (mul(vsm.light_view, float4(world_position, 1.0))).xy;
     for (uint level = vsmLevel(vsm, unmoved); level < vsm.levels; level++) {
         float texel = vsmExtent(vsm, level) / (float(vsm_pages) * vsm_page_texels);
         float3 at = (mul(vsm.light_view, float4(world_position + normal * texel * (1.5 + 2.5 * (1.0 - n_dot_l)), 1.0))).xyz;
-        int2 page;
-        float2 within;
-        if (!vsmLocate(vsm, level, at.xy, page, within)) continue;
-        VsmPage entry = vsm.pages[vsmSlot(level, page)];
-        if (entry.key != vsmKey(page) || entry.place == 0u || (entry.flags & VSM_READY) == 0u) continue;
-        float2 corner = float2(float((entry.place - 1u) % uint(vsm_atlas_pages)), float((entry.place - 1u) / uint(vsm_atlas_pages)));
         float depth = (at.z - vsm.depth_from) / vsm.depth_range;
-        float lit = 0.0;
-        for (int tap = 0; tap < 4; tap++) {
-            float2 offset = float2((tap & 1) == 0 ? -0.5 : 0.5, (tap & 2) == 0 ? -0.5 : 0.5) / vsm_page_texels;
-            float2 inside = clamp(within + offset, float2(1.0 / vsm_page_texels), float2(1.0 - 1.0 / vsm_page_texels));
-            lit += textures_2d[NonUniformResourceIndex(vsm.atlas_texture)].SampleCmpLevelZero(samplers_shadow[NonUniformResourceIndex(frame.shadows.shadow_sampler)], (corner + inside) / float(vsm_atlas_pages), depth);
+        float middle = virtualTap(frame, vsm, level, at.xy, depth);
+        if (middle < 0.0) continue;
+        float radius = max(frame.shadows.shadow_softness, texel);
+        float rotation = noise * 2.0 * PI;
+        float c = cos(rotation);
+        float s = sin(rotation);
+        float2x2 rotate = float2x2(c, s, -s, c);
+        uint wanted = clamp(frame.shadows.shadow_taps, 4u, 16u);
+        int stride = wanted >= 16u ? 1 : (wanted >= 8u ? 2 : 4);
+        float lit = middle;
+        float taps = 1.0;
+        for (int i = 3; i < 16; i += 4) {
+            float tap = virtualTap(frame, vsm, level, at.xy + mul(vogel_disk[i], rotate) * radius, depth);
+            if (tap < 0.0) continue;
+            lit += tap;
+            taps += 1.0;
         }
-        return lit * 0.25;
+        if (lit <= 0.0 || lit >= taps || stride == 4) return lit / taps;
+        for (int i = 0; i < 16; i += stride) {
+            if ((i & 3) == 3) continue;
+            float tap = virtualTap(frame, vsm, level, at.xy + mul(vogel_disk[i], rotate) * radius, depth);
+            if (tap < 0.0) continue;
+            lit += tap;
+            taps += 1.0;
+        }
+        return lit / taps;
     }
     return -1.0;
 }
 
 float sunShadow(FrameConstants frame, float3 world_position, float3 normal, float n_dot_l, float view_depth, float noise) {
     float past_geometry = -1.0;
-    if (frame.shadows.virtual_maps != 0u) past_geometry = virtualShadow(frame, world_position, normal, n_dot_l);
+    if (frame.shadows.virtual_maps != 0u) past_geometry = virtualShadow(frame, world_position, normal, n_dot_l, noise);
     if (past_geometry < 0.0) past_geometry = cascadeShadow(frame, world_position, normal, n_dot_l, view_depth, noise);
     return past_geometry * cloudShadow(frame, world_position) * fluidShadow(frame, world_position);
 }
@@ -243,6 +282,16 @@ float3 hairScatter(float3 tangent, float3 view, float3 l, float3 color, float3 t
     return color * through * (lerp(wrapped, across, 0.33) / PI);
 }
 
+/// Share of light the sheen lobe reflects toward a direction `cosine` from
+/// the normal (an analytic fit of its directional albedo).
+float sheenAlbedo(float cosine, float roughness) {
+    float r2 = roughness * roughness;
+    float a = roughness < 0.25 ? -339.2 * r2 + 161.4 * roughness - 25.9 : -8.48 * r2 + 14.3 * roughness - 9.95;
+    float b = roughness < 0.25 ? 44.0 * r2 - 23.7 * roughness + 3.26 : 1.97 * r2 - 3.27 * roughness + 0.72;
+    float reflected = exp(a * clamp(cosine, 0.0, 1.0) + b) + (roughness < 0.25 ? 0.0 : 0.1 * (roughness - 0.25));
+    return clamp(reflected / PI, 0.0, 1.0);
+}
+
 float3 surfaceLight(Surface surface, float3 l, float3 radiance) {
     if (surface.anisotropy < 0.0) return (hairFibre(surface.grain, surface.view, l, surface.diffuse_color, surface.roughness) + hairScatter(surface.grain, surface.view, l, surface.diffuse_color, float3(1.0))) * radiance;
     float3 base;
@@ -260,7 +309,8 @@ float3 surfaceLight(Surface surface, float3 l, float3 radiance) {
         float sin_squared = 1.0 - n_dot_h * n_dot_h;
         float distribution = (2.0 + inverse_alpha) * pow(sin_squared, 0.5 * inverse_alpha) / (2.0 * PI);
         float visibility = 1.0 / (4.0 * (n_dot_l + n_dot_v - n_dot_l * n_dot_v));
-        base = base * (1.0 - 0.3 * sheen_strength) + surface.sheen_color * radiance * (distribution * visibility * n_dot_l);
+        float kept = 1.0 - sheen_strength * max(sheenAlbedo(n_dot_v, surface.sheen_roughness), sheenAlbedo(n_dot_l, surface.sheen_roughness));
+        base = base * kept + surface.sheen_color * radiance * (distribution * visibility * n_dot_l);
     }
     if (surface.clearcoat <= 0.0) return base;
     float coat_n_dot_l = clamp(dot(surface.coat_normal, l), 0.0, 1.0);
@@ -413,6 +463,53 @@ float localShadow(FrameConstants frame, Light light, float3 world_position, floa
     return lit / 12.0;
 }
 
+/// One edge's share of the vector form factor of a polygon on the unit
+/// sphere (Heitz et al. 2016, fitted arc length).
+float3 ltcEdge(float3 from, float3 to) {
+    float x = dot(from, to);
+    float y = abs(x);
+    float a = 0.8543985 + (0.4965155 + 0.0145206 * y) * y;
+    float b = 3.4175940 + (4.1616724 + y) * y;
+    float v = a / b;
+    float theta_over_sine = x > 0.0 ? v : 0.5 * rsqrt(max(1.0 - x * x, 1e-7)) - v;
+    return cross(from, to) * theta_over_sine;
+}
+
+/// The cosine-weighted share of the hemisphere a quad covers, after the
+/// distribution `m` (inverse matrix entries from the table) turns it.
+/// `corners` are relative to the surface; `across`, `along` and `normal`
+/// are the surface's frame with `across` toward the eye.
+float ltcCoverage(float3 corners[4], float3 across, float3 along, float3 normal, float4 m) {
+    float3 turned[4];
+    for (int i = 0; i < 4; i++) {
+        float3 local = float3(dot(across, corners[i]), dot(along, corners[i]), dot(normal, corners[i]));
+        turned[i] = normalize(float3(m.x * local.x + m.z * local.z, local.y, m.y * local.x + m.w * local.z));
+    }
+    float3 form = ltcEdge(turned[0], turned[1]) + ltcEdge(turned[1], turned[2]) + ltcEdge(turned[2], turned[3]) + ltcEdge(turned[3], turned[0]);
+    float size = length(form);
+    return max((size * size + form.z) / (size + 1.0), 0.0);
+}
+
+/// A rectangle light by linearly transformed cosines, where it looks large
+/// enough for the nearest-point estimate to go wrong, on surfaces with
+/// neither coat, sheen nor grain. `center` is the panel's middle relative to
+/// the surface, `half_right` and `half_up` half its sides, and `radiance`
+/// what the panel gives off per unit of area.
+float3 rectangleLight(FrameConstants frame, Surface surface, float3 center, float3 half_right, float3 half_up, float3 radiance) {
+    float3 corners[4] = { center + half_right + half_up, center - half_right + half_up, center - half_right - half_up, center + half_right - half_up };
+    float n_dot_v = clamp(dot(surface.normal, surface.view), 1e-4, 1.0);
+    float2 uv = float2(surface.roughness, sqrt(1.0 - n_dot_v)) * (63.0 / 64.0) + 0.5 / 64.0;
+    float4 inverse = sampleTextureLod(frame.lights.ltc_table, frame.sampler_linear_clamp, float2(uv.x, uv.y * 0.5), 0.0);
+    float4 scale = sampleTextureLod(frame.lights.ltc_table, frame.sampler_linear_clamp, float2(uv.x, 0.5 + uv.y * 0.5), 0.0);
+    float3 across = surface.view - surface.normal * dot(surface.view, surface.normal);
+    across = dot(across, across) > 1e-8 ? normalize(across) : tangentBasis(surface.normal).side;
+    float3 along = -cross(surface.normal, across);
+    float diffuse = ltcCoverage(corners, across, along, surface.normal, float4(1.0, 0.0, 0.0, 1.0));
+    float specular = ltcCoverage(corners, across, along, surface.normal, inverse);
+    float3 fresnel = surface.f0 * scale.x + (1.0 - surface.f0) * scale.y;
+    return radiance * (surface.diffuse_color * diffuse + fresnel * (specular * (1.0 + surface.f0 * surface.energy)));
+}
+
 float3 sphereLight(Surface surface, float3 to_light, float distance_to_light, float radius, float3 radiance, float3 tube_center, float3 tube_axis, float tube_length) {
     float3 l = to_light / max(distance_to_light, 1e-5);
     if ((radius <= 0.0 && tube_length == 0.0) || surface.anisotropy < 0.0) return surfaceLight(surface, l, radiance);
@@ -494,8 +591,9 @@ float3 localLights(FrameConstants frame, Surface surface, float2 pixel, float no
     float soft_lit = 0.0;
     uint cluster = clusterIndex(frame, pixel, surface.view_depth);
     uint count = frame.lights.clusters.data[cluster].count;
+    uint listed = frame.lights.clusters.data[cluster].offset;
     for (uint i = 0u; i < count; i++) {
-        Light light = frame.lights.lights.data[frame.lights.clusters.data[cluster].lights[i]];
+        Light light = frame.lights.lights.data[frame.lights.light_indices[listed + i]];
         if ((light.flags & LIGHT_DIRECTIONAL) != 0u) {
             float3 l = -light.direction;
             if (dot(surface.normal, l) > 0.0) {
@@ -518,10 +616,14 @@ float3 localLights(FrameConstants frame, Surface surface, float2 pixel, float no
         float3 tube_center = to_light;
         if (tube_length > 0.0) to_light += light.direction * clamp(dot(-to_light, light.direction), -0.5 * tube_length, 0.5 * tube_length);
         bool panel = (light.flags & LIGHT_RECTANGLE) != 0u;
+        float3 panel_right = float3(0.0);
+        float3 panel_up = float3(0.0);
         if (panel) {
             float3 facing = light.direction;
             float3 right = normalize(cross(abs(facing.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0), facing));
             float3 up = cross(facing, right);
+            panel_right = right * (0.5 * light.source_length);
+            panel_up = up * (0.5 * light.source_height);
             float3 from_light = -to_light;
             if (dot(from_light, facing) <= 0.0) continue;
             float2 half_size = 0.5 * float2(light.source_length, light.source_height);
@@ -544,6 +646,7 @@ float3 localLights(FrameConstants frame, Surface surface, float2 pixel, float no
         float attenuation = window * window / max(distance_squared, max(light.source_radius * light.source_radius, 1e-4));
         float distance_to_light = sqrt(distance_squared);
         if (panel) attenuation *= clamp(dot(-to_light, light.direction) / max(distance_to_light, 1e-5), 0.0, 1.0);
+        float falloff = attenuation;
         float3 l = to_light / max(distance_to_light, 1e-5);
         float3 radiance = light.color;
         if ((light.flags & LIGHT_SPOT) != 0u) {
@@ -572,7 +675,13 @@ float3 localLights(FrameConstants frame, Surface surface, float2 pixel, float no
         if (!soft) attenuation *= traced;
         if (attenuation > 0.0 && (light.flags & LIGHT_FIRE) == 0u) attenuation *= fluidShadowToward(frame, surface.position, l, distance_to_light);
         if (attenuation <= 0.0) continue;
-        float3 lit = sphereLight(surface, to_light, distance_to_light, light.source_radius, radiance * attenuation, tube_center, light.direction, tube_length);
+        float3 lit;
+        if (panel && frame.lights.ltc_table != INVALID_ID && max(light.source_length, light.source_height) > 0.25 * distance_to_light && surface.clearcoat <= 0.0 && surface.anisotropy == 0.0 && all(surface.sheen_color <= 0.0)) {
+            float area = max(light.source_length * light.source_height, 1e-4);
+            lit = rectangleLight(frame, surface, light.position - surface.position, panel_right, panel_up, radiance * (window * window * attenuation / max(falloff, 1e-20) / area));
+        } else {
+            lit = sphereLight(surface, to_light, distance_to_light, light.source_radius, radiance * attenuation, tube_center, light.direction, tube_length);
+        }
         if (soft) {
             float brightness = dot(lit, float3(0.2126, 0.7152, 0.0722));
             soft_light += lit;
@@ -686,9 +795,15 @@ float3 ambientLight(FrameConstants frame, Surface surface, float4 gathered, floa
     float3 specular_weight = surface.f0 * dfg.x + dfg.y;
     float3 color = irradiance * surface.diffuse_color * (1.0 - specular_weight) * multiBounceAo(surface.ao, surface.diffuse_color);
     color += surface.bounce * surface.diffuse_color * (1.0 - specular_weight);
-    color += irradiance * surface.sheen_color * (0.08 + 0.92 * pow(1.0 - n_dot_v, 3.0)) * surface.ao;
     float3 energy_compensation = 1.0 + surface.f0 * (1.0 / max(dfg.x + dfg.y, 1e-4) - 1.0);
     float3 reflection_weight = specular_weight * energy_compensation * specularOcclusion(n_dot_v, surface.ao, surface.roughness);
+    float sheen_strength = max(surface.sheen_color.r, max(surface.sheen_color.g, surface.sheen_color.b));
+    if (sheen_strength > 0.0) {
+        float sheen_share = sheenAlbedo(n_dot_v, surface.sheen_roughness);
+        color *= 1.0 - sheen_strength * sheen_share;
+        reflection_weight *= 1.0 - sheen_strength * sheen_share;
+        color += irradiance * surface.sheen_color * sheen_share * surface.ao;
+    }
     sky_visibility = reflectionReach(frame, surface.position, surface.normal, irradiance, sky_visibility);
     bool add_environment = has_environment;
 #ifdef DEFER_REFLECTIONS
@@ -739,7 +854,8 @@ float3 shadeSurface(FrameConstants frame, Surface surface, float2 pixel, float n
         float wrap = clamp((dot(surface.normal, l) + surface.subsurface) / (1.0 + surface.subsurface), 0.0, 1.0);
         float through = pow(clamp(dot(surface.view, -l), 0.0, 1.0), 4.0) * surface.subsurface;
         float lit_behind = sunShadow(frame, surface.position + surface.normal * (0.1 + 0.5 * surface.subsurface), l, 1.0, surface.view_depth, noise);
-        color += surface.diffuse_color * frame.sun_radiance * ((max(wrap * wrap - n_dot_l, 0.0) * 0.7 + through * 0.25) / PI) * lit_behind;
+        float softened = frame.shading.screen_subsurface != 0u ? 0.0 : max(wrap * wrap - n_dot_l, 0.0) * 0.7;
+        color += surface.diffuse_color * frame.sun_radiance * ((softened + through * 0.25) / PI) * lit_behind;
     }
     color += localLights(frame, surface, pixel, noise);
     color += ambientLight(frame, surface, gathered_gi, dfg);

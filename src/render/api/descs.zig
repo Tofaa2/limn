@@ -169,6 +169,17 @@ pub const HairSimulation = struct {
 };
 
 /// A sheet of simulated water; see `Renderer.waters.create`.
+/// See `WaterDesc.ocean`.
+pub const Ocean = struct {
+    /// World units per second, and the direction it blows along X and Z.
+    wind_speed: f32 = 8,
+    wind_direction: [2]f32 = .{ 1, 0 },
+    /// Side of the square the waves repeat over, in world units.
+    period: f32 = 64,
+    /// Scales the height the wind would raise.
+    height: f32 = 1,
+};
+
 pub const WaterDesc = struct {
     /// Cells of the simulation along each side, 16..1024.
     resolution: [2]u32 = .{ 256, 256 },
@@ -190,6 +201,9 @@ pub const WaterDesc = struct {
     /// Swell height and wave length, in world units; 0 for none.
     swell: f32 = 0,
     swell_length: f32 = 6,
+    /// Open sea in place of the swell: wind waves from Tessendorf's
+    /// spectrum, repeating every `Ocean.period`.
+    ocean: ?Ocean = null,
     /// Speed of the simulation; 0 freezes it.
     time_scale: f32 = 1,
     /// Color taken on with depth, and how quickly per world unit.
@@ -508,6 +522,10 @@ pub const SkyDesc = struct {
     turbidity: f32 = 2.5,
     /// Ozone, 1 for the Earth's; 0 leaves it out.
     ozone: f32 = 1,
+    /// Light scattered more than once from a table integrated over every
+    /// direction (Hillaire 2020), in place of the approximation; twilight and
+    /// the sky near the sun change most.
+    multiple_scattering: bool = false,
     /// Frames a change to the sky is spread over; above 1 the sky lags and
     /// briefly mixes two moments. Taken as 1 while a cloud layer is baked into
     /// the lighting.

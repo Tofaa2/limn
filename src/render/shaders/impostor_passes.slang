@@ -6,16 +6,32 @@
 
 [[vk::push_constant]] DrawPush draw_push;
 
-/// The turn is passed as its three columns.
+/// The turn is passed as its three columns. `local_*` is where the point
+/// falls inside each of the three nearest baked frames, `tiles` and
+/// `tile_c` are those frames and `weights` how much each counts.
 struct DrawVaryings {
     [[vk::location(0)]] float3 position;
-    [[vk::location(1)]] float2 uv;
+    [[vk::location(1)]] float2 local_a;
     [[vk::location(2)]] nointerpolation float3 turn_x;
     [[vk::location(3)]] nointerpolation float3 turn_y;
     [[vk::location(4)]] nointerpolation float3 turn_z;
     [[vk::location(5)]] nointerpolation uint3 textures;
+    [[vk::location(6)]] float2 local_b;
+    [[vk::location(7)]] float2 local_c;
+    [[vk::location(8)]] nointerpolation float4 tiles;
+    [[vk::location(9)]] nointerpolation float2 tile_c;
+    [[vk::location(10)]] nointerpolation float3 weights;
     float4 screen : SV_Position;
 };
+
+/// Where `local`, on a quad of unit radius facing the eye, falls inside the
+/// baked frame `tile`, which saw the impostor from its own direction.
+float2 frameLocal(float2 tile, float3 local) {
+    float3 right;
+    float3 up;
+    impostorBasis(impostorUnfold((tile + 0.5) / impostor_frames), right, up);
+    return float2(dot(local, right) * 0.5 + 0.5, 0.5 - dot(local, up) * 0.5);
+}
 
 [shader("vertex")]
 DrawVaryings drawMain(uint vertex : SV_VulkanVertexID, uint copy_index : SV_VulkanInstanceID) {
@@ -30,18 +46,34 @@ DrawVaryings drawMain(uint vertex : SV_VulkanVertexID, uint copy_index : SV_Vulk
     float3 middle = mul(instance.transform, float4(impostor.center, 1.0));
     float3 away = eyePoint(frame, middle) - middle;
     float3 seen_from = normalize(float3(dot(turn_x, away), dot(turn_y, away), dot(turn_z, away)));
-    float2 tile = min(floor(impostorFold(seen_from) * impostor_frames), float2(impostor_frames - 1.0));
-    float3 toward = impostorUnfold((tile + 0.5) / impostor_frames);
+    float2 grid = impostorFold(seen_from) * impostor_frames - 0.5;
+    float2 base = clamp(floor(grid), 0.0, impostor_frames - 2.0);
+    float2 t = clamp(grid - base, 0.0, 1.0);
+    float2 tile_a = base;
+    float2 tile_b = base + float2(1.0, 0.0);
+    float2 tile_c = base + float2(0.0, 1.0);
+    float3 weights = float3(1.0 - t.x - t.y, t.x, t.y);
+    if (t.x + t.y > 1.0) {
+        tile_a = base + 1.0;
+        tile_b = base + float2(0.0, 1.0);
+        tile_c = base + float2(1.0, 0.0);
+        weights = float3(t.x + t.y - 1.0, 1.0 - t.x, 1.0 - t.y);
+    }
     float3 right;
     float3 up;
-    impostorBasis(toward, right, up);
+    impostorBasis(seen_from, right, up);
 
     float2 corner = float2(vertex == 1u || vertex == 4u || vertex == 5u ? 1.0 : -1.0, vertex == 2u || vertex == 3u || vertex == 5u ? 1.0 : -1.0);
     float3 local = right * corner.x + up * corner.y;
     float3 position = middle + (turn_x * local.x + turn_y * local.y + turn_z * local.z) * impostor.radius * scale;
     DrawVaryings result;
     result.position = position;
-    result.uv = (tile + float2(corner.x * 0.5 + 0.5, 0.5 - corner.y * 0.5)) / impostor_frames;
+    result.local_a = frameLocal(tile_a, local);
+    result.local_b = frameLocal(tile_b, local);
+    result.local_c = frameLocal(tile_c, local);
+    result.tiles = float4(tile_a, tile_b);
+    result.tile_c = tile_c;
+    result.weights = weights;
     result.turn_x = turn_x;
     result.turn_y = turn_y;
     result.turn_z = turn_z;
@@ -59,26 +91,37 @@ struct Output {
     float4 motion : SV_Target1;
 };
 
+/// Adds one baked frame's color and normal, weighted by its coverage, unless
+/// the point falls outside it.
+void addFrame(FrameConstants frame, uint3 textures, float2 tile, float2 local, float weight, inout float4 color, inout float3 normal) {
+    if (weight <= 0.0 || any(local < 0.0) || any(local > 1.0)) return;
+    float2 uv = (tile + local) / impostor_frames;
+    float4 texel = sampleTextureLod(textures.x, frame.sampler_linear_clamp, uv, 0.0);
+    float share = weight * texel.a;
+    color += float4(texel.rgb * share, share);
+    normal += (sampleTextureLod(textures.y, frame.sampler_linear_clamp, uv, 0.0).xyz * 2.0 - 1.0) * share;
+}
+
 [shader("fragment")]
-Output shadeMain(
-    [[vk::location(0)]] float3 in_position,
-    [[vk::location(1)]] float2 in_uv,
-    [[vk::location(2)]] nointerpolation float3 in_turn_x,
-    [[vk::location(3)]] nointerpolation float3 in_turn_y,
-    [[vk::location(4)]] nointerpolation float3 in_turn_z,
-    [[vk::location(5)]] nointerpolation uint3 in_textures,
-    float4 fragment : SV_Position) {
+Output shadeMain(DrawVaryings input) {
     Output result;
     FrameConstants frame = shade_push.frame;
-    float4 color = sampleTextureLod(in_textures.x, frame.sampler_linear_clamp, in_uv, 0.0);
+    float4 color = float4(0.0);
+    float3 blended = float3(0.0);
+    addFrame(frame, input.textures, input.tiles.xy, input.local_a, input.weights.x, color, blended);
+    addFrame(frame, input.textures, input.tiles.zw, input.local_b, input.weights.y, color, blended);
+    addFrame(frame, input.textures, input.tile_c, input.local_c, input.weights.z, color, blended);
     if (color.a < 0.5) discard;
-    float3 normal = normalize(mul(sampleTextureLod(in_textures.y, frame.sampler_linear_clamp, in_uv, 0.0).xyz * 2.0 - 1.0, float3x3(in_turn_x, in_turn_y, in_turn_z)));
+    color.rgb /= color.a;
+    float3 normal = normalize(mul(blended, float3x3(input.turn_x, input.turn_y, input.turn_z)));
+    float3 in_position = input.position;
+    float4 fragment = input.screen;
 
     Surface surface;
     surface.position = in_position;
     surface.normal = normal;
     surface.view = normalize(eyePoint(frame, in_position) - in_position);
-    surface.diffuse_color = color.rgb * unpackUnorm(in_textures.z).rgb;
+    surface.diffuse_color = color.rgb * unpackUnorm(input.textures.z).rgb;
     surface.f0 = float3(0.04);
     surface.roughness = 0.9;
     surface.ao = 1.0;

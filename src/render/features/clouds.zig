@@ -47,8 +47,9 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
     _ = r;
 }
 
-/// Adds the feature's passes to a view of a scene. A path traced view leaves
-/// out those whose result the tracer replaces.
+/// `Shared` values this feature's `prepare` sets.
+pub const provides = .{"cloud_address"};
+
 /// Writes the scene's clouds for the shaders that read them.
 pub fn prepare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;

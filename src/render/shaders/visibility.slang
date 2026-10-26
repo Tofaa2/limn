@@ -11,8 +11,13 @@ uint visibilityMain(
     [[vk::location(1)]] nointerpolation uint in_material,
     [[vk::location(2)]] float2 in_uv,
     [[vk::location(3)]] nointerpolation float2 in_fade,
-    float4 fragment : SV_Position,
-    uint primitive : SV_PrimitiveID) : SV_Target {
+    float4 fragment : SV_Position
+#ifdef PULLED
+    , [[vk::location(4)]] nointerpolation uint primitive
+#else
+    , uint primitive : SV_PrimitiveID
+#endif
+    ) : SV_Target {
 #ifdef ALPHA_TEST
     if (in_fade.x < 1.0 || in_fade.y > 0.0) {
         float noise = interleavedGradientNoise(fragment.xy, visibility_push.frame.temporal != 0u ? visibility_push.frame.frame_index : 0u);
@@ -51,6 +56,11 @@ struct VisibilityVertex {
     [[vk::location(1)]] nointerpolation uint material;
     [[vk::location(2)]] float2 uv;
     [[vk::location(3)]] nointerpolation float2 fade;
+#ifdef PULLED
+    /// The triangle within its meshlet, which `SV_PrimitiveID` gives where
+    /// the device can read it.
+    [[vk::location(4)]] nointerpolation uint triangle;
+#endif
 };
 
 VisibilityVertex visibilityVertex(uint ref_index, uint vertex_index) {
@@ -102,10 +112,24 @@ VisibilityVertex visibilityVertex(uint ref_index, uint vertex_index) {
 }
 
 /// One meshlet's triangle per instance, drawn with the classic vertex
-/// pipeline where mesh shaders are missing.
+/// pipeline where mesh shaders are missing. With `PULLED` the draw is not
+/// indexed: `vertex` counts through the index buffer, and the triangle it
+/// belongs to goes to the fragment shader for devices without
+/// `SV_PrimitiveID`.
 [shader("vertex")]
 VisibilityVertex geometryVertexMain(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInstanceID) {
+#ifdef PULLED
+    FrameConstants frame = geometry_push.frame;
+    MeshletRef ref = frame.meshlet_refs.data[instance];
+    Instance record = frame.instances.data[ref.instance];
+    Mesh mesh = loadAligned<16>(frame.meshes.data + record.mesh);
+    Meshlet meshlet = loadAligned<16>(frame.meshlets.data + ref.meshlet);
+    VisibilityVertex result = visibilityVertex(instance, frame.indices.data[vertex]);
+    result.triangle = (vertex - mesh.index_offset - meshlet.index_offset) / 3u;
+    return result;
+#else
     return visibilityVertex(instance, vertex);
+#endif
 }
 
 groupshared MeshletTasks tasks;

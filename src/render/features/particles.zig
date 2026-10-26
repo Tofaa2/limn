@@ -110,10 +110,10 @@ pub fn simulateParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *
                 .particles = device.bufferAddress(emitter.buffer),
             });
             cmd.dispatch((emitter.capacity + 63) / 64, 1, 1);
-            if (step + 1 < steps) cmd.sync(.compute_to_all);
+            if (step + 1 < steps) cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true });
         }
     }
-    cmd.sync(.compute_to_all);
+    cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .graphics_read = true, .vertex_input = true, .indirect = true });
 }
 
 /// The mesh an emitter's particles are drawn as, once loaded; null for sprites.
@@ -134,30 +134,39 @@ pub fn drawParticles(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Scen
     const device = renderer.device;
     cmd.beginScope("particles");
     defer cmd.endScope();
+    var most: u32 = 0;
+    var keyed = false;
+    cmd.bindPipeline(try renderer.internal.pipelines.of(particleSortKeysPipeline));
     for (scene.emitters.items) |handle_value| {
         const emitter = renderer.emitters.internal.table.get(handle_value) orelse continue;
         const order = emitter.order orelse continue;
         if (emitter.frame_params == 0) continue;
-        const count = emitter.order_count;
-        const order_address = device.bufferAddress(order);
-        cmd.bindPipeline(try renderer.internal.pipelines.of(particleSortKeysPipeline));
         cmd.pushConstants(particles_push.SortKeysPush{
             .frame = frame_address,
             .particles = device.bufferAddress(emitter.buffer),
-            .order = order_address,
+            .order = device.bufferAddress(order),
             .capacity = emitter.capacity,
-            .count = count,
+            .count = emitter.order_count,
         });
-        cmd.dispatch((count + 63) / 64, 1, 1);
-        cmd.sync(.compute_to_all);
+        cmd.dispatch((emitter.order_count + 63) / 64, 1, 1);
+        most = @max(most, emitter.order_count);
+        keyed = true;
+    }
+    if (keyed) {
+        cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true, .graphics_read = true });
         cmd.bindPipeline(try renderer.internal.pipelines.of(particleSortPipeline));
         var run: u32 = 2;
-        while (run <= count) : (run *= 2) {
+        while (run <= most) : (run *= 2) {
             var stride = run / 2;
             while (stride > 0) : (stride /= 2) {
-                cmd.pushConstants(particles_push.SortPush{ .order = order_address, .count = count, .run = run, .stride = stride });
-                cmd.dispatch((count + 63) / 64, 1, 1);
-                cmd.sync(.compute_to_all);
+                for (scene.emitters.items) |handle_value| {
+                    const emitter = renderer.emitters.internal.table.get(handle_value) orelse continue;
+                    const order = emitter.order orelse continue;
+                    if (emitter.frame_params == 0 or run > emitter.order_count) continue;
+                    cmd.pushConstants(particles_push.SortPush{ .order = device.bufferAddress(order), .count = emitter.order_count, .run = run, .stride = stride });
+                    cmd.dispatch((emitter.order_count + 63) / 64, 1, 1);
+                }
+                cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true, .graphics_read = true });
             }
         }
     }

@@ -100,11 +100,11 @@ pub fn declare(ctx: *ViewContext) !void {
     state.frame += 1;
     state.fresh = reset;
     if (reset) {
-        p.cmd.sync(.all_to_transfer);
+        p.cmd.dependency(.{ .compute_read = true, .compute_write = true, .graphics_read = true }, .{ .transfer_write = true });
         p.cmd.fillBuffer(state.pages, 0, page_count * @sizeOf(gpu.VsmPage), 0);
         p.cmd.fillBuffer(state.owners, 0, place_count * @sizeOf(u32), 0);
         p.cmd.fillBuffer(state.requested, 0, page_count * @sizeOf(u32), 0);
-        p.cmd.sync(.transfer_to_all);
+        p.cmd.dependency(.{ .transfer_write = true }, .{ .compute_read = true, .compute_write = true, .graphics_read = true });
     }
 
     const hint: Vec3 = if (@abs(sun_travel[1]) < 0.99) .{ 0, 1, 0 } else .{ 1, 0, 0 };
@@ -162,7 +162,7 @@ fn draw(frame: *Frame) !void {
     cmd.bindPipeline(try renderer.internal.pipelines.of(vsmMarkPipeline));
     cmd.pushConstants(vsm_passes_push.MarkPush{ .frame = ctx.frame_address, .vsm = params, .depth_texture = ctx.index(frame.depth) });
     cmd.dispatch((p.width + 7) / 8, (p.height + 7) / 8, 1);
-    cmd.sync(.compute_to_all);
+    cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true });
     cmd.bindPipeline(try renderer.internal.pipelines.of(vsmAllocatePipeline));
     cmd.pushConstants(vsm_passes_push.AllocatePush{
         .frame = ctx.frame_address,
@@ -171,7 +171,7 @@ fn draw(frame: *Frame) !void {
         .first_page_view = render.vsm_view_base,
     });
     cmd.dispatch(1, 1, 1);
-    cmd.sync(.compute_to_all);
+    cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .graphics_read = true, .indirect = true });
 
     if (p.has_geometry) {
         var views: [render.view_count]bool = @splat(false);

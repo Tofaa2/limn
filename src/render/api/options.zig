@@ -46,6 +46,10 @@ pub const ShadowOptions = struct {
 
 /// How textures are stored and sampled; see `Options.textures`.
 pub const TextureOptions = struct {
+    /// Use the GPU's block-compressed formats where it has them. Off, textures
+    /// load as on GPUs without BC or ASTC: Basis Universal files as plain
+    /// texels.
+    block_formats: bool = true,
     /// Anisotropic filtering for color and normal maps (1 disables).
     anisotropy: f32 = 8,
     /// Anisotropic filtering for roughness/metalness, occlusion and emissive.
@@ -65,6 +69,10 @@ pub const GeometryOptions = struct {
     /// draws. Off by default: indirect draws share vertices between
     /// triangles and are the faster of the two.
     mesh_shaders: bool = false,
+    /// Read the triangle a pixel belongs to from `SV_PrimitiveID` where the
+    /// device can. Off, indirect draws pull their indices in the vertex
+    /// shader instead, as on devices without the `geometryShader` feature.
+    primitive_id: bool = true,
     /// Compute per-meshlet bounds of skinned and morphed meshes on the GPU each
     /// frame, so they are culled per meshlet instead of per mesh.
     skinned_meshlet_bounds: bool = false,
@@ -158,7 +166,8 @@ pub const GeometryStreaming = struct {
 /// compressed textures; full mip chains stay in system memory.
 pub const TextureStreaming = struct {
     /// GPU memory budget; when exceeded, every texture drops the same number of
-    /// top mips. 0 means no limit.
+    /// top mips. 0 keeps the process under 90% of the budget the driver
+    /// reports, and means no limit where it reports none.
     budget_bytes: u64 = 0,
     /// Mips this size or smaller always stay loaded.
     min_size: u32 = 64,

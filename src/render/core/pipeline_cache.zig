@@ -15,6 +15,9 @@ pub const PipelineCache = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     made: std.AutoHashMapUnmanaged(u64, rhi.Pipeline) = .empty,
+    /// Held while the cache is read or changed, as views recording beside
+    /// each other ask for pipelines.
+    mutex: std.Io.Mutex = .init,
     /// Pipelines that would not compile; not tried again until `reset`.
     failed: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Tells this cache, until its next `reset`, from every other: what `of`
@@ -60,6 +63,8 @@ pub const PipelineCache = struct {
 
     /// The pipeline `desc` describes, built now if this is its first use.
     pub fn get(self: *PipelineCache, desc: Desc) !rhi.Pipeline {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const key = hash(desc);
         if (self.made.get(key)) |pipeline| return pipeline;
         const pipeline = switch (desc) {
@@ -89,7 +94,9 @@ pub const PipelineCache = struct {
     }
 
     /// The pipeline `desc` describes if it has been built.
-    pub fn peek(self: *const PipelineCache, desc: Desc) ?rhi.Pipeline {
+    pub fn peek(self: *PipelineCache, desc: Desc) ?rhi.Pipeline {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.made.get(hash(desc));
     }
 
@@ -97,6 +104,8 @@ pub const PipelineCache = struct {
     /// is compiled on a worker thread from the first such call on. One that
     /// fails to compile stays null until `reset`.
     pub fn getLater(self: *PipelineCache, desc: Desc) !?rhi.Pipeline {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const key = hash(desc);
         if (self.made.get(key)) |pipeline| return pipeline;
         if (self.failed.contains(key)) return null;

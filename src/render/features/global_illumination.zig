@@ -118,8 +118,9 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
     if (setting.* != null) r.rays = true;
 }
 
-/// Adds the feature's passes to a view of a scene. A path traced view leaves
-/// out those whose result the tracer replaces.
+/// `Shared` values this feature's `prepare` sets.
+pub const provides = .{"gi"};
+
 /// Places and fills the probe grids for this frame.
 pub fn prepare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
@@ -130,7 +131,10 @@ pub fn declare(ctx: *ViewContext) !void {
     const p = ctx.scene orelse return;
     describe(ctx, p);
     const g = ctx.graph;
-    try g.add(.{ .name = "probes", .stage = .lighting, .always = true, .scope = false }, ctx, updateProbes);
+    if (p.shared.gi != null and p.scene.gi_updated_frame != ctx.renderer.internal.frame_index) {
+        p.scene.gi_updated_frame = ctx.renderer.internal.frame_index;
+        try g.add(.{ .name = "probes", .stage = .lighting, .always = true, .scope = false }, ctx, updateProbes);
+    }
     if (p.shared.gi == null) return;
     const reduced = probes(p.settings.global_illumination).resolution;
     if (reduced == .full) return;
@@ -169,7 +173,6 @@ fn updateProbes(ctx: *ViewContext) !void {
     const self = ctx.renderer;
     const scene = p.scene;
     if (c.gi == null) return;
-    if (scene.gi_updated_frame == self.internal.frame_index) return;
     const count = scene.gi_cascade_count;
     const last = count - 1;
     noteChanges(scene, p.scene_frame.tlas_hash);
@@ -180,7 +183,6 @@ fn updateProbes(ctx: *ViewContext) !void {
             try updateGi(self, p.cmd, scene, coarse, p.arena, p.frame_address, p.settings, last);
     }
     for (1..@max(last, 1)) |index| try updateGi(self, p.cmd, scene, &scene.gi_cascades[index].?, p.arena, p.frame_address, p.settings, @intCast(index));
-    scene.gi_updated_frame = self.internal.frame_index;
 }
 
 /// The reduced-resolution probe gather, which the graph has begun rendering
@@ -460,12 +462,12 @@ pub fn updateGi(
         cmd.bindPipeline(try renderer.internal.pipelines.of(giBuriedPipeline));
         cmd.pushConstants(trace_push);
         cmd.dispatch((due_probes + 63) / 64, 1, 1);
-        cmd.sync(.compute_to_all);
+        cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true });
     }
     cmd.bindPipeline(try renderer.internal.pipelines.of(giTracePipeline));
     cmd.pushConstants(trace_push);
     cmd.dispatch((due_probes * volume.rays_per_probe + 63) / 64, 1, 1);
-    cmd.sync(.compute_to_all);
+    cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .graphics_read = true });
     cmd.endScope();
 
     const settled = std.math.pow(f32, std.math.clamp(probes(settings.global_illumination).hysteresis, 0, 0.999), @floatFromInt(stride));

@@ -111,7 +111,7 @@ pub const Images = struct {
         const bytes = try gltf.readFile(self.internal.gpa, self.internal.io, path);
         defer self.internal.gpa.free(bytes);
         if (ktx2.isKtx2(bytes)) {
-            const texture = try ktx2.read(self.internal.gpa, bytes);
+            const texture = try ktx2.read(self.internal.gpa, bytes, renderer_state.basisTarget(self.device.caps));
             defer self.internal.gpa.free(texture.data);
             return createImageFromLevels(self, texture);
         }
@@ -279,7 +279,12 @@ fn createImageFromLevels(self: *Renderer, source: ktx2.Texture) !Image {
     defer self.unlock();
     const device = self.device;
     if (source.faces != 1 or source.layers != 1) return error.UnsupportedTextureFormat;
-    if (source.format != .rgba8 and source.format != .rgba16f and !device.caps.bc_textures) return error.UnsupportedTextureFormat;
+    const readable = switch (source.format) {
+        .rgba8, .rgba16f => true,
+        .astc4x4 => device.caps.astc_textures,
+        else => device.caps.bc_textures,
+    };
+    if (!readable) return error.UnsupportedTextureFormat;
     const format: rhi.Format = switch (source.format) {
         .bc7 => if (source.srgb) .bc7_srgb else .bc7_unorm,
         .bc1 => if (source.srgb) .bc1_srgb else .bc1_unorm,
@@ -289,6 +294,7 @@ fn createImageFromLevels(self: *Renderer, source: ktx2.Texture) !Image {
         .bc6h => .bc6h_ufloat,
         .rgba8 => if (source.srgb) .rgba8_srgb else .rgba8_unorm,
         .rgba16f => .rgba16_float,
+        .astc4x4 => if (source.srgb) .astc_4x4_srgb else .astc_4x4_unorm,
     };
     const texture = try device.createTexture(.{
         .name = "image",

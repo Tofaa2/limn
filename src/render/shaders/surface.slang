@@ -52,6 +52,10 @@ struct HitSurface {
     float alpha_cutoff;
     float transmission;
     float ior;
+    /// Attenuation color and distance; 0 distance absorbs nothing.
+    float4 attenuation;
+    /// Reflectance of the surface where it is not metal.
+    float3 dielectric_f0;
 };
 
 /// The triangle a ray met, before any of its textures are read.
@@ -162,6 +166,8 @@ HitSurface surfaceOf(HitGeometry geometry, SurfaceDetail detail) {
     surface.alpha_cutoff = material.alpha_cutoff;
     surface.transmission = material.transmission;
     surface.ior = material.ior;
+    surface.attenuation = material.attenuation;
+    surface.dielectric_f0 = dielectricF0(material);
     return surface;
 }
 

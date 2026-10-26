@@ -78,6 +78,7 @@ pub const Stats = api.Stats;
 pub const SunDesc = api.SunDesc;
 pub const View = api.View;
 pub const WaterDesc = api.WaterDesc;
+pub const Ocean = api.Ocean;
 pub const scene_color_format = api.scene_color_format;
 const renderer_state = @import("state.zig");
 const scene_pass = @import("scene_pass.zig");
@@ -101,6 +102,8 @@ pub const vsm_view_base = renderer_state.vsm_view_base;
 pub const max_local_shadow_views = renderer_state.max_local_shadow_views;
 pub const local_shadow_tiles_per_side = renderer_state.local_shadow_tiles_per_side;
 const stream_budget_bytes = renderer_state.stream_budget_bytes;
+/// Heitz et al. 2016, `src/third_party/ltc/LICENSE`: two 64 by 64 RGBA tables of f32.
+const ltc_data = @embedFile("../third_party/ltc/ltc.bin");
 const RangeAllocator = renderer_state.RangeAllocator;
 const Pool = renderer_state.Pool;
 pub const FrameArena = renderer_state.FrameArena;
@@ -154,7 +157,7 @@ const freeModel = models_module.freeModel;
 const freeScene = scenes_module.freeScene;
 const insertView = views_module.insertView;
 const registerFont = fonts_module.registerFont;
-const renderView = view_render_module.renderView;
+const renderViews = view_render_module.renderViews;
 const targetWritten = views_module.targetWritten;
 const updateGeometryStreaming = streaming_module.updateGeometryStreaming;
 const updateTextureStreaming = streaming_module.updateTextureStreaming;
@@ -203,6 +206,8 @@ pub const Internal = struct {
     entity_transforms: std.array_list.Aligned(Mat4, .@"64") = .empty,
     entity_previous: std.array_list.Aligned(Mat4, .@"64") = .empty,
     entity_marks: std.ArrayList(EntityMark) = .empty,
+    /// What each entity takes of its scene's slots, by entity slot.
+    entity_spans: std.ArrayList(renderer_state.EntitySpan) = .empty,
     /// Entity edits made while the lock was taken, and the ones being made;
     /// see `queueEdit`.
     pending: std.ArrayList(EntityEdit) = .empty,
@@ -250,12 +255,23 @@ pub const Internal = struct {
     /// Shadow atlas for spot and point lights.
     local_shadow_map: rhi.Texture = undefined,
     clusters: rhi.Buffer = undefined,
-    transparent_order: std.ArrayList(TransparentDraw) = .empty,
+    /// Per cluster, lights placed in its list so far, and the lists.
+    cluster_cursors: rhi.Buffer = undefined,
+    cluster_lights: ?rhi.Buffer = null,
+    cluster_lights_capacity: u32 = 0,
+    /// The views of the frame being drawn, planned before they are recorded;
+    /// kept from frame to frame for their room.
+    staged_views: std.ArrayList(view_render_module.StagedView) = .empty,
     /// Frame in which a geometry pool last moved to a new buffer.
     geometry_replaced: ?u64 = null,
     /// Frames a view asked for path tracing and was drawn without it.
     path_trace_misses: u32 = 0,
     brdf_lut: rhi.Texture = undefined,
+    /// Linearly transformed cosine tables for rectangle lights: the matrix in
+    /// the top half, magnitude and Fresnel in the bottom.
+    ltc_table: rhi.Texture = undefined,
+    /// `SkyDesc.multiple_scattering` table, made by the first sky that asks.
+    sky_scattering: ?rhi.Texture = null,
     /// Ray-tracing stand-in box for liquids; made with the first liquid.
     liquid_proxy_model: ?Model = null,
     /// Bumped whenever the set of ready models changes.
@@ -293,11 +309,6 @@ pub const Internal = struct {
     cloud_noise: ?rhi.Texture = null,
     cloud_weather: ?rhi.Texture = null,
     stats: Stats = .{},
-    skin_jobs: std.ArrayList(SkinJob) = .empty,
-    /// Morph target weights of this frame's skin jobs, back to back.
-    skin_weights: std.ArrayList(f32) = .empty,
-    /// Meshes whose meshlet bounds are worked out after skinning.
-    bounds_jobs: std.ArrayList(BoundsJob) = .empty,
     scratch_locals: std.ArrayList(animation.Local) = .empty,
     scratch_refs: std.ArrayList(gpu.MeshletRef) = .empty,
     scratch_settling: std.ArrayList([2]u32) = .empty,
@@ -365,6 +376,8 @@ pub const Renderer = struct {
             .hdr_output = options.hdr_output,
             .ray_tracing = options.ray_tracing.hardware,
             .mesh_shaders = options.geometry.mesh_shaders,
+            .primitive_id = options.geometry.primitive_id,
+            .block_formats = options.textures.block_formats,
             .nvidia_ngx = @import("dlss.zig").available,
         });
         errdefer device.deinit();
@@ -463,6 +476,7 @@ pub const Renderer = struct {
         self.internal.entity_transforms.deinit(self.internal.gpa);
         self.internal.entity_previous.deinit(self.internal.gpa);
         self.internal.entity_marks.deinit(self.internal.gpa);
+        self.internal.entity_spans.deinit(self.internal.gpa);
         inline for (stores) |name| {
             const store = &@field(self, name);
             while (store.internal.table.popAny()) |value| {
@@ -498,7 +512,6 @@ pub const Renderer = struct {
         device.destroySampler(self.internal.sampler_linear_repeat);
         device.destroySampler(self.internal.sampler_shadow);
         device.destroySampler(self.internal.sampler_local_shadow);
-        self.internal.transparent_order.deinit(self.internal.gpa);
         inline for (.{ "vertices", "skin_vertices", "morph_deltas", "indices", "meshlets", "meshes" }) |name| @field(self.internal, name).deinit(self);
         self.internal.rays.deinit(self);
         self.materials.internal.pool.deinit(self);
@@ -509,19 +522,20 @@ pub const Renderer = struct {
             device.destroyPipeline(pipelines.reflective);
         };
         if (self.internal.cull_commands) |buffer| device.destroyBuffer(buffer);
+        if (self.internal.cluster_lights) |buffer| device.destroyBuffer(buffer);
+        self.internal.staged_views.deinit(self.internal.gpa);
         if (self.internal.scene_ready) {
-            for ([_]rhi.Buffer{ self.internal.cull_counts, self.internal.cull_dispatch, self.internal.impostor_draw, self.internal.cull_mesh_draws, self.internal.clusters, self.internal.pick_buffer }) |buffer| device.destroyBuffer(buffer);
+            for ([_]rhi.Buffer{ self.internal.cull_counts, self.internal.cull_dispatch, self.internal.impostor_draw, self.internal.cull_mesh_draws, self.internal.clusters, self.internal.cluster_cursors, self.internal.pick_buffer }) |buffer| device.destroyBuffer(buffer);
             for (self.internal.count_readback) |buffer| device.destroyBuffer(buffer);
             for (self.internal.pick_readback) |buffer| device.destroyBuffer(buffer);
             device.destroyTexture(self.internal.local_shadow_map);
             device.destroyTexture(self.internal.shadow_map);
             device.destroyTexture(self.internal.brdf_lut);
+            device.destroyTexture(self.internal.ltc_table);
         }
+        if (self.internal.sky_scattering) |texture| device.destroyTexture(texture);
         if (self.internal.cloud_noise) |texture| device.destroyTexture(texture);
         if (self.internal.cloud_weather) |texture| device.destroyTexture(texture);
-        self.internal.skin_jobs.deinit(self.internal.gpa);
-        self.internal.skin_weights.deinit(self.internal.gpa);
-        self.internal.bounds_jobs.deinit(self.internal.gpa);
         self.internal.scratch_locals.deinit(self.internal.gpa);
         self.internal.scratch_refs.deinit(self.internal.gpa);
         self.internal.scratch_settling.deinit(self.internal.gpa);
@@ -545,6 +559,16 @@ pub const Renderer = struct {
         self.lock();
         defer self.unlock();
         self.device.resize(width, height);
+    }
+
+    /// Replaces the window the renderer presents to, as on Android when the
+    /// app comes back with a new window; null drops it, and views of the
+    /// backbuffer fail with `error.NoSurface` until a new one comes. Fails with
+    /// `error.NoSurface` for a renderer made without a surface.
+    pub fn setSurface(self: *Renderer, surface: ?rhi.Surface) !void {
+        self.lock();
+        defer self.unlock();
+        try self.device.setSurface(surface);
     }
 
     /// What this renderer can do on this device. Safe from any thread.
@@ -581,7 +605,9 @@ pub const Renderer = struct {
         defer self.unlock();
         var result = self.internal.stats;
         result.models_loading = self.internal.loading_count;
-        result.gpu_memory_bytes = self.device.memoryStats().used_bytes;
+        const memory = self.device.memoryStats();
+        result.gpu_memory_bytes = memory.used_bytes;
+        result.gpu_memory_budget_bytes = memory.budget_bytes;
         result.pipelines = self.internal.pipelines.count();
         return result;
     }
@@ -715,7 +741,7 @@ pub const Renderer = struct {
         }
     }
 
-    fn noteEdited(self: *Renderer, index: u32, mark: *EntityMark, change: u32) void {
+    pub fn noteEdited(self: *Renderer, index: u32, mark: *EntityMark, change: u32) void {
         const wanted = change | EntityMark.listed;
         if (mark.bits & wanted == wanted) return;
         const scene = self.scenes.internal.table.get(mark.scene) orelse return;
@@ -758,7 +784,7 @@ pub const Renderer = struct {
         if (raw.instance == gpu.invalid_id) return;
         const scene = self.scenes.internal.table.get(pending.scene) orelse return;
         if (scene.layout_version != pending.layout_version) return;
-        if (raw.instance >= scene.layout.items.len) {
+        if (raw.instance >= scene.entity_capacity) {
             for (scene.groups.items) |group_handle| {
                 const group = self.instances.internal.table.get(group_handle) orelse continue;
                 if (group.per_copy == 0 or raw.instance < group.base) continue;
@@ -776,7 +802,9 @@ pub const Renderer = struct {
             }
             return;
         }
+        if (raw.instance >= scene.layout.items.len) return;
         const entry = scene.layout.items[raw.instance];
+        if (!entry.entity.isValid()) return;
         result.hit = .{
             .entity = entry.entity,
             .mesh_instance = entry.model_instance,
@@ -879,7 +907,7 @@ pub const Renderer = struct {
         try buildPendingBlas(self, cmd, frame.index);
         cmd.endScope();
 
-        for (desc.views) |view_desc| try renderView(self, frame, view_desc, desc.delta_time, arena);
+        try renderViews(self, frame, desc.views, desc.delta_time, arena);
         try captureProbes(self, frame, desc.delta_time, arena);
         self.internal.stats.downgrades = self.internal.downgrades.items;
         self.internal.stats.downgrade_count = self.internal.downgrades.count;
@@ -957,6 +985,7 @@ pub fn ensureSceneResources(self: *Renderer, cmd: *rhi.CommandEncoder) !void {
     const impostor_draw = try Local.buffer(device, &made, .{ .name = "impostor draw", .size = @sizeOf(gpu.DrawIndirect), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } });
     const cull_dispatch = try Local.buffer(device, &made, .{ .name = "cull dispatch", .size = view_count * @sizeOf(gpu.CullDispatch), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } });
     const clusters = try Local.buffer(device, &made, .{ .name = "light clusters", .size = gpu.cluster_count * @sizeOf(gpu.Cluster), .usage = .{ .storage = true } });
+    const cluster_cursors = try Local.buffer(device, &made, .{ .name = "light cluster cursors", .size = gpu.cluster_count * @sizeOf(u32), .usage = .{ .storage = true, .copy_dst = true } });
     const pick_buffer = try Local.buffer(device, &made, .{ .name = "pick", .size = @sizeOf(gpu.Pick), .usage = .{ .storage = true, .copy_src = true } });
     var count_readback: [rhi.frames_in_flight]rhi.Buffer = undefined;
     for (&count_readback) |*buffer| buffer.* = try Local.buffer(device, &made, .{ .name = "cull count readback", .size = (view_count * 2 + 1) * @sizeOf(u32), .usage = .{}, .memory = .gpu_to_cpu });
@@ -989,6 +1018,20 @@ pub fn ensureSceneResources(self: *Renderer, cmd: *rhi.CommandEncoder) !void {
         .usage = .{ .sampled = true, .color_attachment = true },
     });
     errdefer device.destroyTexture(brdf_lut);
+    const ltc_table = try device.createTexture(.{
+        .name = "ltc table",
+        .width = 64,
+        .height = 128,
+        .format = .rgba16_float,
+        .usage = .{ .sampled = true, .copy_dst = true },
+    });
+    errdefer device.destroyTexture(ltc_table);
+    const ltc_source: []align(1) const f32 = std.mem.bytesAsSlice(f32, ltc_data);
+    const ltc_texels = try self.internal.gpa.alloc(f16, ltc_source.len);
+    defer self.internal.gpa.free(ltc_texels);
+    for (ltc_texels, ltc_source) |*texel, value| texel.* = @floatCast(value);
+    try device.uploadTexture(ltc_table, 0, 0, std.mem.sliceAsBytes(ltc_texels));
+    try cmd.flushUploads();
 
     const brdf_pipeline = try self.internal.pipelines.of(brdfLutPipeline);
     try cmd.beginRendering(.{ .color = &.{.{ .texture = brdf_lut, .load = .discard }} });
@@ -1007,12 +1050,14 @@ pub fn ensureSceneResources(self: *Renderer, cmd: *rhi.CommandEncoder) !void {
     self.internal.impostor_draw = impostor_draw;
     self.internal.cull_dispatch = cull_dispatch;
     self.internal.clusters = clusters;
+    self.internal.cluster_cursors = cluster_cursors;
     self.internal.pick_buffer = pick_buffer;
     self.internal.count_readback = count_readback;
     self.internal.pick_readback = pick_readback;
     self.internal.local_shadow_map = local_shadow_map;
     self.internal.shadow_map = shadow_map;
     self.internal.brdf_lut = brdf_lut;
+    self.internal.ltc_table = ltc_table;
     self.internal.scene_ready = true;
 }
 
@@ -1103,11 +1148,14 @@ pub fn markEntity(self: *Renderer, entity: Entity, scene: Scene, transform: Mat4
         try self.internal.entity_transforms.ensureTotalCapacity(self.internal.gpa, needed);
         try self.internal.entity_previous.ensureTotalCapacity(self.internal.gpa, needed);
         try self.internal.entity_marks.ensureTotalCapacity(self.internal.gpa, needed);
+        try self.internal.entity_spans.ensureTotalCapacity(self.internal.gpa, needed);
         @memset(self.internal.entity_transforms.addManyAsSliceAssumeCapacity(needed - self.internal.entity_transforms.items.len), math.identity);
         @memset(self.internal.entity_previous.addManyAsSliceAssumeCapacity(needed - self.internal.entity_previous.items.len), math.identity);
         @memset(self.internal.entity_marks.addManyAsSliceAssumeCapacity(needed - self.internal.entity_marks.items.len), .{});
+        @memset(self.internal.entity_spans.addManyAsSliceAssumeCapacity(needed - self.internal.entity_spans.items.len), .{});
     }
     self.internal.entity_transforms.items[entity.index] = transform;
     self.internal.entity_previous.items[entity.index] = transform;
     self.internal.entity_marks.items[entity.index] = .{ .handle = @bitCast(entity), .scene = scene };
+    self.internal.entity_spans.items[entity.index] = .{};
 }

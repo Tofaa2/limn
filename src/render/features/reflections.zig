@@ -61,6 +61,9 @@ pub fn resolve(setting: *?Settings, r: *features.Resolve) void {
     if (s.ray_tracing) r.rays = true;
 }
 
+/// `Shared` values this feature's `prepare` sets.
+pub const provides = .{"reflections"};
+
 /// Makes this frame's reflection targets and publishes the ones shading
 /// writes.
 pub fn prepare(ctx: *ViewContext) !void {
@@ -144,7 +147,8 @@ pub fn drawReflections(renderer: *Renderer, p: *const ScenePass, targets: Reflec
         .step_count = @intCast(std.math.clamp(filled(settings.reflections).steps, 4, 256)),
         .history_texture = if (targets.history_valid and filled(settings.reflections).temporal_filter) device.textureIndex(targets.history) else gpu.invalid_id,
         .history_blend = 0.12,
-        .tlas = traced_tlas,
+        .tlas_low = @truncate(traced_tlas),
+        .tlas_high = @truncate(traced_tlas >> 32),
     });
     cmd.drawFullscreen();
     cmd.endRendering();

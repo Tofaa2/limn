@@ -11,7 +11,8 @@
 //!   A/D      orbit
 //!   T        hold to move the sun through the day
 //!
-//! `--dive 1`, `--frames N`, `--screenshot file.png`.
+//! `--dive 1`, `--ocean 1` for open sea waves, `--frames N`,
+//! `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");
 const math = gfx.math;
@@ -78,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
         defer arguments.deinit();
         while (arguments.next()) |argument| {
             if (std.mem.eql(u8, argument, "--dive")) dive = true;
+            if (std.mem.eql(u8, argument, "--ocean")) desc.ocean = .{ .wind_speed = 5, .period = 12, .height = 0.6 };
         }
     }
 

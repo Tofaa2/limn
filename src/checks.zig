@@ -274,6 +274,19 @@ const Checks = struct {
         std.log.info("threads: 90 frames of {d} entities drawn while other threads edited them", .{crowd.len});
     }
 
+    /// Pixels a channel of which differs by more than 16 levels.
+    fn pixelsApart(before: []const u8, after: []const u8) usize {
+        var count: usize = 0;
+        var at: usize = 0;
+        while (at + 4 <= before.len) : (at += 4) {
+            for (before[at..][0..4], after[at..][0..4]) |a, b| if (@abs(@as(i32, a) - @as(i32, b)) > 16) {
+                count += 1;
+                break;
+            };
+        }
+        return count;
+    }
+
     fn levelsApart(before: []const u8, after: []const u8) f32 {
         var total: u64 = 0;
         for (before, after) |a, b| total += @abs(@as(i32, a) - @as(i32, b));
@@ -314,6 +327,48 @@ const Checks = struct {
         for (row) |entity| renderer.entities.destroy(entity);
         try self.draw(2);
         std.log.info("moves: the picture changed by {d:.2} levels, and differs by {d:.2} from one drawn afresh", .{ changed, apart });
+    }
+
+    /// Entities made, hidden, shown and destroyed take and give back slots of
+    /// their own instead of laying out the scene again. The picture must be
+    /// the one a scene laid out whole gives.
+    fn structure(self: *Checks) !void {
+        const renderer = self.renderer;
+        try self.draw(20);
+        const pixels_empty = try renderer.device.readTexture(self.gpa, self.target);
+        defer self.gpa.free(pixels_empty);
+        var row: [32]?gfx.Entity = @splat(null);
+        defer for (row) |slot| if (slot) |entity| renderer.entities.destroy(entity);
+        for (0..12) |round| {
+            for (&row, 0..) |*slot, index| {
+                if ((index + round) % 3 != 0) continue;
+                if (slot.*) |entity| {
+                    renderer.entities.destroy(entity);
+                    slot.* = null;
+                } else {
+                    const x = @as(f32, @floatFromInt(index)) * 0.2 - 3.1;
+                    slot.* = try renderer.entities.create(self.scene, .{ .model = self.box_model, .transform = math.mul(math.translation(.{ x, 0.6 + 0.1 * @as(f32, @floatFromInt(round % 4)), -0.5 }), math.scaling(.{ 0.15, 0.3, 0.15 })) });
+                }
+            }
+            if (row[round % row.len]) |entity| renderer.entities.setVisible(entity, round % 2 == 0);
+            try self.draw(2);
+        }
+        for (&row, 0..) |*slot, index| if (slot.* == null and index % 2 == 0) {
+            const x = @as(f32, @floatFromInt(index)) * 0.2 - 3.1;
+            slot.* = try renderer.entities.create(self.scene, .{ .model = self.box_model, .transform = math.mul(math.translation(.{ x, 0.9, -0.5 }), math.scaling(.{ 0.15, 0.3, 0.15 })) });
+        };
+        try self.draw(60);
+        const pixels_kept = try renderer.device.readTexture(self.gpa, self.target);
+        defer self.gpa.free(pixels_kept);
+        renderer.scenes.internal.table.get(self.scene).?.layout_dirty = true;
+        try self.draw(60);
+        const pixels_whole = try renderer.device.readTexture(self.gpa, self.target);
+        defer self.gpa.free(pixels_whole);
+        const changed = pixelsApart(pixels_empty, pixels_kept);
+        const apart = pixelsApart(pixels_kept, pixels_whole);
+        if (changed < 100) return error.AddedEntitiesNotDrawn;
+        if (apart * 50 > changed) return error.AddedEntitiesDrawnWrong;
+        std.log.info("structure: made and destroyed entities changed {d} pixels, and {d} differ from the scene laid out whole", .{ changed, apart });
     }
 
     fn failedPass(self: *Checks) !void {
@@ -420,6 +475,57 @@ const Checks = struct {
             return error.DestroyedViewsKeptMemory;
         }
         std.log.info("many views: six views made, drawn and destroyed in turn, memory back within {d} KiB", .{(after -| before) / 1024});
+    }
+
+    /// Views recorded on several threads draw what views recorded on one do:
+    /// each of four views has a twin with the same camera, settings and age
+    /// later in the frame, recorded by another thread when there are several,
+    /// and every twin must come out the same.
+    fn parallelViews(self: *Checks) !void {
+        const renderer = self.renderer;
+        const kept_threads = renderer.options.worker_threads;
+        defer renderer.options.worker_threads = kept_threads;
+        var targets: [8]gfx.rhi.Texture = undefined;
+        for (&targets) |*target| target.* = try renderer.views.createTarget(width / 2, height / 2);
+        defer for (targets) |target| renderer.views.destroyTarget(target);
+        const settings = [4]gfx.Settings{ .{}, gfx.Settings.lightweight, .{ .shadows = .{ .virtual = true } }, .{ .reflections = null } };
+        var scenes: [2]gfx.Scene = undefined;
+        const sky = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.3, -0.6 } };
+        const environment = try renderer.environments.createSky(sky);
+        defer renderer.environments.destroy(environment);
+        for (&scenes) |*scene| {
+            scene.* = try renderer.scenes.create();
+            renderer.scenes.setEnvironment(scene.*, .{ .environment = environment, .intensity = 1 });
+            renderer.scenes.setSun(scene.*, gfx.skySun(sky));
+            _ = try renderer.entities.create(scene.*, .{ .model = self.box_model, .transform = math.identity });
+        }
+        defer for (scenes) |scene| renderer.scenes.destroy(scene);
+        try renderer.waitUntilLoaded();
+        for ([_]u32{ 1, 0 }) |worker_threads| {
+            renderer.options.worker_threads = worker_threads;
+            var views: [8]gfx.View = undefined;
+            for (&views) |*view| view.* = try renderer.views.create();
+            defer for (views) |view| renderer.views.destroy(view);
+            var descs: [8]gfx.ViewDesc = undefined;
+            for (&descs, views, targets, 0..) |*desc, view, target, index| {
+                const angle: f32 = @floatFromInt(index % 4);
+                desc.* = .{ .view = view, .scene = scenes[index / 4], .camera = gfx.Camera.lookAt(.{ 4 * @sin(angle), 1.5, 4 * @cos(angle) }, .{ 0, 0.5, 0 }), .target = .{ .texture = target }, .settings = settings[index % 4] };
+            }
+            for (0..10) |_| _ = try renderer.render(.{ .views = &descs, .delta_time = 1.0 / 60.0 });
+            for (0..4) |index| {
+                const first = try renderer.device.readTexture(self.gpa, targets[index]);
+                defer self.gpa.free(first);
+                const twin = try renderer.device.readTexture(self.gpa, targets[index + 4]);
+                defer self.gpa.free(twin);
+                const apart = pixelsApart(first, twin);
+                if (apart != 0) {
+                    std.log.err("parallel views: view {d} and its twin differ at {d} pixels with {d} worker threads", .{ index, apart, worker_threads });
+                    return error.ParallelViewsDiffer;
+                }
+            }
+        }
+        if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
+        std.log.info("parallel views: eight views on one thread and on several, every twin the same", .{});
     }
 
     /// A box and its mirror image through the plane x = 0, lit and seen from
@@ -957,6 +1063,7 @@ pub fn main(init: std.process.Init) !void {
     try checks.staleHandles();
     try checks.staleDrawResources();
     try checks.moves();
+    try checks.structure();
     try checks.threads();
     try checks.failedPass();
     try checks.plainViewPasses();
@@ -967,6 +1074,7 @@ pub fn main(init: std.process.Init) !void {
     try checks.switchedOffCosts();
     try checks.mirrored();
     try checks.manyViews();
+    try checks.parallelViews();
     try checks.resizing();
     try checks.reloadWhileStreaming();
     try checks.shaderReload();
@@ -979,6 +1087,8 @@ pub fn main(init: std.process.Init) !void {
     if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
     try withoutFeatures(init.gpa, init.io);
     try lostDevice(init.gpa, init.io);
+    try pulledDraws(init.gpa, init.io);
+    try withoutBlockFormats(init.gpa, init.io);
 }
 
 /// A second renderer with ray tracing, mesh shaders and shading variants
@@ -1040,5 +1150,81 @@ fn lostDevice(gpa: std.mem.Allocator, io: std.Io) !void {
         if (renderer.render(frame)) |_| return error.LostDeviceDrew else |err| if (err != error.DeviceLost) return err;
     }
     if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
+    if (renderer.setSurface(null)) |_| return error.SurfaceSetWithoutOne else |err| if (err != error.NoSurface) return err;
     std.log.info("lost device: drew {d} frames, then every frame reported the loss", .{drawn});
+}
+
+/// Draws that pull their indices, as on devices without `SV_PrimitiveID`,
+/// give the picture the indexed draws give.
+fn pulledDraws(gpa: std.mem.Allocator, io: std.Io) !void {
+    var pictures: [2][]u8 = undefined;
+    for ([_]bool{ true, false }, &pictures) |primitive_id, *picture| {
+        const renderer = try gfx.Renderer.init(gpa, io, .{
+            .application_name = "limn checks, pulled draws",
+            .validation = true,
+            .deterministic = true,
+            .geometry = .{ .mesh_shaders = false, .primitive_id = primitive_id },
+        });
+        defer renderer.deinit();
+        const target = try renderer.views.createTarget(width, height);
+        defer renderer.views.destroyTarget(target);
+        const scene = try renderer.scenes.create();
+        renderer.scenes.setSun(scene, .{ .direction = .{ -0.5, -0.7, -0.4 }, .color = .{ 1, 1, 1 }, .intensity = 3 });
+        const corners = [8][3]f32{ .{ -0.5, 0, -0.5 }, .{ 0.5, 0, -0.5 }, .{ 0.5, 1, -0.5 }, .{ -0.5, 1, -0.5 }, .{ -0.5, 0, 0.5 }, .{ 0.5, 0, 0.5 }, .{ 0.5, 1, 0.5 }, .{ -0.5, 1, 0.5 } };
+        const faces = [36]u32{ 0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5 };
+        const box = try renderer.models.create(&.{.{ .positions = &corners, .indices = &faces }});
+        for (0..5) |index| _ = try renderer.entities.create(scene, .{ .model = box, .transform = math.translation(.{ @as(f32, @floatFromInt(index)) - 2, 0, 0 }) });
+        try renderer.waitUntilLoaded();
+        for (0..8) |_| _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = gfx.Camera.lookAt(.{ 1, 2.5, 5 }, .{ 0, 0.5, 0 }), .target = .{ .texture = target } }}, .delta_time = 1.0 / 60.0 });
+        if (renderer.device.caps.primitive_id == !primitive_id and !primitive_id) return error.PrimitiveIdNotTurnedOff;
+        picture.* = try renderer.device.readTexture(gpa, target);
+        try renderer.device.waitIdle();
+        if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
+    }
+    defer for (pictures) |picture| gpa.free(picture);
+    const apart = Checks.pixelsApart(pictures[0], pictures[1]);
+    if (apart != 0) {
+        std.log.err("pulled draws: {d} pixels differ from indexed draws", .{apart});
+        return error.PulledDrawsDiffer;
+    }
+    std.log.info("pulled draws: the same picture as indexed draws, without SV_PrimitiveID", .{});
+}
+
+/// A model with Basis Universal textures, loaded on a GPU taken to have no
+/// block-compressed formats, draws what it draws with them: its textures are
+/// transcoded to plain texels instead.
+fn withoutBlockFormats(gpa: std.mem.Allocator, io: std.Io) !void {
+    var pictures: [2][]u8 = undefined;
+    for ([_]bool{ true, false }, &pictures) |block_formats, *picture| {
+        const renderer = try gfx.Renderer.init(gpa, io, .{
+            .application_name = "limn checks, without block formats",
+            .validation = true,
+            .deterministic = true,
+            .textures = .{ .block_formats = block_formats },
+        });
+        defer renderer.deinit();
+        if (!block_formats and (renderer.device.caps.bc_textures or renderer.device.caps.astc_textures)) return error.BlockFormatsNotTurnedOff;
+        const target = try renderer.views.createTarget(width, height);
+        defer renderer.views.destroyTarget(target);
+        const scene = try renderer.scenes.create();
+        renderer.scenes.setSun(scene, .{ .direction = .{ -0.2, -0.5, -1 }, .color = .{ 1, 1, 1 }, .intensity = 3 });
+        const model = try renderer.models.load("examples/assets/panel/panel_etc1s.gltf");
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.identity });
+        try renderer.waitUntilLoaded();
+        const info = renderer.models.info(model) orelse return error.ModelNotLoaded;
+        const center = math.scale(math.add(info.bounds_min, info.bounds_max), 0.5);
+        const reach = math.length(math.sub(info.bounds_max, info.bounds_min));
+        const camera = gfx.Camera.lookAt(math.add(center, .{ 0, 0, reach * 1.2 }), center);
+        for (0..8) |_| _ = try renderer.render(.{ .views = &.{.{ .scene = scene, .camera = camera, .target = .{ .texture = target } }}, .delta_time = 1.0 / 60.0 });
+        picture.* = try renderer.device.readTexture(gpa, target);
+        try renderer.device.waitIdle();
+        if (renderer.device.validationErrorCount() != 0) return error.ValidationErrors;
+    }
+    defer for (pictures) |picture| gpa.free(picture);
+    const apart = Checks.pixelsApart(pictures[0], pictures[1]);
+    if (apart * 100 > width * height) {
+        std.log.err("without block formats: {d} pixels differ from the picture with them", .{apart});
+        return error.TranscodedTexturesDiffer;
+    }
+    std.log.info("without block formats: Basis textures as plain texels, {d} pixels apart from BC7", .{apart});
 }

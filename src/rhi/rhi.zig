@@ -4,6 +4,8 @@ const types = @import("types.zig");
 const device = @import("vulkan/device.zig");
 
 pub const Device = device.Device;
+/// Most encoders `Device.beginParallel` gives at once.
+pub const max_parallel = device.max_parallel;
 pub const FrameGenerator = device.FrameGenerator;
 /// Native handles for external SDKs.
 pub const native = @import("vulkan/native.zig");
@@ -30,6 +32,7 @@ pub const BufferDesc = types.BufferDesc;
 pub const BufferUsage = types.BufferUsage;
 pub const BufferMemory = types.BufferMemory;
 pub const BufferSync = types.BufferSync;
+pub const BufferAccess = types.BufferAccess;
 pub const SamplerDesc = types.SamplerDesc;
 pub const Filter = types.Filter;
 pub const AddressMode = types.AddressMode;
