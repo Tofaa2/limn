@@ -3,6 +3,7 @@
 ## 0.1.4 
 
 ### Added
+- `Options.ordered_culling`: draws listed in the scene's meshlet order, so surfaces at exactly the same depth resolve the same way every run; on with `deterministic`.
 - Builds fetch Slang, glslang, GLFW with its platform headers, the macOS SDK headers, MoltenVK and the Android NDK; `-Dtarget` cross-compiles from any host, `zig build cross` builds every target.
 - Android: `-Dtarget=aarch64-linux-android` packs each windowed example into a signed APK, without the Android SDK.
 - macOS: MoltenVK is shipped beside the examples and loaded when no Vulkan loader is installed.
@@ -95,6 +96,7 @@
 - `views.saveTarget`.
 
 ### Changed
+- The command encoder holds barriers until the next command and records them as one call, folding moves of the same mips: half the barrier calls of a frame.
 - DLSS and NRD build in by default only for the machine building, not for cross targets.
 - Entities are culled instance by instance before their meshlets, like instance groups.
 - Light and decal records stay on the GPU between frames; only those that changed are uploaded.

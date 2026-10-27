@@ -136,11 +136,15 @@ pub const Options = struct {
     /// Make runs of the same frames give the same picture, for comparing
     /// pictures between runs: shading variants, asset loads and ray tracing
     /// structures are waited for instead of arriving when they are ready,
-    /// and liquids add up neighbours in a fixed order. Surfaces at exactly
-    /// the same depth are still drawn in the order culling finds them, and
-    /// vendor upscalers keep their own order, so a few pixels can differ by
-    /// a level. Slower to start.
+    /// liquids add up neighbours in a fixed order, and culling lists draws
+    /// in a fixed order (`ordered_culling`). Vendor upscalers keep their own
+    /// order. Slower to start.
     deterministic: bool = false,
+    /// List each view's meshlet draws in the order of the scene's meshlets
+    /// instead of the order culling finds them, so surfaces at exactly the
+    /// same depth resolve the same way every run. Three more compute passes
+    /// per culled view. Null follows `deterministic`.
+    ordered_culling: ?bool = null,
     /// Threads for animation poses and instance records, including the render
     /// thread: 0 picks automatically (at most 8), 1 uses no other thread.
     worker_threads: u32 = 0,

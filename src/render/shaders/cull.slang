@@ -69,6 +69,29 @@ bool shadowUnseen(float3 center, float radius) {
     return nearest < farthestDepth(meshletOcclusion(), uv_min, uv_max);
 }
 
+/// Lists one meshlet's draw at `at` of a view's lists, in the form
+/// `mesh_lists` names: index draws, pulled draws or mesh shader references.
+void writeDraw(uint mesh_lists, DrawCommand* commands, uint* lists, uint at, uint ref_index, uint index_count, uint first_index) {
+    if (mesh_lists == 2u) {
+        lists[at * 4u] = index_count;
+        lists[at * 4u + 1u] = 1u;
+        lists[at * 4u + 2u] = first_index;
+        lists[at * 4u + 3u] = ref_index;
+        return;
+    }
+    if (mesh_lists != 0u) {
+        lists[at] = ref_index;
+        return;
+    }
+    DrawCommand command;
+    command.index_count = index_count;
+    command.instance_count = 1u;
+    command.first_index = first_index;
+    command.vertex_offset = 0;
+    command.first_instance = ref_index;
+    commands[at] = command;
+}
+
 float largestScale(float3x4 transform) {
     return max(length(matrixColumn(transform, 0)), max(length(matrixColumn(transform, 1)), length(matrixColumn(transform, 2))));
 }
@@ -172,32 +195,138 @@ void meshletMain(uint3 id : SV_DispatchThreadID) {
     if (meshlet_push.phase == PHASE_SINGLE) markSeen(ref.instance);
 
     uint bucket = fading || mirrored || (material.flags & (MATERIAL_ALPHA_TEST | MATERIAL_DOUBLE_SIDED | MATERIAL_BLEND)) != 0u ? 1u : 0u;
+    if (meshlet_push.ordered != 0u) {
+        meshlet_push.marks[ref_index] = bucket + 1u;
+        return;
+    }
     uint slot;
     InterlockedAdd(meshlet_push.counts[bucket], 1u, slot);
     if (slot >= (bucket == 0u ? meshlet_push.bucket_capacity : meshlet_push.masked_capacity)) {
         InterlockedAdd(meshlet_push.counts[bucket], 0xffffffffu);
         return;
     }
-    if (meshlet_push.mesh_lists == 2u) {
-        uint at = (bucket * meshlet_push.bucket_capacity + slot) * 4u;
-        meshlet_push.lists[at] = meshlet.index_count;
-        meshlet_push.lists[at + 1u] = 1u;
-        meshlet_push.lists[at + 2u] = mesh.index_offset + meshlet.index_offset;
-        meshlet_push.lists[at + 3u] = ref_index;
-        return;
+    writeDraw(meshlet_push.mesh_lists, meshlet_push.commands, meshlet_push.lists, bucket * meshlet_push.bucket_capacity + slot, ref_index, meshlet.index_count, mesh.index_offset + meshlet.index_offset);
+    if (meshlet_push.mesh_lists == 1u) InterlockedMax(meshlet_push.mesh_draws[bucket].x, (slot + meshlets_per_task) / meshlets_per_task);
+}
+
+#include "cull.OrderPush.slang"
+
+[[vk::push_constant]] OrderPush order_push;
+
+static const uint order_block = 1024u;
+static const uint order_threads = 256u;
+static const uint order_per_thread = order_block / order_threads;
+
+groupshared uint2 order_wave_sums[order_threads];
+groupshared uint2 order_scan[1024];
+
+/// The bucket `ref_index` was marked for, plus one; 0 when unmarked.
+uint orderMark(uint ref_index) {
+    return ref_index < order_push.ref_count ? order_push.marks[ref_index] : 0u;
+}
+
+/// How many of a thread's references each bucket holds.
+uint2 orderCount(uint first, out uint marks[order_per_thread]) {
+    uint2 counted = uint2(0u, 0u);
+    for (uint i = 0u; i < order_per_thread; i++) {
+        marks[i] = orderMark(first + i);
+        if (marks[i] == 1u) counted.x++;
+        if (marks[i] == 2u) counted.y++;
     }
-    if (meshlet_push.mesh_lists != 0u) {
-        meshlet_push.lists[bucket * meshlet_push.bucket_capacity + slot] = ref_index;
-        InterlockedMax(meshlet_push.mesh_draws[bucket].x, (slot + meshlets_per_task) / meshlets_per_task);
-        return;
+    return counted;
+}
+
+/// Adds up the counts of the workgroup's earlier waves, and of all its
+/// waves in `total`.
+uint2 orderBefore(uint thread, uint2 counted, out uint2 total) {
+    uint lanes = WaveGetLaneCount();
+    uint2 sum = uint2(WaveActiveSum(counted.x), WaveActiveSum(counted.y));
+    if (WaveIsFirstLane()) order_wave_sums[thread / lanes] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    uint2 before = uint2(0u, 0u);
+    total = uint2(0u, 0u);
+    for (uint wave = 0u; wave < order_threads / lanes; wave++) {
+        if (wave < thread / lanes) before += order_wave_sums[wave];
+        total += order_wave_sums[wave];
     }
-    DrawCommand command;
-    command.index_count = meshlet.index_count;
-    command.instance_count = 1u;
-    command.first_index = mesh.index_offset + meshlet.index_offset;
-    command.vertex_offset = 0;
-    command.first_instance = ref_index;
-    meshlet_push.commands[bucket * meshlet_push.bucket_capacity + slot] = command;
+    return before + uint2(WavePrefixSum(counted.x), WavePrefixSum(counted.y));
+}
+
+/// Counts each block's marked references per bucket.
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void orderCountMain(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+    uint marks[order_per_thread];
+    uint2 counted = orderCount(group.x * order_block + thread.x * order_per_thread, marks);
+    uint2 total;
+    orderBefore(thread.x, counted, total);
+    if (thread.x == 0u) {
+        order_push.blocks[group.x * 2u] = total.x;
+        order_push.blocks[group.x * 2u + 1u] = total.y;
+    }
+}
+
+/// Turns the block counts into each block's first place per bucket, and
+/// sets the lists' lengths.
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void orderScanMain(uint3 thread : SV_GroupThreadID) {
+    uint blocks = (order_push.ref_count + order_block - 1u) / order_block;
+    uint per = (blocks + 1023u) / 1024u;
+    uint first = thread.x * per;
+    uint last = min(first + per, blocks);
+    uint2 sum = uint2(0u, 0u);
+    for (uint block = first; block < last; block++) sum += uint2(order_push.blocks[block * 2u], order_push.blocks[block * 2u + 1u]);
+    order_scan[thread.x] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint step = 1u; step < 1024u; step <<= 1u) {
+        uint2 add = thread.x >= step ? order_scan[thread.x - step] : uint2(0u, 0u);
+        GroupMemoryBarrierWithGroupSync();
+        order_scan[thread.x] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    uint2 running = thread.x == 0u ? uint2(0u, 0u) : order_scan[thread.x - 1u];
+    for (uint block = first; block < last; block++) {
+        uint2 here = uint2(order_push.blocks[block * 2u], order_push.blocks[block * 2u + 1u]);
+        order_push.blocks[block * 2u] = running.x;
+        order_push.blocks[block * 2u + 1u] = running.y;
+        running += here;
+    }
+    if (thread.x == 1023u) {
+        uint2 listed = uint2(min(order_scan[1023u].x, order_push.bucket_capacity), min(order_scan[1023u].y, order_push.masked_capacity));
+        order_push.counts[0] = listed.x;
+        order_push.counts[1] = listed.y;
+        if (order_push.mesh_lists == 1u) {
+            order_push.mesh_draws[0].x = (listed.x + meshlets_per_task - 1u) / meshlets_per_task;
+            order_push.mesh_draws[1].x = (listed.y + meshlets_per_task - 1u) / meshlets_per_task;
+        }
+    }
+}
+
+/// Lists each block's marked references at its places, in reference order,
+/// and clears the marks for the next view.
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void orderWriteMain(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+    uint first = group.x * order_block + thread.x * order_per_thread;
+    uint marks[order_per_thread];
+    uint2 counted = orderCount(first, marks);
+    uint2 total;
+    uint2 slot = orderBefore(thread.x, counted, total) + uint2(order_push.blocks[group.x * 2u], order_push.blocks[group.x * 2u + 1u]);
+    FrameConstants frame = order_push.frame;
+    for (uint i = 0u; i < order_per_thread; i++) {
+        if (marks[i] == 0u) continue;
+        uint ref_index = first + i;
+        order_push.marks[ref_index] = 0u;
+        uint bucket = marks[i] - 1u;
+        uint at = bucket == 0u ? slot.x++ : slot.y++;
+        if (at >= (bucket == 0u ? order_push.bucket_capacity : order_push.masked_capacity)) continue;
+        MeshletRef ref = frame.meshlet_refs.data[ref_index];
+        Instance instance = frame.instances.data[ref.instance];
+        Mesh mesh = loadAligned<16>(frame.meshes.data + instance.mesh);
+        Meshlet meshlet = loadAligned<16>(frame.meshlets.data + ref.meshlet);
+        writeDraw(order_push.mesh_lists, order_push.commands, order_push.lists, bucket * order_push.bucket_capacity + at, ref_index, meshlet.index_count, mesh.index_offset + meshlet.index_offset);
+    }
 }
 
 struct ImpostorDraw {

@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         }
         for (boxes[0..@min(moving_boxes, spawned)], 0..) |entity, index| renderer.entities.setTransform(entity, boxAt(index, count, tick.time));
 
-        const stats = renderer.stats();
+        const stats = stage.stats();
         const work = stats.commands;
         list.clear();
         try list.rect(.{ .x = 12, .y = 12, .width = 560, .height = 112 }, gfx.Color.rgba(10, 12, 20, 190));

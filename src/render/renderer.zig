@@ -233,6 +233,11 @@ pub const Internal = struct {
     meshes: Pool,
     arenas: [rhi.frames_in_flight]FrameArena,
     cull_commands: ?rhi.Buffer = null,
+    /// In deterministic mode: what each meshlet reference was culled to, and
+    /// per block of references where its draws go, for listing draws in
+    /// reference order.
+    cull_marks: ?rhi.Buffer = null,
+    cull_blocks: ?rhi.Buffer = null,
     cull_capacity: u32 = 0,
     /// Views `cull_commands` has room for.
     cull_views: u32 = 0,
@@ -525,6 +530,8 @@ pub const Renderer = struct {
             device.destroyPipeline(pipelines.reflective);
         };
         if (self.internal.cull_commands) |buffer| device.destroyBuffer(buffer);
+        if (self.internal.cull_marks) |buffer| device.destroyBuffer(buffer);
+        if (self.internal.cull_blocks) |buffer| device.destroyBuffer(buffer);
         if (self.internal.cluster_lights) |buffer| device.destroyBuffer(buffer);
         self.internal.staged_views.deinit(self.internal.gpa);
         if (self.internal.scene_ready) {

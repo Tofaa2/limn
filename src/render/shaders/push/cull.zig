@@ -25,9 +25,36 @@ pub const MeshletPush = extern struct {
     mesh_lists: u32 = 0,
     mesh_draws: u64 = 0,
     lists: u64 = 0,
+    /// With `ordered`, the bucket each visible reference is marked for
+    /// instead of being listed: 1 opaque, 2 masked.
+    marks: u64 = 0,
+    ordered: u32 = 0,
+    push_pad: u32 = 0,
 
-    pub const references = .{ .frame = "FrameConstants", .view = "CullView", .commands = "DrawCommand*", .counts = "uint*", .visibility = "uint*", .skin_bounds = "float4*", .seen = "uint*", .candidates = "uint*", .dispatch = "CullDispatch", .instance_visibility = "uint*", .mesh_draws = "MeshDraw*", .lists = "uint*" };
+    pub const references = .{ .frame = "FrameConstants", .view = "CullView", .commands = "DrawCommand*", .counts = "uint*", .visibility = "uint*", .skin_bounds = "float4*", .seen = "uint*", .candidates = "uint*", .dispatch = "CullDispatch", .instance_visibility = "uint*", .mesh_draws = "MeshDraw*", .lists = "uint*", .marks = "uint*" };
 };
+
+/// Push constants of the passes that list marked references in reference
+/// order: counted per block of `order_block`, the counts turned into
+/// offsets, then written.
+pub const OrderPush = extern struct {
+    frame: u64,
+    marks: u64,
+    blocks: u64,
+    commands: u64,
+    lists: u64,
+    counts: u64,
+    mesh_draws: u64,
+    ref_count: u32,
+    bucket_capacity: u32,
+    masked_capacity: u32,
+    mesh_lists: u32,
+
+    pub const references = .{ .frame = "FrameConstants", .marks = "uint*", .blocks = "uint*", .commands = "DrawCommand*", .lists = "uint*", .counts = "uint*", .mesh_draws = "MeshDraw*" };
+};
+
+/// References each workgroup of the ordering passes covers.
+pub const order_block = 1024;
 
 /// Push constants of the instance pass in cull.slang.
 pub const InstancePush = extern struct {
