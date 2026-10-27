@@ -2,6 +2,7 @@
 const pipelines_module = @import("../renderer/pipelines.zig");
 const skin_push = @import("../shaders/push/skin.zig");
 const hiz_push = @import("../shaders/push/hiz.zig");
+const cull_push_module = @import("../shaders/push/cull.zig");
 const pick_push = @import("../shaders/push/pick.zig");
 const scene_pass = @import("../scene_pass.zig");
 const render = @import("../renderer.zig");
@@ -253,9 +254,14 @@ pub fn fitCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total: 
     }
     const views_wanted: u32 = if (filled(p.settings.shadows).virtual) view_count else if (p.shared.lighting.tile_count == 0) local_view_base else render.vsm_view_base;
     const masked_wanted = if (p.lod_band > 1) scene.ref_count else scene.masked_ref_count;
-    if (renderer.internal.cull_commands == null or scene.ref_count > renderer.internal.cull_capacity or masked_wanted > renderer.internal.cull_masked_capacity or views_wanted > renderer.internal.cull_views) {
+    const ordered = renderer.options.ordered_culling orelse renderer.options.deterministic;
+    if (renderer.internal.cull_commands == null or scene.ref_count > renderer.internal.cull_capacity or masked_wanted > renderer.internal.cull_masked_capacity or views_wanted > renderer.internal.cull_views or (ordered and renderer.internal.cull_marks == null)) {
         if (renderer.internal.cull_commands) |buffer| device.destroyBuffer(buffer);
         renderer.internal.cull_commands = null;
+        for ([_]*?rhi.Buffer{ &renderer.internal.cull_marks, &renderer.internal.cull_blocks }) |made| {
+            if (made.*) |buffer| device.destroyBuffer(buffer);
+            made.* = null;
+        }
         const capacity = scene.ref_count + @min(scene.ref_count / 2, cull_headroom);
         const masked_capacity = @max(@min(masked_wanted + @min(masked_wanted / 2, cull_headroom), capacity), 1);
         const views = @max(renderer.internal.cull_views, views_wanted);
@@ -267,6 +273,10 @@ pub fn fitCullBuffers(renderer: *Renderer, p: *const ScenePass, instance_total: 
         renderer.internal.cull_capacity = capacity;
         renderer.internal.cull_masked_capacity = masked_capacity;
         renderer.internal.cull_views = views;
+        if (ordered) {
+            renderer.internal.cull_marks = try device.createBuffer(.{ .name = "cull marks", .size = @as(u64, @max(capacity, 1)) * @sizeOf(u32), .usage = .{ .storage = true } });
+            renderer.internal.cull_blocks = try device.createBuffer(.{ .name = "cull blocks", .size = @as(u64, @max(capacity, 1) / cull_push_module.order_block + 1) * 2 * @sizeOf(u32), .usage = .{ .storage = true } });
+        }
     }
 
     if (scene.ref_count > scene.candidate_capacity or views_wanted > scene.candidate_views) {
@@ -623,9 +633,17 @@ pub fn cullViews(renderer: *Renderer, p: *const ScenePass, push: *CullPush, view
         }
         cmd.dependency(.{ .compute_write = true }, .{ .compute_read = true, .compute_write = true, .indirect = true });
     }
+    const marks = if (renderer.options.ordered_culling orelse renderer.options.deterministic) renderer.internal.cull_marks else null;
+    if (marks) |buffer| {
+        cmd.dependency(.{ .compute_read = true, .compute_write = true, .transfer_write = true }, .{ .transfer_write = true });
+        cmd.fillBuffer(buffer, 0, @as(u64, @max(scene.ref_count, 1)) * @sizeOf(u32), 0);
+        cmd.dependency(.{ .transfer_write = true }, .{ .compute_read = true, .compute_write = true });
+    }
     cmd.bindPipeline(try renderer.internal.pipelines.of(cullPipeline));
     for (views, 0..) |wanted, index| {
         if (!wanted) continue;
+        push.ordered = @intFromBool(marks != null);
+        push.marks = if (marks) |buffer| device.bufferAddress(buffer) else 0;
         push.view = views_address + index * @sizeOf(gpu.CullView);
         push.commands = device.bufferAddress(renderer.internal.cull_commands.?) + commandOffset(renderer, index, 0);
         push.counts = device.bufferAddress(renderer.internal.cull_counts) + index * 2 * @sizeOf(u32);
@@ -638,8 +656,48 @@ pub fn cullViews(renderer: *Renderer, p: *const ScenePass, push: *CullPush, view
         push.mesh_draws = device.bufferAddress(renderer.internal.cull_mesh_draws) + index * 2 * @sizeOf(gpu.MeshDraw);
         cmd.pushConstants(push.*);
         cmd.dispatchIndirect(renderer.internal.cull_dispatch, index * @sizeOf(gpu.CullDispatch));
+        if (marks) |buffer| try listInOrder(renderer, cmd, push, buffer, scene.ref_count);
     }
     cmd.dependency(.{ .compute_write = true }, .{ .indirect = true, .graphics_read = true, .compute_read = true, .transfer_read = true });
+}
+
+/// Lists the references culling marked for the view of `push` in
+/// reference order, so draws at equal depth resolve the same way every run.
+fn listInOrder(renderer: *Renderer, cmd: *rhi.CommandEncoder, push: *const CullPush, marks: rhi.Buffer, ref_count: u32) !void {
+    const device = renderer.device;
+    const blocks = (ref_count + cull_push_module.order_block - 1) / cull_push_module.order_block;
+    const order = cull_push_module.OrderPush{
+        .frame = push.frame,
+        .marks = device.bufferAddress(marks),
+        .blocks = device.bufferAddress(renderer.internal.cull_blocks.?),
+        .commands = push.commands,
+        .lists = push.lists,
+        .counts = push.counts,
+        .mesh_draws = push.mesh_draws,
+        .ref_count = ref_count,
+        .bucket_capacity = push.bucket_capacity,
+        .masked_capacity = push.masked_capacity,
+        .mesh_lists = push.mesh_lists,
+    };
+    const step = rhi.BufferAccess{ .compute_read = true, .compute_write = true };
+    cmd.dependency(.{ .compute_write = true }, step);
+    if (blocks != 0) {
+        cmd.bindPipeline(try renderer.internal.pipelines.of(orderCountPipeline));
+        cmd.pushConstants(order);
+        cmd.dispatch(blocks, 1, 1);
+        cmd.dependency(.{ .compute_write = true }, step);
+    }
+    cmd.bindPipeline(try renderer.internal.pipelines.of(orderScanPipeline));
+    cmd.pushConstants(order);
+    cmd.dispatch(1, 1, 1);
+    cmd.dependency(.{ .compute_write = true }, step);
+    if (blocks != 0) {
+        cmd.bindPipeline(try renderer.internal.pipelines.of(orderWritePipeline));
+        cmd.pushConstants(order);
+        cmd.dispatch(blocks, 1, 1);
+        cmd.dependency(.{ .compute_write = true }, step);
+    }
+    cmd.bindPipeline(try renderer.internal.pipelines.of(cullPipeline));
 }
 
 /// Draws what culling listed for `view_index`, opaque then alpha-tested.
@@ -794,6 +852,18 @@ fn skinBoundsPipeline(_: *rhi.Device) pipelines_module.Desc {
 
 fn cullPipeline(_: *rhi.Device) pipelines_module.Desc {
     return .{ .compute = .{ .name = "cull", .shader = pipelines_module.shaderCode("cull.comp.spv") } };
+}
+
+fn orderCountPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "cull order count", .shader = pipelines_module.shaderCode("cull_order_count.comp.spv") } };
+}
+
+fn orderScanPipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "cull order scan", .shader = pipelines_module.shaderCode("cull_order_scan.comp.spv") } };
+}
+
+fn orderWritePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return .{ .compute = .{ .name = "cull order write", .shader = pipelines_module.shaderCode("cull_order_write.comp.spv") } };
 }
 
 fn cullInstancesPipeline(_: *rhi.Device) pipelines_module.Desc {

@@ -347,6 +347,7 @@ pub fn readTexture(self: *Device, gpa: std.mem.Allocator, texture: types.Texture
     var encoder = try self.beginImmediate();
     const previous = self.textureResource(texture).states[0];
     encoder.transition(texture, .copy_src);
+    encoder.flush();
     self.vkd.cmdCopyImageToBuffer(encoder.command, self.textureResource(texture).image, .transfer_src_optimal, self.bufferResource(staging).handle, &.{.{
         .buffer_offset = 0,
         .buffer_row_length = 0,

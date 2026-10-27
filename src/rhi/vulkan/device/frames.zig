@@ -105,6 +105,7 @@ pub fn submitFrame(self: *Device) !void {
         recordGeneratedFrame(self, frame);
         self.encoder.transition(self.swapchain.?.textures.items[self.swapchain.?.image_index], .present);
     }
+    self.encoder.flush();
     try self.vkd.endCommandBuffer(self.encoder.command);
     self.encoder.submitInto(frame);
     self.in_frame = false;
@@ -140,6 +141,7 @@ pub fn submitFrame(self: *Device) !void {
     self.queue_mutex.lockUncancelable(self.io);
     defer self.queue_mutex.unlock(self.io);
     if (frame.async_recorded) {
+        self.async_encoder.flush();
         try self.vkd.endCommandBuffer(frame.async_command);
         const after_previous = vk.SemaphoreSubmitInfo{ .semaphore = self.frame_timeline, .value = self.frame_number, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
         const done = vk.SemaphoreSubmitInfo{ .semaphore = self.async_timeline, .value = self.frame_number + 1, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
@@ -477,6 +479,7 @@ pub fn beginParallel(self: *Device, count: u32) ![]CommandEncoder {
             frame.worker_pools[index] = pool;
         }
     }
+    self.encoder.flush();
     try self.vkd.endCommandBuffer(self.encoder.command);
     self.encoder.submitInto(frame);
     for (0..count) |index| {
@@ -518,6 +521,7 @@ pub fn joinParallel(self: *Device) !void {
             if (now != entry.found) encoder.moveMip(entry.texture, entry.mip, now, entry.found);
         };
         inline for (std.meta.fields(types.Work)) |field| @field(self.encoder.work, field.name) += @field(encoder.work, field.name);
+        encoder.flush();
         try self.vkd.endCommandBuffer(encoder.command);
         encoder.submitInto(frame);
     }

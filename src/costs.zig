@@ -416,7 +416,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (device) |name| init.gpa.free(name);
 
     var counting = CountingAllocator{ .backing = init.gpa };
-    const renderer = try gfx.Renderer.init(counting.allocator(), init.io, .{ .application_name = "limn costs", .deterministic = true, .job_allocator = counting.allocator(), .preferred_device = device, .worker_threads = threads });
+    const renderer = try gfx.Renderer.init(counting.allocator(), init.io, .{ .application_name = "limn costs", .deterministic = true, .ordered_culling = false, .job_allocator = counting.allocator(), .preferred_device = device, .worker_threads = threads });
     defer renderer.deinit();
     std.debug.print("{s} GPU, unified memory {}\n", .{ @tagName(renderer.device.adapterInfo().kind), renderer.device.caps.unified_memory });
     const target = try renderer.views.createTarget(width, height);
