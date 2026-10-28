@@ -9,7 +9,6 @@
 - macOS: MoltenVK is shipped beside the examples and loaded when no Vulkan loader is installed.
 - `decals --scatter N`: thousands of decals at once.
 - `zig build checks -- <names>` runs only those checks; `--no-ray-tracing` for software drivers. `-Dtsan` builds `checks` and `costs` with the thread sanitizer, with `src/tsan.supp` for Mesa's driver.
-- `Options.async_compute` (`--async-compute` in the examples): liquids simulate on a second queue beside culling and visibility; `rhi.Device.planAsync`, `acquireAsync`, `CommandEncoder.awaitAsync`. Off by default: no faster on an RTX 4060 Ti.
 - `rhi.AdapterInfo.tiled`, for phone and Apple GPUs; `Quality.recommended` gives them `.low` (Apple `.medium`).
 - `rhi.ColorAttachment.store`; `DepthAttachment.read_only` stores nothing back.
 - `Settings.fog.local_lights`: the clustered local lights light the fog, unshadowed.
@@ -98,7 +97,6 @@
 ### Changed
 - The command encoder holds barriers until the next command and records them as one call, folding moves of the same mips: half the barrier calls of a frame.
 - `scene_update.zig`, `renderer.zig` and `shading.slang` are split into topic files.
-- With `Options.async_compute`, liquids simulate beside the whole frame instead of holding up its shadows, and are drawn from the next frame on.
 - DLSS and NRD build in by default only for the machine building, not for cross targets.
 - Entities are culled instance by instance before their meshlets, like instance groups.
 - Light and decal records stay on the GPU between frames; only those that changed are uploaded.
