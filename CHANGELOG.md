@@ -210,6 +210,8 @@
 - A full culling bucket no longer leaves its count above what was listed, which let task shaders read past the list.
 - Handle tables no longer move their slots as they grow: a pipeline or texture made on a worker thread could free the array the render thread was reading.
 - The bindless uint textures are declared without a format; fetching an R32_UINT view through Rgba32ui was undefined.
+- Ray queries that reach no distance meet nothing instead of starting with a negative range.
+- FidelityFX downsampling takes its barrier-only path; the wave path wrote shared memory other quads were still reading.
 - `Stats.gi_probes`, `particles` and the path tracing counters are written atomically, as views record on several threads.
 - Headless runs could hang waiting for a ray tracing structure built in the same frame.
 - Path tracing: fully transmissive glass was skipped like a cutout; it now refracts.
