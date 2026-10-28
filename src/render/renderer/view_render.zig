@@ -21,7 +21,7 @@ const canvas = @import("../features/canvas.zig");
 const post = @import("../features/post.zig");
 const ray_scene = @import("../scene/ray_scene.zig");
 const render = @import("../renderer.zig");
-const ensureSceneResources = render.ensureSceneResources;
+const ensureSceneResources = @import("scene_resources.zig").ensureSceneResources;
 
 const Renderer = render.Renderer;
 const Vec3 = math.Vec3;
@@ -51,7 +51,7 @@ const ReflectionTargets = renderer_state.ReflectionTargets;
 const buildPendingBlas = @import("../scene/ray_scene.zig").buildPendingBlas;
 const view_math = @import("view_math.zig");
 const halton = @import("view_math.zig").halton;
-const prepareLights = @import("scene_update.zig").prepareLights;
+const prepareLights = @import("scene_lights.zig").prepareLights;
 const prepareScene = @import("scene_update.zig").prepareScene;
 const applySceneUpdate = @import("scene_update.zig").applySceneUpdate;
 const targetWritten = @import("views.zig").targetWritten;

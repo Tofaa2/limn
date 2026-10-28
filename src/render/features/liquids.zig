@@ -49,24 +49,24 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
         defer cmd.endScope();
         for (scene.liquids.items) |item| {
             const state = renderer.liquids.internal.table.get(item) orelse continue;
-            if (state.params_frame != renderer.internal.frame_index or state.live == 0) continue;
+            const shown = state.shown(device, renderer.internal.frame_index) orelse continue;
             const radius = state.desc.particle_radius;
             const ParticlePush = liquid_push.SpherePush;
             const particle_push = ParticlePush{
                 .frame = frame_address,
-                .liquid = state.params,
-                .shapes = device.bufferAddress(state.shapes),
+                .liquid = shown.liquid,
+                .shapes = shown.shapes,
                 .depth_texture = device.textureIndex(view.depth),
             };
             try cmd.beginRendering(.{ .depth = .{ .texture = targets.depth, .clear = 0 } });
             cmd.bindPipeline(try renderer.internal.pipelines.of(liquidDepthPipeline));
             cmd.pushConstants(particle_push);
-            cmd.draw(state.live * 6, 1, 0, 0);
+            cmd.draw(shown.live * 6, 1, 0, 0);
             cmd.endRendering();
             try cmd.beginRendering(.{ .color = &.{.{ .texture = targets.thickness, .load = .clear, .clear = .{ 0, 0, 0, 0 } }} });
             cmd.bindPipeline(try renderer.internal.pipelines.of(liquidThicknessPipeline));
             cmd.pushConstants(particle_push);
-            cmd.draw(state.live * 6, 1, 0, 0);
+            cmd.draw(shown.live * 6, 1, 0, 0);
             cmd.endRendering();
             const BlurPush = liquid_push.BlurPush;
             cmd.bindPipeline(try renderer.internal.pipelines.of(liquidBlurPipeline));
@@ -93,7 +93,7 @@ pub fn drawLiquids(renderer: *Renderer, p: *const ScenePass) !void {
             cmd.bindPipeline(try renderer.internal.pipelines.of(liquidPipeline));
             cmd.pushConstants(liquid_push.ShadePush{
                 .frame = frame_address,
-                .liquid = state.params,
+                .liquid = shown.liquid,
                 .distance_texture = device.textureIndex(targets.smooth[1]),
                 .thickness_texture = device.textureIndex(targets.thickness),
                 .scene_texture = device.textureIndex(copy),

@@ -132,15 +132,15 @@ fn createLiquidAlone(self: *Renderer, scene: Scene, desc: LiquidDesc) !Liquid {
     const capacity = std.math.clamp(desc.capacity, 64, 1 << 20);
     var block: [3]u32 = undefined;
     inline for (0..3) |axis| block[axis] = @intFromFloat(std.math.clamp(@floor(std.math.clamp(desc.fill[axis], 0, 1) * box.extent[axis] / (radius * 2) - 1), 0, 1 << 21));
-    const particles = try device.createBuffer(.{ .name = "liquid particles", .size = @as(u64, capacity) * @sizeOf(gpu.LiquidParticle), .usage = .{ .storage = true } });
+    const particles = try device.createBuffer(.{ .name = "liquid particles", .size = @as(u64, capacity) * @sizeOf(gpu.LiquidParticle), .usage = .{ .storage = true, .copy_src = true } });
     errdefer device.destroyBuffer(particles);
-    const shapes = try device.createBuffer(.{ .name = "liquid shapes", .size = @as(u64, capacity) * 64, .usage = .{ .storage = true } });
+    const shapes = try device.createBuffer(.{ .name = "liquid shapes", .size = @as(u64, capacity) * 64, .usage = .{ .storage = true, .copy_src = true } });
     errdefer device.destroyBuffer(shapes);
     const counts = try device.createBuffer(.{ .name = "liquid grid counts", .size = cell_count * @sizeOf(u32), .usage = .{ .storage = true } });
     errdefer device.destroyBuffer(counts);
     const cells = try device.createBuffer(.{ .name = "liquid grid", .size = cell_count * liquid_cell_slots * @sizeOf(u32), .usage = .{ .storage = true } });
     errdefer device.destroyBuffer(cells);
-    const params_buffer = try device.createBuffer(.{ .name = "liquid steps", .size = 8 * @sizeOf(gpu.Liquid), .usage = .{ .storage = true } });
+    const params_buffer = try device.createBuffer(.{ .name = "liquid steps", .size = 8 * @sizeOf(gpu.Liquid), .usage = .{ .storage = true, .copy_src = true } });
     errdefer device.destroyBuffer(params_buffer);
     var state = LiquidState{
         .scene = scene,

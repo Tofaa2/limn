@@ -7,8 +7,8 @@ const gpu = @import("../gpu.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
 const render = @import("../renderer.zig");
-const markOf = render.markOf;
-const transformOf = render.transformOf;
+const markOf = @import("entity_edits.zig").markOf;
+const transformOf = @import("entity_edits.zig").transformOf;
 
 const Renderer = render.Renderer;
 const Mat4 = math.Mat4;

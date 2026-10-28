@@ -11,7 +11,7 @@ const rhi = @import("../../rhi/rhi.zig");
 const math = @import("../../math.zig");
 const gpu = @import("../gpu.zig");
 const std = @import("std");
-const scene_update = @import("../renderer/scene_update.zig");
+const scene_lights = @import("../renderer/scene_lights.zig");
 const lights_feature = @import("lights.zig");
 const global_illumination_feature = @import("global_illumination.zig");
 const api = @import("../api.zig");
@@ -163,7 +163,7 @@ pub fn writeDecals(renderer: *Renderer, p: *const ScenePass) !u64 {
         .normal_strength = decal.normal_strength,
         .bounds = decalBounds(decal.transform),
     };
-    return scene_update.uploadChanged(gpu.Decal, renderer.device, "decals", &scene.decal_buffer, &scene.decal_capacity, &scene.decal_uploaded, &scene.decal_next);
+    return scene_lights.uploadChanged(gpu.Decal, renderer.device, "decals", &scene.decal_buffer, &scene.decal_capacity, &scene.decal_uploaded, &scene.decal_next);
 }
 
 /// The sphere a decal's box fits in: its center, and half its diagonal.

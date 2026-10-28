@@ -5,14 +5,15 @@ const water_passes_push = @import("../shaders/push/water_passes.zig");
 const ocean_push = @import("../shaders/push/ocean.zig");
 const fluid_passes_push = @import("../shaders/push/fluid_passes.zig");
 const render = @import("../renderer.zig");
-const restyleEntity = render.restyleEntity;
-const moveEntity = render.moveEntity;
-const transformOf = render.transformOf;
+const restyleEntity = @import("../renderer/entity_edits.zig").restyleEntity;
+const moveEntity = @import("../renderer/entity_edits.zig").moveEntity;
+const transformOf = @import("../renderer/entity_edits.zig").transformOf;
 const hair_feature = @import("hair.zig");
 const particles_feature = @import("particles.zig");
 const fluids_feature = @import("fluids.zig");
 const gpu = @import("../gpu.zig");
 const WaterState = @import("../state.zig").WaterState;
+const LiquidState = @import("../state.zig").LiquidState;
 const rhi = @import("../../rhi/rhi.zig");
 const std = @import("std");
 const math = @import("../../math.zig");
@@ -48,8 +49,8 @@ fn simulate(ctx: *ViewContext) !void {
     if (c.fresh_scene) {
         if (try ctx.device.acquireAsync()) |beside| {
             defer ctx.device.releaseAsync();
-            try simulateLiquids(ctx.renderer, beside, p.scene, c.arena, c.delta_time);
-        } else try simulateLiquids(ctx.renderer, p.cmd, p.scene, c.arena, c.delta_time);
+            try simulateLiquids(ctx.renderer, beside, p.scene, c.arena, c.delta_time, true);
+        } else try simulateLiquids(ctx.renderer, p.cmd, p.scene, c.arena, c.delta_time, false);
     }
     if (c.fresh_scene) try hair_feature.simulateHair(ctx.renderer, p, c.delta_time);
     c.fluid_list.* = fluids_feature.shadowingFluids(ctx.renderer, p);
@@ -152,7 +153,7 @@ pub fn splashDesc(desc: WaterDesc) EmitterDesc {
 pub const liquid_swell = 1.5;
 
 /// Steps every liquid of a scene, once per frame.
-pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, arena: *FrameArena, delta_time: f32) !void {
+pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *SceneData, arena: *FrameArena, delta_time: f32, ahead: bool) !void {
     if (scene.liquids.items.len == 0) return;
     const device = renderer.device;
     cmd.beginScope("liquid simulation");
@@ -271,7 +272,7 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             records.items[step] = record;
         }
         const stride = @sizeOf(gpu.Liquid);
-        cmd.dependency(.{ .compute_read = true, .graphics_read = true }, .{ .transfer_write = true });
+        cmd.dependency(.{ .compute_read = true, .graphics_read = true, .transfer_read = true }, .{ .transfer_write = true });
         cmd.copyBuffer(records.buffer, state.params_buffer, records.offset, 0, records.items.len * stride);
         cmd.dependency(.{ .transfer_write = true }, .{ .compute_read = true });
         const params_address = device.bufferAddress(state.params_buffer);
@@ -329,6 +330,9 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
         }
         state.params = params_address + (records.items.len - 1) * stride;
         state.params_frame = renderer.internal.frame_index;
+        if (state.ahead and !ahead) state.snapshots = @splat(.{});
+        state.ahead = ahead;
+        if (ahead and steps != 0) try keepForDrawing(renderer, cmd, state, (records.items.len - 1) * stride);
         if (state.proxy) |stand_in| if (renderer.entities.internal.table.get(stand_in)) |proxy| {
             const volume = @as(f32, @floatFromInt(state.live)) * spacing * spacing * spacing;
             const filled = std.math.clamp(volume / (box.extent[0] * box.extent[1] * box.extent[2]), 0.002, 1);
@@ -339,6 +343,29 @@ pub fn simulateLiquids(renderer: *Renderer, cmd: *rhi.CommandEncoder, scene: *Sc
             }
         };
     }
+}
+
+/// Copies what drawing reads after a step ahead into the copy no frame
+/// still in flight draws: the frames after this one draw it.
+fn keepForDrawing(renderer: *Renderer, cmd: *rhi.CommandEncoder, state: *LiquidState, last_record: u64) !void {
+    const device = renderer.device;
+    const particle_size = @sizeOf(gpu.LiquidParticle);
+    const shape_size = 64;
+    if (state.drawn_params == null) {
+        state.drawn_particles = try device.createBuffer(.{ .name = "liquid particles drawn", .size = 2 * @as(u64, state.capacity) * particle_size, .usage = .{ .storage = true } });
+        state.drawn_shapes = try device.createBuffer(.{ .name = "liquid shapes drawn", .size = 2 * @as(u64, state.capacity) * shape_size, .usage = .{ .storage = true } });
+        state.drawn_params = try device.createBuffer(.{ .name = "liquid record drawn", .size = 2 * @sizeOf(gpu.Liquid), .usage = .{ .storage = true } });
+    }
+    const newest = state.snapshots[0];
+    const slot: u1 = if (newest.frame == std.math.maxInt(u64)) 0 else newest.slot ^ 1;
+    const at: u64 = slot;
+    cmd.dependency(.{ .compute_write = true, .transfer_write = true }, .{ .transfer_read = true });
+    if (state.live != 0) {
+        cmd.copyBuffer(state.particles, state.drawn_particles.?, 0, at * state.capacity * particle_size, @as(u64, state.live) * particle_size);
+        cmd.copyBuffer(state.shapes, state.drawn_shapes.?, 0, at * state.capacity * shape_size, @as(u64, state.live) * shape_size);
+    }
+    cmd.copyBuffer(state.params_buffer, state.drawn_params.?, last_record, at * @sizeOf(gpu.Liquid), @sizeOf(gpu.Liquid));
+    state.snapshots = .{ .{ .frame = renderer.internal.frame_index, .live = state.live, .slot = slot }, newest };
 }
 
 /// Steps the scene's water surfaces and their splashes.

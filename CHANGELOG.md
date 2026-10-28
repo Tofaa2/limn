@@ -97,6 +97,8 @@
 
 ### Changed
 - The command encoder holds barriers until the next command and records them as one call, folding moves of the same mips: half the barrier calls of a frame.
+- `scene_update.zig`, `renderer.zig` and `shading.slang` are split into topic files.
+- With `Options.async_compute`, liquids simulate beside the whole frame instead of holding up its shadows, and are drawn from the next frame on.
 - DLSS and NRD build in by default only for the machine building, not for cross targets.
 - Entities are culled instance by instance before their meshlets, like instance groups.
 - Light and decal records stay on the GPU between frames; only those that changed are uploaded.

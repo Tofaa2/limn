@@ -1197,6 +1197,14 @@ pub const LiquidTargets = struct {
     smooth: [2]rhi.Texture,
 };
 
+/// A copy of a liquid made for drawing by a step ahead: the frame it was
+/// stepped in (none at the maximum), its live particles and which of the
+/// two copies it is.
+pub const LiquidSnapshot = struct { frame: u64 = std.math.maxInt(u64), live: u32 = 0, slot: u1 = 0 };
+
+/// Where a frame's liquid drawing reads.
+pub const LiquidShown = struct { liquid: u64, particles: u64, shapes: u64, live: u32 };
+
 pub const LiquidState = struct {
     scene: Scene,
     /// Time not yet simulated; see `steadyStep`.
@@ -1227,6 +1235,16 @@ pub const LiquidState = struct {
     /// Address of this frame's record on the GPU.
     params: u64 = 0,
     params_frame: u64 = std.math.maxInt(u64),
+    /// Whether the last step ran on the async queue, drawn from the next
+    /// frame on through the copies below.
+    ahead: bool = false,
+    /// Two copies each of the particles, shapes and last record a step ahead
+    /// leaves for drawing, made on its first such step.
+    drawn_particles: ?rhi.Buffer = null,
+    drawn_shapes: ?rhi.Buffer = null,
+    drawn_params: ?rhi.Buffer = null,
+    /// The copies made, newest first.
+    snapshots: [2]LiquidSnapshot = @splat(.{}),
 
     pub fn deinit(self: *LiquidState, device: *rhi.Device) void {
         device.destroyBuffer(self.particles);
@@ -1234,6 +1252,28 @@ pub const LiquidState = struct {
         device.destroyBuffer(self.counts);
         device.destroyBuffer(self.cells);
         device.destroyBuffer(self.params_buffer);
+        inline for (.{ self.drawn_particles, self.drawn_shapes, self.drawn_params }) |buffer| if (buffer) |made| device.destroyBuffer(made);
+    }
+
+    /// What frame `frame_index` draws: this frame's step on the frame's own
+    /// queue, else the newest copy an earlier frame's async step made. Null
+    /// for nothing to draw.
+    pub fn shown(self: *const LiquidState, device: *rhi.Device, frame_index: u64) ?LiquidShown {
+        if (!self.ahead) {
+            if (self.params_frame != frame_index or self.live == 0) return null;
+            return .{ .liquid = self.params, .particles = device.bufferAddress(self.particles), .shapes = device.bufferAddress(self.shapes), .live = self.live };
+        }
+        const copy = for (self.snapshots) |snapshot| {
+            if (snapshot.frame < frame_index) break snapshot;
+        } else return null;
+        if (copy.live == 0) return null;
+        const slot: u64 = copy.slot;
+        return .{
+            .liquid = device.bufferAddress(self.drawn_params.?) + slot * @sizeOf(gpu.Liquid),
+            .particles = device.bufferAddress(self.drawn_particles.?) + slot * self.capacity * @sizeOf(gpu.LiquidParticle),
+            .shapes = device.bufferAddress(self.drawn_shapes.?) + slot * self.capacity * 64,
+            .live = copy.live,
+        };
     }
 
     /// Keeps the sources whose numbers are all finite.

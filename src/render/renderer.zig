@@ -7,7 +7,6 @@ const math = @import("../math.zig");
 const gltf = @import("../asset/gltf.zig");
 const gpu = @import("gpu.zig");
 const animation = @import("animation.zig");
-const bvh = @import("bvh.zig");
 const font_module = @import("font_baker").font;
 const models_module = @import("renderer/models.zig");
 const streaming_module = @import("renderer/streaming.zig");
@@ -102,8 +101,6 @@ pub const vsm_view_base = renderer_state.vsm_view_base;
 pub const max_local_shadow_views = renderer_state.max_local_shadow_views;
 pub const local_shadow_tiles_per_side = renderer_state.local_shadow_tiles_per_side;
 const stream_budget_bytes = renderer_state.stream_budget_bytes;
-/// Heitz et al. 2016, `src/third_party/ltc/LICENSE`: two 64 by 64 RGBA tables of f32.
-const ltc_data = @embedFile("../third_party/ltc/ltc.bin");
 const RangeAllocator = renderer_state.RangeAllocator;
 const Pool = renderer_state.Pool;
 pub const FrameArena = renderer_state.FrameArena;
@@ -113,7 +110,6 @@ pub const ModelMesh = renderer_state.ModelMesh;
 pub const SceneData = renderer_state.SceneData;
 const EntityData = renderer_state.EntityData;
 pub const TransparentDraw = renderer_state.TransparentDraw;
-const BlasJob = renderer_state.BlasJob;
 pub const BoundsJob = renderer_state.BoundsJob;
 pub const SkinJob = renderer_state.SkinJob;
 pub const MadeTextures = renderer_state.MadeTextures;
@@ -147,20 +143,17 @@ const bakeSky = environments_module.bakeSky;
 const buildPendingBlas = ray_scene.buildPendingBlas;
 const captureProbes = probes_module.captureProbes;
 const compactGeometry = scene_update_module.compactGeometry;
-const destroyFluidTextures = fluid_module.destroyFluidTextures;
 const finalizeEnvironment = environments_module.finalizeEnvironment;
 const finalizeModel = models_module.finalizeModel;
-const freeEntityStorage = scenes_module.freeEntityStorage;
 const freeEnvironment = environments_module.freeEnvironment;
-const freeHair = hair_module.freeHair;
 const freeModel = models_module.freeModel;
-const freeScene = scenes_module.freeScene;
 const insertView = views_module.insertView;
 const registerFont = fonts_module.registerFont;
 const renderViews = view_render_module.renderViews;
 const targetWritten = views_module.targetWritten;
 const updateGeometryStreaming = streaming_module.updateGeometryStreaming;
 const updateTextureStreaming = streaming_module.updateTextureStreaming;
+const entity_edits = @import("renderer/entity_edits.zig");
 
 /// The kinds of object kept in a handle table, freed in this order when the
 /// renderer is destroyed. Each namespace has `internal.table` and `internal.free`. A freed
@@ -712,59 +705,12 @@ pub const Renderer = struct {
     /// renderer methods while holding it.
     pub fn lock(self: *Renderer) void {
         self.internal.mutex.lockUncancelable(self.internal.io);
-        if (self.internal.pending_any.load(.acquire)) self.applyPending();
+        if (self.internal.pending_any.load(.acquire)) entity_edits.applyPending(self);
     }
 
     /// Must be called from the thread that took the lock.
     pub fn unlock(self: *Renderer) void {
         self.internal.mutex.unlock(self.internal.io);
-    }
-
-    fn applyPending(self: *Renderer) void {
-        {
-            self.internal.pending_mutex.lockUncancelable(self.internal.io);
-            defer self.internal.pending_mutex.unlock(self.internal.io);
-            std.mem.swap(std.ArrayList(EntityEdit), &self.internal.pending, &self.internal.applying);
-            self.internal.pending_any.store(false, .release);
-        }
-        for (self.internal.applying.items) |edit| applyEdit(self, edit);
-        self.internal.applying.clearRetainingCapacity();
-    }
-
-    fn applyEdit(self: *Renderer, edit: EntityEdit) void {
-        switch (edit.change) {
-            .transform => |transform| moveEntity(self, edit.entity, transform, false),
-            .teleport => |transform| moveEntity(self, edit.entity, transform, true),
-            .tint => |tint| if (self.entities.internal.table.get(edit.entity)) |data| {
-                if (data.tint == tint) return;
-                data.tint = tint;
-                restyleEntity(self, edit.entity);
-            },
-            .params => |params| if (self.entities.internal.table.get(edit.entity)) |data| {
-                if (std.mem.eql(f32, &data.params, &params)) return;
-                data.params = params;
-                restyleEntity(self, edit.entity);
-            },
-            .pose => |pose| if (self.entities.internal.table.get(edit.entity)) |data| {
-                data.pose = pose;
-            },
-        }
-    }
-
-    pub fn noteEdited(self: *Renderer, index: u32, mark: *EntityMark, change: u32) void {
-        const wanted = change | EntityMark.listed;
-        if (mark.bits & wanted == wanted) return;
-        const scene = self.scenes.internal.table.get(mark.scene) orelse return;
-        const whole = EntityMark.restyled | EntityMark.teleported;
-        if (change & whole != 0 and mark.bits & whole == 0) scene.restyled_entries += mark.layout_count;
-        mark.bits |= change;
-        if (mark.bits & EntityMark.listed != 0) return;
-        scene.edited.append(self.internal.gpa, index) catch {
-            scene.records_valid = false;
-            return;
-        };
-        scene.edited_entries += mark.layout_count;
-        mark.bits |= EntityMark.listed;
     }
 
     /// Asks which entity is under `pixel` (in the view's pixels; null is the
@@ -963,209 +909,3 @@ test "range allocator reuses and coalesces freed ranges" {
 }
 
 pub const shaderCode = pipelines_module.shaderCode;
-
-fn brdfLutPipeline(_: *rhi.Device) pipelines_module.Desc {
-    return pipelines_module.pass("brdf lut", pipelines_module.shaderCode("brdf_lut.frag.spv"), &.{.{ .format = .rg16_float }});
-}
-
-/// Makes what only scenes use, the first time a scene is drawn: the
-/// geometry pools, culling and picking buffers, shadow maps, light
-/// clusters and the BRDF table. A renderer that draws no scene has none.
-pub fn ensureSceneResources(self: *Renderer, cmd: *rhi.CommandEncoder) !void {
-    if (self.internal.scene_ready) return;
-    const device = self.device;
-    inline for (.{ "vertices", "skin_vertices", "morph_deltas", "indices", "meshlets", "meshes" }) |name| try @field(self.internal, name).ensure(device);
-    try self.internal.rays.ensure(device);
-    try self.materials.internal.pool.ensure(device);
-
-    var made: std.ArrayList(rhi.Buffer) = .empty;
-    defer made.deinit(self.internal.gpa);
-    errdefer for (made.items) |buffer| device.destroyBuffer(buffer);
-    try made.ensureTotalCapacity(self.internal.gpa, 6 + 2 * rhi.frames_in_flight);
-    const Local = struct {
-        fn buffer(d: *rhi.Device, list: *std.ArrayList(rhi.Buffer), desc: rhi.BufferDesc) !rhi.Buffer {
-            const result = try d.createBuffer(desc);
-            list.appendAssumeCapacity(result);
-            if (desc.memory == .gpu_to_cpu) @memset(d.mapped(result), 0);
-            return result;
-        }
-    };
-    const cull_counts = try Local.buffer(device, &made, .{ .name = "cull counts", .size = view_count * 2 * @sizeOf(u32), .usage = .{ .storage = true, .indirect = true, .copy_src = true } });
-    const cull_mesh_draws = try Local.buffer(device, &made, .{ .name = "cull mesh draws", .size = view_count * 2 * @sizeOf(gpu.MeshDraw), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } });
-    const impostor_draw = try Local.buffer(device, &made, .{ .name = "impostor draw", .size = @sizeOf(gpu.DrawIndirect), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } });
-    const cull_dispatch = try Local.buffer(device, &made, .{ .name = "cull dispatch", .size = view_count * @sizeOf(gpu.CullDispatch), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } });
-    const clusters = try Local.buffer(device, &made, .{ .name = "light clusters", .size = gpu.cluster_count * @sizeOf(gpu.Cluster), .usage = .{ .storage = true } });
-    const cluster_cursors = try Local.buffer(device, &made, .{ .name = "light cluster cursors", .size = gpu.cluster_count * @sizeOf(u32), .usage = .{ .storage = true, .copy_dst = true } });
-    const pick_buffer = try Local.buffer(device, &made, .{ .name = "pick", .size = @sizeOf(gpu.Pick), .usage = .{ .storage = true, .copy_src = true } });
-    var count_readback: [rhi.frames_in_flight]rhi.Buffer = undefined;
-    for (&count_readback) |*buffer| buffer.* = try Local.buffer(device, &made, .{ .name = "cull count readback", .size = (view_count * 2 + 1) * @sizeOf(u32), .usage = .{}, .memory = .gpu_to_cpu });
-    var pick_readback: [rhi.frames_in_flight]rhi.Buffer = undefined;
-    for (&pick_readback) |*buffer| buffer.* = try Local.buffer(device, &made, .{ .name = "pick readback", .size = @sizeOf(gpu.Pick), .usage = .{}, .memory = .gpu_to_cpu });
-
-    const local_shadow_map = try device.createTexture(.{
-        .name = "local shadow atlas",
-        .width = 1,
-        .height = 1,
-        .format = .depth32_float,
-        .usage = .{ .sampled = true, .depth_attachment = true },
-    });
-    errdefer device.destroyTexture(local_shadow_map);
-    const shadow_map = try device.createTexture(.{
-        .name = "shadow fallback",
-        .width = 1,
-        .height = 1,
-        .format = .depth32_float,
-        .usage = .{ .sampled = true, .depth_attachment = true },
-        .layers = gpu.cascade_count,
-        .kind = .@"2d_array",
-    });
-    errdefer device.destroyTexture(shadow_map);
-    const brdf_lut = try device.createTexture(.{
-        .name = "brdf lut",
-        .width = 128,
-        .height = 128,
-        .format = .rg16_float,
-        .usage = .{ .sampled = true, .color_attachment = true },
-    });
-    errdefer device.destroyTexture(brdf_lut);
-    const ltc_table = try device.createTexture(.{
-        .name = "ltc table",
-        .width = 64,
-        .height = 128,
-        .format = .rgba16_float,
-        .usage = .{ .sampled = true, .copy_dst = true },
-    });
-    errdefer device.destroyTexture(ltc_table);
-    const ltc_source: []align(1) const f32 = std.mem.bytesAsSlice(f32, ltc_data);
-    const ltc_texels = try self.internal.gpa.alloc(f16, ltc_source.len);
-    defer self.internal.gpa.free(ltc_texels);
-    for (ltc_texels, ltc_source) |*texel, value| texel.* = @floatCast(value);
-    try device.uploadTexture(ltc_table, 0, 0, std.mem.sliceAsBytes(ltc_texels));
-    try cmd.flushUploads();
-
-    const brdf_pipeline = try self.internal.pipelines.of(brdfLutPipeline);
-    try cmd.beginRendering(.{ .color = &.{.{ .texture = brdf_lut, .load = .discard }} });
-    cmd.bindPipeline(brdf_pipeline);
-    cmd.drawFullscreen();
-    cmd.endRendering();
-    for (0..gpu.cascade_count) |cascade| {
-        try cmd.beginRendering(.{ .depth = .{ .texture = shadow_map, .layer = @intCast(cascade), .clear = 1 } });
-        cmd.endRendering();
-    }
-    try cmd.beginRendering(.{ .depth = .{ .texture = local_shadow_map, .clear = 0 } });
-    cmd.endRendering();
-
-    self.internal.cull_counts = cull_counts;
-    self.internal.cull_mesh_draws = cull_mesh_draws;
-    self.internal.impostor_draw = impostor_draw;
-    self.internal.cull_dispatch = cull_dispatch;
-    self.internal.clusters = clusters;
-    self.internal.cluster_cursors = cluster_cursors;
-    self.internal.pick_buffer = pick_buffer;
-    self.internal.count_readback = count_readback;
-    self.internal.pick_readback = pick_readback;
-    self.internal.local_shadow_map = local_shadow_map;
-    self.internal.shadow_map = shadow_map;
-    self.internal.brdf_lut = brdf_lut;
-    self.internal.ltc_table = ltc_table;
-    self.internal.scene_ready = true;
-}
-
-/// Takes the lock if nothing holds it. The entity setters use it so as
-/// not to wait for a frame that is being recorded; see `queueEdit`.
-pub fn tryLock(self: *Renderer) bool {
-    if (!self.internal.mutex.tryLock()) return false;
-    if (self.internal.pending_any.load(.acquire)) self.applyPending();
-    return true;
-}
-
-/// Leaves an entity edit to be made, in order, before anything else next
-/// uses the lock, so that the caller does not wait for a frame.
-pub fn queueEdit(self: *Renderer, entity: Entity, change: EntityEdit.Change) void {
-    queueEdits(self, &.{.{ .entity = entity, .change = change }});
-}
-
-/// `queueEdit` for several edits under one lock of the queue.
-pub fn queueEdits(self: *Renderer, edits: []const EntityEdit) void {
-    const queued = queued: {
-        self.internal.pending_mutex.lockUncancelable(self.internal.io);
-        defer self.internal.pending_mutex.unlock(self.internal.io);
-        self.internal.pending.appendSlice(self.internal.gpa, edits) catch break :queued false;
-        self.internal.pending_any.store(true, .release);
-        break :queued true;
-    };
-    if (queued) return;
-    self.lock();
-    defer self.unlock();
-    for (edits) |edit| self.applyEdit(edit);
-}
-
-/// The bookkeeping of a live entity. Needs the lock, as do the calls below.
-pub fn markOf(self: *Renderer, entity: Entity) ?*EntityMark {
-    if (entity.index >= self.internal.entity_marks.items.len) return null;
-    const mark = &self.internal.entity_marks.items[entity.index];
-    return if (mark.handle == @as(u64, @bitCast(entity))) mark else null;
-}
-
-/// An entity's transform; the identity for a stale handle.
-pub fn transformOf(self: *Renderer, entity: Entity) Mat4 {
-    return if (markOf(self, entity) != null) self.internal.entity_transforms.items[entity.index] else math.identity;
-}
-
-/// Gives an entity a transform, relative to its parent if it has one. A
-/// teleport is not motion.
-pub fn moveEntity(self: *Renderer, entity: Entity, transform: Mat4, teleport: bool) void {
-    const mark = markOf(self, entity) orelse return;
-    if (!mark.related) {
-        _ = placeEntity(self, entity, mark, transform, teleport);
-        return;
-    }
-    const data = self.entities.internal.table.get(entity) orelse return;
-    data.local = transform;
-    followParent(self, entity, data, teleport);
-}
-
-/// Places a related entity under its parent from its `local` transform, and
-/// its children after it.
-pub fn followParent(self: *Renderer, entity: Entity, data: *const EntityData, teleport: bool) void {
-    const mark = markOf(self, entity) orelse return;
-    const world = if (data.parent) |parent| math.mul(transformOf(self, parent), data.local) else data.local;
-    if (!placeEntity(self, entity, mark, world, teleport) and !teleport) return;
-    for (data.children.items) |child| if (self.entities.internal.table.get(child)) |child_data| followParent(self, child, child_data, teleport);
-}
-
-/// Writes an entity's world transform; false when it was there already.
-fn placeEntity(self: *Renderer, entity: Entity, mark: *EntityMark, world: Mat4, teleport: bool) bool {
-    const slot = &self.internal.entity_transforms.items[entity.index];
-    if (teleport) {
-        self.internal.entity_previous.items[entity.index] = world;
-    } else if (std.mem.eql(f32, slot, &world)) return false;
-    slot.* = world;
-    self.noteEdited(entity.index, mark, if (teleport) EntityMark.teleported else EntityMark.moved);
-    return true;
-}
-
-/// Has an entity's instance records written again.
-pub fn restyleEntity(self: *Renderer, entity: Entity) void {
-    const mark = markOf(self, entity) orelse return;
-    self.noteEdited(entity.index, mark, EntityMark.restyled);
-}
-
-/// Starts the bookkeeping of a new entity.
-pub fn markEntity(self: *Renderer, entity: Entity, scene: Scene, transform: Mat4) !void {
-    const needed = @as(usize, entity.index) + 1;
-    if (self.internal.entity_marks.items.len < needed) {
-        try self.internal.entity_transforms.ensureTotalCapacity(self.internal.gpa, needed);
-        try self.internal.entity_previous.ensureTotalCapacity(self.internal.gpa, needed);
-        try self.internal.entity_marks.ensureTotalCapacity(self.internal.gpa, needed);
-        try self.internal.entity_spans.ensureTotalCapacity(self.internal.gpa, needed);
-        @memset(self.internal.entity_transforms.addManyAsSliceAssumeCapacity(needed - self.internal.entity_transforms.items.len), math.identity);
-        @memset(self.internal.entity_previous.addManyAsSliceAssumeCapacity(needed - self.internal.entity_previous.items.len), math.identity);
-        @memset(self.internal.entity_marks.addManyAsSliceAssumeCapacity(needed - self.internal.entity_marks.items.len), .{});
-        @memset(self.internal.entity_spans.addManyAsSliceAssumeCapacity(needed - self.internal.entity_spans.items.len), .{});
-    }
-    self.internal.entity_transforms.items[entity.index] = transform;
-    self.internal.entity_previous.items[entity.index] = transform;
-    self.internal.entity_marks.items[entity.index] = .{ .handle = @bitCast(entity), .scene = scene };
-    self.internal.entity_spans.items[entity.index] = .{};
-}
