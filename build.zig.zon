@@ -56,7 +56,7 @@
             .lazy = true,
         },
         .glslang = .{
-            .url = "git+https://github.com/KhronosGroup/glslang?ref=16.4.0#8df24f913681e4566f91de99445f47baaceb60f1",
+            .url = "git+https://github.com/KhronosGroup/glslang#ed883c736e0d5633242218c534264b7eea28b27e",
             .hash = "N-V-__8AAG64xAI0wnxIpFigB0A8xW9nuGDEiBkN0yNNmhtT",
             .lazy = true,
         },
