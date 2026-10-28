@@ -148,8 +148,9 @@ pub const Options = struct {
     /// Threads for animation poses and instance records, including the render
     /// thread: 0 picks automatically (at most 8), 1 uses no other thread.
     worker_threads: u32 = 0,
-    /// Liquids simulate on a second GPU queue, beside the frame's culling and
-    /// visibility, where the device has one (`Capabilities.async_compute`).
+    /// Liquids simulate on a second GPU queue beside the whole frame and are
+    /// drawn from the next one, a frame late, where the device has one
+    /// (`Capabilities.async_compute`).
     async_compute: bool = false,
 };
 

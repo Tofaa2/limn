@@ -824,14 +824,14 @@ pub const CommandEncoder = struct {
         return self.frame;
     }
 
-    /// Marks where the frame starts to need this frame's async compute: what
+    /// Marks where the frame starts to need earlier frames' async compute: what
     /// is recorded from here on waits for it. Only the first call of an
-    /// encoder counts, and only in a frame that planned async work; the
+    /// encoder counts, and only after a frame that recorded async work; the
     /// earliest mark in submission order is where the wait goes.
     pub fn awaitAsync(self: *CommandEncoder) !void {
         const frame = self.frame orelse return;
         const bit = @as(u16, 1) << @intCast(self.split_slot);
-        if (!frame.async_planned or self.before != .null_handle) return;
+        if (frame.async_wait == 0 or self.before != .null_handle) return;
         if (@atomicRmw(u16, &frame.split_taken, .Or, bit, .monotonic) & bit != 0) return;
         std.debug.assert(!self.rendering);
         const device = self.device;

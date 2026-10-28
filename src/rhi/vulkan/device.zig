@@ -225,12 +225,18 @@ pub const FrameData = struct {
     /// Second command buffers for encoders cut by `awaitAsync`: one per
     /// worker pool, then the frame pool's.
     split_commands: [max_parallel + 1]vk.CommandBuffer = @splat(.null_handle),
-    /// Async compute this frame: planned while staging, recorded into
-    /// `async_command`, and waited for from submit `wait_from` on.
+    /// Async compute this frame: planned while staging and recorded into
+    /// `async_command`. The next frame waits for it, not this one.
     async_planned: bool = false,
     async_recorded: bool = false,
     async_pool: vk.CommandPool = .null_handle,
     async_command: vk.CommandBuffer = .null_handle,
+    /// Value of `async_timeline` the earlier frames' async compute reaches,
+    /// waited for from submit `wait_from` on; 0 for none.
+    async_wait: u64 = 0,
+    /// Value this slot's async compute signals, waited for before the slot
+    /// is used again; 0 for none.
+    async_done: u64 = 0,
     wait_from: u32 = std.math.maxInt(u32),
     /// The `split_commands` used this frame, one bit each.
     split_taken: u16 = 0,
@@ -388,6 +394,8 @@ pub const Device = struct {
     async_timeline: vk.Semaphore = .null_handle,
     async_encoder: CommandEncoder = undefined,
     async_mutex: std.Io.Mutex = .init,
+    /// The last value an async submit signals; 0 before the first.
+    async_signaled: u64 = 0,
     detached_signaled: u64 = 0,
     /// Encoders recording beside each other between `beginParallel` and
     /// `joinParallel`, and their texture states.

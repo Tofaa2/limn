@@ -8,17 +8,18 @@ const gltf = @import("../../asset/gltf.zig");
 const gpu = @import("../gpu.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
-const scene_update = @import("scene_update.zig");
+const scene_layout = @import("scene_layout.zig");
 const render = @import("../renderer.zig");
-const restyleEntity = render.restyleEntity;
-const transformOf = render.transformOf;
-const moveEntity = render.moveEntity;
-const queueEdit = render.queueEdit;
-const queueEdits = render.queueEdits;
-const tryLock = render.tryLock;
-const markEntity = render.markEntity;
-const markOf = render.markOf;
-const followParent = render.followParent;
+const entity_edits = @import("entity_edits.zig");
+const restyleEntity = entity_edits.restyleEntity;
+const transformOf = entity_edits.transformOf;
+const moveEntity = entity_edits.moveEntity;
+const queueEdit = entity_edits.queueEdit;
+const queueEdits = entity_edits.queueEdits;
+const tryLock = entity_edits.tryLock;
+const markEntity = entity_edits.markEntity;
+const markOf = entity_edits.markOf;
+const followParent = entity_edits.followParent;
 
 const Renderer = render.Renderer;
 const Mat4 = math.Mat4;
@@ -413,7 +414,7 @@ pub const Entities = struct {
                 for (scene.entities.items[index..], index..) |after, at| self.internal.entity_marks.items[after.index].listed_at = @intCast(at);
                 break;
             };
-            scene_update.forgetEntity(self, scene, span);
+            scene_layout.forgetEntity(self, scene, span);
         }
         releaseModel(self, data.model);
         freeEntityStorage(self, data);
@@ -543,7 +544,7 @@ pub const Entities = struct {
             return;
         }
         const mark = &self.internal.entity_marks.items[entity.index];
-        scene_update.forgetEntity(self, scene, self.internal.entity_spans.items[entity.index]);
+        scene_layout.forgetEntity(self, scene, self.internal.entity_spans.items[entity.index]);
         self.internal.entity_spans.items[entity.index] = .{};
         mark.layout_first = 0;
         mark.layout_count = 0;

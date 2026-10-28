@@ -56,6 +56,11 @@ pub fn waitForFrame(self: *Device) !void {
         if (err == error.DeviceLost) reportFault(self);
         return err;
     };
+    if (frame.async_done == 0) return;
+    _ = self.vkd.waitSemaphores(&.{ .semaphore_count = 1, .p_semaphores = @ptrCast(&self.async_timeline), .p_values = @ptrCast(&frame.async_done) }, std.math.maxInt(u64)) catch |err| {
+        if (err == error.DeviceLost) reportFault(self);
+        return err;
+    };
 }
 
 /// Begins recording, after `waitForFrame` and `acquireImage`. On failure
@@ -77,6 +82,7 @@ pub fn startFrame(self: *Device) !Frame {
     frame.submit_count = 0;
     frame.async_planned = false;
     frame.async_recorded = false;
+    frame.async_wait = self.async_signaled;
     frame.wait_from = std.math.maxInt(u32);
     frame.split_taken = 0;
     try self.vkd.beginCommandBuffer(frame.command, &.{ .flags = .{ .one_time_submit_bit = true } });
@@ -140,6 +146,7 @@ pub fn submitFrame(self: *Device) !void {
     var first_waiting: u32 = 0;
     self.queue_mutex.lockUncancelable(self.io);
     defer self.queue_mutex.unlock(self.io);
+    frame.async_done = 0;
     if (frame.async_recorded) {
         self.async_encoder.flush();
         try self.vkd.endCommandBuffer(frame.async_command);
@@ -153,7 +160,11 @@ pub fn submitFrame(self: *Device) !void {
             .signal_semaphore_info_count = 1,
             .p_signal_semaphore_infos = @ptrCast(&done),
         }}, .null_handle);
-        wait_info[wait_count] = .{ .semaphore = self.async_timeline, .value = self.frame_number + 1, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
+        self.async_signaled = self.frame_number + 1;
+        frame.async_done = self.async_signaled;
+    }
+    if (frame.async_wait != 0) {
+        wait_info[wait_count] = .{ .semaphore = self.async_timeline, .value = frame.async_wait, .stage_mask = .{ .all_commands_bit = true }, .device_index = 0 };
         wait_count += 1;
         first_waiting = @min(frame.wait_from, frame.submit_count - 1);
     }
@@ -533,7 +544,7 @@ pub fn joinParallel(self: *Device) !void {
 }
 
 /// Says, while the frame is being planned, that it will record async
-/// compute: encoders then wait for it from their first `awaitAsync`. Does
+/// compute, which the next frame waits for from its first `awaitAsync`. Does
 /// nothing without an async queue.
 pub fn planAsync(self: *Device) void {
     std.debug.assert(self.in_frame);
@@ -543,8 +554,9 @@ pub fn planAsync(self: *Device) void {
 
 /// The frame's encoder for the async queue, held by the caller until
 /// `releaseAsync`; null when the frame planned none. Its work runs once the
-/// previous frame is done, beside this frame's work before its first
-/// `awaitAsync`. Only buffers and pipelines; no texture transitions.
+/// previous frame is done, beside this frame, and is seen from the next
+/// frame's first `awaitAsync` on. Only buffers and pipelines; no texture
+/// transitions.
 pub fn acquireAsync(self: *Device) !?*CommandEncoder {
     const frame = &self.frames[@intCast(self.frame_number % frames_in_flight)];
     if (!frame.async_planned) return null;
