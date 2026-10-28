@@ -307,18 +307,17 @@ pub fn drawSunShadows(renderer: *Renderer, p: *const ScenePass, sun: *const SunS
         try hair_feature.drawHairShadows(renderer, p, cascades.view_proj[cascade], cascades.texel_size[cascade], 0);
         for (scene.liquids.items) |item| {
             const state = renderer.liquids.internal.table.get(item) orelse continue;
-            if (state.desc.shadow <= 0) continue;
-            const shown = state.shown(device, renderer.internal.frame_index) orelse continue;
+            if (state.params_frame != renderer.internal.frame_index or state.live == 0 or state.desc.shadow <= 0) continue;
             cmd.bindPipeline(try renderer.internal.pipelines.of(liquidShadowPipeline));
             cmd.pushConstants(liquid_push.ShadowPush{
                 .frame = frame_address,
-                .liquid = shown.liquid,
-                .particles = shown.particles,
+                .liquid = state.params,
+                .particles = device.bufferAddress(state.particles),
                 .view_proj = cascades.view_proj[cascade],
                 .swell = 1.4,
                 .strength = std.math.clamp(state.desc.shadow, 0, 1),
             });
-            cmd.draw(shown.live * 6, 1, 0, 0);
+            cmd.draw(state.live * 6, 1, 0, 0);
         }
         cmd.endRendering();
     }

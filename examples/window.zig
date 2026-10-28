@@ -170,7 +170,6 @@ pub fn frameLimit(init: std.process.Init) !?u64 {
 ///                        window does; finds what depends on the frame rate
 ///   --memory N           print GPU memory and resident memory every N
 ///                        frames, to find what grows in long runs
-///   --async-compute      simulate liquids on a second GPU queue
 pub const Stage = struct {
     init: std.process.Init,
     window: ?Window,
@@ -229,7 +228,6 @@ pub const Stage = struct {
         var timings = false;
         var uneven = false;
         var memory_every: u64 = 0;
-        var async_compute = false;
         var args = try init.minimal.args.iterateAllocator(init.gpa);
         defer args.deinit();
         _ = args.skip();
@@ -250,8 +248,6 @@ pub const Stage = struct {
                 timings = true;
             } else if (std.mem.eql(u8, arg, "--uneven-frames")) {
                 uneven = true;
-            } else if (std.mem.eql(u8, arg, "--async-compute")) {
-                async_compute = true;
             } else if (std.mem.eql(u8, arg, "--memory")) {
                 memory_every = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArgument, 10);
             } else if (std.mem.startsWith(u8, arg, "--")) {
@@ -268,7 +264,6 @@ pub const Stage = struct {
         if (screenshot != null or validation) renderer_options.validation = true;
         if (screenshot != null) renderer_options.deterministic = true;
         if (debug_names) renderer_options.debug_names = true;
-        if (async_compute) renderer_options.async_compute = true;
         if (renderer_options.cache.pipelines == null) renderer_options.cache.pipelines = "zig-out/pipeline.cache";
         if (timings and renderer_options.profiler == null) {
             zones.io = init.io;

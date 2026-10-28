@@ -566,8 +566,6 @@ pub const Capabilities = struct {
     /// The GPU shares the CPU's memory; GPU-only buffers are mapped and
     /// written without staging.
     unified_memory: bool = false,
-    /// A second queue runs compute beside the frame (`Device.acquireAsync`).
-    async_compute: bool = false,
     /// The extensions NVIDIA's NGX asks for are enabled; see
     /// `DeviceDesc.nvidia_ngx`.
     nvidia_ngx: bool = false,
