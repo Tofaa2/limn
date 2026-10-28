@@ -19,16 +19,16 @@ const Tool = union(enum) {
     path: std.Build.LazyPath,
     system: []const u8,
 
-    /// A run step that starts the tool, named for the work it does.
-    fn command(self: Tool, b: *std.Build, label: []const u8) *std.Build.Step.Run {
-        return switch (self) {
-            .path => |path| run: {
-                const run = std.Build.Step.Run.create(b, b.fmt("compile {s}", .{label}));
-                run.addFileArg(path);
-                break :run run;
-            },
-            .system => |name| b.addSystemCommand(&.{name}),
-        };
+    /// A run step that starts the tool through `depfile` (src/depfile.zig),
+    /// named for the work it does.
+    fn command(self: Tool, b: *std.Build, depfile: *std.Build.Step.Compile, label: []const u8) *std.Build.Step.Run {
+        const run = b.addRunArtifact(depfile);
+        run.setName(b.fmt("compile {s}", .{label}));
+        switch (self) {
+            .path => |path| run.addFileArg(path),
+            .system => |name| run.addArg(name),
+        }
+        return run;
     }
 };
 
@@ -491,7 +491,15 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    addShaders(b, renderer, manifest.renderer, shaders_step, generated_dir, spirv_readonly, slangc);
+    const depfile = b.addExecutable(.{
+        .name = "depfile",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/depfile.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    addShaders(b, renderer, manifest.renderer, shaders_step, generated_dir, spirv_readonly, depfile, slangc);
     const shader_reload = b.option(bool, "shader_reload", "Keep the shader source paths in the library for `shaders.reload` (default: Debug only)") orelse (optimize == .Debug);
     const shader_options = b.addOptions();
     var shader_names: [manifest.renderer.len][]const u8 = undefined;
@@ -525,7 +533,7 @@ pub fn build(b: *std.Build) void {
     }
     renderer.addOptions("shader_sources", shader_options);
     renderer.addImport("build_features", features_module);
-    if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk, if (system_tools) .{ .system = "glslangValidator" } else glslangCompiler(b) orelse return);
+    if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk, depfile, if (system_tools) .{ .system = "glslangValidator" } else glslangCompiler(b) orelse return);
     if (dlss) addDlss(b, renderer, target, asset_optimize, vulkan_include, dlss_sdk);
     if (nrd) addNrd(b, renderer, target, asset_optimize, vulkan_include, nrd_sdk);
 
@@ -558,6 +566,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tests).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = texture_codec })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = font_baker })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = depfile.root_module })).step);
 
     const glfw_module = if (android) b.createModule(.{ .root_source_file = b.path("examples/android/glfw.zig"), .target = target, .optimize = optimize }) else glfw: {
         const glfw_source = b.lazyDependency("glfw", .{}) orelse return;
@@ -566,7 +575,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        glfw.addSystemIncludePath(glfw_source.path("include"));
+        glfw.addIncludePath(glfw_source.path("include"));
         const module = glfw.createModule();
         if (!addGlfw(b, module, target, glfw_source)) return;
         break :glfw module;
@@ -616,7 +625,7 @@ pub fn build(b: *std.Build) void {
             module.addImport("glfw", glfw_module);
             module.addImport("window", window_module);
         }
-        addShaders(b, module, example.shaders, shaders_step, generated_dir, spirv_readonly, slangc);
+        addShaders(b, module, example.shaders, shaders_step, generated_dir, spirv_readonly, depfile, slangc);
         if (android) {
             if (example.windowed) if (addAndroidExample(b, example, module, glfw_module, target, optimize, apk_packer)) |packed_apk| b.getInstallStep().dependOn(packed_apk);
             continue;
@@ -873,6 +882,7 @@ fn addFidelityFx(
     optimize: std.builtin.OptimizeMode,
     vulkan_include: std.Build.LazyPath,
     volk: *std.Build.Dependency,
+    depfile: *std.Build.Step.Compile,
     glslang: Tool,
 ) void {
     const library = b.addLibrary(.{
@@ -904,7 +914,7 @@ fn addFidelityFx(
                     generate.addArg("-");
                     continue;
                 }
-                const compile = glslang.command(b, b.fmt("{s}_{d}", .{ pass, combination }));
+                const compile = glslang.command(b, depfile, b.fmt("{s}_{d}", .{ pass, combination }));
                 compile.addArgs(&.{ "-V", "-S", "comp", "--target-env", "vulkan1.2", "-g", "-DFFX_GLSL=1", "-DFFX_GPU=1", "-DFFX_HALF=0", "-DFFX_SPD_NO_WAVE_OPERATIONS" });
                 for (effect.fixed) |fixed| compile.addArg(b.fmt("-D{s}_{s}", .{ effect.prefix, fixed }));
                 for (option_names, 0..) |name, bit| compile.addArg(b.fmt("-D{s}={d}", .{ name, (combination >> @intCast(bit)) & 1 }));
@@ -1244,9 +1254,9 @@ fn volkModule(
 /// shader opts out, and exposes the SPIR-V to `module` as an anonymous
 /// import. Included files are tracked through a depfile, so editing a shared
 /// header rebuilds exactly the shaders that use it.
-fn addShaders(b: *std.Build, module: *std.Build.Module, shaders: []const Shader, shaders_step: *std.Build.Step, generated_dir: std.Build.LazyPath, spirv_readonly: *std.Build.Step.Compile, slangc: Tool) void {
+fn addShaders(b: *std.Build, module: *std.Build.Module, shaders: []const Shader, shaders_step: *std.Build.Step, generated_dir: std.Build.LazyPath, spirv_readonly: *std.Build.Step.Compile, depfile: *std.Build.Step.Compile, slangc: Tool) void {
     for (shaders) |shader| {
-        const command = slangc.command(b, shader.name);
+        const command = slangc.command(b, depfile, shader.name);
         command.addFileArg(b.path(shader.src));
         command.addArgs(&slang_arguments);
         command.addArgs(&.{ "-stage", shader.stage, "-entry", shader.entry });
