@@ -212,6 +212,7 @@ struct Tracer {
 
 #else
 /// The scene as rays see it. Every shader that traces goes through this.
+/// A ray that reaches no distance (zero, negative or NaN) meets nothing.
 struct Tracer {
     FrameConstants frame;
     uint64_t scene;
@@ -230,6 +231,7 @@ struct Tracer {
         hit.instance = 0u;
         hit.primitive = 0u;
         hit.barycentric = float2(0.0);
+        if (!(reach > 0.0)) return false;
         RayQuery<RAY_FLAG_NONE> query;
         query.TraceRayInline(RaytracingAccelerationStructure(scene), cutouts == Cutouts.cut ? RAY_FLAG_NONE : RAY_FLAG_FORCE_OPAQUE, mask, ray(origin, direction, reach));
         while (query.Proceed()) {
@@ -246,6 +248,7 @@ struct Tracer {
     }
 
     bool any(float3 origin, float3 direction, float reach, uint mask, Cutouts cutouts) {
+        if (!(reach > 0.0)) return false;
         RayQuery<RAY_FLAG_NONE> query;
         uint flags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | (cutouts == Cutouts.cut ? RAY_FLAG_NONE : RAY_FLAG_FORCE_OPAQUE);
         query.TraceRayInline(RaytracingAccelerationStructure(scene), flags, mask, ray(origin, direction, reach));

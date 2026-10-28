@@ -864,7 +864,8 @@ const ffx_effects = [_]FfxEffect{
 /// Builds the FidelityFX SDK and the renderer's wrapper round it, and links
 /// `renderer` with them. The shader permutations that are asked for are
 /// compiled with glslang and packed into the SDK's headers by
-/// src/ffx_permutations.zig.
+/// src/ffx_permutations.zig. SPD takes its barrier-only path: its wave path
+/// writes shared memory that other quads may still be reading.
 fn addFidelityFx(
     b: *std.Build,
     renderer: *std.Build.Module,
@@ -904,7 +905,7 @@ fn addFidelityFx(
                     continue;
                 }
                 const compile = glslang.command(b, b.fmt("{s}_{d}", .{ pass, combination }));
-                compile.addArgs(&.{ "-V", "-S", "comp", "--target-env", "vulkan1.2", "-g", "-DFFX_GLSL=1", "-DFFX_GPU=1", "-DFFX_HALF=0" });
+                compile.addArgs(&.{ "-V", "-S", "comp", "--target-env", "vulkan1.2", "-g", "-DFFX_GLSL=1", "-DFFX_GPU=1", "-DFFX_HALF=0", "-DFFX_SPD_NO_WAVE_OPERATIONS" });
                 for (effect.fixed) |fixed| compile.addArg(b.fmt("-D{s}_{s}", .{ effect.prefix, fixed }));
                 for (option_names, 0..) |name, bit| compile.addArg(b.fmt("-D{s}={d}", .{ name, (combination >> @intCast(bit)) & 1 }));
                 compile.addPrefixedDirectoryArg("-I", gpu);
