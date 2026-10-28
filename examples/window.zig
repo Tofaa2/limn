@@ -66,13 +66,11 @@ pub const Window = struct {
     }
 
     fn native(self: Window) !gfx.rhi.NativeWindow {
+        if (comptime builtin.abi.isAndroid()) return .{ .android = .{ .window = glfw.androidWindow() orelse return error.NativeWindowUnavailable } };
+        if (comptime builtin.os.tag == .macos) return .{ .metal = .{ .layer = try metalLayer(glfw.glfwGetCocoaWindow(self.handle) orelse return error.NativeWindowUnavailable) } };
         if (comptime builtin.os.tag == .windows) return .{ .win32 = .{
             .instance = @ptrCast(glfw.GetModuleHandleW(null)),
             .window = @ptrCast(glfw.glfwGetWin32Window(self.handle) orelse return error.NativeWindowUnavailable),
-        } };
-        if (comptime !@hasDecl(glfw, "glfwGetPlatform")) return .{ .xlib = .{
-            .display = @ptrCast(glfw.glfwGetX11Display() orelse return error.NativeWindowUnavailable),
-            .window = @intCast(glfw.glfwGetX11Window(self.handle)),
         } };
         return switch (glfw.glfwGetPlatform()) {
             glfw.GLFW_PLATFORM_X11 => .{ .xlib = .{
@@ -87,6 +85,26 @@ pub const Window = struct {
         };
     }
 };
+
+/// Gives the content view of an `NSWindow` a `CAMetalLayer`, which MoltenVK
+/// presents to, through the Objective-C runtime.
+fn metalLayer(window: *anyopaque) !*anyopaque {
+    const objc = struct {
+        extern "objc" fn objc_getClass(name: [*:0]const u8) ?*anyopaque;
+        extern "objc" fn sel_registerName(name: [*:0]const u8) *anyopaque;
+        extern "objc" fn objc_msgSend() void;
+    };
+    const Send = *const fn (*anyopaque, *anyopaque) callconv(.c) ?*anyopaque;
+    const SendFlag = *const fn (*anyopaque, *anyopaque, bool) callconv(.c) void;
+    const SendObject = *const fn (*anyopaque, *anyopaque, *anyopaque) callconv(.c) void;
+    const send: Send = @ptrCast(&objc.objc_msgSend);
+    const view = send(window, objc.sel_registerName("contentView")) orelse return error.NativeWindowUnavailable;
+    const class = objc.objc_getClass("CAMetalLayer") orelse return error.NativeWindowUnavailable;
+    const layer = send(class, objc.sel_registerName("layer")) orelse return error.NativeWindowUnavailable;
+    @as(SendFlag, @ptrCast(&objc.objc_msgSend))(view, objc.sel_registerName("setWantsLayer:"), true);
+    @as(SendObject, @ptrCast(&objc.objc_msgSend))(view, objc.sel_registerName("setLayer:"), layer);
+    return layer;
+}
 
 /// CPU time of the renderer's zones, for `--timings`.
 const Zones = struct {
@@ -139,13 +157,19 @@ pub fn frameLimit(init: std.process.Init) !?u64 {
 /// offscreen target, the renderer, frame timing and key presses.
 ///
 ///   --frames N           exit after N frames
-///   --screenshot f.png   render without a window (with validation on) and
+///   --screenshot f.png   render without a window, with validation and
+///                        `Options.deterministic` on, and
 ///                        write the last frame, to check the picture
 ///   --timings            render without a window and print the average
 ///                        GPU time of each pass and the CPU time of a frame
 ///   --validation         turn the Vulkan validation layers on
 ///   --names              name GPU objects and label passes for debuggers
 ///                        such as RenderDoc; always on in a debug build
+///   --uneven-frames      without a window, step time by an uneven, repeating
+///                        run of frame lengths instead of 1/60 s, as a
+///                        window does; finds what depends on the frame rate
+///   --memory N           print GPU memory and resident memory every N
+///                        frames, to find what grows in long runs
 pub const Stage = struct {
     init: std.process.Init,
     window: ?Window,
@@ -166,14 +190,24 @@ pub const Stage = struct {
     meter_time: f32 = 0,
     meter_frames: u32 = 0,
     timings: bool = false,
+    uneven: bool = false,
+    memory_every: u64 = 0,
     timed_frames: u32 = 0,
     timed_cpu: f64 = 0,
+    /// GPU time of the slowest frame once the scene has settled.
+    timed_worst: f64 = 0,
     timed: [128]Timed = undefined,
     timed_count: usize = 0,
 
     const Timed = struct { name: []const u8, depth: u32, total: f64 };
     /// Frames left out of `--timings`, while pipelines compile and history fills.
     const timing_warmup = 60;
+    /// Frames left out of the slowest frame, while lighting is first gathered.
+    const timing_settle = 300;
+
+    /// Frame lengths `--uneven-frames` cycles through: vsync jitter at
+    /// several refresh rates, and the odd hitch.
+    pub const uneven_frames = [_]f32{ 1.0 / 144.0, 1.0 / 98.0, 1.0 / 144.0, 1.0 / 60.0, 1.0 / 240.0, 1.0 / 75.0, 1.0 / 30.0, 1.0 / 120.0, 1.0 / 11.0, 1.0 / 165.0 };
 
     pub const width = 1280;
     pub const height = 720;
@@ -192,6 +226,8 @@ pub const Stage = struct {
         var debug_names = builtin.mode == .Debug;
         var validation = false;
         var timings = false;
+        var uneven = false;
+        var memory_every: u64 = 0;
         var args = try init.minimal.args.iterateAllocator(init.gpa);
         defer args.deinit();
         _ = args.skip();
@@ -210,6 +246,10 @@ pub const Stage = struct {
                 validation = true;
             } else if (std.mem.eql(u8, arg, "--timings")) {
                 timings = true;
+            } else if (std.mem.eql(u8, arg, "--uneven-frames")) {
+                uneven = true;
+            } else if (std.mem.eql(u8, arg, "--memory")) {
+                memory_every = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArgument, 10);
             } else if (std.mem.startsWith(u8, arg, "--")) {
                 own_value = true;
             } else return error.InvalidArgument;
@@ -222,8 +262,9 @@ pub const Stage = struct {
         renderer_options.application_name = title;
         renderer_options.surface = if (window) |value| try value.surface(false) else null;
         if (screenshot != null or validation) renderer_options.validation = true;
+        if (screenshot != null) renderer_options.deterministic = true;
         if (debug_names) renderer_options.debug_names = true;
-        if (renderer_options.pipeline_cache_path == null) renderer_options.pipeline_cache_path = "zig-out/pipeline.cache";
+        if (renderer_options.cache.pipelines == null) renderer_options.cache.pipelines = "zig-out/pipeline.cache";
         if (timings and renderer_options.profiler == null) {
             zones.io = init.io;
             renderer_options.profiler = .{ .begin = Zones.begin, .end = Zones.end };
@@ -236,6 +277,8 @@ pub const Stage = struct {
             .offscreen = if (headless) try renderer.views.createTarget(width, height) else null,
             .screenshot = screenshot,
             .timings = timings,
+            .uneven = uneven,
+            .memory_every = memory_every,
             .frame_limit = frame_limit,
             .last = if (window) |value| value.time() else 0,
         };
@@ -244,10 +287,11 @@ pub const Stage = struct {
     /// Starts a frame. Null when the example should end.
     pub fn begin(self: *Stage) ?Tick {
         if (self.frame_limit) |limit| if (self.frames >= limit) return null;
-        var tick = Tick{ .dt = 1.0 / 60.0, .time = 0, .size = .{ width, height } };
+        var tick = Tick{ .dt = if (self.uneven) uneven_frames[self.frames % uneven_frames.len] else 1.0 / 60.0, .time = 0, .size = .{ width, height } };
         if (self.window) |window| {
             if (window.shouldClose() or window.keyDown(glfw.GLFW_KEY_ESCAPE)) return null;
             window.pollEvents();
+            if (comptime builtin.abi.isAndroid()) if (!self.followSurface(window)) return null;
             const now = window.time();
             tick.dt = @floatCast(@min(now - self.last, 0.1));
             self.last = now;
@@ -257,6 +301,25 @@ pub const Stage = struct {
         self.time += tick.dt;
         tick.time = self.time;
         return tick;
+    }
+
+    /// On Android, lets go of a window the activity is losing, waits for
+    /// the next and presents to that. False if the activity ends first.
+    fn followSurface(self: *Stage, window: Window) bool {
+        switch (glfw.surfaceChange()) {
+            .none => return true,
+            .gained => {},
+            .lost => {
+                self.renderer.setSurface(null) catch |err| std.log.err("could not drop the window: {t}", .{err});
+                if (!glfw.surfaceReleased()) return false;
+            },
+        }
+        const next = window.surface(false) catch return false;
+        self.renderer.setSurface(next) catch |err| {
+            std.log.err("could not present to the new window: {t}", .{err});
+            return false;
+        };
+        return true;
     }
 
     pub fn keyDown(self: *const Stage, key: c_int) bool {
@@ -275,6 +338,21 @@ pub const Stage = struct {
         return if (self.offscreen) |texture| .{ .texture = texture } else .backbuffer;
     }
 
+    /// The renderer's counters, with CPU time left at 0 in a `--screenshot`
+    /// run, so that its picture comes out the same every time.
+    pub fn stats(self: *const Stage) gfx.Stats {
+        var counted = self.renderer.stats();
+        if (self.screenshot != null) counted.cpu_ms = 0;
+        return counted;
+    }
+
+    /// GPU times of the passes of a recent frame. None in a `--screenshot`
+    /// run, so that its picture comes out the same every time.
+    pub fn passTimings(self: *const Stage) []const gfx.rhi.PassTiming {
+        if (self.screenshot != null) return &.{};
+        return self.renderer.device.passTimings();
+    }
+
     /// Call with the result of `render`.
     pub fn end(self: *Stage, presented: bool) !void {
         if (!presented) return self.init.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
@@ -282,13 +360,14 @@ pub const Stage = struct {
         self.meter_frames += 1;
         if (self.timings and self.frames == timing_warmup) zones.totals = @splat(0);
         if (self.timings and self.frames > timing_warmup) self.noteTimings();
+        if (self.memory_every != 0 and self.frames % self.memory_every == 0) self.logMemory();
         if (self.time - self.meter_time >= 0.5) {
             self.fps = @as(f32, @floatFromInt(self.meter_frames)) / (self.time - self.meter_time);
             const images = self.renderer.device.presented.load(.monotonic);
             self.shown_fps = @as(f32, @floatFromInt(images - self.meter_presented)) / (self.time - self.meter_time);
             self.meter_presented = images;
             self.gpu_ms = 0;
-            for (self.renderer.device.passTimings()) |timing| {
+            for (self.passTimings()) |timing| {
                 if (timing.depth == 0) self.gpu_ms += timing.milliseconds;
             }
             self.meter_time = self.time;
@@ -296,9 +375,27 @@ pub const Stage = struct {
         }
     }
 
+    fn logMemory(self: *Stage) void {
+        const frame_stats = self.renderer.stats();
+        const peak = if (comptime builtin.os.tag == .windows) 0 else std.posix.getrusage(std.posix.rusage.SELF).maxrss;
+        var statm: [128]u8 = undefined;
+        const resident: u64 = if (std.Io.Dir.cwd().readFile(self.init.io, "/proc/self/statm", &statm)) |text| blk: {
+            var fields = std.mem.tokenizeScalar(u8, text, ' ');
+            _ = fields.next();
+            const pages = std.fmt.parseInt(u64, fields.next() orelse "0", 10) catch 0;
+            break :blk pages * 4;
+        } else |_| 0;
+        std.log.info("memory: frame {d} · gpu {d} KiB · resident {d} KiB (peak {d}) · {d} pipelines", .{ self.frames, frame_stats.gpu_memory_bytes / 1024, resident, peak, frame_stats.pipelines });
+    }
+
     fn noteTimings(self: *Stage) void {
         self.timed_frames += 1;
-        self.timed_cpu += self.renderer.getStats().cpu_ms;
+        self.timed_cpu += self.renderer.stats().cpu_ms;
+        var frame_gpu: f64 = 0;
+        for (self.renderer.device.passTimings()) |timing| {
+            if (timing.depth == 0) frame_gpu += timing.milliseconds;
+        }
+        if (self.frames > timing_settle) self.timed_worst = @max(self.timed_worst, frame_gpu);
         for (self.renderer.device.passTimings()) |timing| {
             const entry = for (self.timed[0..self.timed_count]) |*entry| {
                 if (entry.depth == timing.depth and std.mem.eql(u8, entry.name, timing.name)) break entry;
@@ -319,7 +416,12 @@ pub const Stage = struct {
             if (entry.depth == 0) gpu += entry.total;
             std.debug.print("{d:8.3} ms  {s}{s}\n", .{ entry.total / frames, "        "[0..@min(entry.depth * 2, 8)], entry.name });
         }
-        std.debug.print("{d:8.3} ms  GPU\n{d:8.3} ms  CPU\n", .{ gpu / frames, self.timed_cpu / frames });
+        std.debug.print("{d:8.3} ms  GPU\n{d:8.3} ms  GPU slowest frame\n{d:8.3} ms  CPU\n", .{ gpu / frames, self.timed_worst, self.timed_cpu / frames });
+        const counted = self.renderer.stats();
+        std.debug.print("{d:8.1} MiB GPU memory\n{d:8} pipelines\n", .{ @as(f64, @floatFromInt(counted.gpu_memory_bytes)) / (1024 * 1024), counted.pipelines });
+        for (counted.downgraded()) |downgrade| {
+            std.debug.print("{s}: asked for {s}, got {s} ({s})\n", .{ downgrade.feature, downgrade.requested, downgrade.used, @tagName(downgrade.reason) });
+        }
         for (zones.names[0..zones.count], zones.totals[0..zones.count], zones.depths[0..zones.count]) |name, total, depth| {
             std.debug.print("{d:8.3} ms  {s}{s}\n", .{ total / frames, "        "[0 .. depth * 2 + 2], name });
         }

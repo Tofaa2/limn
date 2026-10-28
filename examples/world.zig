@@ -143,29 +143,28 @@ pub fn main(init: std.process.Init) !void {
         .application_name = "world",
         .validation = validation,
         .surface = try window.surface(vsync),
-        .pipeline_cache_path = "zig-out/pipeline.cache",
         .hdr_output = hdr,
-        .asset_cache_dir = "zig-out/asset-cache",
+        .cache = .{ .pipelines = "zig-out/pipeline.cache", .assets = "zig-out/asset-cache" },
     });
     defer renderer.deinit();
-    if (hdr) std.log.info("hdr output: {s}", .{if (renderer.hdrActive()) "active (HDR10)" else "not available on this display, using sRGB"});
+    if (hdr) std.log.info("hdr output: {s}", .{if (renderer.capabilities().hdr_output == .available) "active (HDR10)" else "not available on this display, using sRGB"});
     std.log.info("device: {s}", .{renderer.device.name()});
 
     const scene = try renderer.scenes.create();
-    const environment = try renderer.environments.load("examples/assets/world/venice_sunset_2k.hdr", 24);
+    const environment = try renderer.environments.load(.{ .path = "examples/assets/world/venice_sunset_2k.hdr", .max_radiance = 24 });
     const sponza = try renderer.models.load("examples/assets/world/Sponza.glb");
     const robot = try renderer.models.load("examples/assets/world/RobotExpressive.glb");
-    renderer.scenes.setEnvironment(scene, environment, 1.0);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 1.0 });
     renderer.scenes.setSun(scene, .{ .direction = .{ -0.42, -1.0, 0.18 }, .color = .{ 1.0, 0.93, 0.82 }, .intensity = 28 });
-    _ = try renderer.entities.spawn(scene, .{ .model = sponza });
-    const player_entity = try renderer.entities.spawn(scene, .{ .model = robot });
+    _ = try renderer.entities.create(scene, .{ .model = sponza });
+    const player_entity = try renderer.entities.create(scene, .{ .model = robot });
 
     var player = Player{};
     var camera = OrbitCamera{};
     var clips: ?Clips = null;
     var bounds = [2]math.Vec3{ .{ -100, 0, -100 }, .{ 100, 0, 100 } };
     var bounds_known = false;
-    var settings = gfx.Settings{ .fog_density = fog_density };
+    var settings = gfx.Settings{ .fog = if (fog_density > 0) .{ .density = fog_density } else null };
     var keys = KeyLatch{};
     var animation_time: f32 = 0;
     var frames: u64 = 0;
@@ -229,7 +228,7 @@ pub fn main(init: std.process.Init) !void {
             const count = @typeInfo(gfx.DebugView).@"enum".fields.len;
             settings.debug_view = @enumFromInt((@intFromEnum(settings.debug_view) + 1) % count);
         }
-        if (keys.pressed(window, glfw.GLFW_KEY_T)) settings.temporal_antialiasing = !settings.temporal_antialiasing;
+        if (keys.pressed(window, glfw.GLFW_KEY_T)) settings.resolution.temporal_antialiasing = !settings.resolution.temporal_antialiasing;
         if (keys.pressed(window, glfw.GLFW_KEY_H)) show_hud = !show_hud;
         if (keys.pressed(window, glfw.GLFW_KEY_F5)) {
             if (renderer.shaders.reload()) |count| {
@@ -245,7 +244,7 @@ pub fn main(init: std.process.Init) !void {
             renderer.emitters.set(fire, if (fire_on) fire_desc else stopped_fire);
             renderer.emitters.set(smoke, if (fire_on) smoke_desc else stopped_smoke);
         }
-        if (keys.pressed(window, glfw.GLFW_KEY_G)) settings.global_illumination = !settings.global_illumination;
+        if (keys.pressed(window, glfw.GLFW_KEY_G)) settings.global_illumination = if (settings.global_illumination == null) .{ .probes = .{} } else null;
         if (keys.pressed(window, glfw.GLFW_KEY_L)) {
             lanterns = !lanterns;
             try renderer.scenes.setLights(scene, if (lanterns) &.{
@@ -264,7 +263,7 @@ pub fn main(init: std.process.Init) !void {
                 .{ .position = .{ -4.0, 1.4, 3.4 }, .color = .{ 0.3, 0.6, 1.0 }, .intensity = 18, .range = 8 },
             } else &.{});
         }
-        if (keys.pressed(window, glfw.GLFW_KEY_F)) settings.fog_density = if (settings.fog_density > 0) 0 else fog_density;
+        if (keys.pressed(window, glfw.GLFW_KEY_F)) settings.fog = if (settings.fog == null) .{ .density = fog_density } else null;
         if (keys.pressed(window, glfw.GLFW_KEY_V)) {
             vsync = !vsync;
             renderer.device.setVsync(vsync);
@@ -324,15 +323,15 @@ pub fn main(init: std.process.Init) !void {
                     return if (value) "on" else "off";
                 }
             }.text;
-            const gi_available = renderer.device.ray_tracing;
+            const gi_available = renderer.capabilities().ray_tracing == .available;
             const toggles = [_]Toggle{
-                .{ .key = "T", .label = "antialiasing", .state = on_off(settings.temporal_antialiasing), .on = settings.temporal_antialiasing },
-                .{ .key = "F", .label = "fog", .state = on_off(settings.fog_density > 0), .on = settings.fog_density > 0 },
+                .{ .key = "T", .label = "antialiasing", .state = on_off(settings.resolution.temporal_antialiasing), .on = settings.resolution.temporal_antialiasing },
+                .{ .key = "F", .label = "fog", .state = on_off(settings.fog != null), .on = settings.fog != null },
                 .{
                     .key = "G",
                     .label = "global illumination",
-                    .state = if (!gi_available) "not supported" else on_off(settings.global_illumination),
-                    .on = gi_available and settings.global_illumination,
+                    .state = if (!gi_available) "not supported" else on_off(settings.global_illumination != null),
+                    .on = gi_available and (settings.global_illumination != null),
                 },
                 .{ .key = "L", .label = "lanterns", .state = on_off(lanterns), .on = lanterns },
                 .{ .key = "P", .label = "fire particles", .state = on_off(fire_on), .on = fire_on },
@@ -363,7 +362,7 @@ pub fn main(init: std.process.Init) !void {
         }
         const presented = try renderer.render(.{
             .views = &.{.{
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .scene = scene,
                 .camera = camera.update(window, focus, dt),
                 .settings = settings,
@@ -382,7 +381,7 @@ pub fn main(init: std.process.Init) !void {
             for (renderer.device.passTimings()) |timing| {
                 if (timing.depth == 0) gpu_ms += timing.milliseconds;
             }
-            const stats = renderer.getStats();
+            const stats = renderer.stats();
             hud_text = try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms\n{d} / {d} meshlets drawn · {d}k triangles{s}{s}{s}", .{
                 @as(f64, @floatFromInt(title_frames)) / (now - title_time),
                 gpu_ms,

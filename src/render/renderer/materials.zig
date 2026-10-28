@@ -29,39 +29,46 @@ fn textureIndex(self: *Renderer, entry: *ModelEntry, reference: ?gltf.TextureRef
 fn materialSampler(self: *Renderer, data: gltf.SamplerData, anisotropic: bool) !rhi.Sampler {
     const key = @as(usize, @intFromBool(anisotropic)) * 18 + @as(usize, @intFromBool(data.linear)) * 9 +
         @as(usize, @intFromEnum(data.repeat_u)) * 3 + @intFromEnum(data.repeat_v);
-    if (self.material_samplers[key]) |sampler| return sampler;
+    if (self.internal.material_samplers[key]) |sampler| return sampler;
     const filter: rhi.Filter = if (data.linear) .linear else .nearest;
     const sampler = try self.device.createSampler(.{
         .min_filter = .linear,
         .mag_filter = filter,
         .address_u = addressMode(data.repeat_u),
         .address_v = addressMode(data.repeat_v),
-        .max_anisotropy = if (anisotropic) self.options.texture_anisotropy else self.options.data_texture_anisotropy,
+        .max_anisotropy = if (anisotropic) self.options.textures.anisotropy else self.options.textures.data_anisotropy,
     });
-    self.material_samplers[key] = sampler;
+    self.internal.material_samplers[key] = sampler;
     return sampler;
 }
 
 /// Material records, textures and custom material shaders.
 pub const Materials = struct {
-    pool: renderer_state.Pool,
-    shaders: [32]?renderer_state.MaterialPipelines = @splat(null),
-    shader_users: [32]u32 = @splat(0),
+    internal: Internal,
+
+    /// Not part of the API.
+    pub const Internal = struct {
+        pool: renderer_state.Pool,
+        shaders: [32]?renderer_state.MaterialPipelines = @splat(null),
+        shader_users: [32]u32 = @splat(0),
+        shader_generations: [32]u32 = @splat(0),
+    };
 
     fn renderer(materials: *Materials) *Renderer {
         return @alignCast(@fieldParentPtr("materials", materials));
     }
 
-    /// Registers a custom material. `spirv` is a fragment shader that defines
-    /// `CUSTOM_MATERIAL`, includes "shade.glsl" and defines
-    /// `customMaterial()`; see `examples/shaders/lava.frag`. `plain_spirv` is the
+    /// Registers a custom material. `spirv` is a Slang fragment shader that
+    /// defines `CUSTOM_MATERIAL`, includes "shade.slang", defines
+    /// `customMaterial()` and is compiled with entry `fragmentMain`; see
+    /// `examples/shaders/lava.slang`. `plain_spirv` is the
     /// same shader compiled with `PLAIN` defined, for views that keep no
     /// reflection targets; null uses `spirv` there too.
     pub fn createShader(materials: *Materials, spirv: []const u8, plain_spirv: ?[]const u8) !MaterialShader {
         const self = materials.renderer();
         self.lock();
         defer self.unlock();
-        for (self.materials.shaders[1..], 1..) |*slot, index| {
+        for (self.materials.internal.shaders[1..], 1..) |*slot, index| {
             if (slot.* != null) continue;
             const plain = try self.device.createGraphicsPipeline(.{
                 .name = "custom material",
@@ -81,7 +88,7 @@ pub const Materials = struct {
                     .cull = .none,
                 }),
             };
-            return .{ .slot = @intCast(index) };
+            return .{ .slot = @intCast(index), .generation = self.materials.internal.shader_generations[index] };
         }
         return error.TooManyMaterialShaders;
     }
@@ -91,49 +98,62 @@ pub const Materials = struct {
         const self = materials.renderer();
         self.lock();
         defer self.unlock();
-        if (shader.slot == 0 or shader.slot >= self.materials.shaders.len) return;
-        if (self.materials.shaders[shader.slot]) |pipelines| {
+        if (!self.materials.live(shader)) return;
+        if (self.materials.internal.shaders[shader.slot]) |pipelines| {
             self.device.destroyPipeline(pipelines.plain);
             self.device.destroyPipeline(pipelines.reflective);
         }
-        self.materials.shaders[shader.slot] = null;
+        self.materials.internal.shaders[shader.slot] = null;
+        self.materials.internal.shader_generations[shader.slot] +%= 1;
     }
 
-    /// Sets a loaded model's material shader and parameters. `material` null
-    /// applies to all materials; `shader` null restores the standard one. The
-    /// model must have finished loading.
-    pub fn setShader(materials: *Materials, model: Model, material: ?u32, shader: ?MaterialShader, params: [4]f32) !void {
+    fn live(materials: *const Materials, shader: MaterialShader) bool {
+        return shader.slot != 0 and shader.slot < materials.internal.shaders.len and materials.internal.shaders[shader.slot] != null and
+            materials.internal.shader_generations[shader.slot] == shader.generation;
+    }
+
+    /// Sets the shader and parameters of material `material` of a loaded
+    /// model, or of all of them when null. The model must have finished
+    /// loading.
+    pub fn setShader(materials: *Materials, model: Model, material: ?u32, assignment: api.ShaderAssignment) !void {
+        const shader = assignment.shader;
+        const params = assignment.params;
         const self = materials.renderer();
         self.lock();
         defer self.unlock();
-        const entry = self.models.table.get(model) orelse return;
+        const entry = self.models.internal.table.get(model) orelse return;
         if (entry.state != .ready) return error.ModelNotReady;
         const records = entry.source.?.materials;
         if (material) |index| if (index >= records.len) return error.InvalidMaterial;
+        if (shader) |value| if (!self.materials.live(value)) return error.InvalidShader;
         for (records, 0..) |*item, index| {
             if (material) |only| if (only != index) continue;
-            self.materials.shader_users[if (item.shader < self.materials.shaders.len) item.shader else 0] -= 1;
+            self.materials.internal.shader_users[shaderSlot(self, item.*)] -= 1;
             item.shader = if (shader) |value| value.slot else 0;
             item.params = params;
             const encoded = try encodeMaterial(self, entry, item.*, index);
-            self.materials.shader_users[encoded.shader] += 1;
-            try self.materials.pool.write(self.device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded));
+            self.materials.internal.shader_users[encoded.shader] += 1;
+            try self.materials.internal.pool.write(self.device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded));
         }
     }
 
     /// Sets a model material's textures from images. `material` null applies
-    /// to all. Color images should be sRGB, data images linear. The images
-    /// must outlive the model's use of them.
+    /// to all. Color images should be sRGB, data images linear. A destroyed
+    /// image is `error.InvalidImage`; destroying one later puts the model's
+    /// own texture back.
     pub fn setTextures(materials: *Materials, model: Model, material: ?u32, textures: MaterialTextures) !void {
         const self = materials.renderer();
         self.lock();
         defer self.unlock();
-        const entry = self.models.table.get(model) orelse return;
+        inline for (@typeInfo(MaterialTextures).@"struct".fields) |field| {
+            if (field.type == ?api.Image) if (@field(textures, field.name)) |image| if (!self.images.valid(image)) return error.InvalidImage;
+        }
+        const entry = self.models.internal.table.get(model) orelse return;
         const source = entry.source orelse return error.ModelNotReady;
         const count = source.materials.len;
         if (material) |index| if (index >= count) return error.InvalidMaterial;
         if (entry.material_images.len == 0) {
-            entry.material_images = try self.gpa.alloc(MaterialTextures, count);
+            entry.material_images = try self.internal.gpa.alloc(MaterialTextures, count);
             @memset(entry.material_images, .{});
         }
         for (entry.material_images, 0..) |*images, index| {
@@ -142,14 +162,21 @@ pub const Materials = struct {
         }
         if (entry.state != .ready) return;
         // Which instances are sampled as glowing depends on these textures.
-        self.asset_generation += 1;
+        self.internal.asset_generation += 1;
         for (source.materials, 0..) |item, index| {
             if (material) |only| if (only != index) continue;
             const encoded = try encodeMaterial(self, entry, item, index);
-            try self.materials.pool.write(self.device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded));
+            try self.materials.internal.pool.write(self.device, entry.material_base + @as(u32, @intCast(index)), std.mem.asBytes(&encoded));
         }
     }
 };
+
+/// The custom shader slot a material is drawn with: 0, the built-in one,
+/// for specular-glossiness materials and unknown slots.
+pub fn shaderSlot(self: *const Renderer, material: gltf.Material) u32 {
+    if (material.specular_glossiness or material.shader >= self.materials.internal.shaders.len) return 0;
+    return material.shader;
+}
 
 pub fn encodeMaterial(self: *Renderer, entry: *ModelEntry, material: gltf.Material, index: usize) !gpu.Material {
     const device = self.device;
@@ -161,6 +188,7 @@ pub fn encodeMaterial(self: *Renderer, entry: *ModelEntry, material: gltf.Materi
     if (material.double_sided) flags |= gpu.material_double_sided;
     if (material.specular_glossiness) flags |= gpu.material_specular_glossiness;
     if (material.sway_weights) flags |= gpu.material_sway_weights;
+    if (material.unlit) flags |= gpu.material_unlit;
     var encoded: gpu.Material = .{
         .base_color = material.base_color,
         .emissive = material.emissive,
@@ -184,7 +212,7 @@ pub fn encodeMaterial(self: *Renderer, entry: *ModelEntry, material: gltf.Materi
         .sampler_index = device.samplerIndex(try materialSampler(self, if (sampler_source) |ref| ref.sampler else .{}, true)),
         .detail_sampler = device.samplerIndex(try materialSampler(self, if (sampler_source) |ref| ref.sampler else .{}, false)),
         .flags = flags,
-        .shader = if (material.specular_glossiness) 0 else if (material.shader < self.materials.shaders.len) material.shader else 0,
+        .shader = shaderSlot(self, material),
         .params = if (material.specular_glossiness) .{ material.specular[0], material.specular[1], material.specular[2], 0 } else material.params,
         .uv_transform = uvMatrix(material.uv_scale, material.uv_rotation),
         .texture_transforms = transformSlot(entry, index),
@@ -195,6 +223,9 @@ pub fn encodeMaterial(self: *Renderer, entry: *ModelEntry, material: gltf.Materi
         .transmission = std.math.clamp(material.transmission, 0, 1),
         .ior = @max(material.ior, 1),
         .thickness = @max(material.thickness, 0),
+        .attenuation = .{ std.math.clamp(material.attenuation_color[0], 0, 1), std.math.clamp(material.attenuation_color[1], 0, 1), std.math.clamp(material.attenuation_color[2], 0, 1), @max(material.attenuation_distance, 0) },
+        .reflectance = .{ @max(material.reflectance_color[0], 0), @max(material.reflectance_color[1], 0), @max(material.reflectance_color[2], 0), std.math.clamp(material.reflectance, 0, 1) },
+        .iridescence = .{ std.math.clamp(material.iridescence, 0, 1), @max(material.iridescence_ior, 1), @max(material.iridescence_thickness, 0), 0 },
         .sheen_color = material.sheen_color,
         .sheen_roughness = std.math.clamp(material.sheen_roughness, 0.07, 1),
         .anisotropy = std.math.clamp(material.anisotropy, 0, 1),
@@ -215,7 +246,9 @@ pub fn encodeMaterial(self: *Renderer, entry: *ModelEntry, material: gltf.Materi
             .{ "sheen_color", "sheen_color_texture" },
             .{ "sheen_roughness", "sheen_roughness_texture" },
         }) |pair| {
-            if (@field(images, pair[0])) |image| @field(encoded, pair[1]) = image.index;
+            if (@field(images, pair[0])) |image| if (self.images.valid(image)) {
+                @field(encoded, pair[1]) = image.index;
+            };
         }
         if (images.sampler) |sampler| {
             encoded.sampler_index = device.samplerIndex(try materialSampler(self, sampler, true));

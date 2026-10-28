@@ -15,7 +15,19 @@ const EmitterDesc = api.EmitterDesc;
 
 /// Particle emitters.
 pub const Emitters = struct {
-    table: handle.HandleTable(renderer_state.EmitterData, api.EmitterTag),
+    internal: Internal,
+
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.EmitterData, api.EmitterTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.EmitterData) void {
+            owner.device.destroyBuffer(entry.buffer);
+            if (entry.order) |order| owner.device.destroyBuffer(order);
+            if (entry.trail) |trail| owner.device.destroyBuffer(trail);
+        }
+    };
 
     fn renderer(emitters: *Emitters) *Renderer {
         return @alignCast(@fieldParentPtr("emitters", emitters));
@@ -35,7 +47,7 @@ pub const Emitters = struct {
         const self = emitters.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.emitters.table.get(emitter) orelse return error.InvalidEmitter;
+        const data = self.emitters.internal.table.get(emitter) orelse return error.InvalidEmitter;
         const order = data.order orelse return error.EmitterNotSorted;
         const bytes = try self.device.readBuffer(gpa, order, @as(u64, data.order_count) * 8);
         defer gpa.free(bytes);
@@ -49,7 +61,7 @@ pub const Emitters = struct {
         const self = emitters.renderer();
         self.lock();
         defer self.unlock();
-        if (self.emitters.table.get(emitter)) |data| data.desc = desc;
+        if (self.emitters.internal.table.get(emitter)) |data| data.desc = desc;
     }
 
     /// Adds `count` births at once, on top of `rate`, at the emitter's
@@ -58,7 +70,7 @@ pub const Emitters = struct {
         const self = emitters.renderer();
         self.lock();
         defer self.unlock();
-        if (self.emitters.table.get(emitter)) |data| data.pending += @floatFromInt(count);
+        if (self.emitters.internal.table.get(emitter)) |data| data.pending += @floatFromInt(count);
     }
 
     /// Live particles vanish at once. A stale handle is ignored.
@@ -72,7 +84,7 @@ pub const Emitters = struct {
 
 /// `emitters.create` for a caller that holds the renderer's lock.
 pub fn createEmitterLocked(self: *Renderer, scene: Scene, desc: EmitterDesc) !Emitter {
-    const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+    const data = self.scenes.internal.table.get(scene) orelse return error.InvalidScene;
     const capacity = std.math.clamp(desc.capacity, 1, 1 << 20);
     const buffer = try self.device.createBuffer(.{
         .name = "particles",
@@ -80,8 +92,8 @@ pub fn createEmitterLocked(self: *Renderer, scene: Scene, desc: EmitterDesc) !Em
         .usage = .{ .storage = true },
     });
     errdefer self.device.destroyBuffer(buffer);
-    const zeros = try self.gpa.alloc(u8, capacity * @sizeOf(gpu.Particle));
-    defer self.gpa.free(zeros);
+    const zeros = try self.internal.gpa.alloc(u8, capacity * @sizeOf(gpu.Particle));
+    defer self.internal.gpa.free(zeros);
     @memset(zeros, 0);
     try self.device.uploadBuffer(buffer, 0, zeros);
     const order_count = std.math.ceilPowerOfTwo(u32, capacity) catch capacity;
@@ -98,19 +110,19 @@ pub fn createEmitterLocked(self: *Renderer, scene: Scene, desc: EmitterDesc) !Em
         .usage = .{ .storage = true },
     }) else null;
     errdefer if (trail) |value| self.device.destroyBuffer(value);
-    const emitter = try self.emitters.table.insert(.{ .scene = scene, .desc = desc, .buffer = buffer, .capacity = capacity, .order = order, .order_count = order_count, .trail = trail, .trail_points = trail_points });
-    errdefer _ = self.emitters.table.remove(emitter);
-    try data.emitters.append(self.gpa, emitter);
+    const emitter = try self.emitters.internal.table.insert(.{ .scene = scene, .desc = desc, .buffer = buffer, .capacity = capacity, .order = order, .order_count = order_count, .trail = trail, .trail_points = trail_points });
+    errdefer _ = self.emitters.internal.table.remove(emitter);
+    try data.emitters.append(self.internal.gpa, emitter);
     return emitter;
 }
 
 /// `emitters.destroy` for a caller that holds the renderer's lock.
 pub fn destroyEmitterLocked(self: *Renderer, emitter: Emitter) void {
-    const removed = self.emitters.table.remove(emitter) orelse return;
+    const removed = self.emitters.internal.table.remove(emitter) orelse return;
     self.device.destroyBuffer(removed.buffer);
     if (removed.order) |order| self.device.destroyBuffer(order);
     if (removed.trail) |trail| self.device.destroyBuffer(trail);
-    const scene = self.scenes.table.get(removed.scene) orelse return;
+    const scene = self.scenes.internal.table.get(removed.scene) orelse return;
     for (scene.emitters.items, 0..) |item, index| if (std.meta.eql(item, emitter)) {
         _ = scene.emitters.swapRemove(index);
         break;

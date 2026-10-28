@@ -26,6 +26,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y glslc libglfw3-dev
+      - name: Install the Slang compiler
+        run: |
+          curl -sSL https://github.com/shader-slang/slang/releases/download/v2026.19/slang-2026.19-linux-x86_64.tar.gz -o slang.tar.gz
+          mkdir -p "$HOME/slang" && tar -xzf slang.tar.gz -C "$HOME/slang" && rm slang.tar.gz
+          echo "$HOME/slang/bin" >> "$GITHUB_PATH"
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0

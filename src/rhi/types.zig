@@ -28,6 +28,10 @@ pub const NativeWindow = union(enum) {
     wayland: struct { display: *anyopaque, surface: *anyopaque },
     /// Win32 `HINSTANCE` (may be null) and `HWND`.
     win32: struct { instance: ?*anyopaque, window: *anyopaque },
+    /// A `CAMetalLayer*`, on macOS and iOS through MoltenVK.
+    metal: struct { layer: *anyopaque },
+    /// An Android `ANativeWindow*`.
+    android: struct { window: *anyopaque },
 };
 
 pub const Surface = struct {
@@ -49,10 +53,15 @@ pub const DeviceDesc = struct {
     preferred_device: ?[]const u8 = null,
     /// Null for headless use.
     surface: ?Surface = null,
-    /// Enable ray queries when supported; check `Device.ray_tracing`.
+    /// Enable ray queries when supported; check `Device.caps`.
     ray_tracing: bool = true,
-    /// Use mesh shaders when supported; check `Device.mesh_shaders`.
+    /// Use mesh shaders when supported; check `Device.caps`.
     mesh_shaders: bool = true,
+    /// Use BC and ASTC texture formats when supported; check `Device.caps`.
+    block_formats: bool = true,
+    /// Read `SV_PrimitiveID` when supported; off, visibility is drawn the
+    /// way devices without it draw it. Check `Device.caps`.
+    primitive_id: bool = true,
     /// File the driver pipeline cache is persisted to.
     pipeline_cache_path: ?[]const u8 = null,
     /// Name objects and label passes for debuggers, without validation.
@@ -60,7 +69,7 @@ pub const DeviceDesc = struct {
     /// Prefer an HDR10 surface (10-bit, PQ, Rec.2020) when there is one.
     hdr_output: bool = false,
     /// Enable the extensions NVIDIA's NGX asks for, when the device has them;
-    /// check `Device.nvidia_ngx`.
+    /// check `Device.caps`.
     nvidia_ngx: bool = false,
 };
 
@@ -88,12 +97,12 @@ pub const Format = enum {
     a2b10g10r10_unorm,
     depth16_unorm,
     depth32_float,
-    /// RGBA, 8 bits per texel. Needs `Device.bc_textures`.
+    /// RGBA, 8 bits per texel. Needs `Capabilities.bc_textures`.
     bc7_unorm,
     bc7_srgb,
-    /// Red and green, 8 bits per texel. Needs `Device.bc_textures`.
+    /// Red and green, 8 bits per texel. Needs `Capabilities.bc_textures`.
     bc5_unorm,
-    /// Red, 4 bits per texel. Needs `Device.bc_textures`.
+    /// Red, 4 bits per texel. Needs `Capabilities.bc_textures`.
     bc4_unorm,
     /// From KTX2 files: opaque color at 4 bits per texel, color with alpha
     /// at 8, HDR color at 8.
@@ -102,19 +111,24 @@ pub const Format = enum {
     bc3_unorm,
     bc3_srgb,
     bc6h_ufloat,
+    /// RGBA in 4x4 blocks of 16 bytes, as mobile GPUs read. Needs
+    /// `Capabilities.astc_textures`.
+    astc_4x4_unorm,
+    astc_4x4_srgb,
 
     pub fn isDepth(self: Format) bool {
         return self == .depth16_unorm or self == .depth32_float;
     }
 
     pub fn isSrgb(self: Format) bool {
-        return self == .rgba8_srgb or self == .bgra8_srgb or self == .bc7_srgb or self == .bc1_srgb or self == .bc3_srgb;
+        return self == .rgba8_srgb or self == .bgra8_srgb or self == .bc7_srgb or self == .bc1_srgb or self == .bc3_srgb or self == .astc_4x4_srgb;
     }
 
-    /// BC formats: sampled and uploaded, but not rendered to or read back.
+    /// BC and ASTC formats: sampled and uploaded, but not rendered to or read
+    /// back.
     pub fn isBlockCompressed(self: Format) bool {
         return switch (self) {
-            .bc7_unorm, .bc7_srgb, .bc5_unorm, .bc4_unorm, .bc1_unorm, .bc1_srgb, .bc3_unorm, .bc3_srgb, .bc6h_ufloat => true,
+            .bc7_unorm, .bc7_srgb, .bc5_unorm, .bc4_unorm, .bc1_unorm, .bc1_srgb, .bc3_unorm, .bc3_srgb, .bc6h_ufloat, .astc_4x4_unorm, .astc_4x4_srgb => true,
             else => false,
         };
     }
@@ -134,7 +148,7 @@ pub const Format = enum {
             .r32_float, .r32_uint, .b10g11r11_float, .a2b10g10r10_unorm, .depth32_float => 4,
             .rgba16_unorm, .rgba16_float => 8,
             .rgba32_float => 16,
-            .bc7_unorm, .bc7_srgb, .bc5_unorm, .bc4_unorm, .bc1_unorm, .bc1_srgb, .bc3_unorm, .bc3_srgb, .bc6h_ufloat => unreachable,
+            .bc7_unorm, .bc7_srgb, .bc5_unorm, .bc4_unorm, .bc1_unorm, .bc1_srgb, .bc3_unorm, .bc3_srgb, .bc6h_ufloat, .astc_4x4_unorm, .astc_4x4_srgb => unreachable,
         };
     }
 };
@@ -150,20 +164,27 @@ pub const TextureUsage = packed struct(u8) {
     copy_src: bool = false,
     /// Implied when the texture has more than one mip level.
     copy_dst: bool = false,
-    /// Storage image for compute shaders; see `Device.storageIndex`. Needs
-    /// `Device.storage_images`.
+    /// Storage image, read and written by shaders; see `Device.storageIndex`. Needs
+    /// `Capabilities.storage_images`.
     storage: bool = false,
     /// Usable as `RenderingDesc.shading_rate`. Needs
-    /// `Device.shading_rate_tile`.
+    /// `Capabilities.shading_rate_tile`.
     shading_rate: bool = false,
     _padding: u1 = 0,
 };
 
 /// Cube faces are in the order +X, -X, +Y, -Y, +Z, -Z. Rendering targets
 /// one layer or face at a time.
-pub const TextureKind = enum { @"2d", @"2d_array", cube };
+pub const TextureKind = enum {
+    @"2d",
+    @"2d_array",
+    cube,
+    /// A volume of `TextureDesc.depth` slices, with one mip and one layer.
+    /// Filled by shaders through `Device.storageIndex`.
+    @"3d",
+};
 
-/// Textures are 2D, single-sampled and device-local.
+/// Textures are single-sampled and device-local.
 pub const TextureDesc = struct {
     /// Debug name, shown when `DeviceDesc.debug_names` or validation is on.
     name: [:0]const u8 = "texture",
@@ -177,6 +198,8 @@ pub const TextureDesc = struct {
     mip_levels: u32 = 1,
     /// Cube textures always have six.
     layers: u32 = 1,
+    /// Slices of a `TextureKind.@"3d"` texture.
+    depth: u32 = 1,
     kind: TextureKind = .@"2d",
 
     /// Levels in a complete mip chain down to 1x1.
@@ -309,7 +332,7 @@ pub const GraphicsPipelineDesc = struct {
     /// Null for depth-only pipelines.
     fragment: ?[]const u8 = null,
     /// Mesh shader replacing `vertex`, and its task shader; drawn with
-    /// `CommandEncoder.drawMeshTasksIndirect`. Needs `Device.mesh_shaders`.
+    /// `CommandEncoder.drawMeshTasksIndirect`. Needs `Capabilities.mesh_shaders`.
     mesh: ?[]const u8 = null,
     task: ?[]const u8 = null,
     /// In attachment order; at most 8.
@@ -328,6 +351,8 @@ pub const ComputePipelineDesc = struct {
     name: [:0]const u8 = "compute pipeline",
     /// SPIR-V bytes, entry point `main`.
     shader: []const u8,
+    /// Specialization constants, by constant id from 0.
+    constants: []const u32 = &.{},
 };
 
 /// What a texture is about to be used for; the encoder derives layout
@@ -355,7 +380,6 @@ pub const TextureState = enum {
 /// `discard` leaves the contents undefined.
 pub const LoadOp = enum { load, clear, discard };
 
-/// Contents are always stored.
 pub const ColorAttachment = struct {
     texture: Texture,
     mip: u32 = 0,
@@ -364,6 +388,9 @@ pub const ColorAttachment = struct {
     clear: [4]f32 = .{ 0, 0, 0, 0 },
     /// Clear value for `*_uint` formats.
     clear_uint: [4]u32 = .{ 0, 0, 0, 0 },
+    /// False lets the driver skip writing the color back, for an attachment
+    /// nothing reads after the pass.
+    store: bool = true,
 };
 
 pub const DepthAttachment = struct {
@@ -375,7 +402,8 @@ pub const DepthAttachment = struct {
     clear: f32 = 0,
     /// False lets the driver skip writing depth back.
     store: bool = true,
-    /// Reserved; not read by the encoder.
+    /// The pass only tests against depth: nothing is written back, which
+    /// tile-based GPUs skip. Its pipelines must not write depth.
     read_only: bool = false,
 };
 
@@ -385,7 +413,7 @@ pub const RenderingDesc = struct {
     color: []const ColorAttachment = &.{},
     depth: ?DepthAttachment = null,
     /// An `r8_uint` texture of `shadingRate` values, one texel per
-    /// `Device.shading_rate_tile` pixels each way. Null shades every pixel.
+    /// `Capabilities.shading_rate_tile` pixels each way. Null shades every pixel.
     shading_rate: ?Texture = null,
 };
 
@@ -394,6 +422,48 @@ pub const RenderingDesc = struct {
 pub fn shadingRate(width: u32, height: u32) u8 {
     return @intCast((std.math.log2_int(u32, width) << 2) | std.math.log2_int(u32, height));
 }
+
+/// Ways work uses buffers, with the stages that use them, for
+/// `CommandEncoder.dependency`. A set of them: `.{ .compute_write = true }`.
+pub const BufferAccess = packed struct(u16) {
+    compute_read: bool = false,
+    compute_write: bool = false,
+    /// Vertex, fragment, task and mesh shaders.
+    graphics_read: bool = false,
+    graphics_write: bool = false,
+    indirect: bool = false,
+    index: bool = false,
+    vertex_input: bool = false,
+    transfer_read: bool = false,
+    transfer_write: bool = false,
+    /// Inputs and scratch of acceleration structure builds, and their output.
+    build_read: bool = false,
+    build_write: bool = false,
+    host_read: bool = false,
+    pad: u4 = 0,
+
+    pub fn merge(self: BufferAccess, other: BufferAccess) BufferAccess {
+        return @bitCast(@as(u16, @bitCast(self)) | @as(u16, @bitCast(other)));
+    }
+
+    pub fn empty(self: BufferAccess) bool {
+        return @as(u16, @bitCast(self)) == 0;
+    }
+
+    pub fn writes(self: BufferAccess) bool {
+        return self.compute_write or self.graphics_write or self.transfer_write or self.build_write;
+    }
+
+    /// Only the reading accesses of the set.
+    pub fn reads(self: BufferAccess) BufferAccess {
+        var result = self;
+        result.compute_write = false;
+        result.graphics_write = false;
+        result.transfer_write = false;
+        result.build_write = false;
+        return result;
+    }
+};
 
 /// Coarse buffer synchronization points; buffers are not tracked
 /// individually.
@@ -408,6 +478,34 @@ pub const BufferSync = enum {
 
 pub const IndexType = enum { uint16, uint32 };
 
+/// Commands one encoder recorded, counted as they are recorded.
+pub const Work = struct {
+    render_passes: u32 = 0,
+    /// Draws whose counts the CPU gave.
+    draws: u32 = 0,
+    /// Draws whose counts come from a GPU buffer.
+    indirect_draws: u32 = 0,
+    dispatches: u32 = 0,
+    /// Pipeline barrier commands, and the image layout changes in them.
+    barriers: u32 = 0,
+    image_barriers: u32 = 0,
+    pipeline_binds: u32 = 0,
+    push_constants: u32 = 0,
+    /// Buffer and image copies, buffer fills, mip chains generated.
+    transfers: u32 = 0,
+    /// Acceleration structure builds and updates.
+    builds: u32 = 0,
+    /// Bytes copied from staging buffers into GPU-only memory.
+    staged_bytes: u64 = 0,
+
+    /// What was recorded after `earlier`, a count taken from the same encoder.
+    pub fn since(self: Work, earlier: Work) Work {
+        var result: Work = .{};
+        inline for (std.meta.fields(Work)) |field| @field(result, field.name) = @field(self, field.name) - @field(earlier, field.name);
+        return result;
+    }
+};
+
 /// From `Device.textureInfo`.
 pub const TextureInfo = struct {
     width: u32,
@@ -417,6 +515,9 @@ pub const TextureInfo = struct {
     /// 6 for cube textures.
     layers: u32,
     kind: TextureKind,
+    depth: u32 = 1,
+    /// What it was made for.
+    usage: TextureUsage = .{},
 };
 
 /// GPU time of one `CommandEncoder.beginScope` region.
@@ -426,6 +527,8 @@ pub const PassTiming = struct {
     milliseconds: f32,
     /// Nesting level; sum only depth 0 for a frame total.
     depth: u8,
+    /// Commands recorded inside the scope, nested scopes included.
+    work: Work = .{},
 };
 
 pub const AdapterKind = enum {
@@ -437,6 +540,60 @@ pub const AdapterKind = enum {
     other,
 };
 
+/// What a device can do, in `Device.caps`. Each optional feature is used only
+/// where its field says it is there.
+pub const Capabilities = struct {
+    /// Ray queries and acceleration structures.
+    ray_tracing: bool = false,
+    /// Task and mesh shaders.
+    mesh_shaders: bool = false,
+    /// Fragment shaders can read `SV_PrimitiveID` (the `geometryShader`
+    /// feature); without it and mesh shaders, visibility draws pull their
+    /// indices in the vertex shader.
+    primitive_id: bool = false,
+    /// 64-bit integers in shaders, which ray tracing needs.
+    int64: bool = false,
+    /// Shaders can read and write textures (`TextureUsage.storage`).
+    storage_images: bool = false,
+    /// BC texture formats.
+    bc_textures: bool = false,
+    /// ASTC 4x4 texture formats (`textureCompressionASTC_LDR`).
+    astc_textures: bool = false,
+    /// Pixels per shading rate texel each way; 0 when unsupported.
+    shading_rate_tile: u32 = 0,
+    /// `Device.createSharedTexture` works.
+    shared_textures: bool = false,
+    /// The GPU shares the CPU's memory; GPU-only buffers are mapped and
+    /// written without staging.
+    unified_memory: bool = false,
+    /// The extensions NVIDIA's NGX asks for are enabled; see
+    /// `DeviceDesc.nvidia_ngx`.
+    nvidia_ngx: bool = false,
+    /// Largest width or height of a 2D texture.
+    max_texture_size: u32 = 0,
+    /// Largest width, height or depth of a 3D texture.
+    max_volume_size: u32 = 0,
+    max_texture_layers: u32 = 0,
+    /// Invocations in one compute workgroup.
+    max_workgroup_size: u32 = 0,
+    /// Workgroups in one dispatch, each way.
+    max_workgroups: [3]u32 = .{ 0, 0, 0 },
+    /// What each format can be used for, in optimal tiling.
+    formats: std.EnumArray(Format, FormatSupport) = .initFill(.{}),
+};
+
+/// The uses of one texture format a device supports.
+pub const FormatSupport = struct {
+    sampled: bool = false,
+    /// Sampled with linear filtering.
+    filtered: bool = false,
+    color_attachment: bool = false,
+    /// A color attachment that blends.
+    blended: bool = false,
+    depth_attachment: bool = false,
+    storage: bool = false,
+};
+
 /// From `Device.adapterInfo`.
 pub const AdapterInfo = struct {
     kind: AdapterKind,
@@ -446,6 +603,9 @@ pub const AdapterInfo = struct {
     /// system memory.
     memory_bytes: u64,
     ray_tracing: bool,
+    /// A tile-based GPU, as phones and Apple silicon have: ARM Mali, Qualcomm
+    /// Adreno, Imagination PowerVR or Apple. Bandwidth is what it lacks.
+    tiled: bool = false,
 };
 
 /// Device memory managed by the RHI.
@@ -454,10 +614,18 @@ pub const MemoryStats = struct {
     reserved_bytes: u64,
     /// Bytes handed out to live resources.
     used_bytes: u64,
+    /// Device-local bytes the driver lets this process use, from
+    /// `VK_EXT_memory_budget`; 0 when the driver does not say.
+    budget_bytes: u64 = 0,
+    /// Device-local bytes the driver counts against this process; 0 when
+    /// `budget_bytes` is.
+    process_bytes: u64 = 0,
 };
 
 /// Positions are three floats at the start of each vertex.
-pub const BlasDesc = struct {
+/// Triangles of a bottom-level structure. Shaders see the place of a
+/// geometry in `BlasDesc.geometries` as the geometry index of a hit.
+pub const BlasGeometry = struct {
     /// Needs `acceleration_input` usage.
     vertices: Buffer,
     vertex_offset: u64 = 0,
@@ -469,11 +637,32 @@ pub const BlasDesc = struct {
     index_offset: u64 = 0,
     /// Three per triangle.
     index_count: u32,
-    /// Rebuilt every frame: built for speed, scratch memory kept.
-    dynamic: bool = false,
     /// False sends every ray that meets the geometry through the shader's
     /// candidate test, as alpha tested surfaces need.
     solid: bool = true,
+};
+
+pub const BlasDesc = struct {
+    /// At most `max_blas_geometries`; a structure is always built from the
+    /// same number, each with the triangle count it was created for.
+    geometries: []const BlasGeometry,
+    /// Rebuilt every frame: built for speed, scratch memory kept.
+    dynamic: bool = false,
+};
+
+pub const max_blas_geometries = 16;
+
+/// One structure of a `CommandEncoder.buildBlases` batch.
+pub const BlasBuild = struct {
+    blas: AccelerationStructure,
+    desc: BlasDesc,
+};
+
+pub const TlasDesc = struct {
+    max_instances: u32,
+    /// Built so that `CommandEncoder.updateTlas` can move instances
+    /// without a full rebuild, at some cost to tracing.
+    updatable: bool = false,
 };
 
 /// Layout of `VkAccelerationStructureInstanceKHR`.

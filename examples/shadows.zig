@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
     var sky = gfx.SkyDesc{ .sun_direction = .{ -@cos(sun_turn), -0.42, -@sin(sun_turn) * 0.4 } };
     renderer.scenes.setSun(scene, gfx.skySun(sky));
     const environment = try renderer.environments.createSky(sky);
-    renderer.scenes.setEnvironment(scene, environment, 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 1 });
 
     var positions: [24][3]f32 = undefined;
     var indices: [36]u32 = undefined;
@@ -70,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
         .indices = ball_indices,
         .material = .{ .base_color = .{ 0.75, 0.2, 0.15, 1 }, .metallic = 0, .roughness = 0.4 },
     }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.5, -avenue_length * 0.5 }), math.scaling(.{ 60, 1, avenue_length + 40 })) });
+    _ = try renderer.entities.create(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.5, -avenue_length * 0.5 }), math.scaling(.{ 60, 1, avenue_length + 40 })) });
 
     var bars: std.ArrayList(math.Mat4) = .empty;
     defer bars.deinit(gpa);
@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     _ = try renderer.instances.create(scene, wood, bars.items);
-    const roller = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.translation(.{ 0, 0.6, -6 }) });
+    const roller = try renderer.entities.create(scene, .{ .model = ball, .transform = math.translation(.{ 0, 0.6, -6 }) });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(gpa);
@@ -112,13 +112,13 @@ pub fn main(init: std.process.Init) !void {
 
         var cascades_ms: f32 = 0;
         var virtual_ms: f32 = 0;
-        for (renderer.device.passTimings()) |timing| {
+        for (stage.passTimings()) |timing| {
             if (std.mem.eql(u8, timing.name, "shadows")) cascades_ms = timing.milliseconds;
             if (std.mem.eql(u8, timing.name, "virtual shadows")) virtual_ms = timing.milliseconds;
         }
         list.clear();
         try list.rect(.{ .x = 12, .y = 12, .width = 520, .height = 112 }, gfx.Color.rgba(8, 10, 18, 190));
-        try list.text(font, if (virtual) "Sun shadows: virtual shadow map" else "Sun shadows: cascades", .{ 24, 20 }, .{ .size = 20 });
+        try list.text(font, if (virtual) "SunDesc shadows: virtual shadow map" else "SunDesc shadows: cascades", .{ 24, 20 }, .{ .size = 20 });
         try list.text(font, try std.fmt.bufPrint(&text, "cascades {d:.2} ms · virtual pages {d:.2} ms · frame {d:.1} ms GPU\n{d:.0} fps", .{
             cascades_ms, if (virtual) virtual_ms else 0, stage.gpu_ms, stage.fps,
         }), .{ 24, 50 }, .{ .size = 15 });
@@ -128,13 +128,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = .{ .position = .{ 0, 1.7, 3 }, .forward = .{ -@sin(look), -0.16, -@cos(look) } },
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{
-                    .shadow_distance = 140,
-                    .virtual_shadow_maps = virtual,
-                    .global_illumination = false,
-                },
+                .settings = .{ .shadows = .{ .distance = 140, .virtual = virtual }, .global_illumination = null },
             }},
             .delta_time = tick.dt,
         }));

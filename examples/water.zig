@@ -11,7 +11,8 @@
 //!   A/D      orbit
 //!   T        hold to move the sun through the day
 //!
-//! `--dive 1`, `--frames N`, `--screenshot file.png`.
+//! `--dive 1`, `--ocean 1` for open sea waves, `--frames N`,
+//! `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");
 const math = gfx.math;
@@ -27,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     var sky = gfx.SkyDesc{ .sun_direction = .{ -0.5 * @cos(sun_height), -@sin(sun_height), -0.6 } };
     renderer.scenes.setSun(scene, gfx.skySun(sky));
     const environment = try renderer.environments.createSky(sky);
-    renderer.scenes.setEnvironment(scene, environment, 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 1 });
 
     var positions: [1][24][3]f32 = undefined;
     var indices: [1][36]u32 = undefined;
@@ -47,14 +48,14 @@ pub fn main(init: std.process.Init) !void {
         .{ .model = red, .at = .{ 1.0, -0.2, 1.5 }, .size = .{ 1.2, 1.2, 1.2 } },
         .{ .model = tile, .at = .{ -3.5, -1.2, 2.5 }, .size = .{ 1.5, 0.6, 1.5 } },
     };
-    for (boxes) |box| _ = try renderer.entities.spawn(scene, .{ .model = box.model, .transform = math.mul(math.translation(box.at), math.scaling(box.size)) });
+    for (boxes) |box| _ = try renderer.entities.create(scene, .{ .model = box.model, .transform = math.mul(math.translation(box.at), math.scaling(box.size)) });
     const helpers = @import("window");
     var ball_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(0.4, &ball_positions, &ball_normals, &ball_indices);
     const ball_model = try renderer.models.create(&.{.{ .positions = &ball_positions, .normals = &ball_normals, .indices = &ball_indices, .material = .{ .base_color = .{ 0.95, 0.75, 0.1, 1 }, .metallic = 0, .roughness = 0.3 } }});
-    const ball = try renderer.entities.spawn(scene, .{ .model = ball_model, .transform = math.translation(.{ 3.6, -0.3, 0 }) });
+    const ball = try renderer.entities.create(scene, .{ .model = ball_model, .transform = math.translation(.{ 3.6, -0.3, 0 }) });
     try renderer.waitUntilLoaded();
 
     var desc = gfx.WaterDesc{
@@ -78,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
         defer arguments.deinit();
         while (arguments.next()) |argument| {
             if (std.mem.eql(u8, argument, "--dive")) dive = true;
+            if (std.mem.eql(u8, argument, "--ocean")) desc.ocean = .{ .wind_speed = 5, .period = 12, .height = 0.6 };
         }
     }
 
@@ -105,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
         try renderer.waters.set(water, desc);
 
         list.clear();
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         try list.rect(.{ .x = 12, .y = 12, .width = 430, .height = 80 }, gfx.Color.rgba(10, 12, 20, 180));
         try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · cpu {d:.2} ms\nrain {s} · swell {d:.2} m · murk {d:.2}", .{
             stage.fps, stage.gpu_ms, stats.cpu_ms, if (desc.rain > 0) "on" else "off", desc.swell, desc.murk,
@@ -117,9 +119,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, if (dive) .{ 0, -0.9, 0 } else .{ 0, -0.4, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 50 },
+                .settings = .{ .shadows = .{ .distance = 50 } },
             }},
             .delta_time = tick.dt,
         }));

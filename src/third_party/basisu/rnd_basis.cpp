@@ -34,10 +34,19 @@ void* rnd_basis_open(const void* data, uint32_t size, uint32_t* info) {
 
 // Writes one image of one level as 16-byte blocks (BC7, or BC6H when
 // `hdr`); `blocks` is how many `out` has room for. Returns 0 on failure.
-int rnd_basis_level(void* handle, uint32_t level, uint32_t layer, uint32_t face, void* out, uint32_t blocks, int hdr) {
+// target: 0 BC7, 1 BC6H, 2 ASTC 4x4, 3 RGBA8 texels, 4 RGBA16F texels. `units`
+// counts blocks, or texels for the last two.
+int rnd_basis_level(void* handle, uint32_t level, uint32_t layer, uint32_t face, void* out, uint32_t units, int target) {
     basist::ktx2_transcoder* transcoder = static_cast<basist::ktx2_transcoder*>(handle);
-    const basist::transcoder_texture_format format = hdr ? basist::transcoder_texture_format::cTFBC6H : basist::transcoder_texture_format::cTFBC7_RGBA;
-    return transcoder->transcode_image_level(level, layer, face, out, blocks, format) ? 1 : 0;
+    basist::transcoder_texture_format format = basist::transcoder_texture_format::cTFBC7_RGBA;
+    switch (target) {
+        case 1: format = basist::transcoder_texture_format::cTFBC6H; break;
+        case 2: format = basist::transcoder_texture_format::cTFASTC_4x4_RGBA; break;
+        case 3: format = basist::transcoder_texture_format::cTFRGBA32; break;
+        case 4: format = basist::transcoder_texture_format::cTFRGBA_HALF; break;
+        default: break;
+    }
+    return transcoder->transcode_image_level(level, layer, face, out, units, format) ? 1 : 0;
 }
 
 void rnd_basis_close(void* handle) {

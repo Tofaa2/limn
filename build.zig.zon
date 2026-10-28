@@ -30,6 +30,66 @@
             .hash = "N-V-__8AAKE_TAAJO1RHyQ6MPZFPLLCAyHNu7iYXh7n1KEfH",
             .lazy = true,
         },
+        .x11_headers = .{
+            .url = "https://github.com/allyourcodebase/x11-headers/archive/947022308236478b13fd39b638bf8a2264725751.zip",
+            .hash = "N-V-__8AAJaARwDVWtryGrmN1iiu2qeZKabbbr9H1GCKrTiN",
+            .lazy = true,
+        },
+        .wayland_headers = .{
+            .url = "https://github.com/allyourcodebase/wayland-headers/archive/1bcb1200b5fa17ef9ff603f66817e72c170342c1.zip",
+            .hash = "N-V-__8AAAVvCwDLr0LianOagXBVKPRDucj7FfMLG9SwJq7S",
+            .lazy = true,
+        },
+        .xcode_frameworks = .{
+            .url = "https://code.hexops.org/hexops/xcode-frameworks/archive/8a1cfb373587ea4c9bb1468b7c986462d8d4e10e.zip",
+            .hash = "N-V-__8AALShqgXkvqYU6f__FrA22SMWmi2TXCJjNTO1m8XJ",
+            .lazy = true,
+        },
+        .moltenvk = .{
+            .url = "https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar",
+            .hash = "N-V-__8AAE_YiwPIE_JJGNssqD-hldlwyTTI7tQDZMXFtb9m",
+            .lazy = true,
+        },
+        .android_ndk = .{
+            .url = "https://dl.google.com/android/repository/android-ndk-r27c-linux.zip",
+            .hash = "N-V-__8AAF6YaXqq7J3pYrhuKflWrACYDDn7GwUCLm0HSLxf",
+            .lazy = true,
+        },
+        .glslang = .{
+            .url = "git+https://github.com/KhronosGroup/glslang?ref=16.4.0#8df24f913681e4566f91de99445f47baaceb60f1",
+            .hash = "N-V-__8AAG64xAI0wnxIpFigB0A8xW9nuGDEiBkN0yNNmhtT",
+            .lazy = true,
+        },
+        .slang_linux_x86_64 = .{
+            .url = "https://github.com/shader-slang/slang/releases/download/v2026.19/slang-2026.19-linux-x86_64.tar.gz",
+            .hash = "N-V-__8AAA271g7xwsQojDOEc7cYJjTGw9LAXidJWibDv1MB",
+            .lazy = true,
+        },
+        .slang_linux_aarch64 = .{
+            .url = "https://github.com/shader-slang/slang/releases/download/v2026.19/slang-2026.19-linux-aarch64.tar.gz",
+            .hash = "N-V-__8AAEijnwWQcy342ZvAIBE4ektHo_oG7rrZWJ6RfXUZ",
+            .lazy = true,
+        },
+        .slang_macos_x86_64 = .{
+            .url = "https://github.com/shader-slang/slang/releases/download/v2026.19/slang-2026.19-macos-x86_64.tar.gz",
+            .hash = "N-V-__8AAEk0uQVkzbUbXT0YX0uP1MZtIWXPa5oaz0i9k0ti",
+            .lazy = true,
+        },
+        .slang_macos_aarch64 = .{
+            .url = "https://github.com/shader-slang/slang/releases/download/v2026.19/slang-2026.19-macos-aarch64.tar.gz",
+            .hash = "N-V-__8AAEMP6wt8WhE1SJmKpt423gaEYJMnTYH9tVNkCfwR",
+            .lazy = true,
+        },
+        .slang_windows_x86_64 = .{
+            .url = "https://github.com/shader-slang/slang/releases/download/v2026.19/slang-2026.19-windows-x86_64.zip",
+            .hash = "N-V-__8AAAYJXwopSCjsQvHuu7Ke3AURwVDNubNvxph8Yk5e",
+            .lazy = true,
+        },
+        .slang_windows_aarch64 = .{
+            .url = "https://github.com/shader-slang/slang/releases/download/v2026.19/slang-2026.19-windows-aarch64.zip",
+            .hash = "N-V-__8AAEC4WQWixyZw_waR6jfa7oZkZfEGyZkkFBP6Iwa4",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

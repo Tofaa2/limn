@@ -143,7 +143,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
     const sky = gfx.SkyDesc{ .sun_direction = .{ -0.55, -0.6, -0.4 } };
     renderer.scenes.setSun(scene, gfx.skySun(sky));
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky), .intensity = 1 });
 
     var positions: [3][24][3]f32 = undefined;
     var indices: [3][36]u32 = undefined;
@@ -153,17 +153,17 @@ pub fn main(init: std.process.Init) !void {
     const ground = try renderer.models.create(&.{.{ .positions = &positions[0], .indices = &indices[0], .material = .{ .base_color = .{ 0.3, 0.3, 0.32, 1 }, .metallic = 0, .roughness = 0.85 } }});
     const hearth = try renderer.models.create(&.{.{ .positions = &positions[1], .indices = &indices[1], .material = .{ .base_color = .{ 0.12, 0.1, 0.09, 1 }, .metallic = 0, .roughness = 0.9 } }});
     const pillar = try renderer.models.create(&.{.{ .positions = &positions[2], .indices = &indices[2], .material = .{ .base_color = .{ 0.7, 0.66, 0.6, 1 }, .metallic = 0, .roughness = 0.7 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.25, 0 }) });
-    _ = try renderer.entities.spawn(scene, .{ .model = hearth, .transform = math.translation(.{ 0, 0.12, 0 }) });
-    _ = try renderer.entities.spawn(scene, .{ .model = pillar, .transform = math.translation(.{ -3.2, 1.4, -1.5 }) });
-    _ = try renderer.entities.spawn(scene, .{ .model = pillar, .transform = math.translation(.{ 3.0, 1.4, -2.2 }) });
+    _ = try renderer.entities.create(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.25, 0 }) });
+    _ = try renderer.entities.create(scene, .{ .model = hearth, .transform = math.translation(.{ 0, 0.12, 0 }) });
+    _ = try renderer.entities.create(scene, .{ .model = pillar, .transform = math.translation(.{ -3.2, 1.4, -1.5 }) });
+    _ = try renderer.entities.create(scene, .{ .model = pillar, .transform = math.translation(.{ 3.0, 1.4, -2.2 }) });
     const helpers = @import("window");
     var ball_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var ball_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(ball_radius, &ball_positions, &ball_normals, &ball_indices);
     const ball = try renderer.models.create(&.{.{ .positions = &ball_positions, .normals = &ball_normals, .indices = &ball_indices, .material = .{ .base_color = .{ 0.2, 0.2, 0.22, 1 }, .metallic = 1, .roughness = 0.35 } }});
-    const ball_entity = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.translation(ballAt(.hung, 0)) });
+    const ball_entity = try renderer.entities.create(scene, .{ .model = ball, .transform = math.translation(ballAt(.hung, 0)) });
     try renderer.waitUntilLoaded();
 
     var scene_obstacles = false;
@@ -265,7 +265,7 @@ pub fn main(init: std.process.Init) !void {
         try renderer.fluids.set(fluid, desc);
 
         list.clear();
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         try list.rect(.{ .x = 12, .y = 12, .width = 520, .height = 100 }, gfx.Color.rgba(10, 12, 20, 180));
         try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · cpu {d:.2} ms\nswirl {d:.0} · wind {d:.2}", .{
             stage.fps, stage.gpu_ms, stats.cpu_ms, desc.vorticity, wind,
@@ -290,9 +290,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 2.6, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 60, .global_illumination = scene_obstacles },
+                .settings = .{ .shadows = .{ .distance = 60 }, .global_illumination = if (scene_obstacles) .{ .probes = .{} } else null },
             }},
             .delta_time = tick.dt,
         }));

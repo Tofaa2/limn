@@ -1,4 +1,6 @@
 //! Reflection probes and their capture. Internal to the renderer.
+const pipelines_module = @import("pipelines.zig");
+const environment_push = @import("../shaders/push/environment.zig");
 const std = @import("std");
 const handle = @import("../../handle.zig");
 const rhi = @import("../../rhi/rhi.zig");
@@ -23,20 +25,30 @@ const renderView = @import("view_render.zig").renderView;
 
 /// Local reflection probes.
 pub const Probes = struct {
-    table: handle.HandleTable(renderer_state.ProbeData, api.ReflectionProbeTag),
+    internal: Internal,
+
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.ProbeData, api.ReflectionProbeTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.ProbeData) void {
+            freeProbe(owner, entry);
+        }
+    };
 
     fn renderer(probes: *Probes) *Renderer {
-        return @alignCast(@fieldParentPtr("probes", probes));
+        return @alignCast(@fieldParentPtr("reflection_probes", probes));
     }
 
     /// Adds a local reflection probe. Its six faces are captured one per
-    /// frame from the next frames that draw; call `probes.update`
+    /// frame from the next frames that draw; call `probes.recapture`
     /// after the scene or its lighting changes.
     pub fn create(probes: *Probes, scene: Scene, desc: ReflectionProbeDesc) !ReflectionProbe {
         const self = probes.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+        const data = self.scenes.internal.table.get(scene) orelse return error.InvalidScene;
         if (data.probes.items.len >= max_reflection_probes) return error.TooManyReflectionProbes;
         const size = std.math.clamp(desc.resolution, 16, 1024);
         const target = try self.device.createTexture(.{
@@ -48,22 +60,22 @@ pub const Probes = struct {
         });
         errdefer self.device.destroyTexture(target);
         const view = try insertView(self);
-        errdefer if (self.views.table.remove(view)) |removed_view| {
+        errdefer if (self.views.internal.table.remove(view)) |removed_view| {
             var removed = removed_view;
             removed.deinit(self.device);
         };
-        const probe = try self.probes.table.insert(.{ .scene = scene, .desc = desc, .target = target, .view = view, .cubes = .{ .max_radiance = desc.max_radiance } });
-        errdefer _ = self.probes.table.remove(probe);
-        try data.probes.append(self.gpa, probe);
+        const probe = try self.reflection_probes.internal.table.insert(.{ .scene = scene, .desc = desc, .target = target, .view = view, .cubes = .{ .max_radiance = desc.max_radiance } });
+        errdefer _ = self.reflection_probes.internal.table.remove(probe);
+        try data.probes.append(self.internal.gpa, probe);
         return probe;
     }
 
-    /// A new position takes effect with the next `probes.update`.
+    /// A new position takes effect with the next `probes.recapture`.
     pub fn set(probes: *Probes, probe: ReflectionProbe, desc: ReflectionProbeDesc) void {
         const self = probes.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.probes.table.get(probe) orelse return;
+        const data = self.reflection_probes.internal.table.get(probe) orelse return;
         const resolution = data.desc.resolution;
         data.desc = desc;
         data.desc.resolution = resolution;
@@ -71,11 +83,11 @@ pub const Probes = struct {
     }
 
     /// Asks for a probe to be captured again.
-    pub fn update(probes: *Probes, probe: ReflectionProbe) void {
+    pub fn recapture(probes: *Probes, probe: ReflectionProbe) void {
         const self = probes.renderer();
         self.lock();
         defer self.unlock();
-        if (self.probes.table.get(probe)) |data| data.dirty = true;
+        if (self.reflection_probes.internal.table.get(probe)) |data| data.dirty = true;
     }
 
     /// A stale handle is ignored.
@@ -83,35 +95,29 @@ pub const Probes = struct {
         const self = probes.renderer();
         self.lock();
         defer self.unlock();
-        var removed = self.probes.table.remove(probe) orelse return;
-        freeProbe(self, &removed);
-        const scene = self.scenes.table.get(removed.scene) orelse return;
-        for (scene.probes.items, 0..) |item, index| if (std.meta.eql(item, probe)) {
-            _ = scene.probes.swapRemove(index);
-            break;
-        };
+        render.destroyObject(self, "reflection_probes", "probes", probe);
     }
 };
 
 pub fn freeProbe(self: *Renderer, probe: *ProbeData) void {
     freeEnvironment(self, &probe.cubes);
     self.device.destroyTexture(probe.target);
-    if (self.views.table.remove(probe.view)) |removed_view| {
+    if (self.views.internal.table.remove(probe.view)) |removed_view| {
         var removed = removed_view;
-        removed.deinit(self.device);
+        removed.deinit(self.internal.gpa, self.device);
     }
 }
 
 /// Captures the first waiting probe, one face per frame, and filters the
 /// result into its reflection cube.
 pub fn captureProbes(self: *Renderer, frame: rhi.Frame, delta_time: f32, arena: *FrameArena) !void {
-    for (self.probes.table.slots.items) |*slot| if (slot.value) |*probe| {
+    for (0..self.reflection_probes.internal.table.slotCount()) |slot_index| if (self.reflection_probes.internal.table.slotAt(slot_index).value) |*probe| {
         if (!probe.dirty and probe.face == 0) continue;
         if (!probe.captured and probe.face == 0 and probe.waited < probe.desc.settle_frames) {
             probe.waited += 1;
             continue;
         }
-        const scene = self.scenes.table.get(probe.scene) orelse continue;
+        const scene = self.scenes.internal.table.get(probe.scene) orelse continue;
         if (scene.layout.items.len == 0 and scene.static_count == 0) continue;
         if (probe.face == 0) probe.dirty = false;
         probe.capturing = true;
@@ -133,29 +139,26 @@ pub fn captureProbes(self: *Renderer, frame: rhi.Frame, delta_time: f32, arena: 
                 .camera = .{ .position = probe.desc.position, .forward = axes[0], .up = axes[1], .fov_y = std.math.pi * 0.5, .near = 0.05 },
                 .target = .{ .texture = probe.target },
                 .settings = .{
-                    .temporal_antialiasing = false,
-                    .screen_space_reflections = false,
-                    .occlusion_culling = false,
-                    .automatic_exposure = false,
-                    .gi_follow_camera = false,
-                    .ao_temporal_filter = false,
-                    .cloud_temporal_filter = false,
-                    .shadow_cascade_stagger = false,
-                    .light_shadow_filter = false,
-                    .bloom = 0,
-                    .sharpen = 0,
+                    .resolution = .{ .temporal_antialiasing = false, .sharpen = 0 },
+                    .reflections = null,
+                    .geometry = .{ .occlusion_culling = false },
+                    .post = .{ .automatic_exposure = false, .bloom = 0 },
+                    .global_illumination = .{ .probes = .{ .follow_camera = false } },
+                    .clouds = .{ .temporal_filter = false },
+                    .shadows = .{ .cascade_stagger = false, .light_filter = false },
+                    .ambient_occlusion = .{ .temporal_filter = false, .bounce = 0 },
                 },
             }, delta_time, arena);
-            const state = &(self.views.table.get(probe.view).?.state orelse return);
+            const state = &(self.views.internal.table.get(probe.view).?.state orelse return);
             cmd.transition(state.hdr, .shader_read);
             const forward = axes[0];
             const right = math.normalize(math.cross(forward, axes[1]));
             const up = math.cross(right, forward);
             try cmd.beginRendering(.{ .color = &.{.{ .texture = probe.cubes.sky.?, .layer = @intCast(face), .load = .discard }} });
-            cmd.bindPipeline(self.pipelines.probe_face);
-            cmd.pushConstants(extern struct { source: u32, sampler: u32, face: u32, max_radiance: f32, right: [3]f32, up: [3]f32, forward: [3]f32 }{
-                .source = device.textureIndex(state.hdr),
-                .sampler = device.samplerIndex(self.sampler_linear_clamp),
+            cmd.bindPipeline(try self.internal.pipelines.of(probeFacePipeline));
+            cmd.pushConstants(environment_push.ProbeFacePush{
+                .source_texture = device.textureIndex(state.hdr),
+                .sampler_index = device.samplerIndex(self.internal.sampler_linear_clamp),
                 .face = @intCast(face),
                 .max_radiance = probe.desc.max_radiance,
                 .right = right,
@@ -174,4 +177,8 @@ pub fn captureProbes(self: *Renderer, frame: rhi.Frame, delta_time: f32, arena: 
         probe.captured = true;
         return;
     };
+}
+
+fn probeFacePipeline(_: *rhi.Device) pipelines_module.Desc {
+    return pipelines_module.pass("probe face", pipelines_module.shaderCode("probe_face.frag.spv"), &.{.{ .format = pipelines_module.hdr_format }});
 }

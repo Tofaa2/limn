@@ -48,7 +48,9 @@ const Decorations = struct {
     name: []const u8 = "",
 };
 
-/// Every bound variable of a SPIR-V module: name, binding and kind.
+/// Every bound variable a SPIR-V module's functions use: name, binding
+/// and kind. Declared but unused ones are left out, as an optimizing
+/// compiler would have removed them.
 fn reflect(gpa: std.mem.Allocator, bytes: []const u8) ![]Resource {
     if (bytes.len < 20 or bytes.len % 4 != 0) return error.InvalidSpirv;
     const words = try gpa.alloc(u32, bytes.len / 4);
@@ -63,6 +65,9 @@ fn reflect(gpa: std.mem.Allocator, bytes: []const u8) ![]Resource {
     @memset(constants, 1);
     const Variable = struct { id: u32, pointer: u32, storage: u32 };
     var variables: std.ArrayList(Variable) = .empty;
+    const used = try gpa.alloc(bool, bound);
+    @memset(used, false);
+    var in_function = false;
 
     var at: usize = 5;
     while (at < words.len) {
@@ -70,6 +75,11 @@ fn reflect(gpa: std.mem.Allocator, bytes: []const u8) ![]Resource {
         const opcode = words[at] & 0xffff;
         if (length == 0 or at + length > words.len) return error.InvalidSpirv;
         const operands = words[at + 1 .. at + length];
+        if (opcode == 54) in_function = true;
+        if (opcode == 56) in_function = false;
+        if (in_function) for (operands) |operand| {
+            if (operand < bound) used[operand] = true;
+        };
         switch (opcode) {
             5 => decorations[operands[0]].name = std.mem.sliceTo(std.mem.sliceAsBytes(operands[1..]), 0),
             71 => switch (operands[1]) {
@@ -102,6 +112,7 @@ fn reflect(gpa: std.mem.Allocator, bytes: []const u8) ![]Resource {
     for (variables.items) |variable| {
         const decoration = decorations[variable.id];
         const binding = decoration.binding orelse continue;
+        if (!used[variable.id]) continue;
         var pointee = switch (types[variable.pointer]) {
             .pointer => |target| target,
             else => continue,

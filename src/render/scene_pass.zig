@@ -1,5 +1,8 @@
 //! State and results shared between the passes of one view of a scene.
 //! Internal to the renderer.
+const cull_push = @import("shaders/push/cull.zig");
+const visibility_push = @import("shaders/push/visibility.zig");
+const std = @import("std");
 const rhi = @import("../rhi/rhi.zig");
 const math = @import("../math.zig");
 const gpu = @import("gpu.zig");
@@ -61,6 +64,43 @@ pub const SceneFrame = struct {
     bounds: [2]Vec3,
 };
 
+/// What `Shared` holds until the feature that provides a value sets it: no
+/// sun shadows, lights or local shadows.
+pub const no_sun = SunShadows{ .enabled = false, .colored = false, .map = rhi.Texture.invalid, .cascades = std.mem.zeroes(Cascades), .count = 0, .update = @splat(false) };
+pub const no_lighting = Lighting{ .lights = 0, .tiles = 0, .light_count = 0, .tile_count = 0, .tile_view_proj = std.mem.zeroes([max_local_shadow_views]Mat4), .tile_views = std.mem.zeroes([max_local_shadow_views]gpu.CullView) };
+pub const no_local_shadows = LocalShadows{ .draw = false, .same_atlas = false, .key = 0, .tile_dirty = @splat(false) };
+
+/// What the features of one view of a scene hand each other while its frame
+/// is put together and drawn.
+/// Values a feature's `prepare` sets for later ones are named by its
+/// `provides`; a feature whose `prepare` reads one names it in `uses`, and
+/// `core/features.zig` checks that an earlier feature provides it.
+pub const Shared = struct {
+    frame: rhi.Frame,
+    arena: *FrameArena,
+    delta_time: f32,
+    sun: *const SunShadows,
+    lighting: *const Lighting,
+    local_shadows: *const LocalShadows,
+    gi: ?*render.GiVolume,
+    shadow_tlas: u64,
+    colored_shadows: bool,
+    cloud_address: u64,
+    fluid_list: *gpu.FluidList,
+    shadows_enabled: bool,
+    first_view: bool,
+    fresh_scene: bool,
+    instance_total: u32,
+    count_readback: rhi.Buffer,
+    culling: *CullState,
+    reflections: ?render.ReflectionTargets = null,
+    path_traced: bool = false,
+    resolved: *rhi.Texture,
+    bloom_count: usize = 0,
+    /// The pick this view answers, taken from the renderer while it is planned.
+    pick: ?@import("state.zig").PickRequest = null,
+};
+
 /// State shared by the passes of one view of a scene.
 pub const ScenePass = struct {
     frame: rhi.Frame,
@@ -75,11 +115,18 @@ pub const ScenePass = struct {
     /// True for the first view to draw the scene this frame, which also does
     /// the per-scene work.
     fresh_scene: bool,
+    /// True for the view that rebuilds the scene's ray tracing structure
+    /// this frame (`ray_scene.claim`).
+    builds_ray_scene: bool = false,
     view_data: *ViewData,
     view: *ViewState,
     /// Size the scene is rendered at.
     width: u32,
     height: u32,
+    /// Size of the picture once antialiasing has resolved it: the output
+    /// size when that also upscales.
+    resolved_width: u32,
+    resolved_height: u32,
     /// Size of the area of the target the view fills.
     output_width: u32,
     output_height: u32,
@@ -108,6 +155,31 @@ pub const ScenePass = struct {
     lod_band: f32,
     /// Address of the frame constants; 0 until they have been written.
     frame_address: u64 = 0,
+    /// The view is path traced: passes whose result the tracer replaces are
+    /// left out.
+    tracing: bool = false,
+    shared: *Shared = undefined,
+    /// The sun casts shadows in this view.
+    sun_shadows: bool = false,
+    /// What culling leaves for the passes after it; filled when it runs.
+    culling: *const CullState = undefined,
+    /// The antialiased HDR picture, once the resolve stage has run.
+    resolved: *const rhi.Texture = undefined,
+
+    /// A color target the view keeps from frame to frame, made when first
+    /// asked for and dropped a few frames after it no longer is.
+    pub fn keep(p: *const ScenePass, renderer: *render.Renderer, name: [:0]const u8, width: u32, height: u32, format: rhi.Format) !rhi.Texture {
+        return p.keepAs(renderer, .{ .name = name, .width = width, .height = height, .format = format, .usage = .{ .sampled = true, .color_attachment = true } });
+    }
+
+    pub fn keepAs(p: *const ScenePass, renderer: *render.Renderer, desc: rhi.TextureDesc) !rhi.Texture {
+        return p.view_data.kept.single(renderer.internal.gpa, renderer.device, desc, renderer.internal.frame_index);
+    }
+
+    /// `size` at an effect's fraction of the view's resolution.
+    pub fn scaled(resolution: render.EffectResolution, size: u32) u32 {
+        return @max(size >> @intFromEnum(resolution), 1);
+    }
 };
 
 /// The sun's shadow cascades for one view of a frame.
@@ -148,81 +220,18 @@ pub const CullState = struct {
     receiver_culled: [gpu.cascade_count]bool,
 };
 
-/// Push constants of the meshlet passes: camera visibility and shadows.
-pub const DrawPush = extern struct {
-    frame: u64,
-    /// 1 in a shadow pass whose see-through casters go into the tint
-    /// instead of the depth.
-    tinted: u32 = 0,
-    /// Nonzero when `page` replaces `view_proj`.
-    paged: u32 = 0,
-    view_proj: Mat4,
-    /// LOD cross-fade in the camera pass: camera and selection scale, band
-    /// width, and near plane.
-    lod: [4]f32 = .{ 0, 0, 0, 0 },
-    lod_band: f32 = 1,
-    lod_near: f32 = 0,
-    /// With mesh shaders: the meshlet list for this draw and the address of
-    /// its length.
-    list: u64 = 0,
-    count: u64 = 0,
-    /// A page of the sun's virtual shadow map (`VisibilityPage` in
-    /// visibility_page.glsl).
-    page: u64 = 0,
-};
+pub const DrawPush = visibility_push.GeometryPush;
 
-/// Push constants of the culling pass, for one view at a time.
-pub const CullPush = extern struct {
-    frame: u64,
-    view: u64,
-    commands: u64,
-    counts: u64,
-    visibility: u64,
-    ref_count: u32,
-    bucket_capacity: u32,
-    phase: u32,
-    hiz_texture: u32,
-    hiz_size: [2]f32,
-    skin_bounds: u64,
-    seen: u64,
-    mark_seen: u32 = 0,
-    entity_refs: u32 = 0,
-    candidates: u64 = 0,
-    dispatch: u64 = 0,
-    instance_visibility: u64 = 0,
-    entity_instances: u32 = 0,
-    masked_capacity: u32 = 0,
-    seen_total: u32 = 0,
-    mesh_lists: u32 = 0,
-    mesh_draws: u64 = 0,
-    lists: u64 = 0,
-};
+pub const CullPush = cull_push.MeshletPush;
 
-/// Push constants of cull_instances.comp.
-pub const InstanceCullPush = extern struct {
-    frame: u64,
-    view: u64,
-    instances: u64,
-    candidates: u64,
-    dispatch: u64,
-    visibility: u64,
-    instance_count: u32,
-    phase: u32,
-    hiz_texture: u32,
-    entity_refs: u32,
-    hiz_size: [2]f32,
-    impostors: u64 = 0,
-    impostor_list: u64 = 0,
-    impostor_draw: u64 = 0,
-    /// Nonzero for the camera's view, where small copies become impostors.
-    impostor_view: u32 = 0,
-    pad: u32 = 0,
-};
+pub const InstanceCullPush = cull_push.InstancePush;
 
 /// A view's lights as the shaders read them and the shadow tiles assigned
 /// to them; made by `prepareLights`.
 pub const Lighting = struct {
     lights: u64,
+    /// The same records, as the CPU wrote them this frame.
+    records: []const gpu.Light = &.{},
     tiles: u64,
     light_count: u32,
     /// Hash of which lights were given shadow tiles.

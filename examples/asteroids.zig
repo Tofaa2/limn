@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
     const sun_direction = math.normalize(math.Vec3{ -0.55, -0.35, -0.6 });
     renderer.scenes.setSun(scene, .{ .direction = sun_direction, .color = .{ 1, 0.96, 0.9 }, .intensity = 6 });
     const environment = try renderer.environments.createSky(.{ .sun_direction = .{ 0, 1, 0 }, .stars = 40 });
-    renderer.scenes.setEnvironment(scene, environment, 0.35);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 0.35 });
 
     var models: [kinds.len]gfx.Model = undefined;
     for (kinds, &models, 0..) |kind, *model, index| {
@@ -217,7 +217,7 @@ pub fn main(init: std.process.Init) !void {
             .material = .{ .base_color = .{ 0.62, 0.45, 0.30, 1 }, .metallic = 0, .roughness = 0.85 },
         }});
     };
-    _ = try renderer.entities.spawn(scene, .{ .model = planet, .transform = math.identity });
+    _ = try renderer.entities.create(scene, .{ .model = planet, .transform = math.identity });
     try renderer.waitUntilLoaded();
 
     const transforms = try gpa.alloc(math.Mat4, max_count);
@@ -231,7 +231,7 @@ pub fn main(init: std.process.Init) !void {
         placed += share;
     }
 
-    if (impostors) for (groups) |group| try renderer.instances.setImpostor(group, .{ .pixels = impostor_pixels });
+    if (impostors) for (groups) |group| try renderer.instances.setImpostor(group, .{ .max_pixels = impostor_pixels });
 
     var list = gfx.DrawList.init(gpa);
     defer list.deinit();
@@ -262,7 +262,7 @@ pub fn main(init: std.process.Init) !void {
             for (kinds, groups, 0..) |kind, group, index| {
                 const share = shareOf(kind, count);
                 scatter(transforms[0..share], kind, 100 + index);
-                try renderer.instances.set(group, transforms[0..share]);
+                try renderer.instances.setTransforms(group, transforms[0..share]);
                 placed += share;
             }
         }
@@ -271,7 +271,7 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_S)) shadows = !shadows;
         if (stage.keyPressed(glfw.GLFW_KEY_I)) {
             impostors = !impostors;
-            for (groups) |group| try renderer.instances.setImpostor(group, if (impostors) .{ .pixels = impostor_pixels } else null);
+            for (groups) |group| try renderer.instances.setImpostor(group, if (impostors) .{ .max_pixels = impostor_pixels } else null);
         }
         if (stage.keyPressed(glfw.GLFW_KEY_TAB)) meshlet_view = !meshlet_view;
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE)) flying = !flying;
@@ -286,7 +286,7 @@ pub fn main(init: std.process.Init) !void {
         const toward = math.normalize(math.sub(target, eye));
         const forward = math.Vec3{ toward[0] * @cos(look) - toward[2] * @sin(look), toward[1], toward[0] * @sin(look) + toward[2] * @cos(look) };
 
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         list.clear();
         try list.rect(.{ .x = 12, .y = 12, .width = 500, .height = 170 }, gfx.Color.rgba(8, 10, 18, 190));
         try list.text(font, try std.fmt.bufPrint(&text, "{d} objects", .{placed + 1}), .{ 24, 20 }, .{ .size = 22 });
@@ -310,16 +310,14 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = .{ .position = eye, .forward = forward, .near = 0.5 },
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = .{
-                    .occlusion_culling = occlusion,
-                    .lod_error_pixels = if (detail) 1 else 0,
-                    .shadows = shadows,
-                    .shadow_distance = 1500,
-                    .global_illumination = false,
-                    .ambient_occlusion = false,
-                    .automatic_exposure = false,
+                    .geometry = .{ .occlusion_culling = occlusion, .lod_error_pixels = if (detail) 1 else 0 },
+                    .shadows = if (shadows) .{ .distance = 1500 } else null,
+                    .global_illumination = null,
+                    .post = .{ .automatic_exposure = false },
+                    .ambient_occlusion = null,
                     .debug_view = if (meshlet_view) .meshlets else .none,
                 },
             }},

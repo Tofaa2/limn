@@ -29,7 +29,7 @@ const Clips = struct {
 const labels = [4][]const u8{ "cross-fade", "masked layer", "additive layer", "both layers" };
 
 pub fn main(init: std.process.Init) !void {
-    var stage = try Stage.create(init, "Limn animation", .{ .asset_cache_dir = "zig-out/asset-cache" });
+    var stage = try Stage.create(init, "Limn animation", .{ .cache = .{ .assets = "zig-out/asset-cache" } });
     const renderer = stage.renderer;
 
     const scene = try renderer.scenes.create();
@@ -41,18 +41,18 @@ pub fn main(init: std.process.Init) !void {
         .indices = &indices,
         .material = .{ .base_color = .{ 0.22, 0.23, 0.26, 1 }, .metallic = 0, .roughness = 0.7 },
     }});
-    _ = try renderer.entities.spawn(scene, .{ .model = floor, .transform = math.translation(.{ 0, -0.1, 0 }) });
+    _ = try renderer.entities.create(scene, .{ .model = floor, .transform = math.translation(.{ 0, -0.1, 0 }) });
 
     const robot = try renderer.models.load("examples/assets/world/RobotExpressive.glb");
-    const environment = try renderer.environments.load("examples/assets/world/venice_sunset_1k.hdr", 24);
+    const environment = try renderer.environments.load(.{ .path = "examples/assets/world/venice_sunset_1k.hdr", .max_radiance = 24 });
     try renderer.waitUntilLoaded();
-    renderer.scenes.setEnvironment(scene, environment, 0.5);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 0.5 });
     renderer.scenes.setSun(scene, .{ .direction = .{ -0.5, -0.8, -0.4 }, .color = .{ 1.0, 0.93, 0.82 }, .intensity = 5 });
 
     var robots: [4]gfx.Entity = undefined;
     for (&robots, 0..) |*entity, index| {
         const x = (@as(f32, @floatFromInt(index)) - 1.5) * 3.2;
-        entity.* = try renderer.entities.spawn(scene, .{
+        entity.* = try renderer.entities.create(scene, .{
             .model = robot,
             .transform = math.mul(math.translation(.{ x, 0, 0 }), math.uniformScaling(0.5)),
         });
@@ -132,9 +132,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.2, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 30 },
+                .settings = .{ .shadows = .{ .distance = 30 } },
             }},
             .delta_time = tick.dt,
         }));

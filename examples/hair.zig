@@ -21,7 +21,8 @@
 //!   S        the strands move, or stay as they were combed
 //!   A/D      orbit the camera
 //!
-//! `--wind 1` starts with the wind on, `--still 1` with the head still.
+//! `--wind 1` starts with the wind on, `--still 1` with the head still,
+//! `--orbit N` sets the camera angle and `--blonde 1` makes the hair fair.
 //! `--frames N`, `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");
@@ -192,6 +193,8 @@ pub fn main(init: std.process.Init) !void {
     var head_path: []const u8 = "examples/assets/hair/woman.obj";
     var windy = false;
     var turning = true;
+    var start_orbit: f32 = 0.9;
+    var blonde = false;
     var arguments = try init.minimal.args.iterateAllocator(gpa);
     defer arguments.deinit();
     while (arguments.next()) |argument| {
@@ -199,6 +202,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, argument, "--head")) head_path = arguments.next() orelse return error.MissingArgument;
         if (std.mem.eql(u8, argument, "--wind")) windy = true;
         if (std.mem.eql(u8, argument, "--still")) turning = false;
+        if (std.mem.eql(u8, argument, "--orbit")) start_orbit = try std.fmt.parseFloat(f32, arguments.next() orelse "0.9");
+        if (std.mem.eql(u8, argument, "--blonde")) blonde = true;
     }
 
     var stage = try Stage.create(init, "Limn hair", .{});
@@ -206,7 +211,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
     const sky = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.75, -0.45 } };
     renderer.scenes.setSun(scene, gfx.skySun(sky));
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky), .intensity = 1 });
 
     var ground_positions: [24][3]f32 = undefined;
     var ground_indices: [36]u32 = undefined;
@@ -216,7 +221,7 @@ pub fn main(init: std.process.Init) !void {
         .indices = &ground_indices,
         .material = .{ .base_color = .{ 0.35, 0.36, 0.38, 1 }, .metallic = 0, .roughness = 0.8 },
     }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.05, 0 }) });
+    _ = try renderer.entities.create(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.05, 0 }) });
 
     var from_file = true;
     const points = loadHair(gpa, init.io, hair_path) catch |failure| made: {
@@ -247,7 +252,7 @@ pub fn main(init: std.process.Init) !void {
 
     const upright = math.mul(math.rotationX(-std.math.pi * 0.5), math.uniformScaling(scale));
     var placement = math.mul(math.translation(.{ 0, head_height, 0 }), upright);
-    const head_entity = try renderer.entities.spawn(scene, .{ .model = head, .transform = placement });
+    const head_entity = try renderer.entities.create(scene, .{ .model = head, .transform = placement });
     var simulation = gfx.HairSimulation{};
     const hair = try renderer.hairs.create(scene, .{
         .points = points,
@@ -257,8 +262,8 @@ pub fn main(init: std.process.Init) !void {
         .taper = 0.7,
         .copies = 4,
         .spread = 0.7,
-        .root_color = .{ 0.16, 0.10, 0.05 },
-        .tip_color = .{ 0.36, 0.25, 0.14 },
+        .root_color = if (blonde) .{ 0.55, 0.42, 0.26 } else .{ 0.16, 0.10, 0.05 },
+        .tip_color = if (blonde) .{ 0.85, 0.72, 0.50 } else .{ 0.36, 0.25, 0.14 },
         .simulation = simulation,
     });
 
@@ -267,7 +272,7 @@ pub fn main(init: std.process.Init) !void {
     const font = renderer.fonts.default();
     var text: [200]u8 = undefined;
     var moving = true;
-    var orbit: f32 = 0.9;
+    var orbit: f32 = start_orbit;
     var turned: f32 = 0;
     var turn_time: f32 = 0;
 
@@ -294,7 +299,7 @@ pub fn main(init: std.process.Init) !void {
         simulation.wind = if (windy) .{ -4.5, 0.6, 2 } else .{ 0, 0, 0 };
         renderer.hairs.setSimulation(hair, if (moving) simulation else null);
 
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         list.clear();
         try list.rect(.{ .x = 12, .y = 12, .width = 600, .height = 104 }, gfx.Color.rgba(8, 10, 18, 190));
         try list.text(font, try std.fmt.bufPrint(&text, "{d} strands moved on the GPU, each drawn 4 times · {d} points\n{d:.1} ms GPU · {d:.2} ms CPU · {d:.0} fps", .{
@@ -317,9 +322,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, head_height + 0.02, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 8, .global_illumination = false },
+                .settings = .{ .shadows = .{ .distance = 8 }, .global_illumination = null },
             }},
             .delta_time = tick.dt,
         }));

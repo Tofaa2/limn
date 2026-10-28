@@ -23,16 +23,18 @@ const helpers = @import("window");
 const Stage = helpers.Stage;
 
 pub fn main(init: std.process.Init) !void {
-    var options = gfx.Options{ .path_tracing_fallback = true };
+    var options = gfx.Options{ .ray_tracing = .{ .software_path_tracing = true } };
     var traced = true;
     var orbiting = false;
+    var denoiser: gfx.Denoiser = .builtin;
     {
         var arguments = try init.minimal.args.iterateAllocator(init.gpa);
         defer arguments.deinit();
         while (arguments.next()) |argument| {
-            if (std.mem.eql(u8, argument, "--software")) options.ray_tracing = false;
+            if (std.mem.eql(u8, argument, "--software")) options.ray_tracing.hardware = false;
             if (std.mem.eql(u8, argument, "--raster")) traced = false;
             if (std.mem.eql(u8, argument, "--orbit")) orbiting = true;
+            if (std.mem.eql(u8, argument, "--nrd")) denoiser = .nrd;
         }
     }
     var stage = try Stage.create(init, "Limn path tracing", options);
@@ -40,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.35, -0.8, -0.45 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
@@ -51,16 +53,16 @@ pub fn main(init: std.process.Init) !void {
         .{ .color = .{ 0.75, 0.75, 0.72, 1 }, .at = .{ 0, -0.1, 0 }, .size = .{ 9, 0.2, 7 }, .roughness = 0.35 },
         .{ .color = .{ 0.75, 0.1, 0.08, 1 }, .at = .{ -4.4, 1.6, 0 }, .size = .{ 0.2, 3.2, 7 } },
         .{ .color = .{ 0.1, 0.6, 0.12, 1 }, .at = .{ 4.4, 1.6, 0 }, .size = .{ 0.2, 3.2, 7 } },
-        .{ .color = .{ 0.78, 0.78, 0.76, 1 }, .at = .{ 0, 1.6, -3.4 }, .size = .{ 9, 3.2, 0.2 } },
+        .{ .color = .{ 0.78, 0.78, 0.76, 1 }, .at = .{ 0, 1.6, -3.4 }, .size = .{ 8.6, 3.2, 0.2 } },
         .{ .color = .{ 0.78, 0.78, 0.76, 1 }, .at = .{ 1.6, 3.3, -0.8 }, .size = .{ 5.8, 0.2, 5.4 } },
         .{ .color = .{ 0.8, 0.8, 0.8, 1 }, .at = .{ 2.4, 0.75, -1.4 }, .size = .{ 1.2, 1.5, 1.2 } },
     };
     for (walls) |wall| {
         const model = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = wall.color, .metallic = 0, .roughness = wall.roughness } }});
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.mul(math.translation(wall.at), math.scaling(wall.size)) });
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.mul(math.translation(wall.at), math.scaling(wall.size)) });
     }
     const bar = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0, 0, 0, 1 }, .emissive = .{ 9, 6.5, 3.5 }, .metallic = 0, .roughness = 0.5 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = bar, .transform = math.mul(math.translation(.{ 2.6, 3.0, -1.2 }), math.scaling(.{ 2.4, 0.08, 0.3 })) });
+    _ = try renderer.entities.create(scene, .{ .model = bar, .transform = math.mul(math.translation(.{ 2.6, 3.0, -1.2 }), math.scaling(.{ 2.4, 0.08, 0.3 })) });
 
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
@@ -74,10 +76,10 @@ pub fn main(init: std.process.Init) !void {
     };
     for (balls) |ball| {
         const model = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = ball.material }});
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(ball.at) });
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.translation(ball.at) });
     }
     const helmet = try renderer.models.load("examples/assets/DamagedHelmet.glb");
-    _ = try renderer.entities.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ -3.0, 1.0, 1.8 }), math.mul(math.rotationY(0.9), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.8)))) });
+    _ = try renderer.entities.create(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ -3.0, 1.0, 1.8 }), math.mul(math.rotationY(0.9), math.mul(math.rotationX(std.math.pi * 0.5), math.uniformScaling(0.8)))) });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(init.gpa);
@@ -86,6 +88,7 @@ pub fn main(init: std.process.Init) !void {
     var bounces: u32 = 5;
     var orbit: f32 = 0.2;
     var hud_buffer: [160]u8 = undefined;
+    const tracer = renderer.capabilities().path_tracing;
 
     while (stage.begin()) |tick| {
         if (stage.keyPressed(glfw.GLFW_KEY_P)) traced = !traced;
@@ -96,10 +99,10 @@ pub fn main(init: std.process.Init) !void {
         if (orbiting) orbit += tick.dt * 0.35;
 
         list.clear();
-        const stats = renderer.getStats();
+        const stats = renderer.stats();
         try list.rect(.{ .x = 12, .y = 12, .width = 560, .height = 58 }, gfx.Color.rgba(10, 12, 20, 180));
         const line = if (traced)
-            try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · path traced by {s} · {d} bounces · {d} frames gathered", .{ stage.fps, stage.gpu_ms, switch (renderer.pathTracing()) {
+            try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · path traced by {s} · {d} bounces · {d} frames gathered", .{ stage.fps, stage.gpu_ms, switch (tracer) {
                 .hardware => "the GPU's ray tracing",
                 .shader => "a shader",
                 .unavailable => "nothing",
@@ -114,12 +117,11 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.1, -0.5 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = .{
-                    .shadow_distance = 30,
-                    .path_tracing = traced,
-                    .path_tracing_bounces = bounces,
+                    .shadows = .{ .distance = 30 },
+                    .path_tracing = if (traced) .{ .bounces = bounces, .denoiser = denoiser } else null,
                 },
             }},
             .delta_time = tick.dt,

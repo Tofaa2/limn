@@ -20,14 +20,14 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.6, -0.4 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
     const block = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.7, 0.7, 0.72, 1 }, .metallic = 0, .roughness = 0.6 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 40, 0.5, 40 })), .tint = .{ 0.45, 0.5, 0.42 } });
+    _ = try renderer.entities.create(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 40, 0.5, 40 })), .tint = .{ 0.45, 0.5, 0.42 } });
     var towers: [64]math.Mat4 = undefined;
     var colors: [64][3]f32 = undefined;
     for (&towers, &colors, 0..) |*tower, *color, index| {
@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     const group = try renderer.instances.create(scene, block, &towers);
     try renderer.instances.setColors(group, &colors);
     const fox_model = try renderer.models.load("examples/assets/world/Fox.glb");
-    const fox = try renderer.entities.spawn(scene, .{ .model = fox_model });
+    const fox = try renderer.entities.create(scene, .{ .model = fox_model });
     try renderer.waitUntilLoaded();
     const run = renderer.models.findAnimation(fox_model, "Run") orelse 0;
     const run_length = if (renderer.models.animationInfo(fox_model, run)) |clip| clip.duration else 1;
@@ -98,25 +98,25 @@ pub fn main(init: std.process.Init) !void {
 
         try stage.end(try renderer.render(.{
             .views = &.{
-                .{ .view = chase_view, .scene = scene, .camera = chase, .target = .{ .texture = chase_target }, .settings = .{ .shadow_distance = 50 } },
+                .{ .view = chase_view, .scene = scene, .camera = chase, .target = .{ .texture = chase_target }, .settings = .{ .shadows = .{ .distance = 50 } } },
                 .{
                     .scene = scene,
                     .camera = overview,
-                    .draw_lists = &.{&list},
+                    .draw_lists = &.{.{ .list = &list }},
                     .target = stage.target(),
                     .region = .{ .x = 0, .y = 0, .width = half, .height = size[1] },
-                    .settings = .{ .shadow_distance = 70 },
+                    .settings = .{ .shadows = .{ .distance = 70 } },
                 },
                 .{
                     .view = right_view,
                     .scene = scene,
                     .camera = if (modes[mode].view == .none) behind else overview,
-                    .draw_lists = &.{&list},
+                    .draw_lists = &.{.{ .list = &list }},
                     .target = stage.target(),
                     .region = .{ .x = half, .y = 0, .width = size[0] - half, .height = size[1] },
-                    .settings = .{ .shadow_distance = 70, .debug_view = modes[mode].view },
+                    .settings = .{ .shadows = .{ .distance = 70 }, .debug_view = modes[mode].view },
                 },
-                .{ .draw_lists = &.{&overlay}, .target = stage.target() },
+                .{ .draw_lists = &.{.{ .list = &overlay }}, .target = stage.target() },
             },
             .delta_time = tick.dt,
         }));

@@ -71,11 +71,12 @@ pub const Upscaler = struct {
     /// Null where the SDK is not built in or will not start on this GPU.
     pub fn create(device: *rhi.Device, generation: Generation, render_size: [2]u32, output_size: [2]u32) ?Upscaler {
         if (!available) return null;
+        const native = rhi.native.device(device);
         const handle = c.limnFfxCreate(&.{
-            .physical_device = @intFromEnum(device.physical),
-            .device = @intFromEnum(device.vkd.handle),
-            .get_device_proc_addr = rhi.deviceProcAddr(),
-            .pipeline_cache = @intFromEnum(device.pipeline_cache),
+            .physical_device = native.physical_device,
+            .device = native.device,
+            .get_device_proc_addr = native.get_device_proc_addr,
+            .pipeline_cache = native.pipeline_cache,
             .generation = @intFromEnum(generation),
             .render_width = render_size[0],
             .render_height = render_size[1],
@@ -115,7 +116,7 @@ pub const Upscaler = struct {
         const width: f32 = @floatFromInt(self.render_size[0]);
         const height: f32 = @floatFromInt(self.render_size[1]);
         const result = c.limnFfxDispatch(self.handle, &.{
-            .command_buffer = @intFromEnum(cmd.command),
+            .command_buffer = rhi.native.commandBuffer(cmd),
             .color = image(device, inputs.color),
             .depth = image(device, inputs.depth),
             .motion = image(device, inputs.motion),
@@ -130,7 +131,7 @@ pub const Upscaler = struct {
             .camera_fov_y = inputs.fov_y,
             .reset = @intFromBool(inputs.reset),
         });
-        cmd.bindGlobals();
+        rhi.native.restore(cmd);
         if (result != 0) return error.FidelityFxFailed;
     }
 
@@ -140,13 +141,13 @@ pub const Upscaler = struct {
     pub fn generate(self: Upscaler, device: *rhi.Device, cmd: *rhi.CommandEncoder, shown: rhi.Texture, output: rhi.Texture, reset: bool) error{FrameGenerationFailed}!bool {
         if (!available) return false;
         const result = c.limnFfxGenerateFrame(self.handle, &.{
-            .command_buffer = @intFromEnum(cmd.command),
+            .command_buffer = rhi.native.commandBuffer(cmd),
             .shown = image(device, shown),
             .output = image(device, output),
             .pq = @intFromBool(device.hdr_active),
             .reset = @intFromBool(reset),
         });
-        cmd.bindGlobals();
+        rhi.native.restore(cmd);
         if (result < 0) return error.FrameGenerationFailed;
         return result == 1;
     }
@@ -155,12 +156,7 @@ pub const Upscaler = struct {
     const jitter_sign = [2]f32{ 1, 1 };
 
     fn image(device: *rhi.Device, texture: rhi.Texture) Image {
-        const resource = device.textureResource(texture);
-        return .{
-            .image = @intFromEnum(resource.image),
-            .format = @intFromEnum(resource.vk_format),
-            .width = resource.info.width,
-            .height = resource.info.height,
-        };
+        const native = rhi.native.image(device, texture);
+        return .{ .image = native.image, .format = native.format, .width = native.width, .height = native.height };
     }
 };

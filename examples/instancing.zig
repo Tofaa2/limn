@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
     var sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -@sin(sun_height), -0.45 } };
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
     const environment = try renderer.environments.createSky(sky_desc);
-    renderer.scenes.setEnvironment(scene, environment, 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 1 });
 
     var positions: [3][24][3]f32 = undefined;
     var indices: [3][36]u32 = undefined;
@@ -60,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
         .indices = &indices[0],
         .material = .{ .base_color = .{ 0.16, 0.22, 0.12, 1 }, .metallic = 0, .roughness = 0.9 },
     }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.1, 0 }) });
+    _ = try renderer.entities.create(scene, .{ .model = ground, .transform = math.translation(.{ 0, -0.1, 0 }) });
     const tree = try renderer.models.create(&.{
         .{ .positions = &positions[1], .indices = &indices[1], .material = .{ .base_color = .{ 0.27, 0.17, 0.09, 1 }, .metallic = 0, .roughness = 0.9 } },
         .{ .positions = &positions[2], .indices = &indices[2], .material = .{ .base_color = .{ 0.12, 0.42, 0.14, 1 }, .metallic = 0, .roughness = 0.8 } },
@@ -121,7 +121,7 @@ pub fn main(init: std.process.Init) !void {
                 const lean = if (sway) @sin(tick.time * 1.6 + item.position[0] * 0.25 + item.position[2] * 0.18) * 0.12 else 0;
                 out.* = item.transform(lean);
             }
-            try renderer.instances.set(forest, transforms[0..count]);
+            try renderer.instances.setTransforms(forest, transforms[0..count]);
             if (changed) picked = null;
         }
 
@@ -137,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
             const high = math.add(item.position, .{ 0.4 * item.scale, 1.8 * item.scale, 0.4 * item.scale });
             try list.box3d(low, high, 2, gfx.Color.hex(0xffd23f));
         };
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         try list.rect(.{ .x = 12, .y = 12, .width = 420, .height = 118 }, gfx.Color.rgba(10, 12, 20, 180));
         try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · cpu {d:.2} ms\n{d} trees · {d} gpu instances · {d}k triangles", .{
             stage.fps, stage.gpu_ms, stats.cpu_ms, count, stats.instances, stats.triangles / 1000,
@@ -155,9 +155,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.0, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 110, .global_illumination = false },
+                .settings = .{ .shadows = .{ .distance = 110 }, .global_illumination = null },
             }},
             .delta_time = tick.dt,
         }));

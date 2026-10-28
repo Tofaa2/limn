@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
     var sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.55, -0.5, -0.4 } };
     var sun_height: f32 = 0.52;
     const sky = try renderer.environments.createSky(sky_desc);
-    renderer.scenes.setEnvironment(scene, sky, 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = sky, .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
             .indices = &sphere_indices,
             .material = .{ .base_color = .{ 0.6, 0.6, 0.62, 1 }, .metallic = 0, .roughness = roughness },
         }});
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - 3) * 1.6, 0.6, 1.5 }) });
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - 3) * 1.6, 0.6, 1.5 }) });
     }
     const back = [_]struct { name: []const u8, material: gfx.Material }{
         .{ .name = "gold", .material = .{ .base_color = .{ 1.0, 0.77, 0.34, 1 }, .metallic = 1, .roughness = 0.12 } },
@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
             .indices = &sphere_indices,
             .material = item.material,
         }});
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - 2) * 2.0, 0.6, -1.6 }) });
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - 2) * 2.0, 0.6, -1.6 }) });
     }
 
     helpers.boxMesh(.{ 0.25, 0.9, 0.25 }, &box_positions, &box_indices);
@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
             .indices = &box_indices,
             .material = .{ .base_color = .{ 0.02, 0.02, 0.02, 1 }, .emissive = color, .metallic = 0, .roughness = 0.5 },
         }});
-        entity.* = try renderer.entities.spawn(scene, .{ .model = model });
+        entity.* = try renderer.entities.create(scene, .{ .model = model });
     }
     try renderer.waitUntilLoaded();
 
@@ -121,19 +121,24 @@ pub fn main(init: std.process.Init) !void {
         const level: u8 = if (bar) 0 else 255;
         cookie_pixels[(y * 64 + x) * 4 ..][0..4].* = .{ level, level, level, 255 };
     };
-    const cookie = try renderer.images.create(64, 64, &cookie_pixels, false);
+    const cookie = try renderer.images.create(.{ .width = 64, .height = 64, .pixels = &cookie_pixels, .srgb = false });
     const profile = try renderer.images.createLightProfile(&.{ 0.25, 0.4, 1.0, 0.7, 0.15, 0.0, 0.0 });
     var lights_on = true;
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
     const font = renderer.fonts.default();
-    var settings = gfx.Settings{ .shadow_distance = 40, .bloom = 0.06, .dof_focus_distance = 9 };
+    var settings = gfx.Settings{
+        .shadows = .{ .distance = 40 },
+        .post = .{ .bloom = 0.06 },
+    };
+    var reflections = gfx.Reflections{};
+    var reflections_on = true;
     {
         var arguments = try init.minimal.args.iterateAllocator(init.gpa);
         defer arguments.deinit();
         while (arguments.next()) |argument| {
-            if (std.mem.eql(u8, argument, "--half")) settings.reflection_resolution = .half;
+            if (std.mem.eql(u8, argument, "--half")) reflections.resolution = .half;
         }
     }
     var orbit: f32 = 0.35;
@@ -143,15 +148,16 @@ pub fn main(init: std.process.Init) !void {
     var value_buffers: [8][24]u8 = undefined;
 
     while (stage.begin()) |tick| {
-        if (stage.keyPressed(glfw.GLFW_KEY_R)) settings.screen_space_reflections = !settings.screen_space_reflections;
-        if (stage.keyPressed(glfw.GLFW_KEY_F)) settings.reflection_temporal_filter = !settings.reflection_temporal_filter;
-        if (stage.keyPressed(glfw.GLFW_KEY_H)) settings.reflection_resolution = if (settings.reflection_resolution == .full) .half else .full;
-        if (stage.keyPressed(glfw.GLFW_KEY_UP)) settings.reflection_max_roughness = @min(settings.reflection_max_roughness + 0.1, 1.0);
-        if (stage.keyPressed(glfw.GLFW_KEY_DOWN)) settings.reflection_max_roughness = @max(settings.reflection_max_roughness - 0.1, 0.1);
+        if (stage.keyPressed(glfw.GLFW_KEY_R)) reflections_on = !reflections_on;
+        if (stage.keyPressed(glfw.GLFW_KEY_F)) reflections.temporal_filter = !reflections.temporal_filter;
+        if (stage.keyPressed(glfw.GLFW_KEY_H)) reflections.resolution = if (reflections.resolution == .full) .half else .full;
+        if (stage.keyPressed(glfw.GLFW_KEY_UP)) reflections.max_roughness = @min(reflections.max_roughness + 0.1, 1.0);
+        if (stage.keyPressed(glfw.GLFW_KEY_DOWN)) reflections.max_roughness = @max(reflections.max_roughness - 0.1, 0.1);
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE)) moving = !moving;
         if (stage.keyPressed(glfw.GLFW_KEY_L)) lights_on = !lights_on;
-        if (stage.keyPressed(glfw.GLFW_KEY_O)) settings.dof_aperture = if (settings.dof_aperture > 0) 0 else 0.8;
-        if (stage.keyPressed(glfw.GLFW_KEY_M)) settings.motion_blur = if (settings.motion_blur > 0) 0 else 0.5;
+        if (stage.keyPressed(glfw.GLFW_KEY_O)) settings.post.depth_of_field = if (settings.post.depth_of_field == null) .{ .focus_distance = 9 } else null;
+        if (stage.keyPressed(glfw.GLFW_KEY_M)) settings.post.motion_blur = if (settings.post.motion_blur == null) .{} else null;
+        settings.reflections = if (reflections_on) reflections else null;
         if (stage.keyDown(glfw.GLFW_KEY_A)) orbit -= tick.dt * 0.8;
         if (stage.keyDown(glfw.GLFW_KEY_D)) orbit += tick.dt * 0.8;
         if (stage.keyDown(glfw.GLFW_KEY_T)) {
@@ -191,12 +197,12 @@ pub fn main(init: std.process.Init) !void {
         try list.text(font, try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms", .{ stage.fps, stage.gpu_ms }), .{ 24, 20 }, .{ .size = 17 });
         var limit_buffer: [16]u8 = undefined;
         const rows = [_]struct { key: []const u8, label: []const u8, state: []const u8, on: bool }{
-            .{ .key = "R", .label = "screen-space reflections", .state = if (settings.screen_space_reflections) "on" else "off (sky only)", .on = settings.screen_space_reflections },
-            .{ .key = "F", .label = "temporal filter", .state = if (settings.reflection_temporal_filter) "on" else "off", .on = settings.reflection_temporal_filter },
-            .{ .key = "Up/Dn", .label = "roughness limit", .state = try std.fmt.bufPrint(&limit_buffer, "{d:.1}", .{settings.reflection_max_roughness}), .on = true },
+            .{ .key = "R", .label = "screen-space reflections", .state = if (reflections_on) "on" else "off (sky only)", .on = reflections_on },
+            .{ .key = "F", .label = "temporal filter", .state = if (reflections.temporal_filter) "on" else "off", .on = reflections.temporal_filter },
+            .{ .key = "Up/Dn", .label = "roughness limit", .state = try std.fmt.bufPrint(&limit_buffer, "{d:.1}", .{reflections.max_roughness}), .on = true },
             .{ .key = "L", .label = "lantern, cookie, profile", .state = if (lights_on) "on" else "off", .on = lights_on },
-            .{ .key = "O", .label = "depth of field", .state = if (settings.dof_aperture > 0) "on" else "off", .on = settings.dof_aperture > 0 },
-            .{ .key = "M", .label = "motion blur", .state = if (settings.motion_blur > 0) "on" else "off", .on = settings.motion_blur > 0 },
+            .{ .key = "O", .label = "depth of field", .state = if (settings.post.depth_of_field != null) "on" else "off", .on = settings.post.depth_of_field != null },
+            .{ .key = "M", .label = "motion blur", .state = if (settings.post.motion_blur != null) "on" else "off", .on = settings.post.motion_blur != null },
         };
         for (rows, 0..) |row, index| {
             const y = 46 + 19 * @as(f32, @floatFromInt(index));
@@ -211,7 +217,7 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 0.7, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = settings,
             }},

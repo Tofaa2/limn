@@ -23,14 +23,14 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ 0.55, -0.22, -0.8 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
     const block = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.6, 0.6, 0.62, 1 }, .metallic = 0, .roughness = 0.45 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 60, 0.5, 60 })), .tint = .{ 0.5, 0.5, 0.52 } });
+    _ = try renderer.entities.create(scene, .{ .model = block, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 60, 0.5, 60 })), .tint = .{ 0.5, 0.5, 0.52 } });
     var posts: [40]math.Mat4 = undefined;
     for (&posts, 0..) |*post, index| {
         const along: f32 = @floatFromInt(index / 2);
@@ -46,10 +46,10 @@ pub fn main(init: std.process.Init) !void {
     helpers.sphereMesh(0.22, &sphere_positions, &sphere_normals, &sphere_indices);
     for (lamp_colors, &lamps) |color, *lamp| {
         const model = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0, 0, 0, 1 }, .emissive = color, .metallic = 0, .roughness = 0.5 } }});
-        lamp.* = try renderer.entities.spawn(scene, .{ .model = model });
+        lamp.* = try renderer.entities.create(scene, .{ .model = model });
     }
     const helmet = try renderer.models.load("examples/assets/DamagedHelmet.glb");
-    _ = try renderer.entities.spawn(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 0, 1.3, 0 }), math.mul(math.rotationY(0.5), math.rotationX(std.math.pi * 0.5))) });
+    _ = try renderer.entities.create(scene, .{ .model = helmet, .transform = math.mul(math.translation(.{ 0, 1.3, 0 }), math.mul(math.rotationY(0.5), math.rotationX(std.math.pi * 0.5))) });
     try renderer.waitUntilLoaded();
 
     const Effect = enum { bloom, dof, motion_blur, vignette, grain, fringes, flare, grade, sharpen, antialiasing, upscale, manual_exposure };
@@ -105,23 +105,26 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const settings = gfx.Settings{
-            .shadow_distance = 60,
-            .bloom = if (on.get(.bloom)) 0.08 else 0,
-            .dof_aperture = if (on.get(.dof)) 1.2 else 0,
-            .dof_focus_distance = 7,
-            .motion_blur = if (on.get(.motion_blur)) 0.6 else 0,
-            .vignette = if (on.get(.vignette)) 0.45 else 0,
-            .film_grain = if (on.get(.grain)) 0.35 else 0,
-            .chromatic_aberration = if (on.get(.fringes)) 0.6 else 0,
-            .lens_flare = if (on.get(.flare)) 0.5 else 0,
-            .temperature = if (on.get(.grade)) 0.35 else 0,
-            .saturation = if (on.get(.grade)) 1.2 else 1,
-            .contrast = if (on.get(.grade)) 1.12 else 1,
-            .sharpen = if (on.get(.sharpen)) 0.35 else 0,
-            .temporal_antialiasing = on.get(.antialiasing),
-            .render_scale = if (on.get(.upscale)) 0.67 else 1,
-            .automatic_exposure = !on.get(.manual_exposure),
-            .exposure_compensation = if (on.get(.manual_exposure)) -0.5 else 0,
+            .shadows = .{ .distance = 60 },
+            .post = .{
+                .bloom = if (on.get(.bloom)) 0.08 else 0,
+                .vignette = if (on.get(.vignette)) 0.45 else 0,
+                .film_grain = if (on.get(.grain)) 0.35 else 0,
+                .chromatic_aberration = if (on.get(.fringes)) 0.6 else 0,
+                .lens_flare = if (on.get(.flare)) 0.5 else 0,
+                .temperature = if (on.get(.grade)) 0.35 else 0,
+                .saturation = if (on.get(.grade)) 1.2 else 1,
+                .contrast = if (on.get(.grade)) 1.12 else 1,
+                .automatic_exposure = !on.get(.manual_exposure),
+                .exposure_compensation = if (on.get(.manual_exposure)) -0.5 else 0,
+                .depth_of_field = if (on.get(.dof)) .{ .aperture = 1.2, .focus_distance = 7 } else null,
+                .motion_blur = if (on.get(.motion_blur)) .{ .strength = 0.6 } else null,
+            },
+            .resolution = .{
+                .sharpen = if (on.get(.sharpen)) 0.35 else 0,
+                .temporal_antialiasing = on.get(.antialiasing),
+                .scale = if (on.get(.upscale)) 0.67 else 1,
+            },
         };
 
         list.clear();
@@ -140,7 +143,7 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.2, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = settings,
             }},

@@ -4,6 +4,7 @@ const std = @import("std");
 const rhi = @import("../rhi/rhi.zig");
 const math = @import("../math.zig");
 const gltf = @import("../asset/gltf.zig");
+const api = @import("api.zig");
 const ktx2 = @import("../asset/ktx2.zig");
 const texture_codec = @import("texture_codec");
 const shader_sources = @import("shader_sources");
@@ -16,6 +17,9 @@ const draw_list = @import("draw_list.zig");
 const font_module = @import("font_baker").font;
 const text_layout = @import("text_layout.zig");
 const render = @import("renderer.zig");
+const features = @import("core/features.zig");
+const target_store = @import("core/targets.zig");
+const scene_pass = @import("scene_pass.zig");
 
 const Profiler = render.Profiler;
 const EffectResolution = render.EffectResolution;
@@ -35,7 +39,7 @@ const FluidObstacle = render.FluidObstacle;
 const FluidSource = render.FluidSource;
 const Image = render.Image;
 const InstanceGroup = render.InstanceGroup;
-const Light = render.Light;
+const LightDesc = render.LightDesc;
 const Liquid = render.Liquid;
 const LiquidDesc = render.LiquidDesc;
 const LiquidSource = render.LiquidSource;
@@ -50,7 +54,7 @@ const Renderer = render.Renderer;
 const Scene = render.Scene;
 const SceneFrame = render.SceneFrame;
 const SkyDesc = render.SkyDesc;
-const Sun = render.Sun;
+const SunDesc = render.SunDesc;
 const Vec3 = render.Vec3;
 const View = render.View;
 const Water = render.Water;
@@ -60,9 +64,8 @@ const shaderCode = render.shaderCode;
 
 pub const hdr_format = scene_color_format;
 pub const bloom_format: rhi.Format = .b10g11r11_float;
-/// Most levels a bloom chain can have; see `Settings.bloom_levels`.
+/// Most levels a bloom chain can have; see `Settings.post.bloom_levels`.
 pub const bloom_levels = 6;
-pub const ao_depth_mips = 5;
 /// Culling views of a frame: main view, shadow cascades, the main view's
 /// late (post-occlusion) phase, local light shadows and VSM pages.
 pub const view_count = 2 + gpu.cascade_count + max_local_shadow_views + gpu.vsm_pages_per_frame;
@@ -86,6 +89,24 @@ pub const env_irradiance_size = 32;
 pub const stream_budget_bytes = 48 * 1024 * 1024;
 
 pub const Range = struct { offset: u32, count: u32 };
+
+/// What an entity took of its scene's entity slots, meshlet references and
+/// ray-tracing instances, and what it added to the scene's totals.
+pub const EntitySpan = struct {
+    layout_first: u32 = 0,
+    layout_count: u32 = 0,
+    ref_first: u32 = 0,
+    ref_count: u32 = 0,
+    tlas_first: u32 = 0,
+    tlas_count: u32 = 0,
+    triangles: u64 = 0,
+    joints: u32 = 0,
+    masked_refs: u32 = 0,
+    skinned: u32 = 0,
+    posed: u32 = 0,
+    /// The frame it was given back in.
+    freed_frame: u64 = 0,
+};
 
 /// First-fit range allocator over element indices with coalescing frees.
 pub const RangeAllocator = struct {
@@ -139,11 +160,12 @@ pub const RangeAllocator = struct {
     }
 };
 
-/// A growable GPU array shared by every model (vertices, indices, ...).
+/// A growable GPU array shared by every model (vertices, indices, ...). Its
+/// buffer is made by the first `alloc` or `ensure`.
 pub const Pool = struct {
     name: [:0]const u8,
     stride: u32,
-    buffer: rhi.Buffer,
+    buffer: ?rhi.Buffer = null,
     ranges: RangeAllocator,
     usage: rhi.BufferUsage,
     /// Initial size; the pool never shrinks below it.
@@ -153,20 +175,31 @@ pub const Pool = struct {
     /// frame's commands clears it.
     replaced: bool = false,
 
-    pub fn init(device: *rhi.Device, name: [:0]const u8, stride: u32, capacity: u32, usage: rhi.BufferUsage) !Pool {
+    pub fn init(name: [:0]const u8, stride: u32, capacity: u32, usage: rhi.BufferUsage) Pool {
         return .{
             .name = name,
             .stride = stride,
-            .buffer = try device.createBuffer(.{ .name = name, .size = @as(u64, capacity) * stride, .usage = usage }),
-            .ranges = .{ .capacity = capacity },
+            .ranges = .{ .capacity = 0 },
             .usage = usage,
             .minimum = capacity,
         };
     }
 
     pub fn deinit(self: *Pool, renderer: *Renderer) void {
-        renderer.device.destroyBuffer(self.buffer);
-        self.ranges.free_ranges.deinit(renderer.gpa);
+        if (self.buffer) |buffer| renderer.device.destroyBuffer(buffer);
+        self.ranges.free_ranges.deinit(renderer.internal.gpa);
+    }
+
+    /// Makes the buffer at its initial size if nothing has been allocated yet.
+    pub fn ensure(self: *Pool, device: *rhi.Device) !void {
+        if (self.buffer != null) return;
+        self.buffer = try device.createBuffer(.{ .name = self.name, .size = @as(u64, self.minimum) * self.stride, .usage = self.usage });
+        self.ranges.capacity = self.minimum;
+    }
+
+    /// The buffer; `ensure` or `alloc` must have made it.
+    pub fn get(self: *const Pool) rhi.Buffer {
+        return self.buffer.?;
     }
 
     pub fn alloc(self: *Pool, renderer: *Renderer, count: u32) !u32 {
@@ -174,16 +207,18 @@ pub const Pool = struct {
         if (self.ranges.alloc(count)) |offset| return offset;
         const device = renderer.device;
         const old_capacity = self.ranges.capacity;
-        const new_capacity = @max(old_capacity * 2, self.ranges.top + count);
+        const new_capacity = @max(self.minimum, old_capacity * 2, self.ranges.top + count);
         const new_buffer = try device.createBuffer(.{
             .name = self.name,
             .size = @as(u64, new_capacity) * self.stride,
             .usage = self.usage,
         });
-        if (self.ranges.top != 0) {
-            errdefer device.destroyBuffer(new_buffer);
-            try device.queueBufferCopy(self.buffer, new_buffer, @as(u64, self.ranges.top) * self.stride);
-        } else device.destroyBuffer(self.buffer);
+        if (self.buffer) |old| {
+            if (self.ranges.top != 0) {
+                errdefer device.destroyBuffer(new_buffer);
+                try device.queueBufferCopy(old, new_buffer, @as(u64, self.ranges.top) * self.stride);
+            } else device.destroyBuffer(old);
+        }
         self.buffer = new_buffer;
         self.replaced = true;
         self.ranges.capacity = new_capacity;
@@ -191,7 +226,7 @@ pub const Pool = struct {
     }
 
     pub fn free(self: *Pool, renderer: *Renderer, offset: u32, count: u32) void {
-        self.ranges.free(renderer.gpa, offset, count);
+        self.ranges.free(renderer.internal.gpa, offset, count);
         self.trim(renderer) catch {};
     }
 
@@ -210,15 +245,15 @@ pub const Pool = struct {
         });
         if (self.ranges.top != 0) {
             errdefer device.destroyBuffer(new_buffer);
-            try device.queueBufferCopy(self.buffer, new_buffer, @as(u64, self.ranges.top) * self.stride);
-        } else device.destroyBuffer(self.buffer);
+            try device.queueBufferCopy(self.get(), new_buffer, @as(u64, self.ranges.top) * self.stride);
+        } else device.destroyBuffer(self.get());
         self.buffer = new_buffer;
         self.replaced = true;
         self.ranges.capacity = new_capacity;
     }
 
     pub fn write(self: *Pool, device: *rhi.Device, offset: u32, bytes: []const u8) !void {
-        try device.uploadBuffer(self.buffer, @as(u64, offset) * self.stride, bytes);
+        try device.uploadBuffer(self.get(), @as(u64, offset) * self.stride, bytes);
     }
 };
 
@@ -229,8 +264,12 @@ pub const FrameArena = struct {
     buffer: rhi.Buffer,
     capacity: u64,
     cursor: u64 = 0,
+    /// Bytes handed out since `reset`, over every buffer.
+    used: u64 = 0,
     /// Buffers outgrown this frame, kept until `reset`.
     outgrown: [16]?rhi.Buffer = @splat(null),
+    /// Held to hand out room, as views recording beside each other do.
+    mutex: std.Io.Mutex = .init,
 
     pub fn Allocation(comptime T: type) type {
         return struct {
@@ -251,6 +290,7 @@ pub const FrameArena = struct {
 
     pub fn reset(self: *FrameArena, device: *rhi.Device) void {
         self.cursor = 0;
+        self.used = 0;
         for (&self.outgrown) |*slot| {
             if (slot.*) |buffer| device.destroyBuffer(buffer);
             slot.* = null;
@@ -264,6 +304,8 @@ pub const FrameArena = struct {
 
     /// Room for `count` values of `T`, valid until the next `reset`.
     pub fn alloc(self: *FrameArena, device: *rhi.Device, comptime T: type, count: usize) !Allocation(T) {
+        self.mutex.lockUncancelable(device.io);
+        defer self.mutex.unlock(device.io);
         const size = @sizeOf(T) * @max(count, 1);
         var offset = std.mem.alignForward(u64, self.cursor, 16);
         if (offset + size > self.capacity) {
@@ -282,6 +324,7 @@ pub const FrameArena = struct {
             offset = 0;
         }
         self.cursor = offset + size;
+        self.used += size;
         const bytes = device.mapped(self.buffer)[@intCast(offset)..][0..size];
         return .{
             .address = device.bufferAddress(self.buffer) + offset,
@@ -313,23 +356,10 @@ pub fn runModelJob(job: *ModelJob) std.Io.Cancelable!void {
     job.done.store(true, .release);
 }
 
-/// One build of the standard shading pass.
+/// A build of the standard shading pass that has been asked for.
 pub const ShadeVariant = struct {
     reflective: bool,
     features: u32,
-    pipeline: ?rhi.Pipeline = null,
-    job: ?*ShadeVariantJob = null,
-};
-
-pub const ShadeVariantJob = struct {
-    device: *const rhi.Device,
-    io: std.Io,
-    reflective: bool,
-    constants: [1]u32,
-    group: std.Io.Group = .init,
-    done: std.atomic.Value(bool) = .init(false),
-    compiled: ?rhi.Device.CompiledPipeline = null,
-    failure: ?anyerror = null,
 };
 
 pub fn shadeVariantDesc(device: *const rhi.Device, reflective: bool, constants: []const u32) rhi.GraphicsPipelineDesc {
@@ -337,27 +367,20 @@ pub fn shadeVariantDesc(device: *const rhi.Device, reflective: bool, constants: 
         .name = if (reflective) "shading (reflective, variant)" else "shading (variant)",
         .vertex = shaderCode("fullscreen.vert.spv"),
         .fragment = if (reflective)
-            (if (device.ray_tracing) shaderCode("shade_rt.frag.spv") else shaderCode("shade.frag.spv"))
-        else if (device.ray_tracing) shaderCode("shade_rt_plain.frag.spv") else shaderCode("shade_plain.frag.spv"),
+            (if (device.caps.ray_tracing) shaderCode("shade_rt.frag.spv") else shaderCode("shade.frag.spv"))
+        else if (device.caps.ray_tracing) shaderCode("shade_rt_plain.frag.spv") else shaderCode("shade_plain.frag.spv"),
         .color_targets = if (reflective) &shade_reflective_targets else &shade_plain_targets,
         .cull = .none,
         .fragment_constants = constants,
     };
 }
 
-/// Runs on a worker thread. The shader code it reads is only replaced
-/// after every job has been waited for.
-pub fn runShadeVariantJob(job: *ShadeVariantJob) std.Io.Cancelable!void {
-    if (job.device.compileGraphicsPipeline(std.heap.smp_allocator, shadeVariantDesc(job.device, job.reflective, &job.constants))) |compiled| {
-        job.compiled = compiled;
-    } else |err| job.failure = err;
-    job.done.store(true, .release);
-}
-
 pub const EnvironmentJob = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     path: []u8,
+    /// What Basis Universal cube maps are transcoded to.
+    basis: ktx2.BasisTarget = .bc,
     group: std.Io.Group = .init,
     done: std.atomic.Value(bool) = .init(false),
     image: ?gltf.HdrImage = null,
@@ -384,7 +407,7 @@ pub fn loadEnvironmentFile(job: *EnvironmentJob) !void {
         return;
     }
     defer job.gpa.free(bytes);
-    const cube = try ktx2.read(job.gpa, bytes);
+    const cube = try ktx2.read(job.gpa, bytes, job.basis);
     errdefer job.gpa.free(cube.data);
     if (cube.faces != 6 or cube.layers != 1) return error.NotACubeMap;
     if (cube.format != .rgba16f and cube.format != .bc6h) return error.UnsupportedTextureFormat;
@@ -440,7 +463,7 @@ pub const ModelMesh = struct {
     /// Drawn only where its alpha passes the material's cutoff.
     alpha_tested: bool = false,
     /// Its tree in `bvh_nodes` and leaf triangles in `bvh_items`, when built
-    /// (`Options.path_tracing_fallback`).
+    /// (`Options.ray_tracing.software_path_tracing`).
     bvh_nodes: ?u32 = null,
     bvh_node_count: u32 = 0,
     bvh_items: u32 = 0,
@@ -458,24 +481,7 @@ pub const ModelMesh = struct {
     blas_building: ?rhi.AccelerationStructure = null,
 };
 
-/// Application images used as a material's textures (see
-/// `Renderer.materials.setTextures`). Null keeps the model's own. Channels
-/// follow glTF: roughness in green and metallic in blue, occlusion in red,
-/// coat strength in red, coat roughness in green, sheen roughness in alpha.
-pub const MaterialTextures = struct {
-    base_color: ?Image = null,
-    normal: ?Image = null,
-    metallic_roughness: ?Image = null,
-    occlusion: ?Image = null,
-    emissive: ?Image = null,
-    clearcoat: ?Image = null,
-    clearcoat_roughness: ?Image = null,
-    clearcoat_normal: ?Image = null,
-    sheen_color: ?Image = null,
-    sheen_roughness: ?Image = null,
-    /// Filtering and wrapping for all of them; null keeps the material's own.
-    sampler: ?gltf.SamplerData = null,
-};
+pub const MaterialTextures = api.MaterialTextures;
 
 pub const ModelEntry = struct {
     state: AssetState = .loading,
@@ -497,6 +503,9 @@ pub const ModelEntry = struct {
     /// First material buffer slot of this model's per-texture transforms.
     transform_base: u32 = 0,
     transform_count: u32 = 0,
+    /// A material has a coat, sheen, grain or thin film, which shading then
+    /// keeps code for (`Internal.lobe_users`).
+    lobed: bool = false,
     /// Parents-before-children node order and rest-pose world matrices.
     order: []u32 = &.{},
     /// The part of `order` a posed entity needs: nodes an animation can
@@ -507,10 +516,13 @@ pub const ModelEntry = struct {
     node_world: []Mat4 = &.{},
     info: ModelInfo = std.mem.zeroes(ModelInfo),
     references: u32 = 0,
+    /// `models.destroy` was asked while entities still used it; freed when
+    /// the last one goes.
+    orphaned: bool = false,
     blas_pending: bool = false,
-    /// Frame the geometry was uploaded in; structures are built after it.
-    blas_frame: ?u64 = null,
     blas_job: ?rhi.Detached = null,
+    /// Some of the model's structures wait to be replaced by smaller copies.
+    blas_compacting: bool = false,
     /// Whether vertices and indices are in GPU memory (geometry streaming);
     /// while not, what is drawn with the model is left out of its scene.
     geometry_resident: bool = true,
@@ -583,9 +595,13 @@ pub const EntityMark = struct {
     /// Its entries in the scene's layout.
     layout_first: u32 = 0,
     layout_count: u32 = 0,
+    /// Where it is in its scene's `entities`.
+    listed_at: u32 = 0,
     /// Distance moved in the last prepared frame.
     travelled: f32 = 0,
     bits: u32 = 0,
+    /// Has a parent or children, so moving it means more than its own slot.
+    related: bool = false,
 
     /// In its scene's `edited` list.
     pub const listed: u32 = 1;
@@ -596,7 +612,7 @@ pub const EntityMark = struct {
     pub const restyled: u32 = 8;
 };
 
-/// `Move` in instance_update.comp: a new transform for one instance.
+/// `Move` in instance_update.slang: a new transform for one instance.
 pub const InstanceMove = extern struct {
     instance: u32,
     tlas_slot: u32 = gpu.invalid_id,
@@ -610,7 +626,7 @@ pub const InstanceMove = extern struct {
     pub const keep: u32 = 2;
 };
 
-/// `Rewrite` in instance_update.comp: a whole record for one instance.
+/// `Rewrite` in instance_update.slang: a whole record for one instance.
 pub const InstanceRewrite = extern struct {
     instance: u32,
     tlas_slot: u32 = gpu.invalid_id,
@@ -619,7 +635,7 @@ pub const InstanceRewrite = extern struct {
     record: gpu.Instance,
 };
 
-/// `Glowing` in pathtrace.frag: an evenly emissive instance and the
+/// `Glowing` in pathtrace.slang: an evenly emissive instance and the
 /// triangle count of its full-detail level.
 pub const Glowing = extern struct { instance: u32, triangles: u32 };
 /// Most glowing instances path tracing samples directly.
@@ -631,10 +647,12 @@ pub const SceneData = struct {
     movers: std.ArrayList([4]f32) = .empty,
     movers_overflow: bool = false,
     entities: std.ArrayList(Entity) = .empty,
-    sun: Sun = .{},
+    sun: SunDesc = .{ .intensity = 0 },
     environment: ?Environment = null,
     environment_intensity: f32 = 1,
-    lights: std.ArrayList(Light) = .empty,
+    lights: std.ArrayList(LightDesc) = .empty,
+    /// The handle of each light, where it has one; see `placed.zig`.
+    light_handles: std.ArrayList(?api.Light) = .empty,
     /// Bumped whenever the lights are replaced or moved.
     lights_version: u64 = 0,
     emitters: std.ArrayList(Emitter) = .empty,
@@ -648,6 +666,24 @@ pub const SceneData = struct {
     /// their records must be rewritten.
     static_count: u32 = 0,
     static_version: u64 = 0,
+    /// The last `prepareLights` result, the frame it was made in and what it was
+    /// asked for; later views of the frame that ask the same share it.
+    /// The scene's light records, kept on the GPU between frames; only those
+    /// that changed since `light_uploaded` are uploaded. `light_next` is
+    /// where the frame's records are built.
+    light_buffer: ?rhi.Buffer = null,
+    light_capacity: u32 = 0,
+    light_uploaded: std.ArrayList(gpu.Light) = .empty,
+    light_next: std.ArrayList(gpu.Light) = .empty,
+    /// The scene's decal records, kept the same way as its lights'.
+    decal_buffer: ?rhi.Buffer = null,
+    decal_capacity: u32 = 0,
+    decal_uploaded: std.ArrayList(gpu.Decal) = .empty,
+    decal_next: std.ArrayList(gpu.Decal) = .empty,
+    lighting: ?scene_pass.Lighting = null,
+    lighting_frame: u64 = std.math.maxInt(u64),
+    lighting_shadows: bool = false,
+    lighting_traced: bool = false,
     /// Which lights `prepareLights` gave shadow atlas tiles, and the frame it
     /// chose them in.
     shadow_grants: std.ArrayList(bool) = .empty,
@@ -669,6 +705,8 @@ pub const SceneData = struct {
     trace_instances_capacity: u32 = 0,
     instance_slots: [rhi.frames_in_flight]InstanceSlot = @splat(.{}),
     decals: std.ArrayList(DecalDesc) = .empty,
+    /// The handle of each decal, where it has one.
+    decal_handles: std.ArrayList(?api.Decal) = .empty,
     transmissive: bool = false,
     /// GPU instance indices of blended geometry, drawn in the forward pass.
     transparent: std.ArrayList(TransparentDraw) = .empty,
@@ -718,16 +756,52 @@ pub const SceneData = struct {
     static_tlas_uploaded: bool = false,
     layout_dirty: bool = true,
     layout_generation: u64 = 0,
+    /// This frame's deforming work for the scene, made by `prepareScene` and
+    /// recorded by its first view: skinning, bounds of skinned meshlets and
+    /// refits of dynamic BLASes, the next of which to refit first.
+    skin_jobs: std.ArrayList(SkinJob) = .empty,
+    skin_weights: std.ArrayList(f32) = .empty,
+    bounds_jobs: std.ArrayList(BoundsJob) = .empty,
+    blas_jobs: std.ArrayList(BlasJob) = .empty,
+    refit_cursor: usize = 0,
+    /// Free entity slots, meshlet references and ray-tracing instances below
+    /// the `entity_*_capacity`s.
+    instance_ranges: RangeAllocator = .{ .capacity = 0 },
+    ref_ranges: RangeAllocator = .{ .capacity = 0 },
+    tlas_ranges: RangeAllocator = .{ .capacity = 0 },
+    /// Entities to lay out, and spans to clear, before the next frame's
+    /// records, instead of laying out the whole scene again.
+    added: std.ArrayList(Entity) = .empty,
+    removed: std.ArrayList(EntitySpan) = .empty,
+    /// Cleared spans, free again once no frame in flight or pick names them.
+    quarantine: std.ArrayList(EntitySpan) = .empty,
     refs: ?rhi.Buffer = null,
     refs_capacity: u32 = 0,
     /// Meshlet references of entities; they precede instance groups'.
     entity_ref_count: u32 = 0,
+    /// Instance slots, meshlet references and ray-tracing instances kept
+    /// for entities; instance groups' start after them. They change only
+    /// when the layout is rebuilt.
+    /// Entity slots that hold an entity's instance.
+    live_instances: u32 = 0,
+    /// Meshlet references that belong to an entity.
+    live_refs: u32 = 0,
+    entity_capacity: u32 = 0,
+    entity_ref_capacity: u32 = 0,
+    entity_tlas_capacity: u32 = 0,
     masked_ref_count: u32 = 0,
     /// First reference and count for each instance of the instance groups,
     /// in instance record order.
     static_ranges: std.ArrayList([2]u32) = .empty,
     static_cull: ?rhi.Buffer = null,
     static_cull_capacity: u32 = 0,
+    /// First meshlet reference and count of each entity slot, which culling
+    /// tests entity by entity before their meshlets; `entity_cull_items` is
+    /// the CPU copy and `entity_cull_dirty` the slots changed since upload.
+    entity_cull: ?rhi.Buffer = null,
+    entity_cull_capacity: u32 = 0,
+    entity_cull_items: std.ArrayList([2]u32) = .empty,
+    entity_cull_dirty: [2]u32 = .{ std.math.maxInt(u32), 0 },
     /// One `gpu.Impostor` per instance group that has one, their count, and
     /// the copies culling chose to draw as impostors in the current view.
     impostor_table: ?rhi.Buffer = null,
@@ -749,7 +823,7 @@ pub const SceneData = struct {
     seen_readback: [rhi.frames_in_flight]?rhi.Buffer = @splat(null),
     seen_tags: [rhi.frames_in_flight]SeenTag = @splat(.{}),
     /// Meshlet bounds of deformed meshes, rewritten on the GPU every frame
-    /// (`Options.skinned_meshlet_bounds`).
+    /// (`Options.geometry.skinned_meshlet_bounds`).
     skin_bounds: ?rhi.Buffer = null,
     skin_bounds_capacity: u32 = 0,
     layout_version: u64 = 0,
@@ -758,19 +832,25 @@ pub const SceneData = struct {
     prepared: SceneFrame = undefined,
     gi_frame: u64 = std.math.maxInt(u64),
     gi_updated_frame: u64 = std.math.maxInt(u64),
+    /// What the probes last saw of the scene's geometry and of its lights,
+    /// and for how many frames each has stayed the same.
+    gi_geometry_key: u64 = 0,
+    gi_geometry_still: u32 = 0,
+    gi_lighting_key: u64 = 0,
+    gi_lighting_still: u32 = 0,
     ref_count: u32 = 0,
     joint_count: u32 = 0,
     triangle_count: u64 = 0,
+    /// The ray tracing structure; see scene/ray_scene.zig.
     tlas: ?rhi.AccelerationStructure = null,
     tlas_capacity: u32 = 0,
     tlas_hash: u64 = 0,
-    gi: ?GiVolume = null,
-    /// Coarse grid over the whole scene, present while the main one follows
-    /// the camera.
-    gi_coarse: ?GiVolume = null,
-    /// Camera-following grid at a spacing between the main and coarse ones,
-    /// for very large worlds.
-    gi_middle: ?GiVolume = null,
+    /// A view has asked to trace rays through the scene.
+    rays_wanted: bool = false,
+    /// The irradiance probe grids, finest first. With more than one, the
+    /// last covers the whole scene and the others follow the camera.
+    gi_cascades: [gpu.gi_cascade_max]?GiVolume = @splat(null),
+    gi_cascade_count: u32 = 0,
     /// Explicit probe volume; null derives it from the static geometry.
     gi_bounds: ?[2]Vec3 = null,
     /// This scene's origin in the application's world; see `scenes.shift`.
@@ -802,6 +882,11 @@ pub const LightmapState = struct {
 pub const EntityData = struct {
     lightmap: ?LightmapState = null,
     scene: Scene,
+    /// The entity it moves with, and its transform relative to that entity.
+    parent: ?Entity = null,
+    local: Mat4 = math.identity,
+    /// Entities whose `parent` this is.
+    children: std.ArrayList(Entity) = .empty,
     /// In the ray-tracing structure with an instance record, but never drawn.
     rays_only: bool = false,
     model: Model,
@@ -843,7 +928,7 @@ pub const TransparentDraw = struct {
 };
 
 pub const BlasJob = struct { blas: rhi.AccelerationStructure, vertex_offset: u32, mesh: ModelMesh };
-/// `BoundsJob` in skin_bounds.comp.
+/// `BoundsJob` in skin.slang.
 pub const BoundsJob = extern struct {
     vertex_offset: u32,
     meshlet_offset: u32,
@@ -853,7 +938,7 @@ pub const BoundsJob = extern struct {
     pad: [3]u32 = .{ 0, 0, 0 },
 };
 
-/// `SkinJob` in skin.comp.
+/// `SkinJob` in skin.slang.
 pub const SkinJob = extern struct {
     source_offset: u32,
     destination_offset: u32,
@@ -894,10 +979,14 @@ pub const MadeTextures = struct {
     }
 };
 
-/// One view's render targets at one resolution.
+/// The targets every scene view has, at one resolution. Targets that belong
+/// to one feature are kept apart, in `ViewData.kept`.
 pub const ViewState = struct {
     width: u32,
     height: u32,
+    /// Size of the picture once antialiasing has resolved it.
+    resolved_width: u32,
+    resolved_height: u32,
     depth: rhi.Texture,
     /// Last frame's depth; the two swap every frame.
     previous_depth: rhi.Texture,
@@ -905,195 +994,38 @@ pub const ViewState = struct {
     previous_motion: rhi.Texture,
     visibility: rhi.Texture,
     motion: rhi.Texture,
-    ao_raw: rhi.Texture,
-    ao_depth: rhi.Texture,
-    ao: rhi.Texture,
     hdr: rhi.Texture,
-    fog: rhi.Texture,
-    history: [2]rhi.Texture,
-    /// Depth pyramid for occlusion culling (power-of-two, full mip chain).
-    hiz: rhi.Texture,
-    hiz_width: u32,
-    hiz_height: u32,
-    hiz_mips: u32,
-    bloom: [bloom_levels]rhi.Texture,
     history_valid: bool = false,
-    ao_history: rhi.Texture,
-    ao_history_valid: bool = false,
-    /// `Settings.ao_bounce` light: as sampled, filtered, and last frame's.
-    bounce_raw: rhi.Texture,
-    bounce: rhi.Texture,
-    bounce_history: rhi.Texture,
-    bounce_history_valid: bool = false,
-    scales: EffectScales,
-    /// Probe irradiance gathered below full resolution; null at full rate.
-    gi_gather: ?rhi.Texture,
-    oit: ?OitTargets,
-    peel: ?PeelTargets,
-    /// The scene before transparent surfaces; null without transmission.
-    scene_copy: ?rhi.Texture,
-    /// Liquid surface targets: nearest particle depth, thickness, and the
-    /// smoothed distance in two ping-ponged copies.
-    liquid: ?LiquidTargets = null,
-    upscaled: ?rhi.Texture,
-    /// `Settings.variable_rate_shading` tiles; null where unsupported.
-    shading_rate: ?rhi.Texture,
-    /// Output of the first `Upscaling.fsr` pass, sharpened into `upscaled`.
-    upscaled_edges: ?rhi.Texture,
-    /// Targets of depth of field and motion blur; null while both are off.
-    lens: ?[2]rhi.Texture,
-    dof_reduced: ?rhi.Texture = null,
-    fluid: ?rhi.Texture,
-    fluid_motion: ?rhi.Texture = null,
-    clouds: ?CloudTargets,
-    reflections: ?ReflectionTargets,
 
-    pub fn init(device: *rhi.Device, width: u32, height: u32, scales: EffectScales) !ViewState {
+    pub fn init(device: *rhi.Device, width: u32, height: u32, resolved_width: u32, resolved_height: u32) !ViewState {
         const color = rhi.TextureUsage{ .sampled = true, .color_attachment = true };
         var self: ViewState = undefined;
         var made = MadeTextures{ .device = device };
         errdefer made.destroy();
         self.width = width;
         self.height = height;
+        self.resolved_width = resolved_width;
+        self.resolved_height = resolved_height;
         self.history_valid = false;
-        self.scales = scales;
-        self.peel = if (!scales.peel) null else .{
-            .layer = try made.texture(.{ .name = "peel layer", .width = width, .height = height, .format = hdr_format, .usage = color }),
-            .accumulation = try made.texture(.{ .name = "peel accumulation", .width = width, .height = height, .format = hdr_format, .usage = color }),
-            .depth = .{
-                try made.texture(.{ .name = "peel depth", .width = width, .height = height, .format = .depth32_float, .usage = .{ .sampled = true, .depth_attachment = true } }),
-                try made.texture(.{ .name = "peel depth", .width = width, .height = height, .format = .depth32_float, .usage = .{ .sampled = true, .depth_attachment = true } }),
-            },
-        };
-        self.oit = if (!scales.oit) null else .{
-            .accumulation = try made.texture(.{ .name = "transparency accumulation", .width = width, .height = height, .format = hdr_format, .usage = color }),
-            .reveal = try made.texture(.{ .name = "transparency reveal", .width = width, .height = height, .format = .r8_unorm, .usage = color }),
-        };
-        const resolved_width = if (scales.temporal_upscale) scales.output_width else width;
-        const resolved_height = if (scales.temporal_upscale) scales.output_height else height;
-        self.upscaled = if (scales.temporal_upscale or (scales.output_width == width and scales.output_height == height)) null else try made.texture(.{ .name = "upscaled", .width = scales.output_width, .height = scales.output_height, .format = hdr_format, .usage = color });
-        const tile = device.shading_rate_tile;
-        self.shading_rate = if (tile == 0) null else try made.texture(.{
-            .name = "shading rate",
-            .width = (width + tile - 1) / tile,
-            .height = (height + tile - 1) / tile,
-            .format = .r8_uint,
-            .usage = .{ .color_attachment = true, .shading_rate = true },
-        });
-        self.upscaled_edges = if (self.upscaled == null or !scales.fsr) null else try made.texture(.{ .name = "upscaled edges", .width = scales.output_width, .height = scales.output_height, .format = hdr_format, .usage = color });
-        self.scene_copy = if (!scales.refraction) null else try made.texture(.{ .name = "scene behind glass", .width = width, .height = height, .format = hdr_format, .usage = color });
-        self.liquid = if (!scales.liquid) null else .{
-            .depth = try made.texture(.{ .name = "liquid depth", .width = width, .height = height, .format = .depth32_float, .usage = .{ .sampled = true, .depth_attachment = true } }),
-            .thickness = try made.texture(.{ .name = "liquid thickness", .width = width, .height = height, .format = .r16_float, .usage = color }),
-            .smooth = .{
-                try made.texture(.{ .name = "liquid surface", .width = width, .height = height, .format = .r32_float, .usage = color }),
-                try made.texture(.{ .name = "liquid surface", .width = width, .height = height, .format = .r32_float, .usage = color }),
-            },
-        };
-        self.dof_reduced = if (scales.dof) |scale| try made.texture(.{ .name = "depth of field (reduced)", .width = scaledExtent(scale, resolved_width), .height = scaledExtent(scale, resolved_height), .format = hdr_format, .usage = color }) else null;
-        self.lens = if (!scales.lens) null else .{
-            try made.texture(.{ .name = "depth of field", .width = resolved_width, .height = resolved_height, .format = hdr_format, .usage = color }),
-            try made.texture(.{ .name = "motion blur", .width = resolved_width, .height = resolved_height, .format = hdr_format, .usage = color }),
-        };
-        self.fluid = if (scales.fluid) |scale| try made.texture(.{ .name = "fluids", .width = scaledExtent(scale, width), .height = scaledExtent(scale, height), .format = hdr_format, .usage = color }) else null;
-        self.fluid_motion = if (scales.fluid) |scale| try made.texture(.{ .name = "fluid motion", .width = scaledExtent(scale, width), .height = scaledExtent(scale, height), .format = .rgba16_float, .usage = color }) else null;
-        self.clouds = if (scales.clouds) |scale| .{
-            .current = try made.texture(.{ .name = "clouds", .width = scaledExtent(scale, width), .height = scaledExtent(scale, height), .format = hdr_format, .usage = color }),
-            .history = try made.texture(.{ .name = "clouds (history)", .width = scaledExtent(scale, width), .height = scaledExtent(scale, height), .format = hdr_format, .usage = color }),
-        } else null;
-        self.reflections = if (scales.reflections) |scale| .{
-            .weight = try made.texture(.{ .name = "reflection weight", .width = width, .height = height, .format = hdr_format, .usage = color }),
-            .surface = try made.texture(.{ .name = "reflection surface", .width = width, .height = height, .format = hdr_format, .usage = color }),
-            .traced = try made.texture(.{ .name = "reflections", .width = scaledExtent(scale, width), .height = scaledExtent(scale, height), .format = hdr_format, .usage = color }),
-            .history = try made.texture(.{ .name = "reflections (history)", .width = scaledExtent(scale, width), .height = scaledExtent(scale, height), .format = hdr_format, .usage = color }),
-        } else null;
-        self.gi_gather = if (scales.gi == .full) null else try made.texture(.{
-            .name = "gi gather",
-            .width = scaledExtent(scales.gi, width),
-            .height = scaledExtent(scales.gi, height),
-            .format = hdr_format,
-            .usage = color,
-        });
         self.depth = try made.texture(.{ .name = "depth", .width = width, .height = height, .format = .depth32_float, .usage = .{ .sampled = true, .depth_attachment = true } });
         self.previous_depth = try made.texture(.{ .name = "depth", .width = width, .height = height, .format = .depth32_float, .usage = .{ .sampled = true, .depth_attachment = true } });
         self.visibility = try made.texture(.{ .name = "visibility", .width = width, .height = height, .format = .r32_uint, .usage = color });
         self.motion = try made.texture(.{ .name = "motion", .width = width, .height = height, .format = .rg16_float, .usage = color });
         self.previous_motion = try made.texture(.{ .name = "motion", .width = width, .height = height, .format = .rg16_float, .usage = color });
-        self.ao_raw = try made.texture(.{ .name = "ao raw", .width = scaledExtent(scales.ao, width), .height = scaledExtent(scales.ao, height), .format = .rg16_float, .usage = color });
-        self.ao = try made.texture(.{ .name = "ao", .width = width, .height = height, .format = .r16_float, .usage = color });
-        self.ao_history = try made.texture(.{ .name = "ao history", .width = width, .height = height, .format = .r16_float, .usage = color });
-        self.ao_history_valid = false;
-        self.bounce_raw = try made.texture(.{ .name = "bounce raw", .width = scaledExtent(scales.ao, width), .height = scaledExtent(scales.ao, height), .format = .rgba16_float, .usage = color });
-        self.bounce = try made.texture(.{ .name = "bounce", .width = width, .height = height, .format = .rgba16_float, .usage = color });
-        self.bounce_history = try made.texture(.{ .name = "bounce history", .width = width, .height = height, .format = .rgba16_float, .usage = color });
-        self.bounce_history_valid = false;
-        self.ao_depth = try made.texture(.{
-            .name = "ao depth",
-            .width = scaledExtent(scales.ao, width),
-            .height = scaledExtent(scales.ao, height),
-            .format = .r16_float,
-            .usage = color,
-            .mip_levels = @min(ao_depth_mips, rhi.TextureDesc.fullMipCount(scaledExtent(scales.ao, width), scaledExtent(scales.ao, height))),
-        });
         self.hdr = try made.texture(.{ .name = "hdr", .width = width, .height = height, .format = hdr_format, .usage = color });
-        self.hiz_width = std.math.floorPowerOfTwo(u32, @max(width, 2));
-        self.hiz_height = std.math.floorPowerOfTwo(u32, @max(height, 2));
-        self.hiz_mips = rhi.TextureDesc.fullMipCount(self.hiz_width, self.hiz_height);
-        self.hiz = try made.texture(.{
-            .name = "depth pyramid",
-            .width = self.hiz_width,
-            .height = self.hiz_height,
-            .format = .r32_float,
-            .usage = .{ .sampled = true, .color_attachment = true, .storage = device.storage_images },
-            .mip_levels = self.hiz_mips,
-        });
-        self.fog = try made.texture(.{ .name = "fog", .width = scaledExtent(scales.fog, width), .height = scaledExtent(scales.fog, height), .format = hdr_format, .usage = color });
-        for (&self.history) |*texture| {
-            texture.* = try made.texture(.{ .name = "taa history", .width = resolved_width, .height = resolved_height, .format = hdr_format, .usage = .{ .sampled = true, .color_attachment = true, .storage = device.storage_images, .copy_dst = true } });
-        }
-        for (&self.bloom, 0..) |*texture, level| {
-            texture.* = try made.texture(.{
-                .name = "bloom",
-                .width = @max(width >> @intCast(level + 1), 1),
-                .height = @max(height >> @intCast(level + 1), 1),
-                .format = bloom_format,
-                .usage = color,
-            });
-        }
         return self;
     }
 
     pub fn deinit(self: *ViewState, device: *rhi.Device) void {
-        for ([_]rhi.Texture{ self.depth, self.previous_depth, self.visibility, self.motion, self.previous_motion, self.ao_raw, self.ao, self.ao_history, self.bounce_raw, self.bounce, self.bounce_history, self.ao_depth, self.hdr, self.fog, self.hiz }) |texture|
+        for ([_]rhi.Texture{ self.depth, self.previous_depth, self.visibility, self.motion, self.previous_motion, self.hdr }) |texture|
             device.destroyTexture(texture);
-        for (self.history) |texture| device.destroyTexture(texture);
-        if (self.gi_gather) |texture| device.destroyTexture(texture);
-        if (self.lens) |lens| for (lens) |texture| device.destroyTexture(texture);
-        if (self.dof_reduced) |texture| device.destroyTexture(texture);
-        if (self.oit) |oit| {
-            device.destroyTexture(oit.accumulation);
-            device.destroyTexture(oit.reveal);
-        }
-        if (self.scene_copy) |texture| device.destroyTexture(texture);
-        if (self.liquid) |targets| {
-            device.destroyTexture(targets.depth);
-            device.destroyTexture(targets.thickness);
-            for (targets.smooth) |texture| device.destroyTexture(texture);
-        }
-        if (self.peel) |peel| for ([_]rhi.Texture{ peel.layer, peel.accumulation, peel.depth[0], peel.depth[1] }) |texture| device.destroyTexture(texture);
-        if (self.upscaled) |texture| device.destroyTexture(texture);
-        if (self.upscaled_edges) |texture| device.destroyTexture(texture);
-        if (self.shading_rate) |texture| device.destroyTexture(texture);
-        if (self.reflections) |targets| for ([_]rhi.Texture{ targets.weight, targets.surface, targets.traced, targets.history }) |texture| device.destroyTexture(texture);
-        if (self.clouds) |targets| for ([_]rhi.Texture{ targets.current, targets.history }) |texture| device.destroyTexture(texture);
-        if (self.fluid) |texture| device.destroyTexture(texture);
-        if (self.fluid_motion) |texture| device.destroyTexture(texture);
-        for (self.bloom) |texture| device.destroyTexture(texture);
     }
 };
 
 pub const ViewData = struct {
     state: ?ViewState = null,
+    /// The scene's see-through draws in this view's back-to-front order.
+    transparent_order: std.ArrayList(TransparentDraw) = .empty,
     /// Display-referred picture of a view drawn into part of a target;
     /// copied into place once its draw lists are done.
     output: ?rhi.Texture = null,
@@ -1110,117 +1042,19 @@ pub const ViewData = struct {
     /// Whether `previous_view_proj` is the camera of one frame ago: the view
     /// drew the previous frame into its current targets.
     camera_known: bool = false,
-    shadow_map: ?rhi.Texture = null,
-    /// Tint of sunlight passed by see-through casters, per cascade.
-    shadow_color: ?rhi.Texture = null,
-    shadows_colored: bool = false,
-    cascade_cache: CascadeCache = .{},
-    /// Path tracing: the running average, its frame count, and a key of
-    /// what was accumulated (see `Settings.path_tracing`).
-    path_accum: ?rhi.Texture = null,
-    /// Albedo guide accumulated alongside, and the denoiser's intermediate.
-    path_guide: ?rhi.Texture = null,
-    path_filtered: ?rhi.Texture = null,
-    /// Last frame's accumulation and guide, for reprojection, and the camera
-    /// they were gathered from.
-    path_accum_old: ?rhi.Texture = null,
-    path_guide_old: ?rhi.Texture = null,
-    /// The noisy part of a path-traced picture, this frame's and last
-    /// frame's, and the two targets its filter ping-pongs between.
-    path_soft: ?rhi.Texture = null,
-    path_soft_old: ?rhi.Texture = null,
-    path_filtered_other: ?rhi.Texture = null,
-    /// Normal and distance of what each path-traced pixel shows, seen
-    /// through mirrors; this frame's and last frame's.
-    path_facing: ?rhi.Texture = null,
-    path_facing_old: ?rhi.Texture = null,
-    /// Normal, roughness and distance of the primary hit, for the reflection
-    /// denoiser; this frame's and last frame's.
-    path_surface: ?rhi.Texture = null,
-    path_surface_old: ?rhi.Texture = null,
-    /// Lamp and glow light on the surface seen, over its color; this frame's
-    /// and last frame's.
-    path_lamp: ?rhi.Texture = null,
-    path_lamp_old: ?rhi.Texture = null,
-    /// The light sample each pixel keeps for lamp and glow light (`Reservoir`
-    /// in pathtrace.frag); this frame's and last frame's.
-    path_reservoir: ?rhi.Texture = null,
-    path_reservoir_old: ?rhi.Texture = null,
-    /// Glossy reflections as traced this frame, and the reflection
-    /// denoiser's (ffx_reflections.glsl) targets and history.
-    path_gloss_gathered: ?rhi.Texture = null,
-    path_gloss_gathered_old: ?rhi.Texture = null,
-    reflection_reprojected: ?rhi.Texture = null,
-    reflection_samples: ?rhi.Texture = null,
-    reflection_samples_old: ?rhi.Texture = null,
-    reflection_average: ?rhi.Texture = null,
-    reflection_prefiltered: ?rhi.Texture = null,
-    reflection_resolved: ?rhi.Texture = null,
-    reflection_resolved_old: ?rhi.Texture = null,
-    path_camera: Camera = .{},
-    path_size: [2]u32 = .{ 0, 0 },
-    path_gathered: u32 = 0,
-    /// Whether last frame's light samples and surfaces are there to reuse.
-    path_reusable: bool = false,
-    path_traced: bool = false,
-    path_still: u32 = 0,
-    path_key: u64 = 0,
-    /// Hash of where things and the sun were when the view was last traced.
-    path_motion_key: u64 = 0,
-    /// The sun's virtual shadow map state, once the view has used one.
-    vsm: ?@import("passes/virtual_shadows.zig").State = null,
-    /// One word per meshlet reference: was it visible last frame.
-    visibility: ?rhi.Buffer = null,
-    visibility_capacity: u32 = 0,
-    /// The FidelityFX upscaler this view resolves with, and whether one was
-    /// asked for and would not start.
-    upscaler: ?@import("ffx.zig").Upscaler = null,
-    upscaler_refused: ?@import("ffx.zig").Generation = null,
-    /// Renderer frame the upscaler last ran in; its history is stale after a
-    /// gap.
-    upscaler_frame: u64 = 0,
-    /// The DLSS feature this view resolves with, the one that would not start,
-    /// and the renderer frame it last ran in.
-    dlss: ?@import("dlss.zig").Upscaler = null,
-    dlss_refused: ?@import("dlss.zig").Feature = null,
-    dlss_frame: u64 = 0,
-    /// The view was path traced for DLSS Ray Reconstruction this frame: its
-    /// path tracing targets hold what that reads, not what is gathered.
-    path_reconstructing: bool = false,
-    /// One word per instance of the instance groups: seen last frame
-    /// (`InstanceVisibility` in cull_view.glsl).
-    instance_visibility: ?rhi.Buffer = null,
-    instance_visibility_capacity: u32 = 0,
-    visibility_scene: ?Scene = null,
-    visibility_layout: u64 = 0,
+    /// Targets features keep for this view from frame to frame.
+    kept: target_store.Kept = .{},
+    /// Each feature's own state for this view.
+    features: features.ViewStates = features.emptyViewStates(),
+    /// Frames since each feature last asked for its state.
+    feature_idle: [features.list.len]u32 = @splat(0),
 
-    pub fn deinit(self: *ViewData, device: *rhi.Device) void {
+    pub fn deinit(self: *ViewData, gpa: std.mem.Allocator, device: *rhi.Device) void {
+        self.transparent_order.deinit(gpa);
+        self.kept.deinit(gpa, device);
         if (self.state) |*state| state.deinit(device);
         if (self.output) |texture| device.destroyTexture(texture);
-        if (self.shadow_map) |texture| device.destroyTexture(texture);
-        if (self.shadow_color) |texture| device.destroyTexture(texture);
-        if (self.path_accum) |texture| device.destroyTexture(texture);
-        if (self.path_guide) |texture| device.destroyTexture(texture);
-        if (self.path_filtered) |texture| device.destroyTexture(texture);
-        if (self.path_accum_old) |texture| device.destroyTexture(texture);
-        if (self.path_guide_old) |texture| device.destroyTexture(texture);
-        if (self.path_soft) |texture| device.destroyTexture(texture);
-        if (self.path_soft_old) |texture| device.destroyTexture(texture);
-        if (self.path_filtered_other) |texture| device.destroyTexture(texture);
-        inline for (.{ "path_facing", "path_facing_old", "path_surface", "path_surface_old", "path_reservoir", "path_reservoir_old", "path_lamp", "path_lamp_old", "path_gloss_gathered", "path_gloss_gathered_old", "reflection_reprojected", "reflection_samples", "reflection_samples_old", "reflection_average", "reflection_prefiltered", "reflection_resolved", "reflection_resolved_old" }) |name| {
-            if (@field(self, name)) |texture| device.destroyTexture(texture);
-        }
-        if (self.visibility) |buffer| device.destroyBuffer(buffer);
-        if (self.instance_visibility) |buffer| device.destroyBuffer(buffer);
-        if (self.vsm) |vsm| vsm.deinit(device);
-        if (self.upscaler) |upscaler| {
-            device.waitIdle() catch {};
-            upscaler.destroy();
-        }
-        if (self.dlss) |upscaler| {
-            device.waitIdle() catch {};
-            upscaler.destroy();
-        }
+        features.deinitViewStates(&self.features, device);
         device.destroyBuffer(self.exposure);
     }
 };
@@ -1233,124 +1067,6 @@ pub const Output = struct {
     clear: [4]f32,
     /// Scene depth for world-space draw list items; null without a scene.
     depth: ?rhi.Texture = null,
-};
-
-pub const Pipelines = struct {
-    skin: rhi.Pipeline,
-    cull: rhi.Pipeline,
-    cull_instances: rhi.Pipeline,
-    cluster: rhi.Pipeline,
-    local_shadow: rhi.Pipeline,
-    local_shadow_masked: rhi.Pipeline,
-    forward: rhi.Pipeline,
-    forward_weighted: ?rhi.Pipeline,
-    oit_composite: rhi.Pipeline,
-    forward_peel: ?rhi.Pipeline,
-    peel_under: rhi.Pipeline,
-    peel_composite: rhi.Pipeline,
-    copy: rhi.Pipeline,
-    upscale: rhi.Pipeline,
-    fsr_easu: rhi.Pipeline,
-    shading_rate: rhi.Pipeline,
-    fsr_rcas: rhi.Pipeline,
-    hiz: rhi.Pipeline,
-    hiz_compute: ?rhi.Pipeline = null,
-    visibility: rhi.Pipeline,
-    visibility_masked: rhi.Pipeline,
-    shadow: rhi.Pipeline,
-    shadow_masked: rhi.Pipeline,
-    shadow_color: rhi.Pipeline,
-    gtao: rhi.Pipeline,
-    gtao_bounce_denoise: rhi.Pipeline,
-    ao_depth: rhi.Pipeline,
-    gi_gather: rhi.Pipeline,
-    gtao_denoise: rhi.Pipeline,
-    /// Shading without the reflection outputs; made on first use.
-    shade: ?rhi.Pipeline,
-    shade_reflective: rhi.Pipeline,
-    ssr: rhi.Pipeline,
-    /// Reflections with ray queries; the plain pass without ray tracing.
-    ssr_traced: rhi.Pipeline,
-    ssr_composite: rhi.Pipeline,
-    cloud_noise: rhi.Pipeline,
-    cloud: rhi.Pipeline,
-    cloud_composite: rhi.Pipeline,
-    fluid_advect: rhi.Pipeline,
-    fluid_curl: rhi.Pipeline,
-    fluid_force: rhi.Pipeline,
-    fluid_divergence: rhi.Pipeline,
-    fluid_pressure: rhi.Pipeline,
-    fluid_project: rhi.Pipeline,
-    fluid_present: rhi.Pipeline,
-    water_sim: rhi.Pipeline,
-    water: rhi.Pipeline,
-    underwater: rhi.Pipeline,
-    water_depth: rhi.Pipeline,
-    liquid_sim: rhi.Pipeline,
-    liquid_depth: rhi.Pipeline,
-    liquid_shadow: rhi.Pipeline,
-    liquid_surface: rhi.Pipeline,
-    path_trace: rhi.Pipeline,
-    path_denoise: rhi.Pipeline,
-    path_denoise_final: rhi.Pipeline,
-    /// Denoisers for path-traced gloss (ffx_reflections.glsl).
-    reflection_reproject: rhi.Pipeline,
-    reflection_average: rhi.Pipeline,
-    reflection_prefilter: rhi.Pipeline,
-    reflection_resolve: rhi.Pipeline,
-    liquid_thickness: rhi.Pipeline,
-    liquid_blur: rhi.Pipeline,
-    liquid: rhi.Pipeline,
-    fluid_light: rhi.Pipeline,
-    fluid_solid: rhi.Pipeline,
-    fluid_solid_traced: rhi.Pipeline,
-    fluid_carry: rhi.Pipeline,
-    fluid: rhi.Pipeline,
-    dof: rhi.Pipeline,
-    dof_composite: rhi.Pipeline,
-    motion_blur: rhi.Pipeline,
-    fog: rhi.Pipeline,
-    fog_composite: rhi.Pipeline,
-    taa: rhi.Pipeline,
-    bloom_down: rhi.Pipeline,
-    bloom_up: rhi.Pipeline,
-    exposure: rhi.Pipeline,
-    pick: rhi.Pipeline,
-    particle_sim: rhi.Pipeline,
-    particle_sort_keys: rhi.Pipeline,
-    particle_sort: rhi.Pipeline,
-    particles: rhi.Pipeline,
-    particle_mesh: rhi.Pipeline,
-    hair: rhi.Pipeline,
-    hair_simulation: rhi.Pipeline,
-    hair_shadow: rhi.Pipeline,
-    impostor: rhi.Pipeline,
-    impostor_bake: rhi.Pipeline,
-    lightmap_bake: ?rhi.Pipeline = null,
-    lightmap_dilate: rhi.Pipeline,
-    vsm_mark: rhi.Pipeline,
-    vsm_allocate: rhi.Pipeline,
-    vsm_clear: rhi.Pipeline,
-    probe_face: rhi.Pipeline,
-    fluid_motion: rhi.Pipeline,
-    skin_bounds: rhi.Pipeline,
-    instance_moves: rhi.Pipeline,
-    instance_rewrites: rhi.Pipeline,
-    particle_trails: rhi.Pipeline,
-    env_cube: rhi.Pipeline,
-    env_sky: rhi.Pipeline,
-    env_irradiance: rhi.Pipeline,
-    env_prefilter: rhi.Pipeline,
-    brdf_lut: rhi.Pipeline,
-};
-
-pub const GiPipelines = struct {
-    trace: rhi.Pipeline,
-    irradiance: rhi.Pipeline,
-    clamp_upper: rhi.Pipeline,
-    clamp_lower: rhi.Pipeline,
-    relocate: rhi.Pipeline,
-    visibility: rhi.Pipeline,
 };
 
 pub const GiVolume = struct {
@@ -1367,6 +1083,9 @@ pub const GiVolume = struct {
     irradiance_fast: rhi.Texture,
     visibility: rhi.Texture,
     rays: rhi.Buffer,
+    /// Per probe, whether last trace found it buried, decided before a
+    /// trace overwrites the rays it was decided from.
+    buried: rhi.Buffer,
     /// Per-probe relocation offsets, in two ping-ponged textures.
     offsets: [2]rhi.Texture,
     offset_turn: u32 = 0,
@@ -1383,16 +1102,16 @@ pub const GiVolume = struct {
         device.destroyTexture(self.irradiance_fast);
         device.destroyTexture(self.visibility);
         device.destroyBuffer(self.rays);
+        device.destroyBuffer(self.buried);
         for (self.offsets) |texture| device.destroyTexture(texture);
     }
 };
 
 pub const gi_irradiance_texels = 8;
 pub const gi_visibility_texels = 16;
-/// Upper bound on `Options.gi_max_probes`: the scroll offset has 10 bits.
+/// Upper bound on `Options.ray_tracing.max_probes`: the scroll offset has 10 bits.
 pub const gi_probe_limit = 256;
 
-pub const TonemapPipeline = struct { format: rhi.Format, pipeline: rhi.Pipeline };
 pub const PickRequest = struct { view: View, pixel: [2]u32 };
 pub const ReflectionTargets = struct {
     /// Mirror weight (rgb) and roughness (a) of every surface.
@@ -1404,10 +1123,11 @@ pub const ReflectionTargets = struct {
     history: rhi.Texture,
     history_valid: bool = false,
 };
-pub const CloudTargets = struct { current: rhi.Texture, history: rhi.Texture, history_valid: bool = false };
 pub const cloud_noise_size = [3]i32{ 128, 128, 64 };
 /// The volume is stored as a sheet of slices, this many to a row.
 pub const cloud_noise_tiles = 8;
+/// Texels across the built-in cloud weather, which repeats.
+pub const cloud_weather_size = 512;
 pub const MaterialPipelines = struct { plain: rhi.Pipeline, reflective: rhi.Pipeline };
 /// The 2x2 matrix (by rows) of a coordinate transform: scale, then rotate.
 pub fn uvMatrix(scale: [2]f32, rotation: f32) [4]f32 {
@@ -1489,6 +1209,9 @@ pub const LiquidState = struct {
     source_count: u32 = 0,
     capacity: u32,
     particles: rhi.Buffer,
+    /// Per particle, the ellipsoid it is drawn as: centre and foam, then its
+    /// three axes, in box space.
+    shapes: rhi.Buffer,
     /// Per grid cell, how many particles it lists, and the lists.
     counts: rhi.Buffer,
     cells: rhi.Buffer,
@@ -1507,14 +1230,24 @@ pub const LiquidState = struct {
 
     pub fn deinit(self: *LiquidState, device: *rhi.Device) void {
         device.destroyBuffer(self.particles);
+        device.destroyBuffer(self.shapes);
         device.destroyBuffer(self.counts);
         device.destroyBuffer(self.cells);
         device.destroyBuffer(self.params_buffer);
     }
 
+    /// Keeps the sources whose numbers are all finite.
     pub fn setSources(self: *LiquidState, sources: []const LiquidSource) void {
-        self.source_count = @intCast(@min(sources.len, self.sources.len));
-        @memcpy(self.sources[0..self.source_count], sources[0..self.source_count]);
+        self.source_count = 0;
+        for (sources) |source| {
+            if (self.source_count == self.sources.len) break;
+            const numbers = source.position ++ source.velocity ++ [2]f32{ source.radius, source.rate };
+            if (!for (numbers) |number| {
+                if (!std.math.isFinite(number)) break false;
+            } else true) continue;
+            self.sources[self.source_count] = source;
+            self.source_count += 1;
+        }
         self.desc.sources = &.{};
     }
 };
@@ -1524,7 +1257,7 @@ pub const water_quads = 160;
 pub const HairState = struct {
     scene: Scene,
     desc: render.HairDesc,
-    /// One `HairPoint` (hair.glsl) per point of every strand.
+    /// One `HairPoint` (hair.slang) per point of every strand.
     points: rhi.Buffer,
     stretches: u32,
     strands: u32,
@@ -1538,6 +1271,17 @@ pub const HairState = struct {
     colliders: [max_hair_colliders][4]f32 = undefined,
     collider_count: u32 = 0,
     moving: ?HairMotion = null,
+    /// Mean length between neighbouring points, in the hair's own space.
+    segment: f32 = 0,
+    /// Points per cell of a grid round the hair as drawn, and how much light
+    /// each cell lets through; made when it is first drawn.
+    shade: ?HairShade = null,
+};
+
+/// Buffers of `HairState.shade`.
+pub const HairShade = struct {
+    counts: rhi.Buffer,
+    light: rhi.Buffer,
 };
 
 pub const max_hair_colliders = 6;
@@ -1587,6 +1331,10 @@ pub const WaterState = struct {
     time_owed: f32 = 0,
     params: u64 = 0,
     params_frame: u64 = std.math.maxInt(u64),
+    /// `WaterDesc.ocean`: transformed rows and heights, made on first use.
+    ocean: ?[2]rhi.Buffer = null,
+    /// Seconds of ocean motion so far.
+    ocean_time: f32 = 0,
 };
 pub const FluidState = struct {
     time_owed: f32 = 0,
@@ -1655,7 +1403,7 @@ pub const InstanceGroupData = struct {
     tints: []u32 = &.{},
     /// One set of shader parameters per copy, or empty for zeros.
     params: [][4]f32 = &.{},
-    /// The entity whose pose every copy takes; see `instances.setPose`.
+    /// The entity whose pose every copy takes; see `instances.followPose`.
     driver: ?Entity = null,
     /// First GPU instance index, and GPU instances per copy; set when the
     /// layout is rebuilt.
@@ -1676,7 +1424,8 @@ pub const InstanceSlot = struct {
     buffer: ?rhi.Buffer = null,
     capacity: u32 = 0,
     static_version: u64 = std.math.maxInt(u64),
-    entity_count: usize = 0,
+    /// `SceneData.entity_capacity` the instance groups' records were written at.
+    entity_base: usize = 0,
 };
 
 pub const EmitterData = struct {
@@ -1717,11 +1466,10 @@ pub const ProbeData = struct {
     capturing: bool = false,
     captured: bool = false,
 };
-pub const PickPending = struct { pixel: [2]u32, scene: Scene, layout_version: u64, near: f32 };
+pub const PickPending = struct { pixel: [2]u32, scene: Scene, layout_version: u64, depth_terms: [4]f32 };
 
 /// What a read-back copy of a scene's seen instances describes.
 pub const SeenTag = struct { layout_version: u64 = 0, count: u32 = 0, valid: bool = false };
-pub const DrawPipelines = struct { format: rhi.Format, flat: rhi.Pipeline, depth_tested: rhi.Pipeline };
 pub const ImageEntry = struct { texture: rhi.Texture, index: u32, id: u32 };
 
 pub const StreamFrustum = struct {
@@ -1739,12 +1487,19 @@ pub const StreamFrustum = struct {
     }
 };
 
+/// What Basis Universal textures are transcoded to on this device: the
+/// block formats it reads, else plain texels.
+pub fn basisTarget(caps: rhi.Capabilities) ktx2.BasisTarget {
+    return if (caps.bc_textures) .bc else if (caps.astc_textures) .astc else .rgba;
+}
+
 pub fn blockFormat(block: gltf.Image.Block, one_channel: bool, two_channel: bool, srgb: bool) rhi.Format {
     return switch (block) {
         .bc1 => if (srgb) .bc1_srgb else .bc1_unorm,
         .bc3 => if (srgb) .bc3_srgb else .bc3_unorm,
         .bc6h => .bc6h_ufloat,
         .rgba8 => if (srgb) .rgba8_srgb else .rgba8_unorm,
+        .astc4x4 => if (srgb) .astc_4x4_srgb else .astc_4x4_unorm,
         .bc7 => if (one_channel) .bc4_unorm else if (two_channel) .bc5_unorm else if (srgb) .bc7_srgb else .bc7_unorm,
     };
 }
@@ -1818,27 +1573,6 @@ pub const Zone = struct {
     pub fn stop(self: Zone) void {
         if (self.profiler) |p| p.end(p.context, self.id);
     }
-};
-
-pub const EffectScales = struct {
-    ao: EffectResolution,
-    fog: EffectResolution,
-    gi: EffectResolution,
-    reflections: ?EffectResolution,
-    clouds: ?EffectResolution,
-    fluid: ?EffectResolution,
-    lens: bool,
-    /// Set when depth of field is gathered at reduced resolution.
-    dof: ?EffectResolution = null,
-    oit: bool,
-    peel: bool,
-    refraction: bool,
-    liquid: bool = false,
-    output_width: u32,
-    output_height: u32,
-    /// Temporal antialiasing resolves at the output size.
-    temporal_upscale: bool = false,
-    fsr: bool = false,
 };
 
 pub fn scaledExtent(resolution: EffectResolution, size: u32) u32 {

@@ -1,10 +1,10 @@
 //! Water surfaces. Internal to the renderer.
 const std = @import("std");
+const simulation_feature = @import("../features/simulation.zig");
 const handle = @import("../../handle.zig");
 const math = @import("../../math.zig");
 const api = @import("../api.zig");
 const renderer_state = @import("../state.zig");
-const simulation_passes = @import("../passes/simulation.zig");
 const render = @import("../renderer.zig");
 
 const Renderer = render.Renderer;
@@ -19,7 +19,19 @@ const destroyEmitterLocked = @import("emitters.zig").destroyEmitterLocked;
 
 /// Sheets of simulated water.
 pub const Waters = struct {
-    table: handle.HandleTable(renderer_state.WaterState, api.WaterTag),
+    internal: Internal,
+
+    /// Not part of the API.
+    pub const Internal = struct {
+        table: handle.HandleTable(renderer_state.WaterState, api.WaterTag),
+
+        /// Frees what one of them holds, as when the renderer is destroyed.
+        pub fn free(owner: *Renderer, entry: *renderer_state.WaterState) void {
+            if (entry.splash) |emitter| destroyEmitterLocked(owner, emitter);
+            for (entry.state) |texture| owner.device.destroyTexture(texture);
+            if (entry.ocean) |ocean| for (ocean) |buffer| owner.device.destroyBuffer(buffer);
+        }
+    };
 
     fn renderer(waters: *Waters) *Renderer {
         return @alignCast(@fieldParentPtr("waters", waters));
@@ -30,16 +42,16 @@ pub const Waters = struct {
         const self = waters.renderer();
         self.lock();
         defer self.unlock();
-        const data = self.scenes.table.get(scene) orelse return error.InvalidScene;
+        const data = self.scenes.internal.table.get(scene) orelse return error.InvalidScene;
         if (data.waters.items.len == max_waters) return error.TooManyWaters;
         var state = WaterState{ .scene = scene, .desc = desc };
-        if (desc.splashes > 0) state.splash = try createEmitterLocked(self, scene, simulation_passes.splashDesc(desc));
+        if (desc.splashes > 0) state.splash = try createEmitterLocked(self, scene, simulation_feature.splashDesc(desc));
         errdefer if (state.splash) |emitter| destroyEmitterLocked(self, emitter);
         try createWaterTextures(self, &state);
         errdefer for (state.state) |texture| self.device.destroyTexture(texture);
-        const water = try self.waters.table.insert(state);
-        errdefer _ = self.waters.table.remove(water);
-        try data.waters.append(self.gpa, water);
+        const water = try self.waters.internal.table.insert(state);
+        errdefer _ = self.waters.internal.table.remove(water);
+        try data.waters.append(self.internal.gpa, water);
         return water;
     }
 
@@ -49,18 +61,21 @@ pub const Waters = struct {
         const self = waters.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.waters.table.get(water) orelse return;
+        const state = self.waters.internal.table.get(water) orelse return;
         const resized = !std.mem.eql(u32, &desc.resolution, &state.desc.resolution);
-        if (desc.splashes > 0 and state.splash == null) state.splash = try createEmitterLocked(self, state.scene, simulation_passes.splashDesc(desc));
+        if (desc.splashes > 0 and state.splash == null) state.splash = try createEmitterLocked(self, state.scene, simulation_feature.splashDesc(desc));
         if (desc.splashes <= 0) if (state.splash) |emitter| {
             destroyEmitterLocked(self, emitter);
             state.splash = null;
         };
-        state.desc = desc;
         if (resized) {
+            var fresh = state.*;
+            fresh.desc = desc;
+            try createWaterTextures(self, &fresh);
             for (state.state) |texture| self.device.destroyTexture(texture);
-            try createWaterTextures(self, state);
+            state.* = fresh;
         }
+        state.desc = desc;
     }
 
     /// Dents the water at a world position; `radius` and `depth` in world
@@ -69,7 +84,7 @@ pub const Waters = struct {
         const self = waters.renderer();
         self.lock();
         defer self.unlock();
-        const state = self.waters.table.get(water) orelse return;
+        const state = self.waters.internal.table.get(water) orelse return;
         if (state.ripple_count == state.ripples.len) return;
         const t = state.desc.transform;
         const local = math.transformPoint(math.inverse(t), position);
@@ -94,14 +109,7 @@ pub const Waters = struct {
         const self = waters.renderer();
         self.lock();
         defer self.unlock();
-        const removed = self.waters.table.remove(water) orelse return;
-        if (removed.splash) |emitter| destroyEmitterLocked(self, emitter);
-        for (removed.state) |texture| self.device.destroyTexture(texture);
-        const scene = self.scenes.table.get(removed.scene) orelse return;
-        for (scene.waters.items, 0..) |item, index| if (std.meta.eql(item, water)) {
-            _ = scene.waters.orderedRemove(index);
-            break;
-        };
+        render.destroyObject(self, "waters", "waters", water);
     }
 };
 

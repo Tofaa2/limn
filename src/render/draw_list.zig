@@ -6,7 +6,8 @@ const math = @import("../math.zig");
 const font_module = @import("font_baker").font;
 const text_layout = @import("text_layout.zig");
 
-/// Borrowed by the draw list: a font must outlive every list drawn with it.
+/// Borrowed by the draw list. `Renderer.render` refuses a list drawn with a
+/// font destroyed since (`error.InvalidFont`).
 pub const Font = font_module.Font;
 
 /// 8-bit sRGB color with opacity `a`, 0 clear to 255 opaque. Stored in
@@ -40,15 +41,16 @@ pub const Color = extern struct {
     }
 };
 
-/// A texture usable by draw lists. Valid until the image is destroyed.
+/// A texture usable by draw lists, materials and lights. Valid until the
+/// image is destroyed; see `Renderer.images.destroy`.
 pub const Image = struct {
     /// Index in the renderer's bindless texture table.
     index: u32,
     /// Size in pixels.
     width: u32,
     height: u32,
-    /// Which image of `Renderer.images` this is; 0 for any other.
-    id: u32 = 0,
+    /// Tells this image from any that later takes its index.
+    id: u32,
 };
 
 /// Axis-aligned rectangle; `x`, `y` is the top-left corner, y down.
@@ -153,7 +155,7 @@ pub const Text3dOptions = struct {
     fallback: []const *const Font = &.{},
 };
 
-/// Layout shared with `shaders/draw.vert`.
+/// Layout shared with `shaders/draw.slang`.
 pub const Vertex = extern struct {
     position: [3]f32,
     /// Camera-facing offset in world units (billboards), else zero.
@@ -281,10 +283,12 @@ pub const SpriteSheet = struct {
     rows: u32,
 
     /// Source rectangle of frame `index`, counted left to right, top to bottom.
+    /// Empty for a sheet of no columns or rows.
     pub fn frame(self: SpriteSheet, index: u32) Rect {
+        if (self.columns == 0 or self.rows == 0) return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
         const width = @as(f32, @floatFromInt(self.image.width)) / @as(f32, @floatFromInt(self.columns));
         const height = @as(f32, @floatFromInt(self.image.height)) / @as(f32, @floatFromInt(self.rows));
-        const wrapped = index % (self.columns * self.rows);
+        const wrapped: u32 = @intCast(@as(u64, index) % (@as(u64, self.columns) * self.rows));
         return .{
             .x = @as(f32, @floatFromInt(wrapped % self.columns)) * width,
             .y = @as(f32, @floatFromInt(wrapped / self.columns)) * height,
@@ -400,96 +404,242 @@ const FontSet = struct {
     }
 };
 
+/// How what is drawn is combined with what is already in the picture.
+pub const Blend = enum {
+    /// Over what is there, by its alpha.
+    alpha,
+    /// As `alpha`, for colors already multiplied by their alpha.
+    premultiplied,
+    /// Added to what is there: light, glows, fire.
+    additive,
+    /// What is there, multiplied by the color: shadows, tints.
+    multiply,
+};
+
+/// A fragment shader for draw lists; see `Renderer.canvas.createShader`.
+pub const CanvasShader = struct { slot: u8, generation: u32 };
+
+/// A screen-space parallelogram of one color, as the vertex shader unfolds
+/// it: most of what a draw list holds.
+pub const Quad = extern struct {
+    origin: [2]f32,
+    axis_x: [2]f32,
+    axis_y: [2]f32,
+    /// Texture coordinates at the origin and at the opposite corner.
+    uv: [4]f32,
+    /// `Vertex.offset` of all four corners.
+    extra: [2]f32,
+    color: Color,
+    texture_mode: u32,
+
+    /// `corners` as one record, or null when they are not such a shape.
+    fn from(corners: [4]Vertex) ?Quad {
+        const c = corners;
+        inline for (1..4) |index| {
+            if (@as(u32, @bitCast(c[index].color)) != @as(u32, @bitCast(c[0].color))) return null;
+            if (c[index].offset[0] != c[0].offset[0] or c[index].offset[1] != c[0].offset[1]) return null;
+            if (c[index].position[2] != 0) return null;
+        }
+        if (c[0].position[2] != 0) return null;
+        if (c[1].uv[1] != c[0].uv[1] or c[2].uv[0] != c[1].uv[0] or c[3].uv[0] != c[0].uv[0] or c[3].uv[1] != c[2].uv[1]) return null;
+        inline for (0..2) |axis| {
+            if (@abs(c[1].position[axis] + c[3].position[axis] - c[0].position[axis] - c[2].position[axis]) > 1e-3) return null;
+        }
+        return .{
+            .origin = .{ c[0].position[0], c[0].position[1] },
+            .axis_x = .{ c[1].position[0] - c[0].position[0], c[1].position[1] - c[0].position[1] },
+            .axis_y = .{ c[3].position[0] - c[0].position[0], c[3].position[1] - c[0].position[1] },
+            .uv = .{ c[0].uv[0], c[0].uv[1], c[2].uv[0], c[2].uv[1] },
+            .extra = c[0].offset,
+            .color = c[0].color,
+            .texture_mode = c[0].texture_mode,
+        };
+    }
+};
+
 /// Geometry for one space of a draw list (screen or world): an indexed
 /// triangle list in draw order. Owned by its `DrawList`.
 pub const Batch = struct {
     vertices: std.ArrayList(Vertex) = .empty,
     indices: std.ArrayList(u32) = .empty,
-    /// Clip changes in index order. Empty means the batch is unclipped.
-    clips: std.ArrayList(ClipRange) = .empty,
+    quads: std.ArrayList(Quad) = .empty,
+    /// Changes of clip, blend, layer and shader, in recording order. Before
+    /// the first, nothing is clipped and blending is `Blend.alpha`.
+    states: std.ArrayList(State) = .empty,
+    clip: ?Rect = null,
+    blend: Blend = .alpha,
+    layer: i16 = 0,
+    shader: ?CanvasShader = null,
+    /// Quads that fit one are recorded as `Quad` records.
+    compact: bool = false,
+    /// Quads were recorded since the last state. Within a state triangles
+    /// are drawn first, so triangles recorded now need a state of their own.
+    quads_pending: bool = false,
 
-    /// Indices from `first_index` to the next range are clipped to `rect`, in
-    /// untransformed screen pixels; null is unclipped.
-    pub const ClipRange = struct { first_index: u32, rect: ?Rect };
+    /// What is recorded from `first_index` and `first_quad` up to the next
+    /// state is drawn this way. `clip` is in untransformed screen pixels.
+    pub const State = struct {
+        first_index: u32,
+        first_quad: u32,
+        clip: ?Rect,
+        blend: Blend,
+        layer: i16,
+        shader: ?CanvasShader,
+    };
+
+    fn mark(self: *Batch, gpa: std.mem.Allocator) !void {
+        const state = State{
+            .first_index = @intCast(self.indices.items.len),
+            .first_quad = @intCast(self.quads.items.len),
+            .clip = self.clip,
+            .blend = self.blend,
+            .layer = self.layer,
+            .shader = self.shader,
+        };
+        self.quads_pending = false;
+        if (self.states.items.len != 0) {
+            const last = &self.states.items[self.states.items.len - 1];
+            if (last.first_index == state.first_index and last.first_quad == state.first_quad) {
+                last.* = state;
+                return;
+            }
+        }
+        try self.states.append(gpa, state);
+    }
+
+    /// Call before recording triangles, so they are drawn after the quads
+    /// recorded before them.
+    fn beginTriangles(self: *Batch, gpa: std.mem.Allocator) !void {
+        if (self.quads_pending) try self.mark(gpa);
+    }
 
     fn quad(self: *Batch, gpa: std.mem.Allocator, corners: [4]Vertex) !void {
+        if (self.compact) if (Quad.from(corners)) |record| {
+            try self.quads.append(gpa, record);
+            self.quads_pending = true;
+            return;
+        };
+        try self.beginTriangles(gpa);
         const base: u32 = @intCast(self.vertices.items.len);
         try self.vertices.appendSlice(gpa, &corners);
         try self.indices.appendSlice(gpa, &.{ base, base + 1, base + 2, base, base + 2, base + 3 });
     }
+
+    pub fn isEmpty(self: *const Batch) bool {
+        return self.indices.items.len == 0 and self.quads.items.len == 0;
+    }
+
+    fn deinit(self: *Batch, gpa: std.mem.Allocator) void {
+        self.vertices.deinit(gpa);
+        self.indices.deinit(gpa);
+        self.quads.deinit(gpa);
+        self.states.deinit(gpa);
+    }
+
+    fn clear(self: *Batch) void {
+        self.vertices.clearRetainingCapacity();
+        self.indices.clearRetainingCapacity();
+        self.quads.clearRetainingCapacity();
+        self.states.clearRetainingCapacity();
+        self.clip = null;
+        self.blend = .alpha;
+        self.layer = 0;
+        self.shader = null;
+        self.quads_pending = false;
+    }
 };
+
+var next_list_id = std.atomic.Value(u64).init(1);
 
 /// One frame of 2D and world-space drawing, handed to `Renderer.render`
 /// and drawn in recording order. Not thread safe; use one list per thread.
 /// A failed drawing call leaves what was recorded before valid.
 pub const DrawList = struct {
-    gpa: std.mem.Allocator,
-    /// Screen-space geometry, in pixels from the top-left corner.
-    screen: Batch = .{},
-    /// World-space geometry from the `*3d` calls, depth-tested.
-    world: Batch = .{},
-    /// Current 2D transform, applied to screen-space calls as recorded.
-    transform: Transform2D = .identity,
     /// Soften the edges of filled polygons, convex shapes and triangles
     /// over one pixel, at the cost of extra vertices.
     antialias_fills: bool = true,
-    transform_stack: [16]Transform2D = undefined,
-    transform_depth: u8 = 0,
-    /// Current clip rectangle in screen pixels, or null for none.
-    clip: ?Rect = null,
-    clip_stack: [16]?Rect = undefined,
-    clip_depth: u8 = 0,
-    glyph_scratch: std.ArrayList(u21) = .empty,
-    substitutions: SubstitutionCache = .{},
+    internal: Internal,
+
+    /// Not part of the API.
+    pub const Internal = struct {
+        gpa: std.mem.Allocator,
+        /// Tells this list from every other, and one filling of it from the
+        /// next, so the renderer can keep the GPU copy of a list that is drawn
+        /// again unchanged.
+        id: u64,
+        generation: u64 = 0,
+        /// Screen-space geometry, in pixels from the top-left corner.
+        screen: Batch = .{ .compact = true },
+        /// World-space geometry from the `*3d` calls, depth-tested.
+        world: Batch = .{},
+        /// Current 2D transform, applied to screen-space calls as recorded.
+        transform: Transform2D = .identity,
+        transform_stack: [16]Transform2D = undefined,
+        transform_depth: u8 = 0,
+        /// Current clip rectangle in screen pixels, or null for none.
+        clip: ?Rect = null,
+        clip_stack: [16]?Rect = undefined,
+        clip_depth: u8 = 0,
+        glyph_scratch: std.ArrayList(u21) = .empty,
+        /// Images and fonts drawn with since `clear`, for `Renderer.render` to
+        /// check that they are still there.
+        images: std.AutoArrayHashMapUnmanaged(Image, void) = .empty,
+        fonts: std.AutoArrayHashMapUnmanaged(*const Font, void) = .empty,
+        substitutions: SubstitutionCache = .{},
+    };
 
     pub fn init(gpa: std.mem.Allocator) DrawList {
-        return .{ .gpa = gpa };
+        return .{ .internal = .{ .gpa = gpa, .id = next_list_id.fetchAdd(1, .monotonic) } };
+    }
+
+    /// What the list was made with.
+    pub fn allocator(self: *const DrawList) std.mem.Allocator {
+        return self.internal.gpa;
     }
 
     /// The list must not be in use by a `Renderer.render` call.
     pub fn deinit(self: *DrawList) void {
-        self.screen.vertices.deinit(self.gpa);
-        self.screen.indices.deinit(self.gpa);
-        self.screen.clips.deinit(self.gpa);
-        self.glyph_scratch.deinit(self.gpa);
-        self.substitutions.deinit(self.gpa);
-        self.world.vertices.deinit(self.gpa);
-        self.world.indices.deinit(self.gpa);
+        self.internal.screen.deinit(self.internal.gpa);
+        self.internal.world.deinit(self.internal.gpa);
+        self.internal.glyph_scratch.deinit(self.internal.gpa);
+        self.internal.images.deinit(self.internal.gpa);
+        self.internal.fonts.deinit(self.internal.gpa);
+        self.internal.substitutions.deinit(self.internal.gpa);
         self.* = undefined;
     }
 
     /// Empties the list, keeping its memory.
     pub fn clear(self: *DrawList) void {
-        self.screen.vertices.clearRetainingCapacity();
-        self.screen.indices.clearRetainingCapacity();
-        self.screen.clips.clearRetainingCapacity();
-        self.clip = null;
-        self.clip_depth = 0;
-        self.world.vertices.clearRetainingCapacity();
-        self.world.indices.clearRetainingCapacity();
-        self.transform = .identity;
-        self.transform_depth = 0;
+        self.internal.screen.clear();
+        self.internal.world.clear();
+        self.internal.images.clearRetainingCapacity();
+        self.internal.fonts.clearRetainingCapacity();
+        self.internal.generation +%= 1;
+        self.internal.clip = null;
+        self.internal.clip_depth = 0;
+        self.internal.transform = .identity;
+        self.internal.transform_depth = 0;
     }
 
     pub fn isEmpty(self: *const DrawList) bool {
-        return self.screen.indices.items.len == 0 and self.world.indices.items.len == 0;
+        return self.internal.screen.isEmpty() and self.internal.world.isEmpty();
     }
 
     /// Composes `transform` onto the current 2D transform until the matching
     /// `popTransform`. Screen-space only. Nests up to 16 deep; deeper pushes
     /// change nothing.
     pub fn pushTransform(self: *DrawList, transform: Transform2D) void {
-        self.transform_depth +|= 1;
-        if (self.transform_depth > self.transform_stack.len) return;
-        self.transform_stack[self.transform_depth - 1] = self.transform;
-        self.transform = self.transform.mul(transform);
+        self.internal.transform_depth +|= 1;
+        if (self.internal.transform_depth > self.internal.transform_stack.len) return;
+        self.internal.transform_stack[self.internal.transform_depth - 1] = self.internal.transform;
+        self.internal.transform = self.internal.transform.mul(transform);
     }
 
     /// Ignored without a matching `pushTransform`.
     pub fn popTransform(self: *DrawList) void {
-        if (self.transform_depth == 0) return;
-        self.transform_depth -= 1;
-        if (self.transform_depth < self.transform_stack.len) self.transform = self.transform_stack[self.transform_depth];
+        if (self.internal.transform_depth == 0) return;
+        self.internal.transform_depth -= 1;
+        if (self.internal.transform_depth < self.internal.transform_stack.len) self.internal.transform = self.internal.transform_stack[self.internal.transform_depth];
     }
 
     /// Restricts screen-space drawing to `r` (in the current transform's
@@ -497,46 +647,76 @@ pub const DrawList = struct {
     /// Under a rotation the clip is the bounding box of `r`. Nests 16 deep;
     /// deeper pushes change nothing.
     pub fn pushClip(self: *DrawList, r: Rect) !void {
-        self.clip_depth +|= 1;
-        if (self.clip_depth > self.clip_stack.len) return;
+        self.internal.clip_depth +|= 1;
+        if (self.internal.clip_depth > self.internal.clip_stack.len) return;
         var low = [2]f32{ std.math.inf(f32), std.math.inf(f32) };
         var high = [2]f32{ -std.math.inf(f32), -std.math.inf(f32) };
         for ([4][2]f32{ .{ r.x, r.y }, .{ r.x + r.width, r.y }, .{ r.x, r.y + r.height }, .{ r.x + r.width, r.y + r.height } }) |corner| {
-            const p = self.transform.apply(corner);
+            const p = self.internal.transform.apply(corner);
             inline for (0..2) |axis| {
                 low[axis] = @min(low[axis], p[axis]);
                 high[axis] = @max(high[axis], p[axis]);
             }
         }
-        if (self.clip) |outer| {
+        if (self.internal.clip) |outer| {
             low = .{ @max(low[0], outer.x), @max(low[1], outer.y) };
             high = .{ @min(high[0], outer.x + outer.width), @min(high[1], outer.y + outer.height) };
         }
-        self.clip_stack[self.clip_depth - 1] = self.clip;
+        self.internal.clip_stack[self.internal.clip_depth - 1] = self.internal.clip;
         try self.setClip(.{ .x = low[0], .y = low[1], .width = @max(high[0] - low[0], 0), .height = @max(high[1] - low[1], 0) });
     }
 
     /// Ignored without a matching `pushClip`.
     pub fn popClip(self: *DrawList) !void {
-        if (self.clip_depth == 0) return;
-        self.clip_depth -= 1;
-        if (self.clip_depth < self.clip_stack.len) try self.setClip(self.clip_stack[self.clip_depth]);
+        if (self.internal.clip_depth == 0) return;
+        self.internal.clip_depth -= 1;
+        if (self.internal.clip_depth < self.internal.clip_stack.len) try self.setClip(self.internal.clip_stack[self.internal.clip_depth]);
     }
 
     fn setClip(self: *DrawList, clip: ?Rect) !void {
-        self.clip = clip;
-        const first: u32 = @intCast(self.screen.indices.items.len);
-        if (self.screen.clips.items.len != 0 and self.screen.clips.items[self.screen.clips.items.len - 1].first_index == first) {
-            self.screen.clips.items[self.screen.clips.items.len - 1].rect = clip;
-        } else {
-            try self.screen.clips.append(self.gpa, .{ .first_index = first, .rect = clip });
+        self.internal.clip = clip;
+        self.internal.screen.clip = clip;
+        try self.internal.screen.mark(self.internal.gpa);
+    }
+
+    /// How what is drawn from here on is combined with the picture.
+    pub fn setBlend(self: *DrawList, blend: Blend) !void {
+        for ([_]*Batch{ &self.internal.screen, &self.internal.world }) |batch| {
+            if (batch.blend == blend) continue;
+            batch.blend = blend;
+            try batch.mark(self.internal.gpa);
+        }
+    }
+
+    /// What is drawn from here on goes over everything of a lower layer and
+    /// under everything of a higher one, in any list of the same stage of
+    /// the view. Within a layer, recording order holds. Layers start at 0.
+    pub fn setLayer(self: *DrawList, layer: i16) !void {
+        for ([_]*Batch{ &self.internal.screen, &self.internal.world }) |batch| {
+            if (batch.layer == layer) continue;
+            batch.layer = layer;
+            try batch.mark(self.internal.gpa);
+        }
+    }
+
+    fn useFonts(self: *DrawList, fonts: FontSet) !void {
+        try self.internal.fonts.put(self.internal.gpa, fonts.primary, {});
+        for (fonts.fallback) |font| try self.internal.fonts.put(self.internal.gpa, font, {});
+    }
+
+    /// Draws what follows with `shader`; null is the built-in one.
+    pub fn setShader(self: *DrawList, shader: ?CanvasShader) !void {
+        for ([_]*Batch{ &self.internal.screen, &self.internal.world }) |batch| {
+            if (std.meta.eql(batch.shader, shader)) continue;
+            batch.shader = shader;
+            try batch.mark(self.internal.gpa);
         }
     }
 
     /// Corner colors in order top-left, top-right, bottom-right, bottom-left.
     pub fn rectGradient(self: *DrawList, r: Rect, colors: [4]Color) !void {
         const mode = pack(.solid, 0);
-        try self.screen.quad(self.gpa, .{
+        try self.internal.screen.quad(self.internal.gpa, .{
             self.screenVertex(.{ r.x, r.y }, .{ 0, 0 }, colors[0], mode),
             self.screenVertex(.{ r.x + r.width, r.y }, .{ 0, 0 }, colors[1], mode),
             self.screenVertex(.{ r.x + r.width, r.y + r.height }, .{ 0, 0 }, colors[2], mode),
@@ -564,11 +744,11 @@ pub const DrawList = struct {
     /// Antialiased rectangle with rounded corners, filled or outlined.
     pub fn roundedRect(self: *DrawList, r: Rect, color: Color, options: RoundedOptions) !void {
         const half = [2]f32{ r.width * 0.5, r.height * 0.5 };
-        const radius = std.math.clamp(options.radius, 0, @min(half[0], half[1]));
+        const radius = std.math.clamp(options.radius, 0, @max(@min(half[0], half[1]), 0));
         const packed_radius: u32 = @intFromFloat(@min(radius * 4, 4095));
         const packed_stroke: u32 = @intFromFloat(std.math.clamp(options.stroke * 4, 0, 4095));
         const mode = pack(.rounded, packed_radius | packed_stroke << 12);
-        const pad = 1.0 / @max(self.transform.scale(), 1e-6);
+        const pad = 1.0 / @max(self.internal.transform.scale(), 1e-6);
         const bottom = options.bottom_color orelse color;
         const corners = [4][2]f32{ .{ -half[0] - pad, -half[1] - pad }, .{ half[0] + pad, -half[1] - pad }, .{ half[0] + pad, half[1] + pad }, .{ -half[0] - pad, half[1] + pad } };
         var vertices: [4]Vertex = undefined;
@@ -576,17 +756,17 @@ pub const DrawList = struct {
             vertex.* = self.screenVertex(.{ r.x + half[0] + corner[0], r.y + half[1] + corner[1] }, corner, if (index < 2) color else bottom, mode);
             vertex.offset = half;
         }
-        try self.screen.quad(self.gpa, vertices);
+        try self.internal.screen.quad(self.internal.gpa, vertices);
     }
 
     /// Emits fill vertices half a pixel inside the outline and a fading fringe
     /// half a pixel outside. Returns the index of the first fill vertex; the
     /// caller adds the fill's triangles over vertices `base + i`.
     fn outlineVertices(self: *DrawList, points: []const [2]f32, color: Color) !u32 {
-        const base: u32 = @intCast(self.screen.vertices.items.len);
+        const base: u32 = @intCast(self.internal.screen.vertices.items.len);
         const mode = pack(.solid, 0);
         if (!self.antialias_fills) {
-            for (points) |p| try self.screen.vertices.append(self.gpa, self.screenVertex(p, .{ 0, 0 }, color, mode));
+            for (points) |p| try self.internal.screen.vertices.append(self.internal.gpa, self.screenVertex(p, .{ 0, 0 }, color, mode));
             return base;
         }
         var area: f32 = 0;
@@ -595,10 +775,10 @@ pub const DrawList = struct {
             area += p[0] * q[1] - q[0] * p[1];
         }
         const outward: f32 = if (area >= 0) 1 else -1;
-        const half_pixel = 0.5 / @max(self.transform.scale(), 1e-6);
+        const half_pixel = 0.5 / @max(self.internal.transform.scale(), 1e-6);
         const count: u32 = @intCast(points.len);
-        try self.screen.vertices.ensureUnusedCapacity(self.gpa, points.len * 2);
-        try self.screen.indices.ensureUnusedCapacity(self.gpa, points.len * 6);
+        try self.internal.screen.vertices.ensureUnusedCapacity(self.internal.gpa, points.len * 2);
+        try self.internal.screen.indices.ensureUnusedCapacity(self.internal.gpa, points.len * 6);
         const faded = color.withAlpha(0);
         for (points, 0..) |p, index| {
             const before = points[(index + points.len - 1) % points.len];
@@ -611,7 +791,7 @@ pub const DrawList = struct {
                 const scale = @min(2 / length_squared, 4.0);
                 miter = .{ miter[0] * scale, miter[1] * scale };
             } else miter = n0;
-            self.screen.vertices.appendAssumeCapacity(self.screenVertex(.{ p[0] - miter[0] * half_pixel, p[1] - miter[1] * half_pixel }, .{ 0, 0 }, color, mode));
+            self.internal.screen.vertices.appendAssumeCapacity(self.screenVertex(.{ p[0] - miter[0] * half_pixel, p[1] - miter[1] * half_pixel }, .{ 0, 0 }, color, mode));
         }
         for (points, 0..) |p, index| {
             const before = points[(index + points.len - 1) % points.len];
@@ -624,30 +804,32 @@ pub const DrawList = struct {
                 const scale = @min(2 / length_squared, 4.0);
                 miter = .{ miter[0] * scale, miter[1] * scale };
             } else miter = n0;
-            self.screen.vertices.appendAssumeCapacity(self.screenVertex(.{ p[0] + miter[0] * half_pixel, p[1] + miter[1] * half_pixel }, .{ 0, 0 }, faded, mode));
+            self.internal.screen.vertices.appendAssumeCapacity(self.screenVertex(.{ p[0] + miter[0] * half_pixel, p[1] + miter[1] * half_pixel }, .{ 0, 0 }, faded, mode));
             const i: u32 = @intCast(index);
             const next = (i + 1) % count;
-            self.screen.indices.appendSliceAssumeCapacity(&.{ base + i, base + next, base + count + next, base + i, base + count + next, base + count + i });
+            self.internal.screen.indices.appendSliceAssumeCapacity(&.{ base + i, base + next, base + count + next, base + i, base + count + next, base + count + i });
         }
         return base;
     }
 
     /// Fills a convex polygon given in order around its outline.
     pub fn fillConvex(self: *DrawList, points: []const [2]f32, color: Color) !void {
+        try self.internal.screen.beginTriangles(self.internal.gpa);
         if (points.len < 3) return;
         const base = try self.outlineVertices(points, color);
         for (1..points.len - 1) |index| {
-            try self.screen.indices.appendSlice(self.gpa, &.{ base, base + @as(u32, @intCast(index)), base + @as(u32, @intCast(index)) + 1 });
+            try self.internal.screen.indices.appendSlice(self.internal.gpa, &.{ base, base + @as(u32, @intCast(index)), base + @as(u32, @intCast(index)) + 1 });
         }
     }
 
     /// Fills any simple (non-self-intersecting) polygon by ear clipping.
     pub fn fillPolygon(self: *DrawList, points: []const [2]f32, color: Color) !void {
+        try self.internal.screen.beginTriangles(self.internal.gpa);
         if (points.len < 3) return;
         const base = try self.outlineVertices(points, color);
         var remaining: std.ArrayList(u32) = .empty;
-        defer remaining.deinit(self.gpa);
-        try remaining.ensureTotalCapacity(self.gpa, points.len);
+        defer remaining.deinit(self.internal.gpa);
+        try remaining.ensureTotalCapacity(self.internal.gpa, points.len);
         var area: f32 = 0;
         for (points, 0..) |p, index| {
             const q = points[(index + 1) % points.len];
@@ -677,7 +859,7 @@ pub const DrawList = struct {
                     }
                 }
                 if (blocked) continue;
-                try self.screen.indices.appendSlice(self.gpa, &.{ base + ia, base + ib, base + ic });
+                try self.internal.screen.indices.appendSlice(self.internal.gpa, &.{ base + ia, base + ib, base + ic });
                 _ = remaining.orderedRemove(i);
                 clipped = true;
                 break;
@@ -685,7 +867,7 @@ pub const DrawList = struct {
             if (!clipped) break;
         }
         if (remaining.items.len == 3)
-            try self.screen.indices.appendSlice(self.gpa, &.{ base + remaining.items[0], base + remaining.items[1], base + remaining.items[2] });
+            try self.internal.screen.indices.appendSlice(self.internal.gpa, &.{ base + remaining.items[0], base + remaining.items[1], base + remaining.items[2] });
     }
 
     /// Antialiased line through `points` with round joins and ends; `closed`
@@ -728,12 +910,12 @@ pub const DrawList = struct {
     }
 
     fn screenVertex(self: *const DrawList, p: [2]f32, uv: [2]f32, color: Color, texture_mode: u32) Vertex {
-        const transformed = self.transform.apply(p);
+        const transformed = self.internal.transform.apply(p);
         return .{ .position = .{ transformed[0], transformed[1], 0 }, .uv = uv, .color = color, .texture_mode = texture_mode };
     }
 
     fn screenQuad(self: *DrawList, r: Rect, uv: [4]f32, color: Color, texture_mode: u32) !void {
-        try self.screen.quad(self.gpa, .{
+        try self.internal.screen.quad(self.internal.gpa, .{
             self.screenVertex(.{ r.x, r.y }, .{ uv[0], uv[1] }, color, texture_mode),
             self.screenVertex(.{ r.x + r.width, r.y }, .{ uv[2], uv[1] }, color, texture_mode),
             self.screenVertex(.{ r.x + r.width, r.y + r.height }, .{ uv[2], uv[3] }, color, texture_mode),
@@ -756,8 +938,9 @@ pub const DrawList = struct {
     }
 
     pub fn triangle(self: *DrawList, a: [2]f32, b: [2]f32, c: [2]f32, color: Color) !void {
+        try self.internal.screen.beginTriangles(self.internal.gpa);
         const base = try self.outlineVertices(&.{ a, b, c }, color);
-        try self.screen.indices.appendSlice(self.gpa, &.{ base, base + 1, base + 2 });
+        try self.internal.screen.indices.appendSlice(self.internal.gpa, &.{ base, base + 1, base + 2 });
     }
 
     /// Antialiased line segment.
@@ -766,11 +949,11 @@ pub const DrawList = struct {
         const dy = b[1] - a[1];
         const length = @sqrt(dx * dx + dy * dy);
         if (length < 1e-6) return;
-        const half = thickness * 0.5 + 0.5 / @max(self.transform.scale(), 1e-6);
+        const half = thickness * 0.5 + 0.5 / @max(self.internal.transform.scale(), 1e-6);
         const nx = -dy / length * half;
         const ny = dx / length * half;
         const mode = pack(.smooth, 0);
-        try self.screen.quad(self.gpa, .{
+        try self.internal.screen.quad(self.internal.gpa, .{
             self.screenVertex(.{ a[0] + nx, a[1] + ny }, .{ -1, 1 }, color, mode),
             self.screenVertex(.{ b[0] + nx, b[1] + ny }, .{ 1, 1 }, color, mode),
             self.screenVertex(.{ b[0] - nx, b[1] - ny }, .{ 1, -1 }, color, mode),
@@ -806,6 +989,7 @@ pub const DrawList = struct {
             .{ s.x / w, s.y / h, (s.x + s.width) / w, (s.y + s.height) / h }
         else
             .{ 0, 0, 1, 1 };
+        try self.internal.images.put(self.internal.gpa, img, {});
         try self.screenQuad(destination, uv, options.tint, pack(if (options.pixelated) .image_nearest else .image, img.index));
     }
 
@@ -819,7 +1003,8 @@ pub const DrawList = struct {
             const offset = @max(1, options.size / 16);
             try self.text(font, string, .{ position[0] + offset, position[1] + offset }, shadowed);
         }
-        const fonts = FontSet{ .primary = font, .fallback = options.fallback, .language = options.language, .features = options.features, .cache = &self.substitutions };
+        const fonts = FontSet{ .primary = font, .fallback = options.fallback, .language = options.language, .features = options.features, .cache = &self.internal.substitutions };
+        try self.useFonts(fonts);
         var lines = std.mem.splitScalar(u8, string, '\n');
         var baseline = position[1] + font.ascent * options.size;
         while (lines.next()) |line_text| : (baseline += font.line_height * options.size) {
@@ -834,16 +1019,30 @@ pub const DrawList = struct {
         }
     }
 
-    /// Decodes one line into `self.glyph_scratch`, shaped if it needs it.
+    /// Width and height of what `text` draws for `string` with `options`:
+    /// the widest line, and one line height per line. Shapes and falls back
+    /// as `text` does; records nothing.
+    pub fn measureText(self: *DrawList, font: *const Font, string: []const u8, options: TextOptions) ![2]f32 {
+        const fonts = FontSet{ .primary = font, .fallback = options.fallback, .language = options.language, .features = options.features, .cache = &self.internal.substitutions };
+        var width: f32 = 0;
+        var lines: f32 = 0;
+        var split = std.mem.splitScalar(u8, string, '\n');
+        while (split.next()) |line_text| : (lines += 1) {
+            width = @max(width, lineWidth(fonts, try self.lineGlyphs(fonts, line_text, options.shaping), options.size));
+        }
+        return .{ width, lines * font.line_height * options.size };
+    }
+
+    /// Decodes one line into `self.internal.glyph_scratch`, shaped if it needs it.
     fn lineGlyphs(self: *DrawList, fonts: FontSet, line_text: []const u8, shaping: bool) ![]const u21 {
-        self.glyph_scratch.clearRetainingCapacity();
+        self.internal.glyph_scratch.clearRetainingCapacity();
         if (shaping and (fonts.language != null or fonts.features.len != 0 or text_layout.mayBeSubstituted(line_text))) {
-            try text_layout.shapeLine(self.gpa, line_text, .{ .context = &fonts, .has = FontSet.covers, .substitute = FontSet.substitute }, &self.glyph_scratch);
+            try text_layout.shapeLine(self.internal.gpa, line_text, .{ .context = &fonts, .has = FontSet.covers, .substitute = FontSet.substitute }, &self.internal.glyph_scratch);
         } else {
             var iterator = font_module.Utf8Iterator{ .bytes = line_text };
-            while (iterator.next()) |codepoint| try self.glyph_scratch.append(self.gpa, codepoint);
+            while (iterator.next()) |codepoint| try self.internal.glyph_scratch.append(self.internal.gpa, codepoint);
         }
-        return self.glyph_scratch.items;
+        return self.internal.glyph_scratch.items;
     }
 
     fn lineWidth(fonts: FontSet, glyphs: []const u21, size: f32) f32 {
@@ -892,7 +1091,8 @@ pub const DrawList = struct {
             const offset = @max(1, options.size / 16);
             try self.textVertical(font, string, .{ position[0] + offset, position[1] + offset }, shadowed);
         }
-        const fonts = FontSet{ .primary = font, .fallback = options.fallback, .language = options.language, .features = &.{"vert".*}, .cache = &self.substitutions };
+        const fonts = FontSet{ .primary = font, .fallback = options.fallback, .language = options.language, .features = &.{"vert".*}, .cache = &self.internal.substitutions };
+        try self.useFonts(fonts);
         const size = options.size;
         var column = position[0];
         var lines = std.mem.splitScalar(u8, string, '\n');
@@ -1025,9 +1225,10 @@ pub const DrawList = struct {
     pub fn richText(self: *DrawList, runs: []const TextRun, position: [2]f32, options: RichTextOptions) ![2]f32 {
         const Word = struct { run: usize, text: []const u8, width: f32, space: f32, line_break: bool };
         var words: std.ArrayList(Word) = .empty;
-        defer words.deinit(self.gpa);
+        defer words.deinit(self.internal.gpa);
         for (runs, 0..) |run, run_index| {
-            const fonts = FontSet{ .primary = run.font orelse options.font, .fallback = options.fallback, .cache = &self.substitutions };
+            const fonts = FontSet{ .primary = run.font orelse options.font, .fallback = options.fallback, .cache = &self.internal.substitutions };
+            try self.useFonts(fonts);
             const size = run.size orelse options.size;
             const space = fonts.primary.glyph(' ').advance * size;
             var rest = run.text;
@@ -1036,7 +1237,7 @@ pub const DrawList = struct {
                 const word = rest[0..end];
                 const separator: u8 = if (end < rest.len) rest[end] else 0;
                 const glyphs = try self.lineGlyphs(fonts, word, true);
-                try words.append(self.gpa, .{
+                try words.append(self.internal.gpa, .{
                     .run = run_index,
                     .text = word,
                     .width = lineWidth(fonts, glyphs, size),
@@ -1079,7 +1280,8 @@ pub const DrawList = struct {
             };
             for (words.items[first..last], first..) |word, index| {
                 const run = runs[word.run];
-                const fonts = FontSet{ .primary = run.font orelse options.font, .fallback = options.fallback, .cache = &self.substitutions };
+                const fonts = FontSet{ .primary = run.font orelse options.font, .fallback = options.fallback, .cache = &self.internal.substitutions };
+                try self.useFonts(fonts);
                 const glyphs = try self.lineGlyphs(fonts, word.text, true);
                 pen = try self.emitGlyphs(fonts, glyphs, .{ pen, y + ascent }, run.size orelse options.size, run.color orelse options.color);
                 if (index + 1 < last) pen += word.space;
@@ -1095,7 +1297,7 @@ pub const DrawList = struct {
     /// Filled quad; corners in order around the perimeter.
     pub fn quad3d(self: *DrawList, corners: [4]math.Vec3, color: Color) !void {
         const mode = pack(.solid, 0);
-        try self.world.quad(self.gpa, .{
+        try self.internal.world.quad(self.internal.gpa, .{
             .{ .position = corners[0], .color = color, .texture_mode = mode },
             .{ .position = corners[1], .color = color, .texture_mode = mode },
             .{ .position = corners[2], .color = color, .texture_mode = mode },
@@ -1107,7 +1309,7 @@ pub const DrawList = struct {
     pub fn line3d(self: *DrawList, a: math.Vec3, b: math.Vec3, thickness: f32, color: Color) !void {
         const mode = pack(.line3d, 0);
         const half = thickness * 0.5;
-        try self.world.quad(self.gpa, .{
+        try self.internal.world.quad(self.internal.gpa, .{
             .{ .position = a, .offset = .{ b[0], b[1] }, .uv = .{ b[2], half }, .color = color, .texture_mode = mode },
             .{ .position = b, .offset = .{ a[0], a[1] }, .uv = .{ a[2], -half }, .color = color, .texture_mode = mode },
             .{ .position = b, .offset = .{ a[0], a[1] }, .uv = .{ a[2], half }, .color = color, .texture_mode = mode },
@@ -1129,10 +1331,11 @@ pub const DrawList = struct {
 
     /// Camera-facing image centered on `position`; `size` in world units.
     pub fn billboard(self: *DrawList, img: Image, position: math.Vec3, size: [2]f32, tint: Color) !void {
+        try self.internal.images.put(self.internal.gpa, img, {});
         const mode = pack(.image, img.index);
         const hx = size[0] * 0.5;
         const hy = size[1] * 0.5;
-        try self.world.quad(self.gpa, .{
+        try self.internal.world.quad(self.internal.gpa, .{
             .{ .position = position, .offset = .{ -hx, hy }, .uv = .{ 0, 0 }, .color = tint, .texture_mode = mode },
             .{ .position = position, .offset = .{ hx, hy }, .uv = .{ 1, 0 }, .color = tint, .texture_mode = mode },
             .{ .position = position, .offset = .{ hx, -hy }, .uv = .{ 1, 1 }, .color = tint, .texture_mode = mode },
@@ -1152,7 +1355,8 @@ pub const DrawList = struct {
         var baseline = (line_count * font.line_height * 0.5 - font.ascent) * size;
         var lines = std.mem.splitScalar(u8, string, '\n');
         while (lines.next()) |line_text| : (baseline -= font.line_height * size) {
-            const fonts = FontSet{ .primary = font, .fallback = options.fallback, .cache = &self.substitutions };
+            const fonts = FontSet{ .primary = font, .fallback = options.fallback, .cache = &self.internal.substitutions };
+            try self.useFonts(fonts);
             const glyphs = try self.lineGlyphs(fonts, line_text, true);
             var pen = -switch (options.alignment) {
                 .left => 0,
@@ -1226,7 +1430,7 @@ pub const DrawList = struct {
                                 .texture_mode = mode,
                             };
                     }
-                    try self.world.quad(self.gpa, corners);
+                    try self.internal.world.quad(self.internal.gpa, corners);
                 }
                 pen = if (anchored != null) pen_after else pen + glyph.advance * size;
             }
@@ -1265,13 +1469,35 @@ test "draw list batches quads and honours the transform stack" {
     list.popTransform();
     try list.circle(.{ 0, 0 }, 4, .black);
     try list.line3d(.{ 0, 0, 0 }, .{ 1, 0, 0 }, 2, .white);
-    try std.testing.expectEqual(@as(usize, 8), list.screen.vertices.items.len);
-    try std.testing.expectEqual(@as(usize, 12), list.screen.indices.items.len);
-    try std.testing.expectEqual(@as(usize, 6), list.world.indices.items.len);
-    try std.testing.expectApproxEqAbs(@as(f32, 5), list.screen.vertices.items[0].position[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, -4), list.screen.vertices.items[4].position[0], 1e-6);
+    try std.testing.expectEqual(@as(usize, 2), list.internal.screen.quads.items.len);
+    try std.testing.expectEqual(@as(usize, 0), list.internal.screen.indices.items.len);
+    try std.testing.expectEqual(@as(usize, 6), list.internal.world.indices.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), list.internal.screen.quads.items[0].origin[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -4), list.internal.screen.quads.items[1].origin[0], 1e-6);
     list.clear();
     try std.testing.expect(list.isEmpty());
+}
+
+test "a draw list keeps recording order across quads, triangles and state changes" {
+    var list = DrawList.init(std.testing.allocator);
+    defer list.deinit();
+    try list.rect(.{ .x = 0, .y = 0, .width = 10, .height = 10 }, .white);
+    try list.triangle(.{ 0, 0 }, .{ 4, 0 }, .{ 0, 4 }, .white);
+    try list.setBlend(.additive);
+    try list.setLayer(3);
+    try list.rect(.{ .x = 0, .y = 0, .width = 10, .height = 10 }, .white);
+    const states = list.internal.screen.states.items;
+    try std.testing.expectEqual(@as(usize, 2), states.len);
+    try std.testing.expectEqual(@as(u32, 1), states[0].first_quad);
+    try std.testing.expectEqual(@as(u32, 0), states[0].first_index);
+    try std.testing.expectEqual(Blend.alpha, states[0].blend);
+    try std.testing.expectEqual(@as(u32, 1), states[1].first_quad);
+    try std.testing.expect(states[1].first_index > 0);
+    try std.testing.expectEqual(Blend.additive, states[1].blend);
+    try std.testing.expectEqual(@as(i16, 3), states[1].layer);
+    const generation = list.internal.generation;
+    list.clear();
+    try std.testing.expect(list.internal.generation != generation);
 }
 
 /// Unit normal of the edge from `a` to `b`, pointing out of an outline
@@ -1289,10 +1515,10 @@ test "filled shapes get a fringe that fades out around them" {
     defer list.deinit();
     const square = [_][2]f32{ .{ 10, 10 }, .{ 30, 10 }, .{ 30, 30 }, .{ 10, 30 } };
     try list.fillConvex(&square, Color.rgb(255, 0, 0));
-    try std.testing.expectEqual(@as(usize, 8), list.screen.vertices.items.len);
-    try std.testing.expectEqual(@as(usize, 6 + 4 * 6), list.screen.indices.items.len);
-    const inner = list.screen.vertices.items[0];
-    const outer = list.screen.vertices.items[4];
+    try std.testing.expectEqual(@as(usize, 8), list.internal.screen.vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 6 + 4 * 6), list.internal.screen.indices.items.len);
+    const inner = list.internal.screen.vertices.items[0];
+    const outer = list.internal.screen.vertices.items[4];
     try std.testing.expectApproxEqAbs(@as(f32, 10.5), inner.position[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 9.5), outer.position[0], 1e-4);
     try std.testing.expectEqual(@as(u8, 255), inner.color.a);
@@ -1300,9 +1526,9 @@ test "filled shapes get a fringe that fades out around them" {
     list.clear();
     const reversed = [_][2]f32{ .{ 10, 30 }, .{ 30, 30 }, .{ 30, 10 }, .{ 10, 10 } };
     try list.fillConvex(&reversed, Color.rgb(255, 0, 0));
-    try std.testing.expectApproxEqAbs(@as(f32, 30.5), list.screen.vertices.items[4].position[1], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 30.5), list.internal.screen.vertices.items[4].position[1], 1e-4);
     list.clear();
     list.antialias_fills = false;
     try list.fillConvex(&square, Color.rgb(255, 0, 0));
-    try std.testing.expectEqual(@as(usize, 4), list.screen.vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 4), list.internal.screen.vertices.items.len);
 }

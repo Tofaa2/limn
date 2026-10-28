@@ -3,7 +3,7 @@
 const std = @import("std");
 
 /// Bump when any serialized type changes.
-pub const version: u32 = 26;
+pub const version: u32 = 29;
 const magic = [4]u8{ 'R', 'M', 'D', 'L' };
 
 /// True for types whose bytes can be copied as they are.

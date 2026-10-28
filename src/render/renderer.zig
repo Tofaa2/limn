@@ -7,7 +7,6 @@ const math = @import("../math.zig");
 const gltf = @import("../asset/gltf.zig");
 const gpu = @import("gpu.zig");
 const animation = @import("animation.zig");
-const bvh = @import("bvh.zig");
 const font_module = @import("font_baker").font;
 const models_module = @import("renderer/models.zig");
 const streaming_module = @import("renderer/streaming.zig");
@@ -27,112 +26,71 @@ const scenes_module = @import("renderer/scenes.zig");
 const scene_update_module = @import("renderer/scene_update.zig");
 const views_module = @import("renderer/views.zig");
 const view_render_module = @import("renderer/view_render.zig");
+const ray_scene = @import("scene/ray_scene.zig");
+const placed_module = @import("renderer/placed.zig");
 const view_math_module = @import("renderer/view_math.zig");
 
 const api = @import("api.zig");
+pub const max_curve_keys = api.max_curve_keys;
+pub const EffectResolution = api.EffectResolution;
+pub const Settings = api.Settings;
+pub const ViewDesc = api.ViewDesc;
+pub const Region = api.Region;
+pub const CloudDesc = api.CloudDesc;
+pub const DecalDesc = api.DecalDesc;
+pub const InstanceGroup = api.InstanceGroup;
+pub const Liquid = api.Liquid;
+pub const Hair = api.Hair;
+pub const Water = api.Water;
+pub const Fluid = api.Fluid;
+pub const AssetState = api.AssetState;
+pub const Capabilities = api.Capabilities;
+pub const Emitter = api.Emitter;
+pub const EmitterDesc = api.EmitterDesc;
+pub const Entity = api.Entity;
+pub const Environment = api.Environment;
+pub const FluidDesc = api.FluidDesc;
+pub const FluidFlipbookDesc = api.FluidFlipbookDesc;
+pub const FluidObstacle = api.FluidObstacle;
+pub const FluidSource = api.FluidSource;
+pub const Font = api.Font;
+pub const FrameDesc = api.FrameDesc;
+pub const HairDesc = api.HairDesc;
+pub const HairSimulation = api.HairSimulation;
+pub const Image = api.Image;
+pub const LightDesc = api.LightDesc;
+pub const LiquidDesc = api.LiquidDesc;
+pub const LiquidSource = api.LiquidSource;
+pub const Model = api.Model;
+pub const ModelInfo = api.ModelInfo;
+pub const Options = api.Options;
+pub const PathTracingSupport = api.PathTracingSupport;
+pub const PickResult = api.PickResult;
+pub const Pose = api.Pose;
+pub const Profiler = api.Profiler;
+pub const Quality = api.Quality;
+pub const ReflectionProbe = api.ReflectionProbe;
+pub const ReflectionProbeDesc = api.ReflectionProbeDesc;
+pub const Scene = api.Scene;
+pub const SkyDesc = api.SkyDesc;
+pub const Stats = api.Stats;
+pub const SunDesc = api.SunDesc;
+pub const View = api.View;
+pub const WaterDesc = api.WaterDesc;
+pub const Ocean = api.Ocean;
+pub const scene_color_format = api.scene_color_format;
 const renderer_state = @import("state.zig");
 const scene_pass = @import("scene_pass.zig");
+const features = @import("core/features.zig");
+const canvas_feature = @import("features/canvas.zig");
+const targets = @import("core/targets.zig");
 
 pub const Mat4 = math.Mat4;
 pub const Vec3 = math.Vec3;
 pub const SceneFrame = scene_pass.SceneFrame;
 
-pub const ModelTag = api.ModelTag;
-pub const EnvironmentTag = api.EnvironmentTag;
-pub const SceneTag = api.SceneTag;
-pub const EntityTag = api.EntityTag;
-pub const ViewTag = api.ViewTag;
-pub const EmitterTag = api.EmitterTag;
-pub const ReflectionProbeTag = api.ReflectionProbeTag;
-pub const FluidTag = api.FluidTag;
-pub const WaterTag = api.WaterTag;
-pub const LiquidTag = api.LiquidTag;
-pub const InstanceGroupTag = api.InstanceGroupTag;
-pub const Model = api.Model;
-pub const Environment = api.Environment;
-pub const Scene = api.Scene;
-pub const Entity = api.Entity;
-pub const View = api.View;
-pub const Emitter = api.Emitter;
-pub const ReflectionProbe = api.ReflectionProbe;
-pub const Fluid = api.Fluid;
-pub const Water = api.Water;
-pub const Hair = api.Hair;
-pub const HairDesc = api.HairDesc;
-pub const HairSimulation = api.HairSimulation;
-pub const ImpostorDesc = api.ImpostorDesc;
-pub const LightmapDesc = api.LightmapDesc;
-pub const CollisionField = api.CollisionField;
-pub const Liquid = api.Liquid;
-pub const InstanceGroup = api.InstanceGroup;
-pub const Pose = api.Pose;
-pub const MeshDesc = api.MeshDesc;
-pub const Material = api.Material;
-pub const DrawList = api.DrawList;
-pub const Image = api.Image;
-pub const Font = api.Font;
-pub const Options = api.Options;
-pub const LiquidSource = api.LiquidSource;
-pub const LiquidDesc = api.LiquidDesc;
-pub const GeometryStreaming = api.GeometryStreaming;
-pub const TextureStreaming = api.TextureStreaming;
 pub const TextureStream = renderer_state.TextureStream;
-pub const TextureCompression = api.TextureCompression;
-pub const WaterDesc = api.WaterDesc;
-pub const FluidWalls = api.FluidWalls;
-pub const FluidSource = api.FluidSource;
-pub const FluidObstacle = api.FluidObstacle;
-pub const FluidFlipbookDesc = api.FluidFlipbookDesc;
-pub const FluidDesc = api.FluidDesc;
-pub const CloudDesc = api.CloudDesc;
-pub const CloudFlash = api.CloudFlash;
-pub const TransparencyMode = api.TransparencyMode;
-pub const AerialModel = api.AerialModel;
-pub const ShadowLod = api.ShadowLod;
-pub const OutputEncoding = api.OutputEncoding;
-pub const Profiler = api.Profiler;
 const Zone = renderer_state.Zone;
-pub const AssetState = api.AssetState;
-pub const Camera = api.Camera;
-pub const Sun = api.Sun;
-pub const LightKind = api.LightKind;
-pub const Light = api.Light;
-pub const EntityDesc = api.EntityDesc;
-pub const AnimationInfo = api.AnimationInfo;
-pub const ModelInfo = api.ModelInfo;
-pub const EnvironmentInfo = api.EnvironmentInfo;
-pub const Settings = api.Settings;
-pub const Quality = api.Quality;
-pub const DebugView = api.DebugView;
-pub const Upscaling = api.Upscaling;
-pub const EffectResolution = api.EffectResolution;
-pub const EffectScales = renderer_state.EffectScales;
-pub const Target = api.Target;
-pub const Region = api.Region;
-pub const PassStage = api.PassStage;
-pub const PassContext = api.PassContext;
-pub const Pass = api.Pass;
-pub const scene_color_format = api.scene_color_format;
-pub const Pick = api.Pick;
-pub const MaterialShader = api.MaterialShader;
-pub const PickResult = api.PickResult;
-pub const DecalDesc = api.DecalDesc;
-pub const max_decals = api.max_decals;
-pub const SkyDesc = api.SkyDesc;
-pub const skySun = api.skySun;
-pub const ParticleBlend = api.ParticleBlend;
-pub const max_curve_keys = api.max_curve_keys;
-pub const max_trail_points = api.max_trail_points;
-pub const ColorCurve = api.ColorCurve;
-pub const SizeCurve = api.SizeCurve;
-pub const ReflectionProbeDesc = api.ReflectionProbeDesc;
-pub const max_reflection_probes = api.max_reflection_probes;
-pub const EmitterDesc = api.EmitterDesc;
-pub const ViewDesc = api.ViewDesc;
-pub const FrameDesc = api.FrameDesc;
-pub const PathTracing = api.PathTracing;
-pub const Dlss = api.Dlss;
-pub const Stats = api.Stats;
 
 pub const hdr_format = renderer_state.hdr_format;
 pub const bloom_levels = renderer_state.bloom_levels;
@@ -147,31 +105,26 @@ const RangeAllocator = renderer_state.RangeAllocator;
 const Pool = renderer_state.Pool;
 pub const FrameArena = renderer_state.FrameArena;
 const ShadeVariant = renderer_state.ShadeVariant;
-pub const ShadeVariantJob = renderer_state.ShadeVariantJob;
 pub const shadeVariantDesc = renderer_state.shadeVariantDesc;
-pub const runShadeVariantJob = renderer_state.runShadeVariantJob;
 pub const ModelMesh = renderer_state.ModelMesh;
-pub const MaterialTextures = renderer_state.MaterialTextures;
 pub const SceneData = renderer_state.SceneData;
 const EntityData = renderer_state.EntityData;
 pub const TransparentDraw = renderer_state.TransparentDraw;
-const BlasJob = renderer_state.BlasJob;
 pub const BoundsJob = renderer_state.BoundsJob;
 pub const SkinJob = renderer_state.SkinJob;
 pub const MadeTextures = renderer_state.MadeTextures;
 pub const ViewState = renderer_state.ViewState;
 pub const ViewData = renderer_state.ViewData;
-const Pipelines = renderer_state.Pipelines;
-const GiPipelines = renderer_state.GiPipelines;
+const Pipelines = pipelines_module.Pipelines;
 pub const GiVolume = renderer_state.GiVolume;
 pub const gi_irradiance_texels = renderer_state.gi_irradiance_texels;
 pub const gi_visibility_texels = renderer_state.gi_visibility_texels;
 pub const gi_probe_limit = renderer_state.gi_probe_limit;
-const TonemapPipeline = renderer_state.TonemapPipeline;
 const PickRequest = renderer_state.PickRequest;
 pub const ReflectionTargets = renderer_state.ReflectionTargets;
 pub const cloud_noise_size = renderer_state.cloud_noise_size;
 pub const cloud_noise_tiles = renderer_state.cloud_noise_tiles;
+pub const cloud_weather_size = renderer_state.cloud_weather_size;
 pub const packTint = renderer_state.packTint;
 pub const max_fluids = renderer_state.max_fluids;
 const max_worker_threads = renderer_state.max_worker_threads;
@@ -184,79 +137,63 @@ pub const CollisionFieldState = renderer_state.CollisionFieldState;
 pub const water_quads = renderer_state.water_quads;
 pub const EmitterData = renderer_state.EmitterData;
 const PickPending = renderer_state.PickPending;
-const DrawPipelines = renderer_state.DrawPipelines;
 
 const bakeLoadedClouds = environments_module.bakeLoadedClouds;
 const bakeSky = environments_module.bakeSky;
-const buildPendingBlas = scene_update_module.buildPendingBlas;
+const buildPendingBlas = ray_scene.buildPendingBlas;
 const captureProbes = probes_module.captureProbes;
 const compactGeometry = scene_update_module.compactGeometry;
-const createGiPipelines = pipelines_module.createGiPipelines;
-const createPipelines = pipelines_module.createPipelines;
-const destroyFluidTextures = fluid_module.destroyFluidTextures;
-const dropShadeVariants = pipelines_module.dropShadeVariants;
 const finalizeEnvironment = environments_module.finalizeEnvironment;
 const finalizeModel = models_module.finalizeModel;
-const freeEntityStorage = scenes_module.freeEntityStorage;
 const freeEnvironment = environments_module.freeEnvironment;
-const freeHair = hair_module.freeHair;
 const freeModel = models_module.freeModel;
-const freeScene = scenes_module.freeScene;
 const insertView = views_module.insertView;
 const registerFont = fonts_module.registerFont;
-const renderView = view_render_module.renderView;
+const renderViews = view_render_module.renderViews;
 const targetWritten = views_module.targetWritten;
 const updateGeometryStreaming = streaming_module.updateGeometryStreaming;
 const updateTextureStreaming = streaming_module.updateTextureStreaming;
+const entity_edits = @import("renderer/entity_edits.zig");
 
-/// Owns the device and everything made through it. Methods lock internally
-/// (see `lock`), so other threads may load and edit while one renders; the
-/// entity setters do not wait for a frame that is being recorded.
-///
-/// A handle whose object was destroyed is never an error to set or destroy:
-/// setters and `destroy` do nothing, and queries answer null, 0 or `.failed`.
-/// Only making something from one fails, with `error.InvalidScene` and the
-/// like.
-///
-/// Everything about one kind of object is under its field: `models`, `scenes`,
-/// `entities` and so on. Those, `device` and `options` are the public fields.
-pub const Renderer = struct {
+/// The kinds of object kept in a handle table, freed in this order when the
+/// renderer is destroyed. Each namespace has `internal.table` and `internal.free`. A freed
+/// scene forgets its lights and decals, so `scenes` goes before them.
+const stores = .{ "entities", "scenes", "lights", "decals", "models", "environments", "emitters", "reflection_probes", "fluids", "waters", "hairs", "liquids", "instances", "views" };
+
+/// Removes `handle` from the table of `kind` and from its scene's list
+/// `list`, then frees what it held. Under the renderer's lock.
+pub fn destroyObject(self: *Renderer, comptime kind: []const u8, comptime list: []const u8, handle: anytype) void {
+    const store = &@field(self, kind);
+    var removed = store.internal.table.remove(handle) orelse return;
+    @TypeOf(store.internal).free(self, &removed);
+    const scene = self.scenes.internal.table.get(removed.scene) orelse return;
+    const items = &@field(scene, list);
+    for (items.items, 0..) |item, index| if (std.meta.eql(item, handle)) {
+        _ = items.orderedRemove(index);
+        break;
+    };
+}
+
+/// What a renderer keeps besides its namespaces, options and device; not part
+/// of the API.
+pub const Internal = struct {
     gpa: std.mem.Allocator,
-    /// Fixed for the renderer's lifetime.
-    options: Options,
     io: std.Io,
-    /// For custom passes and offscreen targets.
-    device: *rhi.Device,
-
-    models: models_module.Models,
-    materials: materials_module.Materials,
-    environments: environments_module.Environments,
-    scenes: scenes_module.Scenes,
-    entities: scenes_module.Entities,
-    instances: instances_module.Instances,
-    emitters: emitters_module.Emitters,
-    probes: probes_module.Probes,
-    fluids: fluid_module.Fluids,
-    waters: water_module.Waters,
-    liquids: liquid_module.Liquids,
-    hairs: hair_module.Hairs,
-    views: views_module.Views,
-    fonts: fonts_module.Fonts = .{},
-    images: images_module.Images = .{},
-    shaders: pipelines_module.Shaders = .{},
-
     pipelines: Pipelines,
-    tonemap_pipelines: std.ArrayList(TonemapPipeline) = .empty,
     /// Shading pass builds, one per feature set seen.
     shade_variants: std.ArrayList(ShadeVariant) = .empty,
     /// This frame's animated entities.
-    /// Progress through the round of acceleration structure refits.
-    refit_cursor: usize = 0,
     /// Count of loaded models with per-texture UV transforms.
     texture_transform_users: u32 = 0,
+    /// Loaded models with a material that has a coat, sheen, grain or thin
+    /// film; with none, shading leaves those lobes out.
+    lobe_users: u32 = 0,
     pose_scratch: [max_worker_threads]std.ArrayList(animation.Local) = @splat(.empty),
     prepare_chunks: std.ArrayList(renderer_state.PrepareChunk) = .empty,
-    draw_pipelines: std.ArrayList(DrawPipelines) = .empty,
+    /// Short-lived render targets, lent to the passes of every view.
+    target_pool: targets.Pool = .{},
+    /// What the views of this frame asked for and did not get.
+    downgrades: features.Downgrades = .{},
     /// Guards all renderer and device state; see `lock`.
     mutex: std.Io.Mutex = .init,
     /// Each entity's transform by slot, now and as of the last prepared
@@ -265,6 +202,8 @@ pub const Renderer = struct {
     entity_transforms: std.array_list.Aligned(Mat4, .@"64") = .empty,
     entity_previous: std.array_list.Aligned(Mat4, .@"64") = .empty,
     entity_marks: std.ArrayList(EntityMark) = .empty,
+    /// What each entity takes of its scene's slots, by entity slot.
+    entity_spans: std.ArrayList(renderer_state.EntitySpan) = .empty,
     /// Entity edits made while the lock was taken, and the ones being made;
     /// see `queueEdit`.
     pending: std.ArrayList(EntityEdit) = .empty,
@@ -277,58 +216,68 @@ pub const Renderer = struct {
     sampler_shadow: rhi.Sampler,
     sampler_local_shadow: rhi.Sampler,
     material_samplers: [36]?rhi.Sampler = @splat(null),
-
     vertices: Pool,
     skin_vertices: Pool,
     morph_deltas: Pool,
     indices: Pool,
     meshlets: Pool,
-    /// Per-mesh triangle BVHs for the path tracing fallback.
-    bvh_nodes: Pool,
-    bvh_items: Pool,
-    /// Mesh-space box of each mesh with a BVH, by mesh record index.
-    mesh_boxes: std.ArrayList(?[2][3]f32) = .empty,
+    /// BLASes and the software BVHs of meshes.
+    rays: ray_scene.Structures,
     meshes: Pool,
-
     arenas: [rhi.frames_in_flight]FrameArena,
     cull_commands: ?rhi.Buffer = null,
+    /// In deterministic mode: what each meshlet reference was culled to, and
+    /// per block of references where its draws go, for listing draws in
+    /// reference order.
+    cull_marks: ?rhi.Buffer = null,
+    cull_blocks: ?rhi.Buffer = null,
     cull_capacity: u32 = 0,
     /// Views `cull_commands` has room for.
     cull_views: u32 = 0,
     /// Draws each view's second list (masked, two-sided, LOD-fading) has
     /// room for; the first has `cull_capacity`.
     cull_masked_capacity: u32 = 0,
-    cull_counts: rhi.Buffer,
+    /// The buffers and textures only scenes use have been made; see
+    /// `ensureSceneResources`.
+    scene_ready: bool = false,
+    cull_counts: rhi.Buffer = undefined,
     /// One `gpu.CullDispatch` per view of a frame.
-    cull_dispatch: rhi.Buffer,
+    cull_dispatch: rhi.Buffer = undefined,
     /// The `gpu.DrawIndirect` that draws a view's impostors.
-    impostor_draw: rhi.Buffer,
+    impostor_draw: rhi.Buffer = undefined,
     scratch_impostors: std.ArrayList(gpu.Impostor) = .empty,
     /// Two `gpu.MeshDraw`s per view, one per meshlet list; mesh shaders only.
-    cull_mesh_draws: rhi.Buffer,
+    cull_mesh_draws: rhi.Buffer = undefined,
     count_readback: [rhi.frames_in_flight]rhi.Buffer = undefined,
     /// Texture streaming round counter (see `EntityData.seen_round`).
     seen_round: u64 = 0,
     /// Bound in place of cascades for views drawn without shadows.
-    shadow_map: rhi.Texture,
+    shadow_map: rhi.Texture = undefined,
     /// Shadow atlas for spot and point lights.
-    local_shadow_map: rhi.Texture,
-    clusters: rhi.Buffer,
-    transparent_order: std.ArrayList(TransparentDraw) = .empty,
-    gi_pipelines: ?GiPipelines = null,
-    blas_pending: u32 = 0,
+    local_shadow_map: rhi.Texture = undefined,
+    clusters: rhi.Buffer = undefined,
+    /// Per cluster, lights placed in its list so far, and the lists.
+    cluster_cursors: rhi.Buffer = undefined,
+    cluster_lights: ?rhi.Buffer = null,
+    cluster_lights_capacity: u32 = 0,
+    /// The views of the frame being drawn, planned before they are recorded;
+    /// kept from frame to frame for their room.
+    staged_views: std.ArrayList(view_render_module.StagedView) = .empty,
     /// Frame in which a geometry pool last moved to a new buffer.
     geometry_replaced: ?u64 = null,
     /// Frames a view asked for path tracing and was drawn without it.
     path_trace_misses: u32 = 0,
-    brdf_lut: rhi.Texture,
-
+    brdf_lut: rhi.Texture = undefined,
+    /// Linearly transformed cosine tables for rectangle lights: the matrix in
+    /// the top half, magnitude and Fresnel in the bottom.
+    ltc_table: rhi.Texture = undefined,
+    /// `SkyDesc.multiple_scattering` table, made by the first sky that asks.
+    sky_scattering: ?rhi.Texture = null,
     /// Ray-tracing stand-in box for liquids; made with the first liquid.
     liquid_proxy_model: ?Model = null,
     /// Bumped whenever the set of ready models changes.
     asset_generation: u64 = 1,
     loading_count: u32 = 0,
-
     main_view: View = undefined,
     /// Targets drawn to this frame; the first view to touch one clears it.
     frame_targets: [16]rhi.Texture = undefined,
@@ -339,7 +288,7 @@ pub const Renderer = struct {
     /// its history was reset.
     /// What DLSS offers on this device.
     dlss: @import("dlss.zig").Library = .{},
-    generating: ?@import("ffx.zig").Upscaler = null,
+    generating: ?@import("techniques/upscaling.zig").Generator = null,
     generating_reset: bool = false,
     generating_failed: bool = false,
     /// Scene whose lights the local shadow atlas currently holds.
@@ -359,36 +308,77 @@ pub const Renderer = struct {
     frame_index: u64 = 0,
     time: f32 = 0,
     cloud_noise: ?rhi.Texture = null,
+    cloud_weather: ?rhi.Texture = null,
     stats: Stats = .{},
-
-    skin_jobs: std.ArrayList(SkinJob) = .empty,
-    /// Morph target weights of this frame's skin jobs, back to back.
-    skin_weights: std.ArrayList(f32) = .empty,
-    /// Meshes whose meshlet bounds are worked out after skinning.
-    bounds_jobs: std.ArrayList(BoundsJob) = .empty,
-    /// Deformed-mesh acceleration structures to rebuild after skinning.
-    blas_jobs: std.ArrayList(BlasJob) = .empty,
     scratch_locals: std.ArrayList(animation.Local) = .empty,
     scratch_refs: std.ArrayList(gpu.MeshletRef) = .empty,
     scratch_settling: std.ArrayList([2]u32) = .empty,
     scratch_moved: std.ArrayList([2]u32) = .empty,
     scratch_instances: std.ArrayList(gpu.Instance) = .empty,
     scratch_static_cull: std.ArrayList(gpu.StaticCull) = .empty,
+    /// Which lights get shadow tiles, and their ranking, while lights are prepared.
+    scratch_granted: std.ArrayList(bool) = .empty,
+    scratch_light_ranks: std.ArrayList(LightRank) = .empty,
+};
 
-    /// Creates the device and renderer. `gpa` and `io` are kept and must
-    /// outlive it. Missing optional features (ray tracing, BC, HDR output)
-    /// are not errors. Free with `deinit`.
+/// Owns the device and everything made through it. Methods lock internally
+/// (see `lock`), so other threads may load and edit while one renders; the
+/// entity setters do not wait for a frame that is being recorded. Every
+/// method is safe from any thread except `render`, `deinit` and `lock`,
+/// which belong to one thread at a time; `DrawList`s are not shared.
+///
+/// A handle whose object was destroyed is never an error to set or destroy:
+/// setters (`scenes.setLights` and the like included) and `destroy` do
+/// nothing, and queries answer null, 0 or `.failed`. Only making something
+/// from one fails, with `error.InvalidScene` and the like.
+///
+/// Everything about one kind of object is under its field: `models`, `scenes`,
+/// `entities` and so on. Those, `device` and `options` are the public fields.
+pub const Renderer = struct {
+    /// Fixed for the renderer's lifetime.
+    options: Options,
+    /// For custom passes and offscreen targets.
+    device: *rhi.Device,
+    models: models_module.Models,
+    materials: materials_module.Materials,
+    environments: environments_module.Environments,
+    scenes: scenes_module.Scenes,
+    entities: scenes_module.Entities,
+    instances: instances_module.Instances,
+    emitters: emitters_module.Emitters,
+    reflection_probes: probes_module.Probes,
+    /// Single lights of scenes, by handle.
+    lights: placed_module.Lights,
+    /// Single decals of scenes, by handle.
+    decals: placed_module.Decals,
+    fluids: fluid_module.Fluids,
+    waters: water_module.Waters,
+    liquids: liquid_module.Liquids,
+    hairs: hair_module.Hairs,
+    views: views_module.Views,
+    fonts: fonts_module.Fonts = .{},
+    images: images_module.Images = .{},
+    shaders: pipelines_module.Shaders = .{},
+    /// Custom draw list shaders.
+    canvas: canvas_feature.Canvas = .{},
+    /// Everything else the renderer keeps; not part of the API.
+    internal: Internal,
+
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Renderer {
+        const tiles_per_side = std.math.clamp(options.shadows.local_tiles_per_side, 1, local_shadow_tiles_per_side);
+        if (options.shadows.resolution == 0 or options.shadows.local_resolution < tiles_per_side) return error.InvalidOptions;
         const device = try rhi.Device.init(gpa, io, .{
             .application_name = options.application_name,
             .validation = options.validation,
             .surface = options.surface,
             .preferred_device = options.preferred_device,
-            .pipeline_cache_path = options.pipeline_cache_path,
+            .pipeline_cache_path = options.cache.pipelines,
             .debug_names = options.debug_names,
             .hdr_output = options.hdr_output,
-            .ray_tracing = options.ray_tracing,
-            .mesh_shaders = options.mesh_shaders,
+            .ray_tracing = options.ray_tracing.hardware,
+            .mesh_shaders = options.geometry.mesh_shaders,
+            .primitive_id = options.geometry.primitive_id,
+            .block_formats = options.textures.block_formats,
             .nvidia_ngx = @import("dlss.zig").available,
         });
         errdefer device.deinit();
@@ -402,126 +392,78 @@ pub const Renderer = struct {
         const storage = rhi.BufferUsage{ .storage = true, .copy_src = true, .copy_dst = true };
         const geometry = rhi.BufferUsage{ .storage = true, .index = true, .copy_src = true, .copy_dst = true, .acceleration_input = true };
         self.* = .{
-            .gpa = gpa,
             .options = options,
-            .io = io,
             .device = device,
-            .dlss = @import("dlss.zig").Library.start(device),
-            .pipelines = try createPipelines(device),
-            .sampler_linear_clamp = try device.createSampler(.{ .address_u = .clamp_to_edge, .address_v = .clamp_to_edge, .address_w = .clamp_to_edge }),
-            .sampler_nearest_clamp = try device.createSampler(.{
-                .min_filter = .nearest,
-                .mag_filter = .nearest,
-                .mip_filter = .nearest,
-                .address_u = .clamp_to_edge,
-                .address_v = .clamp_to_edge,
-                .address_w = .clamp_to_edge,
-            }),
-            .sampler_linear_repeat = try device.createSampler(.{ .max_anisotropy = 16 }),
-            .sampler_shadow = try device.createSampler(.{
-                .address_u = .clamp_to_border,
-                .address_v = .clamp_to_border,
-                .address_w = .clamp_to_border,
-                .mip_filter = .nearest,
-                .compare = .less_or_equal,
-            }),
-            .vertices = try Pool.init(device, "vertices", @sizeOf(gpu.Vertex), 1 << 20, geometry),
-            .skin_vertices = try Pool.init(device, "skin vertices", @sizeOf(gpu.SkinVertex), 1 << 16, storage),
-            .morph_deltas = try Pool.init(device, "morph deltas", @sizeOf(gltf.MorphDelta), 1 << 14, storage),
-            .indices = try Pool.init(device, "indices", @sizeOf(u32), 1 << 22, geometry),
-            .meshlets = try Pool.init(device, "meshlets", @sizeOf(gpu.Meshlet), 1 << 16, storage),
-            .bvh_nodes = try Pool.init(device, "bvh nodes", @sizeOf(bvh.Node), 1 << 10, storage),
-            .bvh_items = try Pool.init(device, "bvh items", @sizeOf(u32), 1 << 10, storage),
-            .meshes = try Pool.init(device, "meshes", @sizeOf(gpu.Mesh), 1 << 12, storage),
-            .materials = .{ .pool = try Pool.init(device, "materials", @sizeOf(gpu.Material), 1 << 12, storage) },
-            .arenas = undefined,
-            .cull_counts = try device.createBuffer(.{ .name = "cull counts", .size = view_count * 2 * @sizeOf(u32), .usage = .{ .storage = true, .indirect = true, .copy_src = true } }),
-            .cull_mesh_draws = try device.createBuffer(.{ .name = "cull mesh draws", .size = view_count * 2 * @sizeOf(gpu.MeshDraw), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } }),
-            .impostor_draw = try device.createBuffer(.{ .name = "impostor draw", .size = @sizeOf(gpu.DrawIndirect), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } }),
-            .cull_dispatch = try device.createBuffer(.{ .name = "cull dispatch", .size = view_count * @sizeOf(gpu.CullDispatch), .usage = .{ .storage = true, .indirect = true, .copy_dst = true } }),
-            .sampler_local_shadow = try device.createSampler(.{
-                .address_u = .clamp_to_edge,
-                .address_v = .clamp_to_edge,
-                .address_w = .clamp_to_edge,
-                .mip_filter = .nearest,
-                .compare = .greater_or_equal,
-            }),
-            .local_shadow_map = try device.createTexture(.{
-                .name = "local shadow atlas",
-                .width = options.local_shadow_resolution,
-                .height = options.local_shadow_resolution,
-                .format = .depth32_float,
-                .usage = .{ .sampled = true, .depth_attachment = true },
-            }),
-            .clusters = try device.createBuffer(.{ .name = "light clusters", .size = gpu.cluster_count * @sizeOf(gpu.Cluster), .usage = .{ .storage = true } }),
-            .shadow_map = try device.createTexture(.{
-                .name = "shadow fallback",
-                .width = 1,
-                .height = 1,
-                .format = .depth32_float,
-                .usage = .{ .sampled = true, .depth_attachment = true },
-                .layers = gpu.cascade_count,
-                .kind = .@"2d_array",
-            }),
-            .brdf_lut = try device.createTexture(.{
-                .name = "brdf lut",
-                .width = 128,
-                .height = 128,
-                .format = .rg16_float,
-                .usage = .{ .sampled = true, .color_attachment = true },
-            }),
-            .models = .{ .table = .init(gpa) },
-            .environments = .{ .table = .init(gpa) },
-            .scenes = .{ .table = .init(gpa) },
-            .views = .{ .table = .init(gpa) },
-            .entities = .{ .table = .init(gpa) },
-            .emitters = .{ .table = .init(gpa) },
-            .probes = .{ .table = .init(gpa) },
-            .fluids = .{ .table = .init(gpa) },
-            .waters = .{ .table = .init(gpa) },
-            .hairs = .{ .table = .init(gpa), .fields = .init(gpa) },
-            .liquids = .{ .table = .init(gpa) },
-            .instances = .{ .table = .init(gpa) },
+            .materials = .{ .internal = .{ .pool = .init("materials", @sizeOf(gpu.Material), 1 << 12, storage) } },
+            .models = .{ .internal = .{ .table = .init(gpa) } },
+            .environments = .{ .internal = .{ .table = .init(gpa) } },
+            .scenes = .{ .internal = .{ .table = .init(gpa) } },
+            .views = .{ .internal = .{ .table = .init(gpa) } },
+            .entities = .{ .internal = .{ .table = .init(gpa) } },
+            .emitters = .{ .internal = .{ .table = .init(gpa) } },
+            .reflection_probes = .{ .internal = .{ .table = .init(gpa) } },
+            .lights = .{ .internal = .{ .table = .init(gpa) } },
+            .decals = .{ .internal = .{ .table = .init(gpa) } },
+            .fluids = .{ .internal = .{ .table = .init(gpa) } },
+            .waters = .{ .internal = .{ .table = .init(gpa) } },
+            .hairs = .{ .internal = .{ .table = .init(gpa), .fields = .init(gpa) } },
+            .liquids = .{ .internal = .{ .table = .init(gpa) } },
+            .instances = .{ .internal = .{ .table = .init(gpa) } },
+            .internal = .{
+                .gpa = gpa,
+                .io = io,
+                .dlss = @import("dlss.zig").Library.start(device),
+                .pipelines = .init(gpa, device, io),
+                .sampler_linear_clamp = try device.createSampler(.{ .address_u = .clamp_to_edge, .address_v = .clamp_to_edge, .address_w = .clamp_to_edge }),
+                .sampler_nearest_clamp = try device.createSampler(.{
+                    .min_filter = .nearest,
+                    .mag_filter = .nearest,
+                    .mip_filter = .nearest,
+                    .address_u = .clamp_to_edge,
+                    .address_v = .clamp_to_edge,
+                    .address_w = .clamp_to_edge,
+                }),
+                .sampler_linear_repeat = try device.createSampler(.{ .max_anisotropy = 16 }),
+                .sampler_shadow = try device.createSampler(.{
+                    .address_u = .clamp_to_border,
+                    .address_v = .clamp_to_border,
+                    .address_w = .clamp_to_border,
+                    .mip_filter = .nearest,
+                    .compare = .less_or_equal,
+                }),
+                .vertices = .init("vertices", @sizeOf(gpu.Vertex), 1 << 16, geometry),
+                .skin_vertices = .init("skin vertices", @sizeOf(gpu.SkinVertex), 1 << 12, storage),
+                .morph_deltas = .init("morph deltas", @sizeOf(gltf.MorphDelta), 1 << 10, storage),
+                .indices = .init("indices", @sizeOf(u32), 1 << 18, geometry),
+                .meshlets = .init("meshlets", @sizeOf(gpu.Meshlet), 1 << 12, storage),
+                .rays = .init(storage),
+                .meshes = .init("meshes", @sizeOf(gpu.Mesh), 1 << 12, storage),
+                .arenas = undefined,
+                .sampler_local_shadow = try device.createSampler(.{
+                    .address_u = .clamp_to_edge,
+                    .address_v = .clamp_to_edge,
+                    .address_w = .clamp_to_edge,
+                    .mip_filter = .nearest,
+                    .compare = .greater_or_equal,
+                }),
+            },
         };
-        for (&self.arenas) |*arena| arena.* = try FrameArena.init(device, 4 * 1024 * 1024);
-        if (device.ray_tracing) self.gi_pipelines = try createGiPipelines(device);
-        for (&self.count_readback) |*buffer| {
-            buffer.* = try device.createBuffer(.{ .name = "cull count readback", .size = (view_count * 2 + 1) * @sizeOf(u32), .usage = .{}, .memory = .gpu_to_cpu });
-            @memset(device.mapped(buffer.*), 0);
-        }
-        self.main_view = try insertView(self);
-        errdefer self.views.table.deinit();
-        self.pick_buffer = try device.createBuffer(.{ .name = "pick", .size = @sizeOf(gpu.Pick), .usage = .{ .storage = true, .copy_src = true } });
-        for (&self.pick_readback) |*buffer| {
-            buffer.* = try device.createBuffer(.{ .name = "pick readback", .size = @sizeOf(gpu.Pick), .usage = .{}, .memory = .gpu_to_cpu });
-            @memset(device.mapped(buffer.*), 0);
-        }
+        for (&self.internal.arenas) |*arena| arena.* = try FrameArena.init(device, 4 * 1024 * 1024);
+        self.internal.main_view = try insertView(self);
+        errdefer self.views.internal.table.deinit();
 
-        self.fonts.default_font = try gpa.create(Font);
-        errdefer gpa.destroy(self.fonts.default_font);
-        self.fonts.default_font.* = try font_module.load(gpa, @embedFile("fonts/DejaVuSans.ttf"), font_module.default_ranges);
-        errdefer self.fonts.default_font.deinit();
-        try registerFont(self, self.fonts.default_font);
-        if (options.asset_cache_max_bytes != 0) if (options.asset_cache_dir) |directory| {
-            _ = gltf.trimCache(gpa, self.io, directory, options.asset_cache_max_bytes) catch |err| std.log.warn("asset cache not trimmed: {}", .{err});
+        self.fonts.internal.default_font = try gpa.create(Font);
+        errdefer gpa.destroy(self.fonts.internal.default_font);
+        self.fonts.internal.default_font.* = try font_module.load(gpa, @embedFile("fonts/DejaVuSans.ttf"), font_module.default_ranges);
+        errdefer self.fonts.internal.default_font.deinit();
+        try registerFont(self, self.fonts.internal.default_font);
+        if (options.cache.assets_max_bytes != 0) if (options.cache.assets) |directory| {
+            _ = gltf.trimCache(gpa, self.internal.io, directory, options.cache.assets_max_bytes) catch |err| std.log.warn("asset cache not trimmed: {}", .{err});
         };
 
         var cmd = try device.beginImmediate();
         try cmd.flushUploads();
-        try cmd.beginRendering(.{ .color = &.{.{ .texture = self.brdf_lut, .load = .discard }} });
-        cmd.bindPipeline(self.pipelines.brdf_lut);
-        cmd.drawFullscreen();
-        cmd.endRendering();
-        cmd.transition(self.brdf_lut, .shader_read);
-        for (0..gpu.cascade_count) |cascade| {
-            try cmd.beginRendering(.{ .depth = .{ .texture = self.shadow_map, .layer = @intCast(cascade), .clear = 1 } });
-            cmd.endRendering();
-        }
-        cmd.transition(self.shadow_map, .shader_read);
-        try cmd.beginRendering(.{ .depth = .{ .texture = self.local_shadow_map, .clear = 0 } });
-        cmd.endRendering();
-        cmd.transition(self.local_shadow_map, .shader_read);
-        try device.endImmediate();
+        try device.endImmediate(&cmd);
         return self;
     }
 
@@ -530,135 +472,85 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         const device = self.device;
         device.waitIdle() catch {};
-        self.pending.deinit(self.gpa);
-        self.applying.deinit(self.gpa);
-        self.entity_transforms.deinit(self.gpa);
-        self.entity_previous.deinit(self.gpa);
-        self.entity_marks.deinit(self.gpa);
-        while (self.entities.table.popAny()) |entity| freeEntityStorage(self, entity);
-        while (self.scenes.table.popAny()) |scene_value| {
-            var scene = scene_value;
-            freeScene(self, &scene);
+        self.internal.pending.deinit(self.internal.gpa);
+        self.internal.applying.deinit(self.internal.gpa);
+        self.internal.entity_transforms.deinit(self.internal.gpa);
+        self.internal.entity_previous.deinit(self.internal.gpa);
+        self.internal.entity_marks.deinit(self.internal.gpa);
+        self.internal.entity_spans.deinit(self.internal.gpa);
+        inline for (stores) |name| {
+            const store = &@field(self, name);
+            while (store.internal.table.popAny()) |value| {
+                var entry = value;
+                @TypeOf(store.internal).free(self, &entry);
+            }
+            store.internal.table.deinit();
         }
-        while (self.models.table.popAny()) |model_value| {
-            var model = model_value;
-            freeModel(self, &model);
-        }
-        while (self.environments.table.popAny()) |environment_value| {
-            var environment = environment_value;
-            freeEnvironment(self, &environment);
-        }
-        self.entities.table.deinit();
-        while (self.emitters.table.popAny()) |emitter| {
-            device.destroyBuffer(emitter.buffer);
-            if (emitter.order) |order| device.destroyBuffer(order);
-        }
-        self.emitters.table.deinit();
-        self.probes.table.deinit();
-        while (self.fluids.table.popAny()) |fluid| {
-            var state = fluid;
-            destroyFluidTextures(self, &state);
-        }
-        self.fluids.table.deinit();
-        while (self.waters.table.popAny()) |water| for (water.state) |texture| device.destroyTexture(texture);
-        self.waters.table.deinit();
-        while (self.hairs.table.popAny()) |hair| freeHair(self, hair);
-        self.hairs.table.deinit();
-        while (self.hairs.fields.popAny()) |field| device.destroyTexture(field.texture);
-        self.hairs.fields.deinit();
-        for (self.liquids.table.slots.items) |*slot| if (slot.value) |*state| state.deinit(self.device);
-        self.liquids.table.deinit();
-        while (self.instances.table.popAny()) |group| {
-            self.gpa.free(group.transforms);
-            self.gpa.free(group.tints);
-            self.gpa.free(group.params);
-        }
-        self.instances.table.deinit();
-        self.scenes.table.deinit();
-        self.models.table.deinit();
-        self.environments.table.deinit();
-        while (self.views.table.popAny()) |view_value| {
-            var view = view_value;
-            view.deinit(device);
-        }
-        self.views.table.deinit();
-        if (self.gi_pipelines) |pipelines| {
-            device.destroyPipeline(pipelines.trace);
-            device.destroyPipeline(pipelines.irradiance);
-            device.destroyPipeline(pipelines.clamp_upper);
-            device.destroyPipeline(pipelines.clamp_lower);
-            device.destroyPipeline(pipelines.relocate);
-            device.destroyPipeline(pipelines.visibility);
-        }
-        dropShadeVariants(self);
-        self.shade_variants.deinit(self.gpa);
-        for (&self.pose_scratch) |*scratch| scratch.deinit(self.gpa);
-        self.prepare_chunks.deinit(self.gpa);
-        for (self.tonemap_pipelines.items) |entry| device.destroyPipeline(entry.pipeline);
-        self.tonemap_pipelines.deinit(self.gpa);
-        for (self.draw_pipelines.items) |entry| {
-            device.destroyPipeline(entry.flat);
-            device.destroyPipeline(entry.depth_tested);
-        }
-        self.draw_pipelines.deinit(self.gpa);
-        for (self.fonts.list.items, self.fonts.textures.items) |font, texture| {
+        while (self.hairs.internal.fields.popAny()) |field| device.destroyTexture(field.texture);
+        self.hairs.internal.fields.deinit();
+        self.internal.shade_variants.deinit(self.internal.gpa);
+        for (&self.internal.pose_scratch) |*scratch| scratch.deinit(self.internal.gpa);
+        self.internal.prepare_chunks.deinit(self.internal.gpa);
+        canvas_feature.deinit(&self.canvas, self.internal.gpa, device);
+        self.internal.target_pool.deinit(self.internal.gpa, device);
+        for (self.fonts.internal.list.items, self.fonts.internal.textures.items) |font, texture| {
             device.destroyTexture(texture);
             font.deinit();
-            self.gpa.destroy(font);
+            self.internal.gpa.destroy(font);
         }
-        self.fonts.list.deinit(self.gpa);
-        self.fonts.textures.deinit(self.gpa);
-        for (self.images.list.items) |entry| device.destroyTexture(entry.texture);
-        self.images.list.deinit(self.gpa);
-        inline for (@typeInfo(Pipelines).@"struct".fields) |field| {
-            const pipeline = @field(self.pipelines, field.name);
-            if (@typeInfo(@TypeOf(pipeline)) == .optional) {
-                if (pipeline) |made| device.destroyPipeline(made);
-            } else device.destroyPipeline(pipeline);
+        self.fonts.internal.list.deinit(self.internal.gpa);
+        for (self.fonts.internal.destroyed.items) |font| {
+            font.deinit();
+            self.internal.gpa.destroy(font);
         }
-        for (self.material_samplers) |sampler| if (sampler) |value| device.destroySampler(value);
-        device.destroySampler(self.sampler_linear_clamp);
-        device.destroySampler(self.sampler_nearest_clamp);
-        device.destroySampler(self.sampler_linear_repeat);
-        device.destroySampler(self.sampler_shadow);
-        device.destroySampler(self.sampler_local_shadow);
-        device.destroyTexture(self.local_shadow_map);
-        device.destroyBuffer(self.clusters);
-        self.transparent_order.deinit(self.gpa);
-        inline for (.{ "vertices", "skin_vertices", "morph_deltas", "indices", "meshlets", "bvh_nodes", "bvh_items", "meshes" }) |name| @field(self, name).deinit(self);
-        self.materials.pool.deinit(self);
-        self.mesh_boxes.deinit(self.gpa);
-        for (&self.arenas) |*arena| arena.deinit(device);
-        device.destroyBuffer(self.cull_counts);
-        device.destroyBuffer(self.cull_dispatch);
-        device.destroyBuffer(self.impostor_draw);
-        self.scratch_impostors.deinit(self.gpa);
-        device.destroyBuffer(self.cull_mesh_draws);
-        for (self.count_readback) |buffer| device.destroyBuffer(buffer);
-        device.destroyBuffer(self.pick_buffer);
-        for (self.materials.shaders) |shader| if (shader) |pipelines| {
+        self.fonts.internal.destroyed.deinit(self.internal.gpa);
+        self.fonts.internal.textures.deinit(self.internal.gpa);
+        self.images.internal.deinit(self.internal.gpa, device);
+        self.internal.pipelines.deinit();
+        for (self.internal.material_samplers) |sampler| if (sampler) |value| device.destroySampler(value);
+        device.destroySampler(self.internal.sampler_linear_clamp);
+        device.destroySampler(self.internal.sampler_nearest_clamp);
+        device.destroySampler(self.internal.sampler_linear_repeat);
+        device.destroySampler(self.internal.sampler_shadow);
+        device.destroySampler(self.internal.sampler_local_shadow);
+        inline for (.{ "vertices", "skin_vertices", "morph_deltas", "indices", "meshlets", "meshes" }) |name| @field(self.internal, name).deinit(self);
+        self.internal.rays.deinit(self);
+        self.materials.internal.pool.deinit(self);
+        for (&self.internal.arenas) |*arena| arena.deinit(device);
+        self.internal.scratch_impostors.deinit(self.internal.gpa);
+        for (self.materials.internal.shaders) |shader| if (shader) |pipelines| {
             device.destroyPipeline(pipelines.plain);
             device.destroyPipeline(pipelines.reflective);
         };
-        for (self.pick_readback) |buffer| device.destroyBuffer(buffer);
-        if (self.cull_commands) |buffer| device.destroyBuffer(buffer);
-        device.destroyTexture(self.shadow_map);
-        device.destroyTexture(self.brdf_lut);
-        if (self.cloud_noise) |texture| device.destroyTexture(texture);
-        self.skin_jobs.deinit(self.gpa);
-        self.skin_weights.deinit(self.gpa);
-        self.bounds_jobs.deinit(self.gpa);
-        self.blas_jobs.deinit(self.gpa);
-        self.scratch_locals.deinit(self.gpa);
-        self.scratch_refs.deinit(self.gpa);
-        self.scratch_settling.deinit(self.gpa);
-        self.scratch_moved.deinit(self.gpa);
-        self.scratch_instances.deinit(self.gpa);
-        self.scratch_static_cull.deinit(self.gpa);
-        self.dlss.stop(device);
+        if (self.internal.cull_commands) |buffer| device.destroyBuffer(buffer);
+        if (self.internal.cull_marks) |buffer| device.destroyBuffer(buffer);
+        if (self.internal.cull_blocks) |buffer| device.destroyBuffer(buffer);
+        if (self.internal.cluster_lights) |buffer| device.destroyBuffer(buffer);
+        self.internal.staged_views.deinit(self.internal.gpa);
+        if (self.internal.scene_ready) {
+            for ([_]rhi.Buffer{ self.internal.cull_counts, self.internal.cull_dispatch, self.internal.impostor_draw, self.internal.cull_mesh_draws, self.internal.clusters, self.internal.cluster_cursors, self.internal.pick_buffer }) |buffer| device.destroyBuffer(buffer);
+            for (self.internal.count_readback) |buffer| device.destroyBuffer(buffer);
+            for (self.internal.pick_readback) |buffer| device.destroyBuffer(buffer);
+            device.destroyTexture(self.internal.local_shadow_map);
+            device.destroyTexture(self.internal.shadow_map);
+            device.destroyTexture(self.internal.brdf_lut);
+            device.destroyTexture(self.internal.ltc_table);
+        }
+        if (self.internal.sky_scattering) |texture| device.destroyTexture(texture);
+        if (self.internal.cloud_noise) |texture| device.destroyTexture(texture);
+        if (self.internal.cloud_weather) |texture| device.destroyTexture(texture);
+        self.internal.scratch_locals.deinit(self.internal.gpa);
+        self.internal.scratch_refs.deinit(self.internal.gpa);
+        self.internal.scratch_settling.deinit(self.internal.gpa);
+        self.internal.scratch_moved.deinit(self.internal.gpa);
+        self.internal.scratch_granted.deinit(self.internal.gpa);
+        self.internal.scratch_light_ranks.deinit(self.internal.gpa);
+        self.internal.scratch_instances.deinit(self.internal.gpa);
+        self.internal.scratch_static_cull.deinit(self.internal.gpa);
+        self.internal.dlss.stop(device);
         pipelines_module.releaseOverrides();
-        const gpa = self.gpa;
-        const io = self.io;
+        const gpa = self.internal.gpa;
+        const io = self.internal.io;
         gpa.destroy(self);
         gltf.releaseLibraries(io);
         device.deinit();
@@ -672,35 +564,62 @@ pub const Renderer = struct {
         self.device.resize(width, height);
     }
 
-    /// How `Settings.path_tracing` would run on this device. Safe from any
-    /// thread.
-    pub fn pathTracing(self: *const Renderer) PathTracing {
-        if (self.device.ray_tracing) return .hardware;
-        return if (self.options.path_tracing_fallback) .shader else .unavailable;
+    /// Replaces the window the renderer presents to, as on Android when the
+    /// app comes back with a new window; null drops it, and views of the
+    /// backbuffer fail with `error.NoSurface` until a new one comes. Fails with
+    /// `error.NoSurface` for a renderer made without a surface.
+    pub fn setSurface(self: *Renderer, surface: ?rhi.Surface) !void {
+        self.lock();
+        defer self.unlock();
+        try self.device.setSurface(surface);
     }
 
-    /// What `Upscaling.dlss` would do on this device: nothing without
-    /// the DLSS SDK built in, an NVIDIA GPU and a driver that runs it. Safe from any thread.
-    pub fn dlssSupport(self: *const Renderer) Dlss {
-        return .{ .super_resolution = self.dlss.super_resolution, .ray_reconstruction = self.dlss.ray_reconstruction };
+    /// What this renderer can do on this device. Safe from any thread.
+    pub fn capabilities(self: *Renderer) Capabilities {
+        const device = self.device;
+        const built = struct {
+            fn in(present: bool, runs: bool) api.Support {
+                return if (!present) .not_built else if (runs) .available else .no_device_support;
+            }
+        }.in;
+        const offered = struct {
+            fn by(asked: bool, has: bool) api.Support {
+                return if (!asked) .off else if (has) .available else .no_device_support;
+            }
+        }.by;
+        self.lock();
+        defer self.unlock();
+        return .{
+            .ray_tracing = offered(self.options.ray_tracing.hardware, device.caps.ray_tracing),
+            .path_tracing = view_render_module.pathTracingSupport(self),
+            .mesh_shaders = offered(self.options.geometry.mesh_shaders, device.caps.mesh_shaders),
+            .variable_rate_shading = if (device.caps.shading_rate_tile != 0) .available else .no_device_support,
+            .fidelityfx = built(@import("ffx.zig").available, device.caps.storage_images),
+            .dlss = built(@import("dlss.zig").available, device.caps.storage_images and self.internal.dlss.super_resolution),
+            .dlss_ray_reconstruction = built(@import("dlss.zig").available, device.caps.storage_images and self.internal.dlss.ray_reconstruction),
+            .hdr_output = offered(self.options.hdr_output, device.hdr_active),
+        };
     }
 
     /// Last frame's counters, with current loading count and GPU memory use.
     /// Safe from any thread.
-    pub fn getStats(self: *Renderer) Stats {
+    pub fn stats(self: *Renderer) Stats {
         self.lock();
         defer self.unlock();
-        var stats = self.stats;
-        stats.models_loading = self.loading_count;
-        stats.gpu_memory_bytes = self.device.memoryStats().used_bytes;
-        return stats;
+        var result = self.internal.stats;
+        result.models_loading = self.internal.loading_count;
+        const memory = self.device.memoryStats();
+        result.gpu_memory_bytes = memory.used_bytes;
+        result.gpu_memory_budget_bytes = memory.budget_bytes;
+        result.pipelines = self.internal.pipelines.count();
+        return result;
     }
 
     /// True while any model or environment is still streaming in.
     pub fn isLoading(self: *Renderer) bool {
         self.lock();
         defer self.unlock();
-        return self.loading_count != 0;
+        return self.internal.loading_count != 0;
     }
 
     /// Blocks until every pending asset is on the GPU. For tools and tests.
@@ -709,27 +628,27 @@ pub const Renderer = struct {
             {
                 self.lock();
                 defer self.unlock();
-                if (self.loading_count == 0) return;
+                if (self.internal.loading_count == 0) return;
                 if (self.anyJobFinished()) {
                     var cmd = try self.device.beginImmediate();
                     _ = try self.pumpAssets(&cmd, std.math.maxInt(u64));
                     try cmd.flushUploads();
                     try buildPendingBlas(self, &cmd, null);
                     try cmd.flushUploads();
-                    try self.device.endImmediate();
+                    try self.device.endImmediate(&cmd);
                     continue;
                 }
             }
-            try self.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            try self.internal.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
         }
     }
 
     fn anyJobFinished(self: *Renderer) bool {
-        for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
+        for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
             if (entry.state != .loading) continue;
             if (entry.job == null or entry.job.?.done.load(.acquire)) return true;
         };
-        for (self.environments.table.slots.items) |*slot| if (slot.value) |*entry| {
+        for (0..self.environments.internal.table.slotCount()) |slot_index| if (self.environments.internal.table.slotAt(slot_index).value) |*entry| {
             if (entry.state == .loading and entry.job.?.done.load(.acquire)) return true;
         };
         return false;
@@ -740,10 +659,10 @@ pub const Renderer = struct {
     fn pumpAssets(self: *Renderer, cmd: *rhi.CommandEncoder, budget_bytes: u64) !bool {
         const zone = Zone.start(self.options.profiler, "stream assets");
         defer zone.stop();
-        if (self.loading_count == 0) return false;
+        if (self.internal.loading_count == 0) return false;
         var budget = budget_bytes;
         var progressed = false;
-        for (self.models.table.slots.items) |*slot| if (slot.value) |*entry| {
+        for (0..self.models.internal.table.slotCount()) |slot_index| if (self.models.internal.table.slotAt(slot_index).value) |*entry| {
             if (entry.state != .loading) continue;
             if (entry.job) |job| if (!job.done.load(.acquire)) continue;
             progressed = true;
@@ -755,12 +674,12 @@ pub const Renderer = struct {
                 break :blk true;
             };
             if (finished) {
-                self.loading_count -= 1;
-                self.asset_generation += 1;
+                self.internal.loading_count -= 1;
+                self.internal.asset_generation += 1;
             }
             if (budget == 0) break;
         };
-        for (self.environments.table.slots.items) |*slot| if (slot.value) |*entry| {
+        for (0..self.environments.internal.table.slotCount()) |slot_index| if (self.environments.internal.table.slotAt(slot_index).value) |*entry| {
             if (entry.state != .loading or entry.job == null or !entry.job.?.done.load(.acquire)) continue;
             progressed = true;
             finalizeEnvironment(self, entry, cmd) catch |err| {
@@ -769,7 +688,7 @@ pub const Renderer = struct {
                 entry.state = .failed;
                 entry.failure = err;
             };
-            self.loading_count -= 1;
+            self.internal.loading_count -= 1;
         };
         return progressed;
     }
@@ -777,142 +696,21 @@ pub const Renderer = struct {
     /// Deletes the oldest-written asset cache files until at most `max_bytes`
     /// remain; returns the bytes freed.
     pub fn trimAssetCache(self: *Renderer, max_bytes: u64) !u64 {
-        const directory = self.options.asset_cache_dir orelse return 0;
-        return gltf.trimCache(self.gpa, self.io, directory, max_bytes);
+        const directory = self.options.cache.assets orelse return 0;
+        return gltf.trimCache(self.internal.gpa, self.internal.io, directory, max_bytes);
     }
 
     /// Takes the renderer lock. Public methods lock internally; hold it only
     /// to use `device` from a non-rendering thread. Not reentrant: call no
     /// renderer methods while holding it.
     pub fn lock(self: *Renderer) void {
-        self.mutex.lockUncancelable(self.io);
-        if (self.pending_any.load(.acquire)) self.applyPending();
+        self.internal.mutex.lockUncancelable(self.internal.io);
+        if (self.internal.pending_any.load(.acquire)) entity_edits.applyPending(self);
     }
 
     /// Must be called from the thread that took the lock.
     pub fn unlock(self: *Renderer) void {
-        self.mutex.unlock(self.io);
-    }
-
-    /// Takes the lock if nothing holds it. The entity setters use it so as
-    /// not to wait for a frame that is being recorded; see `queueEdit`.
-    pub fn tryLock(self: *Renderer) bool {
-        if (!self.mutex.tryLock()) return false;
-        if (self.pending_any.load(.acquire)) self.applyPending();
-        return true;
-    }
-
-    /// Leaves an entity edit to be made, in order, before anything else next
-    /// uses the lock, so that the caller does not wait for a frame.
-    pub fn queueEdit(self: *Renderer, entity: Entity, change: EntityEdit.Change) void {
-        self.queueEdits(&.{.{ .entity = entity, .change = change }});
-    }
-
-    /// `queueEdit` for several edits under one lock of the queue.
-    pub fn queueEdits(self: *Renderer, edits: []const EntityEdit) void {
-        const queued = queued: {
-            self.pending_mutex.lockUncancelable(self.io);
-            defer self.pending_mutex.unlock(self.io);
-            self.pending.appendSlice(self.gpa, edits) catch break :queued false;
-            self.pending_any.store(true, .release);
-            break :queued true;
-        };
-        if (queued) return;
-        self.lock();
-        defer self.unlock();
-        for (edits) |edit| applyEdit(self, edit);
-    }
-
-    fn applyPending(self: *Renderer) void {
-        {
-            self.pending_mutex.lockUncancelable(self.io);
-            defer self.pending_mutex.unlock(self.io);
-            std.mem.swap(std.ArrayList(EntityEdit), &self.pending, &self.applying);
-            self.pending_any.store(false, .release);
-        }
-        for (self.applying.items) |edit| applyEdit(self, edit);
-        self.applying.clearRetainingCapacity();
-    }
-
-    fn applyEdit(self: *Renderer, edit: EntityEdit) void {
-        switch (edit.change) {
-            .transform => |transform| self.moveEntity(edit.entity, transform, false),
-            .teleport => |transform| self.moveEntity(edit.entity, transform, true),
-            .tint => |tint| if (self.entities.table.get(edit.entity)) |data| {
-                if (data.tint == tint) return;
-                data.tint = tint;
-                self.restyleEntity(edit.entity);
-            },
-            .params => |params| if (self.entities.table.get(edit.entity)) |data| {
-                if (std.mem.eql(f32, &data.params, &params)) return;
-                data.params = params;
-                self.restyleEntity(edit.entity);
-            },
-            .pose => |pose| if (self.entities.table.get(edit.entity)) |data| {
-                data.pose = pose;
-            },
-        }
-    }
-
-    /// The bookkeeping of a live entity. Needs the lock, as do the calls below.
-    pub fn markOf(self: *Renderer, entity: Entity) ?*EntityMark {
-        if (entity.index >= self.entity_marks.items.len) return null;
-        const mark = &self.entity_marks.items[entity.index];
-        return if (mark.handle == @as(u64, @bitCast(entity))) mark else null;
-    }
-
-    /// An entity's transform; the identity for a stale handle.
-    pub fn transformOf(self: *Renderer, entity: Entity) Mat4 {
-        return if (self.markOf(entity) != null) self.entity_transforms.items[entity.index] else math.identity;
-    }
-
-    /// Gives an entity a transform. A teleport is not motion.
-    pub fn moveEntity(self: *Renderer, entity: Entity, transform: Mat4, teleport: bool) void {
-        const mark = self.markOf(entity) orelse return;
-        const slot = &self.entity_transforms.items[entity.index];
-        if (teleport) {
-            self.entity_previous.items[entity.index] = transform;
-        } else if (std.mem.eql(f32, slot, &transform)) return;
-        slot.* = transform;
-        self.noteEdited(entity.index, mark, if (teleport) EntityMark.teleported else EntityMark.moved);
-    }
-
-    /// Has an entity's instance records written again.
-    pub fn restyleEntity(self: *Renderer, entity: Entity) void {
-        const mark = self.markOf(entity) orelse return;
-        self.noteEdited(entity.index, mark, EntityMark.restyled);
-    }
-
-    fn noteEdited(self: *Renderer, index: u32, mark: *EntityMark, change: u32) void {
-        const wanted = change | EntityMark.listed;
-        if (mark.bits & wanted == wanted) return;
-        const scene = self.scenes.table.get(mark.scene) orelse return;
-        const whole = EntityMark.restyled | EntityMark.teleported;
-        if (change & whole != 0 and mark.bits & whole == 0) scene.restyled_entries += mark.layout_count;
-        mark.bits |= change;
-        if (mark.bits & EntityMark.listed != 0) return;
-        scene.edited.append(self.gpa, index) catch {
-            scene.records_valid = false;
-            return;
-        };
-        scene.edited_entries += mark.layout_count;
-        mark.bits |= EntityMark.listed;
-    }
-
-    /// Starts the bookkeeping of a new entity.
-    pub fn markEntity(self: *Renderer, entity: Entity, scene: Scene, transform: Mat4) !void {
-        const needed = @as(usize, entity.index) + 1;
-        if (self.entity_marks.items.len < needed) {
-            try self.entity_transforms.ensureTotalCapacity(self.gpa, needed);
-            try self.entity_previous.ensureTotalCapacity(self.gpa, needed);
-            try self.entity_marks.ensureTotalCapacity(self.gpa, needed);
-            @memset(self.entity_transforms.addManyAsSliceAssumeCapacity(needed - self.entity_transforms.items.len), math.identity);
-            @memset(self.entity_previous.addManyAsSliceAssumeCapacity(needed - self.entity_previous.items.len), math.identity);
-            @memset(self.entity_marks.addManyAsSliceAssumeCapacity(needed - self.entity_marks.items.len), .{});
-        }
-        self.entity_transforms.items[entity.index] = transform;
-        self.entity_previous.items[entity.index] = transform;
-        self.entity_marks.items[entity.index] = .{ .handle = @bitCast(entity), .scene = scene };
+        self.internal.mutex.unlock(self.internal.io);
     }
 
     /// Asks which entity is under `pixel` (in the view's pixels; null is the
@@ -921,30 +719,30 @@ pub const Renderer = struct {
     pub fn requestPick(self: *Renderer, view: ?View, pixel: [2]u32) void {
         self.lock();
         defer self.unlock();
-        self.pick_request = .{ .view = view orelse self.main_view, .pixel = pixel };
+        self.internal.pick_request = .{ .view = view orelse self.internal.main_view, .pixel = pixel };
     }
 
     /// Returns the answer to a `requestPick` once, when it is ready.
     pub fn takePick(self: *Renderer) ?PickResult {
         self.lock();
         defer self.unlock();
-        defer self.pick_result = null;
-        return self.pick_result;
+        defer self.internal.pick_result = null;
+        return self.internal.pick_result;
     }
 
     /// Collects the pick the GPU wrote in this frame slot's previous use.
     fn resolvePick(self: *Renderer, slot: usize) void {
-        const pending = self.pick_pending[slot] orelse return;
-        self.pick_pending[slot] = null;
-        const raw = self.device.mappedSlice(gpu.Pick, self.pick_readback[slot])[0];
+        const pending = self.internal.pick_pending[slot] orelse return;
+        self.internal.pick_pending[slot] = null;
+        const raw = self.device.mappedSlice(gpu.Pick, self.internal.pick_readback[slot])[0];
         var result = PickResult{ .pixel = pending.pixel, .hit = null };
-        defer self.pick_result = result;
+        defer self.internal.pick_result = result;
         if (raw.instance == gpu.invalid_id) return;
-        const scene = self.scenes.table.get(pending.scene) orelse return;
+        const scene = self.scenes.internal.table.get(pending.scene) orelse return;
         if (scene.layout_version != pending.layout_version) return;
-        if (raw.instance >= scene.layout.items.len) {
+        if (raw.instance >= scene.entity_capacity) {
             for (scene.groups.items) |group_handle| {
-                const group = self.instances.table.get(group_handle) orelse continue;
+                const group = self.instances.internal.table.get(group_handle) orelse continue;
                 if (group.per_copy == 0 or raw.instance < group.base) continue;
                 const offset = raw.instance - group.base;
                 if (offset >= group.transforms.len * group.per_copy) continue;
@@ -954,43 +752,49 @@ pub const Renderer = struct {
                     .copy = offset / group.per_copy,
                     .mesh_instance = offset % group.per_copy,
                     .position = raw.position,
-                    .distance = pending.near / @max(raw.depth, 1e-9),
+                    .distance = view_math_module.viewDepth(pending.depth_terms, raw.depth),
                 };
                 return;
             }
             return;
         }
+        if (raw.instance >= scene.layout.items.len) return;
         const entry = scene.layout.items[raw.instance];
+        if (!entry.entity.isValid()) return;
         result.hit = .{
             .entity = entry.entity,
             .mesh_instance = entry.model_instance,
             .position = raw.position,
-            .distance = pending.near / @max(raw.depth, 1e-9),
+            .distance = view_math_module.viewDepth(pending.depth_terms, raw.depth),
         };
     }
 
     /// Renders one frame; false when skipped because the window has no
     /// drawable surface. Call from one thread at a time; the lock is held
     /// only while recording, not while waiting for the GPU or display.
+    /// `error.DeviceLost` is final: every later frame fails the same way, and
+    /// the application deinits this renderer and creates a new one.
     pub fn render(self: *Renderer, desc: FrameDesc) !bool {
         const device = self.device;
+        if (!std.math.isFinite(desc.delta_time) or desc.delta_time < 0) return error.InvalidDeltaTime;
         var failure: ?anyerror = null;
-        try device.waitForFrame();
+        if (self.options.deterministic) try self.waitUntilLoaded();
+        try device.internal.waitForFrame();
         {
             self.lock();
             defer self.unlock();
-            if (!try device.prepareSurface()) return false;
+            if (!try device.internal.prepareSurface()) return false;
         }
-        if (!try device.acquireImage()) return false;
+        if (!try device.internal.acquireImage()) return false;
         {
             self.lock();
             defer self.unlock();
-            const cpu_start = std.Io.Clock.Timestamp.now(self.io, .awake);
-            const frame = try device.startFrame();
+            const cpu_start = std.Io.Clock.Timestamp.now(self.internal.io, .awake);
+            const frame = try device.internal.startFrame();
             self.renderFrame(frame, desc) catch |err| {
                 failure = err;
-                device.closeFailedFrame();
-                for (self.frame_targets[0..self.frame_target_count]) |target| {
+                device.internal.closeFailedFrame();
+                for (self.internal.frame_targets[0..self.internal.frame_target_count]) |target| {
                     const is_backbuffer = if (frame.backbuffer) |backbuffer| std.meta.eql(backbuffer, target) else false;
                     if (!is_backbuffer) frame.cmd.transition(target, .shader_read);
                 }
@@ -1000,24 +804,27 @@ pub const Renderer = struct {
                     else |_| {}
                 };
             };
-            self.stats.indirect_draws = frame.cmd.indirect_draws;
-            device.setFrameGenerator(if (self.generating != null and failure == null) .{ .context = self, .generate = generateFrame } else null);
-            try device.submitFrame();
-            self.stats.cpu_ms = @as(f32, @floatFromInt(cpu_start.untilNow(self.io).raw.nanoseconds)) / 1e6;
-            self.frame_index += 1;
-            self.time += desc.delta_time;
+            device.setFrameGenerator(if (self.internal.generating != null and failure == null) .{ .context = self, .generate = generateFrame } else null);
+            const arena_used = self.internal.arenas[@intCast(frame.index % rhi.frames_in_flight)].used;
+            try device.internal.submitFrame();
+            self.internal.stats.indirect_draws = frame.cmd.work.indirect_draws;
+            self.internal.stats.commands = frame.cmd.work;
+            self.internal.stats.frame_data_bytes = arena_used;
+            self.internal.stats.cpu_ms = @as(f32, @floatFromInt(cpu_start.untilNow(self.internal.io).raw.nanoseconds)) / 1e6;
+            self.internal.frame_index += 1;
+            self.internal.time += desc.delta_time;
         }
-        try device.presentFrame();
+        try device.internal.presentFrame();
         if (failure) |err| return err;
         return true;
     }
 
     fn generateFrame(context: *anyopaque, cmd: *rhi.CommandEncoder, shown: rhi.Texture, output: rhi.Texture) bool {
         const self: *Renderer = @ptrCast(@alignCast(context));
-        const upscaler = self.generating orelse return false;
-        return upscaler.generate(self.device, cmd, shown, output, self.generating_reset) catch {
-            if (!self.generating_failed) std.log.warn("FidelityFX frame generation failed; frames are shown without it", .{});
-            self.generating_failed = true;
+        const generator = self.internal.generating orelse return false;
+        return generator.generate(self.device, cmd, shown, output, self.internal.generating_reset) catch {
+            if (!self.internal.generating_failed) std.log.warn("frame generation failed; frames are shown without it", .{});
+            self.internal.generating_failed = true;
             return false;
         };
     }
@@ -1026,23 +833,26 @@ pub const Renderer = struct {
         const frame_zone = Zone.start(self.options.profiler, "render frame");
         defer frame_zone.stop();
         const cmd = frame.cmd;
-        const arena = &self.arenas[@intCast(frame.index % rhi.frames_in_flight)];
-        self.stats.draw_list_triangles = 0;
-        self.stats.path_traced_frames = 0;
-        self.stats.views = @intCast(desc.views.len);
+        const arena = &self.internal.arenas[@intCast(frame.index % rhi.frames_in_flight)];
+        self.internal.stats.draw_list_triangles = 0;
+        self.internal.stats.path_traced_frames = 0;
+        self.internal.stats.views = @intCast(desc.views.len);
         arena.reset(self.device);
-        self.frame_target_count = 0;
-        self.frame_scene_views = 0;
-        self.generating = null;
+        self.internal.frame_target_count = 0;
+        self.internal.frame_scene_views = 0;
+        self.internal.downgrades.count = 0;
+        canvas_feature.beginFrame(&self.canvas, self.device, self.internal.frame_index);
+        self.internal.target_pool.collect(self.device, self.internal.frame_index);
+        self.internal.generating = null;
         self.resolvePick(@intCast(frame.index % rhi.frames_in_flight));
 
         cmd.beginScope("streaming");
         _ = try self.pumpAssets(cmd, stream_budget_bytes);
         try updateTextureStreaming(self, frame, desc);
         try updateGeometryStreaming(self, desc);
-        if (self.skies_dirty) {
-            self.skies_dirty = false;
-            for (self.environments.table.slots.items) |*slot| if (slot.value) |*entry| {
+        if (self.internal.skies_dirty) {
+            self.internal.skies_dirty = false;
+            for (0..self.environments.internal.table.slotCount()) |slot_index| if (self.environments.internal.table.slotAt(slot_index).value) |*entry| {
                 if (entry.sky_desc == null) {
                     if (entry.sky_dirty) try bakeLoadedClouds(self, entry, cmd);
                 } else if (entry.sky_dirty or entry.bake_step != 0) try bakeSky(self, entry, cmd, false);
@@ -1053,8 +863,10 @@ pub const Renderer = struct {
         try buildPendingBlas(self, cmd, frame.index);
         cmd.endScope();
 
-        for (desc.views) |view_desc| try renderView(self, frame, view_desc, desc.delta_time, arena);
+        try renderViews(self, frame, desc.views, desc.delta_time, arena);
         try captureProbes(self, frame, desc.delta_time, arena);
+        self.internal.stats.downgrades = self.internal.downgrades.items;
+        self.internal.stats.downgrade_count = self.internal.downgrades.count;
         if (frame.backbuffer) |backbuffer| if (!targetWritten(self, backbuffer)) {
             try cmd.beginRendering(.{ .color = &.{.{ .texture = backbuffer, .load = .clear, .clear = .{ 0, 0, 0, 1 } }} });
             cmd.endRendering();
@@ -1065,14 +877,10 @@ pub const Renderer = struct {
     pub fn recommendedQuality(self: *const Renderer) Quality {
         return Quality.recommended(self.device.adapterInfo());
     }
-
-    /// True when the window surface is HDR10.
-    pub fn hdrActive(self: *Renderer) bool {
-        self.lock();
-        defer self.unlock();
-        return self.device.hdr_active;
-    }
 };
+
+/// A light that could cast shadows, scored for a share of the shadow atlas.
+pub const LightRank = struct { index: u32, score: f32 };
 
 pub const cullView = view_math_module.cullView;
 pub const CascadeCache = view_math_module.CascadeCache;

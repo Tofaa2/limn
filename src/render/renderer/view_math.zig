@@ -24,6 +24,71 @@ pub fn halton(index: u32, base: u32) f32 {
 
 const CullKind = enum { perspective, shadow };
 
+/// The camera's projection for a picture of `aspect`, without jitter.
+pub fn cameraProjection(camera: Camera, aspect: f32) Mat4 {
+    const shift = [2]f32{ camera.lens_shift[0] / aspect, camera.lens_shift[1] };
+    if (camera.orthographic) |parallel| {
+        const half_height = @max(parallel.height, 1e-6) * 0.5;
+        const half_width = half_height * aspect;
+        var result = math.orthographic(-half_width, half_width, -half_height, half_height, farPlane(camera), camera.near);
+        result[12] += shift[0];
+        result[13] += shift[1];
+        return result;
+    }
+    var result = math.perspective(camera.fov_y, aspect, camera.near);
+    result[8] = -shift[0];
+    result[9] = -shift[1];
+    return result;
+}
+
+/// `matrix` drawing `offset` further off its axis, in half picture sizes.
+pub fn shifted(matrix: Mat4, camera: Camera, offset: [2]f32) Mat4 {
+    var result = matrix;
+    if (camera.orthographic != null) {
+        result[12] += offset[0];
+        result[13] += offset[1];
+    } else {
+        result[8] -= offset[0];
+        result[9] -= offset[1];
+    }
+    return result;
+}
+
+/// How far off its axis `matrix` draws, in half picture sizes.
+pub fn lensShift(matrix: Mat4, camera: Camera) [2]f32 {
+    return if (camera.orthographic != null) .{ matrix[12], matrix[13] } else .{ -matrix[8], -matrix[9] };
+}
+
+fn farPlane(camera: Camera) f32 {
+    return @max(camera.orthographic.?.far, camera.near * 2);
+}
+
+/// `FrameConstants.depth_terms` of the camera.
+pub fn depthTerms(camera: Camera) [4]f32 {
+    if (camera.orthographic == null) return .{ 0, camera.near, 1, 0 };
+    const far = farPlane(camera);
+    return .{ camera.near - far, far, 0, 1 };
+}
+
+/// Distance along the view of what a pixel of `depth` shows.
+pub fn viewDepth(terms: [4]f32, depth: f32) f32 {
+    return (terms[1] + terms[0] * depth) / @max(terms[2] * depth + terms[3], 1e-9);
+}
+
+/// Distance at which a perspective camera stands in for a parallel one
+/// where only the direction and the ratio of size to distance matter.
+pub const parallel_distance = 1e7;
+
+pub const Vantage = struct { position: Vec3, scale: f32 };
+
+/// Where levels of detail and facing are judged from, and the factor that
+/// makes sizes over the distance from there come out in the picture's scale.
+pub fn vantage(camera: Camera) Vantage {
+    if (camera.orthographic == null) return .{ .position = camera.position, .scale = 1 };
+    const back = math.scale(math.normalize(camera.forward), -parallel_distance);
+    return .{ .position = math.add(camera.position, back), .scale = parallel_distance };
+}
+
 /// Extracts world-space culling planes (normals pointing inward).
 pub fn cullView(view_proj: Mat4, camera_position: Vec3, kind: CullKind) gpu.CullView {
     const row = struct {
@@ -69,6 +134,7 @@ pub const CascadeCache = struct {
     sun: Vec3 = .{ 0, 0, 0 },
     shadow_distance: f32 = 0,
     near: f32 = 0,
+    orthographic: ?api.Orthographic = null,
     cascades: Cascades = std.mem.zeroes(Cascades),
 };
 
@@ -115,7 +181,7 @@ pub fn computeCascades(camera: Camera, view_matrix: Mat4, aspect: f32, sun_trave
         var corners: [8]Vec3 = undefined;
         var center: Vec3 = .{ 0, 0, 0 };
         for ([_]f32{ slice_near, slice_far }, 0..) |distance, plane| {
-            const half_height = distance * tan_half;
+            const half_height = if (camera.orthographic) |parallel| parallel.height * 0.5 else distance * tan_half;
             const half_width = half_height * aspect;
             for ([_][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, 1 } }, 0..) |corner, index| {
                 const world = math.transformPoint(inv_view, .{ corner[0] * half_width, corner[1] * half_height, -distance });
@@ -184,4 +250,17 @@ pub fn giScroll(volume: *const GiVolume) u32 {
         packed_scroll |= wrapped << (10 * axis);
     }
     return packed_scroll;
+}
+
+test "orthographic depth runs from 1 at the near plane to 0 at the far one" {
+    const camera = Camera{ .position = .{ 0, 0, 0 }, .forward = .{ 0, 0, -1 }, .near = 2, .orthographic = .{ .height = 10, .far = 50 } };
+    const matrix = cameraProjection(camera, 2);
+    const terms = depthTerms(camera);
+    for ([_]f32{ 2, 14, 50 }) |distance| {
+        const clip = math.transformVec4(matrix, .{ 10, 5, -distance, 1 });
+        try std.testing.expectApproxEqAbs(@as(f32, 1), clip[0], 1e-5);
+        try std.testing.expectApproxEqAbs(@as(f32, -1), clip[1], 1e-5);
+        try std.testing.expectApproxEqAbs(distance, viewDepth(terms, clip[2] / clip[3]), 1e-3);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 7), viewDepth(depthTerms(.{ .near = 0.5 }), 0.5 / 7.0), 1e-4);
 }

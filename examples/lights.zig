@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.3, -0.25, -0.5 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 0.02);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 0.02 });
     renderer.scenes.setSun(scene, .{ .direction = sky_desc.sun_direction, .color = .{ 0.6, 0.7, 1.0 }, .intensity = 0.05 });
 
     var box_positions: [24][3]f32 = undefined;
@@ -31,8 +31,8 @@ pub fn main(init: std.process.Init) !void {
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
     const stone = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.55, 0.53, 0.5, 1 }, .metallic = 0, .roughness = 0.7 } }});
     const polished = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.3, 0.3, 0.32, 1 }, .metallic = 0, .roughness = 0.25 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = polished, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 40, 0.5, 30 })) });
-    _ = try renderer.entities.spawn(scene, .{ .model = stone, .transform = math.mul(math.translation(.{ 0, 3.5, -13 }), math.scaling(.{ 40, 7, 0.5 })) });
+    _ = try renderer.entities.create(scene, .{ .model = polished, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 40, 0.5, 30 })) });
+    _ = try renderer.entities.create(scene, .{ .model = stone, .transform = math.mul(math.translation(.{ 0, 3.5, -13 }), math.scaling(.{ 40, 7, 0.5 })) });
     var pillars: [5 * 8]math.Mat4 = undefined;
     for (&pillars, 0..) |*pillar, index| {
         const x = (@as(f32, @floatFromInt(index % 8)) - 3.5) * 4.0;
@@ -45,14 +45,14 @@ pub fn main(init: std.process.Init) !void {
     var sphere_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(0.9, &sphere_positions, &sphere_normals, &sphere_indices);
     const chrome = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0.9, 0.9, 0.92, 1 }, .metallic = 1, .roughness = 0.15 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = chrome, .transform = math.translation(.{ 2, 0.9, 2.2 }) });
-    const dot = try renderer.images.create(1, 1, &.{ 255, 255, 255, 255 }, true);
+    _ = try renderer.entities.create(scene, .{ .model = chrome, .transform = math.translation(.{ 2, 0.9, 2.2 }) });
+    const dot = try renderer.images.create(.{ .width = 1, .height = 1, .pixels = &.{ 255, 255, 255, 255 } });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(init.gpa);
     defer list.deinit();
     const font = renderer.fonts.default();
-    var lights: [max_drifting + 2]gfx.Light = undefined;
+    var lights: [max_drifting + 2]gfx.LightDesc = undefined;
     var drifting: usize = 64;
     var spot_shadows = true;
     var panel = true;
@@ -114,9 +114,12 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.5, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 40, .bloom = 0.08, .automatic_exposure = false, .exposure_compensation = 1.5 },
+                .settings = .{
+                    .shadows = .{ .distance = 40 },
+                    .post = .{ .bloom = 0.08, .automatic_exposure = false, .exposure_compensation = 1.5 },
+                },
             }},
             .delta_time = tick.dt,
         }));

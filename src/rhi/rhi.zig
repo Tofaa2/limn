@@ -1,14 +1,17 @@
-//! Render hardware interface: a thin, explicit Vulkan 1.3 device layer.
+//! Render hardware interface: a thin, explicit device layer. Everything that
+//! knows the graphics API is in the backend directory chosen here.
 const types = @import("types.zig");
-const device = @import("device.zig");
+const device = @import("vulkan/device.zig");
 
 pub const Device = device.Device;
+/// Most encoders `Device.beginParallel` gives at once.
+pub const max_parallel = device.max_parallel;
 pub const FrameGenerator = device.FrameGenerator;
-pub const deviceProcAddr = @import("loader.zig").deviceProcAddr;
-pub const instanceProcAddr = @import("loader.zig").instanceProcAddr;
+/// Native handles for external SDKs.
+pub const native = @import("vulkan/native.zig");
 pub const Detached = device.Detached;
 pub const Frame = device.Frame;
-pub const CommandEncoder = @import("command.zig").CommandEncoder;
+pub const CommandEncoder = @import("vulkan/command.zig").CommandEncoder;
 pub const frames_in_flight = device.frames_in_flight;
 pub const push_constant_size = device.push_constant_size;
 
@@ -29,6 +32,7 @@ pub const BufferDesc = types.BufferDesc;
 pub const BufferUsage = types.BufferUsage;
 pub const BufferMemory = types.BufferMemory;
 pub const BufferSync = types.BufferSync;
+pub const BufferAccess = types.BufferAccess;
 pub const SamplerDesc = types.SamplerDesc;
 pub const Filter = types.Filter;
 pub const AddressMode = types.AddressMode;
@@ -48,9 +52,16 @@ pub const ColorAttachment = types.ColorAttachment;
 pub const DepthAttachment = types.DepthAttachment;
 pub const LoadOp = types.LoadOp;
 pub const IndexType = types.IndexType;
+pub const Work = types.Work;
 pub const PassTiming = types.PassTiming;
 pub const MemoryStats = types.MemoryStats;
 pub const AdapterInfo = types.AdapterInfo;
+pub const Capabilities = types.Capabilities;
+pub const BlasGeometry = types.BlasGeometry;
+pub const BlasBuild = types.BlasBuild;
+pub const TlasDesc = types.TlasDesc;
+pub const max_blas_geometries = types.max_blas_geometries;
+pub const FormatSupport = types.FormatSupport;
 pub const AdapterKind = types.AdapterKind;
 pub const AccelerationStructure = types.AccelerationStructure;
 pub const BlasDesc = types.BlasDesc;

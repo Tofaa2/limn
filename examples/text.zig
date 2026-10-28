@@ -44,13 +44,13 @@ pub fn main(init: std.process.Init) !void {
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.4, -0.6, -0.5 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
     var box_positions: [24][3]f32 = undefined;
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 6, 0.05, 6 }, &box_positions, &box_indices);
     const floor = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.3, 0.32, 0.36, 1 }, .metallic = 0, .roughness = 0.4 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = floor });
+    _ = try renderer.entities.create(scene, .{ .model = floor });
 
     const font = renderer.fonts.default();
     try renderer.fonts.prepareText(font, hebrew ++ arabic ++ mixed ++ "→·“”");
@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(.{ -1.2, 1.6, 6.5 }, .{ -1.2, 2.6, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
             }},
             .delta_time = tick.dt,

@@ -3,8 +3,38 @@
 ## 0.1.4 
 
 ### Added
+- `Options.ordered_culling`: draws listed in the scene's meshlet order, so surfaces at exactly the same depth resolve the same way every run; on with `deterministic`.
+- Builds fetch Slang, glslang, GLFW with its platform headers, the macOS SDK headers, MoltenVK and the Android NDK; `-Dtarget` cross-compiles from any host, `zig build cross` builds every target.
+- Android: `-Dtarget=aarch64-linux-android` packs each windowed example into a signed APK, without the Android SDK.
+- macOS: MoltenVK is shipped beside the examples and loaded when no Vulkan loader is installed.
+- `decals --scatter N`: thousands of decals at once.
+- `zig build checks -- <names>` runs only those checks; `--no-ray-tracing` for software drivers. `-Dtsan` builds `checks` and `costs` with the thread sanitizer, with `src/tsan.supp` for Mesa's driver.
+- `rhi.AdapterInfo.tiled`, for phone and Apple GPUs; `Quality.recommended` gives them `.low` (Apple `.medium`).
+- `rhi.ColorAttachment.store`; `DepthAttachment.read_only` stores nothing back.
+- `Settings.fog.local_lights`: the clustered local lights light the fog, unshadowed.
+- `SkyDesc.multiple_scattering`: multiple scattering from a table integrated over every direction (Hillaire 2020).
+- `WaterDesc.ocean`: open sea from Tessendorf's spectrum, an FFT-style transform of 128 by 128 waves; the `water` example takes `--ocean`.
+- `Settings.shading.subsurface_scattering` and `subsurface_radius`: separable screen-space subsurface scattering in place of wrap lighting.
+- `Settings.post.exposure_ev100`: manual exposure as a camera sets it.
+- `Material.iridescence`, `iridescence_ior` and `iridescence_thickness` (`KHR_materials_iridescence`), raster only.
+- `Material.reflectance_color` and `reflectance` (`KHR_materials_specular`).
+- `Material.attenuation_color` and `attenuation_distance` (`KHR_materials_volume`): light absorbed inside glass, raster and path traced.
+- `Settings.post.exposure_ignore_dark` and `exposure_ignore_bright`: histogram exposure that leaves out the darkest and brightest parts.
+- glTF `EXT_meshopt_compression`.
+- `Stats.gpu_memory_budget_bytes`, from `VK_EXT_memory_budget`.
+- `Renderer.setSurface`: a new window surface, or none, for Android pause and resume.
+- `NativeWindow.metal` and `.android` surfaces; portability enumeration for MoltenVK.
+- Basis textures transcode to ASTC 4x4 or RGBA where BC is missing; `Options.textures.block_formats`.
+- `Options.geometry.primitive_id`: visibility drawn from pulled vertices without `SV_PrimitiveID`.
+- `Pass.threaded`: a pass that may run beside other views' passes.
+- `rhi.Device.beginParallel` and `joinParallel`: encoders that record on several threads.
+- `zig build costs -- --threads N`.
+- `rhi.BufferAccess` and `rhi.CommandEncoder.dependency`: barriers for the stages that use a buffer.
+- Render graph passes declare the buffers they use (`PassDesc.buffers`); the graph puts the barriers between them.
+- `zig build costs` scenario for entities made and destroyed every frame, and GPU time of a pass per row.
+- `rhi.Device.failDevice`: a device that reports itself lost, for tests.
 - glTF and font validation (`-Dvalidate_input=false`).
-- NVIDIA DLSS: `Upscaling.dlss`, `Renderer.dlssSupport`.
+- NVIDIA DLSS: `Upscaler.dlss`.
 - DLSS Ray Reconstruction for path tracing.
 - `zig build dlss-sdk`.
 - Path tracing: normal maps.
@@ -12,8 +42,103 @@
 - `Settings.path_tracing_probes`.
 - `entities.setTransforms`.
 - Entity setters work mid-frame.
+- `rhi.Device.caps` and `rhi.native`.
+- `rhi.Capabilities` limits and per-format support.
+- Compute pipelines take specialization constants; `rhi.Device.compileComputePipeline`.
+- `rhi.Device.storageArrayIndex`: storage views of every layer.
+- `rhi.CommandEncoder.buildBlases` and `updateTlas`.
+- `Stats.pipelines`.
+- `--uneven-frames` for headless example runs.
+- `Stats.commands`, `Stats.frame_data_bytes` and `PassTiming.work`.
+- `zig build costs`.
+- `Settings.lightweight` and the `lightweight` example.
+- `PassStage.sun_shadow` and `.light_shadow`, `PassContext.layer` and `.origin`, `Pass.moving`.
+- `Settings.post.tone_curve`.
+- The `passes` example.
+- `--memory N` for headless example runs.
+- `GeometryStreaming` exported.
+- `rhi.Capabilities.unified_memory`: integrated and software GPUs write GPU-only buffers without staging.
+- `zig build costs -- --device NAME`.
+- `Camera.valid`, `TextureInfo.usage`, `MaterialShader.generation`.
+- A lost device logs where it faulted, where the driver reports it.
+- The `canvas` example takes `--screenshot` and `--timings`.
+- `DrawStage.scene`: draw lists under bloom, exposure and tone mapping, with or without a scene.
+- `DrawStage.under`: draw lists behind the scene, where no surface is.
+- `Renderer.lights` and `Renderer.decals`: single lights and decals by handle, beside `scenes.setLights` and `setDecals`.
+- `Pass.reads`, `PassStage.after_resolve`, and `PassContext.visibility` and `ambient_occlusion`.
+- `Stats.downgraded`.
+- `DrawList.setBlend`, `setLayer` and `setShader`; `Renderer.canvas.createShader`.
+- The `canvas` example takes `--lit` and `--effects`.
+- `Camera.orthographic`, for scenes and draw lists.
+- `Settings.global_illumination.probes.cascades`: up to four probe grids.
+- `Settings.path_tracing.direct`.
+- `Settings.resolution.edge_antialiasing`: antialiasing from the finished picture alone, for views without TAA.
+- `--timings` prints the slowest frame; the `bistro` example takes `--walk`.
+- NVIDIA NRD (ReLAX) as a path tracing denoiser: `Denoiser.nrd`, `zig build nrd-sdk`; the `pathtrace` and `rtx` examples take `--nrd`.
+- `Settings.path_tracing.nrd`: history length and pre-blur radius for NRD.
+- `Settings.global_illumination.probes.idle_interval`: probes are re-traced less often while the scene and its lights are still.
+- `Pass` runs on views without a scene; `PassContext` has the camera, its matrices and the resolved settings.
+- The `isometric` example.
+- `ViewDesc.cut`: temporal history starts over after a camera jump.
+- `Options.deterministic`: runs of the same frames give the same picture; `--screenshot` turns it on.
+- `rhi.TextureKind.@"3d"`; storage images can be read, used in any shader stage and bound per layer.
+- `CloudDesc.weather`, `weather_size`, `kind` and `curl`.
+- `HairDesc.variation`, `clump`, `curl`, `curl_turns` and `frizz`.
+- `LiquidDesc.scatter` and `foam`: lit liquid body and whitewater.
+- The `clouds` example takes `--kind`, `hair` takes `--orbit` and `--blonde`, `liquid` takes `--orbit`.
+- `Camera.project`, `ray` and `viewProjection`.
+- `entities.setParent` and `entities.info`.
+- `Material.unlit`, also from `KHR_materials_unlit`.
+- `primitives` and `models.createPrimitive`.
+- `MeshDesc.textures`.
+- `DrawList.measureText`.
+- `views.saveTarget`.
 
 ### Changed
+- The command encoder holds barriers until the next command and records them as one call, folding moves of the same mips: half the barrier calls of a frame.
+- `scene_update.zig`, `renderer.zig` and `shading.slang` are split into topic files.
+- DLSS and NRD build in by default only for the machine building, not for cross targets.
+- Entities are culled instance by instance before their meshlets, like instance groups.
+- Light and decal records stay on the GPU between frames; only those that changed are uploaded.
+- Decals have no limit: clusters list them like lights. `api.max_decals` and `error.TooManyDecals` are gone.
+- Views of one scene that draw into different targets record on separate threads; the ray scene is claimed while staging, and lightmaps and impostors bake in the first view only. Views that share a target, of one scene or not, stay on one thread: a later one could discard what an earlier one drew.
+- Fewer attachment loads and stores: the tonemap does not read a picture it covers, transparency only tests depth, and the last peeled layer's depth is not kept.
+- Cheaper shading: rectangle lights have a loop of their own, so the busy light loop keeps few registers; coats, sheen, grain and thin films, and rectangle lights, are left out of the shading pipeline when nothing uses them.
+- The subsurface pass shades once instead of twice: its variant leaves every specular term out.
+- Rough glass blurs what is behind it from a mip chain of the scene copy.
+- Path tracing spreads its noise as blue noise: pixels share one scrambled Sobol sequence in Morton order.
+- Virtual shadow maps filter across page edges by `Settings.shadows.softness`, like the cascades.
+- Rectangle lights that look large are shaded by linearly transformed cosines (Heitz 2016); close to a big panel the light is right instead of overestimated.
+- Sheen takes away the light it reflects (glTF albedo scaling) and its ambient part follows the lobe; velvet is darker.
+- Path-traced glass takes its base color once, on the way in.
+- Impostors blend the three nearest baked views instead of snapping to one.
+- glTF files that require an unsupported extension fail with `error.UnsupportedExtension`; Draco is named.
+- Texture streaming without a budget stays under 90% of the driver's memory budget.
+- Uploads stage in a shared ring buffer; one empty memory block per type is kept.
+- Memory objects of their own where the driver prefers them.
+- geometryShader and shaderInt64 are no longer required; int64 is needed only for ray tracing.
+- Views of different scenes record on several threads at once (`Options.worker_threads`).
+- Detached acceleration structure builds wait on the frame that uploads their geometry instead of counting frames, and no longer hold back freeing resources.
+- Barriers between passes name the stages that wait instead of waiting on every stage.
+- Particle emitters sort together: one barrier per sorting step instead of one per emitter.
+- Making, destroying, hiding and showing entities updates only their own slots, instead of laying the scene out again.
+- Light clusters list any number of lights, a cluster per workgroup.
+- `render` fails with `error.InvalidDeltaTime`, `error.InvalidCamera` or `error.InvalidTarget` for a bad frame, `Renderer.init` with `error.InvalidOptions`.
+- `entities.setTransforms` pairs the slices up to the shorter one.
+- Liquids with more than four sources fail with `error.TooManyLiquidSources`.
+- `decals.create` past the limit fails with `error.TooManyDecals`, as `setDecals` does.
+- `bc7_partitions` is no longer public.
+- `entities.spawn`/`despawn` are `entities.create`/`destroy`.
+- `Light` is `LightDesc`, `LightHandle` is `Light`, `DecalHandle` is `Decal`, `Sun` is `SunDesc`.
+- `instances.set` is `setTransforms`, `instances.setPose` is `followPose`, `probes.update` is `recapture`, `getStats` is `stats`, `liquids.particles` is `particleCount`, `fluids.flipbookFrames` is `flipbookFrameCount`.
+- `Renderer.probes` is `Renderer.reflection_probes`.
+- `models.destroy` cannot fail: a model in use is freed when its last entity or group goes.
+- `materials.setShader` takes the material index as an argument; `ShaderAssignment.material` is gone.
+- `images.createCompressed` is `ImageDesc.compressed`; `writeKtx2` takes an `ImageDesc`; `images.update` takes a `Region`.
+- `max_blur_pixels`, `blur_radius_pixels`, `paper_white_nits`, `peak_nits`, `ImpostorDesc.max_pixels`, `ambient_occlusion.power`.
+- `loadSceneLights` and `SceneLight` are `models.loadLights`, which returns `LightDesc`s.
+- `SunDesc.intensity` and `FrameDesc.delta_time` have no default.
+- Renderer internals (`ensureSceneResources`, `tryLock`, `queueEdit`, `markOf`, `moveEntity` and the like) are no longer methods.
 - Breaking: handles are 64 bits.
 - Breaking: `views.targetImage` can fail with `error.InvalidTarget`.
 - Breaking: `shaders.reload` needs `-Dshader_reload` outside Debug.
@@ -21,16 +146,95 @@
 - Breaking: setters and `destroy` ignore destroyed handles.
 - Breaking: `Options.pose_threads` is `worker_threads`.
 - Breaking: `Options.mesh_shaders` is off by default.
+- Breaking: `Device.ray_tracing`, `mesh_shaders` and the like are in `Device.caps`.
+- Breaking: `rhi.instanceProcAddr` and `deviceProcAddr` are in `rhi.native.device`.
+- Breaking: traced reflections, traced light shadows and path tracing work without `global_illumination`.
+- Ray traced reflections, probes, lightmaps and path tracing share one trace and surface shader library.
+- Breaking: `ViewDesc.draw_lists` holds `DrawLayer`s.
+- Breaking: `Settings` is nested by feature (`shadows`, `reflections`, `global_illumination`, `post`, `resolution`, ...); a feature that can be off is an optional, null for off.
+- Breaking: fog, depth of field, motion blur and path tracing are off as null, not as a zero strength.
+- Breaking: `shadows = null` also turns off ray traced light shadows.
+- Breaking: `Settings.resolution.upscaling` is `upscaler`, of type `Upscaler`; `frame_generation` is null or `.fsr3`.
+- Breaking: `Settings.path_tracing.denoise` is `denoiser`; DLSS Ray Reconstruction is asked for with `.ray_reconstruction`.
+- Breaking: `Settings.global_illumination` names its technique: `.{ .probes = .{} }`. `middle_ratio` is `cascade_ratio`.
+- An upscaler, frame generator or denoiser that cannot run is listed in `Stats.downgraded`.
+- Breaking: `Options` is nested: `ray_tracing`, `shadows`, `textures`, `geometry`, `cache`. `ray_tracing` is `ray_tracing.hardware`, `path_tracing_fallback` is `ray_tracing.software_path_tracing`.
+- Breaking: `Renderer.capabilities` replaces `pathTracing`, `dlssSupport` and `hdrActive`.
+- Breaking: `images.create`, `environments.load`, `materials.setShader` and `scenes.setEnvironment` take a struct.
+- Breaking: `PassContext.depth` and `motion` are optional.
+- Breaking: `rhi.Device.storageIndex` takes a layer; `CommandEncoder.copyDepthToColor` is gone.
+- Path tracing runs in a compute shader where storage images are available.
+- Acceleration structures of static meshes are compacted after they are built.
+- The high preset traces 64 rays per probe and 2 shadow rays per lamp.
+- Temporal antialiasing keeps less history of what moves, so motion blurs and trails less.
+- A probe grid that follows the camera to a new cell seeds the probes it moves onto from the coarser grid; it no longer re-traces every probe that frame.
+- The `pathtrace` example's walls no longer overlap, which showed as speckles in motion.
+- Path tracing: the tracer writes what one frame's paths found, and gathering it over frames is a step of the denoiser.
+- The Vulkan code of the RHI is in `src/rhi/vulkan/`.
+- Breaking: the `PathTracing` enum is `PathTracingSupport`.
+- Switching an effect on or off keeps the view's other targets and history.
+- Draw lists send rectangles, sprites and glyphs to the GPU as one record each, and keep the GPU copy of a list drawn again unchanged.
+- Every shader is Slang; `glslc` is only needed to build the FidelityFX SDK.
+- Breaking: custom material shaders are Slang, include "shade.slang" and are compiled with entry `fragmentMain`; see `examples/shaders/lava.slang`.
+- Slang shaders mark the buffers they only read as read-only, as GLSL did; probe GI and culling run faster.
+- `rhi.CommandEncoder` returns drawn and copied textures to `shader_read` itself, before the next work that could sample them.
+- Breaking: `rhi.Device.endImmediate` takes the encoder.
+- Breaking: shaders read a feature's frame constants from its block (`frame.shadows`, `frame.lights`, `frame.gi`, `frame.shading` and so on), and the `FRAME_*` flags are fields of those blocks.
+- Breaking: `Renderer` fields other than the namespaces, `options` and `device` are in `Renderer.internal`.
+- Breaking: `environments.load` takes an `EnvironmentDesc`.
+- Breaking: `rhi.BlasDesc` holds a list of `rhi.BlasGeometry`; `createTlas` takes a `rhi.TlasDesc`.
+- Pipelines are built on first use, kept by their description; any can compile on a worker thread.
+- A renderer that draws no scene makes no scene buffers.
+- The frame constants in shaders are generated from `frame_constants.zig`.
+- The shaders' push constants are generated from `src/render/shaders/push`.
 - Fewer FidelityFX shader permutations compiled.
 - Only changed entities are prepared each frame.
 - Animation poses skip unmoved nodes.
 - Cheaper GI probes and texture streaming.
 - Path tracing keeps its picture while the scene changes.
 - Path traced lamp light is no longer blurred.
+- Clouds fade into the air between them and the eye, take the sun's full colour, and are lit by sky through the cloud around them.
+- The sky reaches below level when seen from high up.
+- Hair is shaded as fibres (Marschner lobes), shadows itself through its density, and lets light through in shadow maps.
+- Liquid particles are drawn as ellipsoids along their neighbours; the liquid reflects the scene.
+- Breaking: `LiquidDesc.murk` defaults to 1.5.
+- Breaking: destroyed images, fonts and canvas shaders are refused (`error.InvalidImage`, `InvalidFont`, `InvalidShader`) or sample nothing; `Image.id` is required, `CanvasShader` has a `generation`.
+- `fonts.destroy` keeps the font readable until the renderer is destroyed.
+- Breaking: namespace state, `DrawList` state and `rhi.Device`'s split frame loop are behind `internal` fields (`device.internal.startFrame`, ...).
+- Breaking: `Material` defaults to metallic 0 and roughness 0.6 for `MeshDesc` too; glTF files still start from 1 and 1.
 
 
 
 ### Fixed
+- Irradiance probes no longer feed NaN into their weights where a probe sits on the surface or its depth moments are zero.
+- A full culling bucket no longer leaves its count above what was listed, which let task shaders read past the list.
+- Handle tables no longer move their slots as they grow: a pipeline or texture made on a worker thread could free the array the render thread was reading.
+- The bindless uint textures are declared without a format; fetching an R32_UINT view through Rgba32ui was undefined.
+- Ray queries that reach no distance meet nothing instead of starting with a negative range.
+- FidelityFX downsampling takes its barrier-only path; the wave path wrote shared memory other quads were still reading.
+- `Stats.gi_probes`, `particles` and the path tracing counters are written atomically, as views record on several threads.
+- Headless runs could hang waiting for a ray tracing structure built in the same frame.
+- Path tracing: fully transmissive glass was skipped like a cutout; it now refracts.
+- Path tracing: rays leaving glass bend by the inverse ratio and reflect inside past the critical angle.
+- `.hdr` panoramas are size-checked before decoding.
+- Lights beyond 127 in one cluster were dropped.
+- Views of one scene converted its lights once each; they share them now.
+- The first layout change of a swapchain image did not wait for its acquire.
+- The bindless table asked for more descriptors than some devices allow.
+- Device teardown took quadratic time in the number of live resources.
+- A model without textures panicked in safe builds.
+- Soft traced shadows of differently colored lights took on each other's color, and trailed in motion.
+- Transparent surfaces were shaded twice.
+- Rough metals lost energy under direct light.
+- Traced sphere light shadows sampled the light unevenly.
+- TAA ghosting when lighting changed on still surfaces.
+- HDR10 output used a different tone curve from SDR.
+- Buried GI probes were picked by threads racing their own trace.
+- Two uploads to the same buffer range or texture level in one frame raced each other.
+- Features switched off on a view give their memory back.
+- Path tracing restarts its history after frames it did not trace.
+- Impostor textures and reflection probes are freed with the renderer.
+- Particle trails are freed with the renderer.
 - Tint, params and flags on skinned entities.
 - GI restarting with reflection probes or several views.
 - Local light and virtual shadows with several views.
@@ -43,6 +247,23 @@
 - Stale model cache entries.
 - A leak when a streamed model runs out of memory.
 - Example flags that take no value.
+- Water and liquid gaining energy at uneven frame rates.
+- Bloom drawn with bloom, automatic exposure and lens flare off.
+- 128 KiB of per-frame data reserved for threads that were not used.
+- Heap allocations every frame while preparing lights.
+- GPU memory held for features and geometry a scene does not use.
+- Decal texture derivatives in divergent shader code.
+- Attachments left in the wrong state after a failed `beginRendering`.
+- A data race on the swapchain's out-of-date flag with paced presentation.
+- Shader reloading half applied when it ran out of memory.
+- Unbounded work shaping text with a malicious font.
+- Application task and mesh shaders sampling textures without a barrier.
+- GPU faults drawing custom materials.
+- Mirrored instances drawn inside out.
+- Crashes from bad mesh attribute lengths, collision meshes, sprite sheets, rounded rects, liquid and fluid sizes, IES files and oversized textures.
+- Stale material shader handles selecting another shader.
+- Custom material use counts underflowing with specular-glossiness materials.
+- Fluid and water textures lost when a resize failed.
 
 ## 0.1.3
 

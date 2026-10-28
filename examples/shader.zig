@@ -1,5 +1,5 @@
 //! A material written by the application: molten rock, from
-//! `examples/shaders/lava.frag`. The shader only says what the surface
+//! `examples/shaders/lava.slang`. The shader only says what the surface
 //! is (its color, roughness, glow and normal) at each point; lighting,
 //! shadows, reflections and antialiasing stay the renderer's. Each block
 //! passes its own number to the shader, so one cools while the next
@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.5, -0.3, -0.6 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 0.6);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 0.6 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     const lava = try renderer.materials.createShader(@embedFile("lava.frag.spv"), @embedFile("lava_plain.frag.spv"));
@@ -42,13 +42,13 @@ pub fn main(init: std.process.Init) !void {
     var box_indices: [36]u32 = undefined;
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
     const ground = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.12, 0.11, 0.1, 1 }, .metallic = 0, .roughness = 0.6 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 30, 0.5, 30 })) });
+    _ = try renderer.entities.create(scene, .{ .model = ground, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 30, 0.5, 30 })) });
 
     const count = 5;
     var balls: [count]gfx.Entity = undefined;
     for (&balls, 0..) |*ball, index| {
         const cooled = @as(f32, @floatFromInt(index)) / (count - 1);
-        ball.* = try renderer.entities.spawn(scene, .{
+        ball.* = try renderer.entities.create(scene, .{
             .model = molten,
             .transform = math.translation(.{ (@as(f32, @floatFromInt(index)) - (count - 1) * 0.5) * 2.6, 1.0, 0 }),
             .params = .{ cooled, 0, 0, 0 },
@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
             glow = @max(glow - 1, 0);
             changed = true;
         }
-        if (changed) try renderer.materials.setShader(molten, null, lava, .{ 2.5, glow, 0, 0 });
+        if (changed) try renderer.materials.setShader(molten, null, .{ .shader = lava, .params = .{ 2.5, glow, 0, 0 } });
 
         list.clear();
         try list.text3d(font, "molten", .{ -(count - 1) * 0.5 * 2.6, 2.4, 0 }, .{ .size = 0.2 });
@@ -88,9 +88,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1, 0 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 30, .bloom = 0.08 },
+                .settings = .{ .shadows = .{ .distance = 30 }, .post = .{ .bloom = 0.08 } },
             }},
             .delta_time = tick.dt,
         }));

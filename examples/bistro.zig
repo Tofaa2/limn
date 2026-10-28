@@ -10,7 +10,7 @@
 //!   W A S D  fly, Space/Ctrl up and down, Shift faster
 //!   P        pause the props' animations
 //!
-//! `--night 1`, `--view N`, `--at "x y z yaw pitch"` (as shown on screen),
+//! `--night`, `--walk` (the camera walks ahead), `--view N`, `--at "x y z yaw pitch"` (as shown on screen),
 //! `--frames N`, `--screenshot file.png`.
 const std = @import("std");
 const gfx = @import("limn");
@@ -34,12 +34,14 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     var night = false;
     var view: usize = 0;
+    var walking = false;
     var start: ?[5]f32 = null;
     {
         var arguments = try init.minimal.args.iterateAllocator(gpa);
         defer arguments.deinit();
         while (arguments.next()) |argument| {
             if (std.mem.eql(u8, argument, "--night")) night = true;
+            if (std.mem.eql(u8, argument, "--walk")) walking = true;
             if (std.mem.eql(u8, argument, "--at")) {
                 var numbers = std.mem.tokenizeScalar(u8, arguments.next() orelse return error.MissingArgument, ' ');
                 var values: [5]f32 = undefined;
@@ -55,34 +57,29 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var stage = try Stage.create(init, "Limn Bistro", .{
-        .asset_cache_dir = "zig-out/asset-cache",
-        .texture_streaming = .{ .budget_bytes = 2 << 30 },
+        .cache = .{ .assets = "zig-out/asset-cache" },
+        .textures = .{ .streaming = .{ .budget_bytes = 2 << 30 } },
     });
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
 
-    const lights = try gfx.loadSceneLights(gpa, init.io, scene_path);
+    const lights = try renderer.models.loadLights(gpa, scene_path, 0.02);
     defer gpa.free(lights);
     var sun_direction = math.Vec3{ -0.4, -1.0, -0.3 };
-    var lamps: std.ArrayList(gfx.Light) = .empty;
+    var lamps: std.ArrayList(gfx.LightDesc) = .empty;
     defer lamps.deinit(gpa);
     for (lights) |light| switch (light.kind) {
         .directional => sun_direction = light.direction,
-        else => try lamps.append(gpa, .{
-            .kind = if (light.kind == .spot) .spot else .point,
-            .position = light.position,
-            .direction = light.direction,
-            .color = light.color,
-            .intensity = light.intensity * 0.02,
-            .range = if (light.range > 0) light.range else 8,
-            .inner_angle = light.inner_angle,
-            .outer_angle = light.outer_angle,
-            .source_radius = 0.05,
-        }),
+        else => {
+            var lamp = light;
+            if (lamp.range > 8) lamp.range = 8;
+            lamp.source_radius = 0.05;
+            try lamps.append(gpa, lamp);
+        },
     };
 
     const model = try renderer.models.load(scene_path);
-    const bistro = try renderer.entities.spawn(scene, .{ .model = model });
+    const bistro = try renderer.entities.create(scene, .{ .model = model });
     try renderer.waitUntilLoaded();
 
     var list = gfx.DrawList.init(gpa);
@@ -98,7 +95,7 @@ pub fn main(init: std.process.Init) !void {
         pitch = values[4];
     }
     var applied_night: ?bool = null;
-    var lit: std.ArrayList(gfx.Light) = .empty;
+    var lit: std.ArrayList(gfx.LightDesc) = .empty;
     defer lit.deinit(gpa);
     var animating = true;
     var clock: f32 = 0;
@@ -133,6 +130,7 @@ pub fn main(init: std.process.Init) !void {
         const forward = math.Vec3{ @sin(yaw) * @cos(pitch), @sin(pitch), -@cos(yaw) * @cos(pitch) };
         const right = math.normalize(math.cross(forward, .{ 0, 1, 0 }));
         const speed = tick.dt * @as(f32, if (stage.keyDown(glfw.GLFW_KEY_LEFT_SHIFT)) 12 else 4);
+        if (walking) eye = math.add(eye, math.scale(.{ forward[0], 0, forward[2] }, tick.dt * 3));
         if (stage.keyDown(glfw.GLFW_KEY_W)) eye = math.add(eye, math.scale(forward, speed));
         if (stage.keyDown(glfw.GLFW_KEY_S)) eye = math.add(eye, math.scale(forward, -speed));
         if (stage.keyDown(glfw.GLFW_KEY_D)) eye = math.add(eye, math.scale(right, speed));
@@ -143,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
         if (applied_night != night) {
             applied_night = night;
             const sky = gfx.SkyDesc{ .sun_direction = if (night) .{ 0.3, 0.25, 0.2 } else sun_direction, .intensity = if (night) 0.02 else 1 };
-            renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky), 1);
+            renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky), .intensity = 1 });
             const sun = gfx.skySun(sky);
             renderer.scenes.setSun(scene, .{ .direction = sun.direction, .color = sun.color, .intensity = 0 });
             lit.clearRetainingCapacity();
@@ -152,7 +150,7 @@ pub fn main(init: std.process.Init) !void {
             try renderer.scenes.setLights(scene, lit.items);
         }
 
-        const stats = renderer.getStats();
+        const stats = renderer.stats();
         list.clear();
         try list.rect(.{ .x = 12, .y = 12, .width = 700, .height = 96 }, gfx.Color.rgba(8, 10, 18, 190));
         try list.text(font, try std.fmt.bufPrint(&text, "Bistro, {s} · {d:.0} fps rendered, {d:.0} shown · gpu {d:.2} ms", .{ if (night) "night" else "day", stage.fps, stage.shown_fps, stage.gpu_ms }), .{ 24, 20 }, .{ .size = 17 });
@@ -169,12 +167,11 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = camera,
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = .{
-                    .shadow_distance = 80,
-                    .automatic_exposure = false,
-                    .exposure_compensation = if (night) 3 else 1.3,
+                    .shadows = .{ .distance = 80 },
+                    .post = .{ .automatic_exposure = false, .exposure_compensation = if (night) 3 else 1.3 },
                 },
             }},
             .delta_time = tick.dt,

@@ -5,6 +5,7 @@
 //!
 //! `--frames N` exits after N frames. `--screenshot file.png` renders
 //! without a window and writes the last frame, for checking the picture.
+//! `--uneven-frames` steps time by uneven frame lengths, as a window would.
 const std = @import("std");
 const gfx = @import("limn");
 const math = gfx.math;
@@ -208,6 +209,7 @@ fn boxMesh(half: [3]f32, positions: *[24][3]f32, indices: *[36]u32) void {
 pub fn main(init: std.process.Init) !void {
     var frame_limit: ?u64 = null;
     var screenshot: ?[]const u8 = null;
+    var uneven = false;
     var args = try init.minimal.args.iterateAllocator(init.gpa);
     defer args.deinit();
     _ = args.skip();
@@ -216,6 +218,8 @@ pub fn main(init: std.process.Init) !void {
             frame_limit = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--screenshot")) {
             screenshot = args.next() orelse return error.MissingArgument;
+        } else if (std.mem.eql(u8, arg, "--uneven-frames")) {
+            uneven = true;
         } else return error.InvalidArgument;
     }
     const offscreen = screenshot != null;
@@ -225,8 +229,9 @@ pub fn main(init: std.process.Init) !void {
     defer if (window) |value| value.deinit();
     const renderer = try gfx.Renderer.init(init.gpa, init.io, .{
         .application_name = "particles",
-        .pipeline_cache_path = "zig-out/pipeline.cache",
+        .cache = .{ .pipelines = "zig-out/pipeline.cache" },
         .validation = offscreen,
+        .deterministic = offscreen,
         .surface = if (window) |value| try value.surface(false) else null,
     });
     defer renderer.deinit();
@@ -249,12 +254,12 @@ pub fn main(init: std.process.Init) !void {
             .indices = &indices[index],
             .material = .{ .base_color = colors[index], .metallic = 0, .roughness = 0.8 },
         }});
-        _ = try renderer.entities.spawn(scene, .{ .model = model, .transform = math.translation(placements[index]) });
+        _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.translation(placements[index]) });
     }
     var shard_positions: [24][3]f32 = undefined;
     var shard_indices: [36]u32 = undefined;
     boxMesh(.{ 0.5, 0.3, 0.4 }, &shard_positions, &shard_indices);
-    const shard = try renderer.models.create(&.{.{ .positions = &shard_positions, .indices = &shard_indices, .material = .{} }});
+    const shard = try renderer.models.create(&.{.{ .positions = &shard_positions, .indices = &shard_indices, .material = .{ .metallic = 1, .roughness = 1 } }});
     try renderer.waitUntilLoaded();
     renderer.scenes.setSun(scene, .{ .direction = .{ -0.55, -0.6, -0.45 }, .color = .{ 0.75, 0.82, 1.0 }, .intensity = 2.5 });
 
@@ -278,7 +283,8 @@ pub fn main(init: std.process.Init) !void {
     var hud_frames: u32 = 0;
 
     while ((window == null or !window.?.shouldClose()) and (frame_limit == null or frames < frame_limit.?)) {
-        var dt: f32 = 1.0 / 60.0;
+        const uneven_frames = @import("window").Stage.uneven_frames;
+        var dt: f32 = if (uneven) uneven_frames[frames % uneven_frames.len] else 1.0 / 60.0;
         var size = [2]u32{ 1280, 720 };
         if (window) |value| {
             value.pollEvents();
@@ -322,7 +328,7 @@ pub fn main(init: std.process.Init) !void {
         }} else &.{});
 
         list.clear();
-        const stats = renderer.getStats();
+        const stats = renderer.stats();
         try list.rect(.{ .x = 12, .y = 12, .width = 300, .height = 62 + 19 * @as(f32, effects.len) }, gfx.Color.rgba(10, 12, 20, 180));
         try list.text(font, hud_text, .{ 24, 20 }, .{ .size = 17 });
         for (&effects, 0..) |*effect, index| {
@@ -343,9 +349,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 1.6, -0.5 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = if (target) |texture| .{ .texture = texture } else .backbuffer,
-                .settings = .{ .shadow_distance = 40, .bloom = 0.06, .exposure_compensation = -1.6 },
+                .settings = .{ .shadows = .{ .distance = 40 }, .post = .{ .bloom = 0.06, .exposure_compensation = -1.6 } },
             }},
             .delta_time = dt,
         });
@@ -358,7 +364,7 @@ pub fn main(init: std.process.Init) !void {
         const now: f64 = if (window) |value| value.time() else @as(f64, @floatFromInt(frames)) / 60.0;
         if (now - hud_time >= 0.5 or hud_text.len == 0) {
             var gpu_ms: f32 = 0;
-            for (renderer.device.passTimings()) |timing| {
+            for (if (screenshot != null) @as([]const gfx.rhi.PassTiming, &.{}) else renderer.device.passTimings()) |timing| {
                 if (timing.depth == 0) gpu_ms += timing.milliseconds;
             }
             hud_text = try std.fmt.bufPrint(&hud_buffer, "{d:.0} fps · gpu {d:.2} ms · {d} particle slots", .{

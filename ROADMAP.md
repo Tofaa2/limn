@@ -1,5 +1,13 @@
 # Roadmap
 
+## 1.0 means
+
+- No floor penalty: every command a frame records belongs to a feature that is on (`zig build costs`).
+- Pay for what you use: a feature switched off records nothing and gives its memory back (`zig build checks`).
+- No ceiling: an application can add or replace any stage with its own GPU work (`passes`, `shader`, `triangle`).
+- Steady: the same at any frame rate, size and run length; misuse and bad input are errors, never crashes (`--uneven-frames`, `--memory`, `zig build checks`).
+- A stable, documented API for 2D, 2D over 3D, lightweight 3D, photoreal 3D and the application's own work.
+
 ## Before 1.0
 
 ### Path tracing
@@ -11,7 +19,6 @@
 - Skinned meshes in the shader fallback.
 
 ### Denoising and upscaling
-- NRD, for GPUs without DLSS.
 - FSR Ray Regeneration.
 - DLSS on Windows.
 - A choice of DLSS model preset.
@@ -21,7 +28,11 @@
 
 ### Platforms
 - Verified on Windows.
+- Verified on macOS (MoltenVK) and an Android device.
 - Verified on AMD and Intel GPUs.
 
 ## Later
 - DLSS frame generation.
+- One bloom and exposure path for scene and 2D views (now two).
+- Typed handles for detached work and compiled pipelines (now raw `u64`).
+- A single-pass depth pyramid for occlusion culling.

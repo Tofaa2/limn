@@ -5,7 +5,8 @@
 //!
 //!   A/D      orbit the camera, Space pauses the moving mark
 //!
-//! `--frames N`, `--screenshot file.png`.
+//! `--frames N`, `--screenshot file.png`; `--scatter N` adds N small marks
+//! across the floor.
 const std = @import("std");
 const gfx = @import("limn");
 const math = gfx.math;
@@ -25,7 +26,7 @@ fn drawImage(renderer: *gfx.Renderer, comptime shape: fn (x: f32, y: f32) f32) !
         const alpha = std.math.clamp(shape(u, v), 0, 1);
         pixels[(y * size + x) * 4 ..][0..4].* = .{ 255, 255, 255, @intFromFloat(alpha * 255) };
     };
-    return renderer.images.create(size, size, &pixels, true);
+    return renderer.images.create(.{ .width = size, .height = size, .pixels = &pixels });
 }
 
 fn arrow(x: f32, y: f32) f32 {
@@ -52,12 +53,22 @@ fn project(position: math.Vec3, turn_y: f32, tilt_x: f32, extent: [2]f32, depth:
 }
 
 pub fn main(init: std.process.Init) !void {
+    var scatter: usize = 0;
+    {
+        var arguments = try init.minimal.args.iterateAllocator(init.gpa);
+        defer arguments.deinit();
+        while (arguments.next()) |argument| {
+            if (std.mem.eql(u8, argument, "--scatter")) scatter = try std.fmt.parseInt(usize, arguments.next() orelse return error.MissingArgument, 10);
+        }
+    }
+    const decals = try init.gpa.alloc(gfx.DecalDesc, 16 + scatter);
+    defer init.gpa.free(decals);
     var stage = try Stage.create(init, "Limn decals", .{});
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
 
     const sky_desc = gfx.SkyDesc{ .sun_direction = .{ -0.45, -0.7, -0.5 } };
-    renderer.scenes.setEnvironment(scene, try renderer.environments.createSky(sky_desc), 1);
+    renderer.scenes.setEnvironment(scene, .{ .environment = try renderer.environments.createSky(sky_desc), .intensity = 1 });
     renderer.scenes.setSun(scene, gfx.skySun(sky_desc));
 
     var box_positions: [24][3]f32 = undefined;
@@ -65,15 +76,15 @@ pub fn main(init: std.process.Init) !void {
     helpers.boxMesh(.{ 0.5, 0.5, 0.5 }, &box_positions, &box_indices);
     const asphalt = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.13, 0.13, 0.14, 1 }, .metallic = 0, .roughness = 0.85 } }});
     const plaster = try renderer.models.create(&.{.{ .positions = &box_positions, .indices = &box_indices, .material = .{ .base_color = .{ 0.75, 0.72, 0.66, 1 }, .metallic = 0, .roughness = 0.8 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = asphalt, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 24, 0.5, 16 })) });
-    _ = try renderer.entities.spawn(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ 0, 2, -5 }), math.scaling(.{ 24, 4, 0.5 })) });
+    _ = try renderer.entities.create(scene, .{ .model = asphalt, .transform = math.mul(math.translation(.{ 0, -0.25, 0 }), math.scaling(.{ 24, 0.5, 16 })) });
+    _ = try renderer.entities.create(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ 0, 2, -5 }), math.scaling(.{ 24, 4, 0.5 })) });
     var sphere_positions: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_normals: [helpers.sphere_vertex_count][3]f32 = undefined;
     var sphere_indices: [helpers.sphere_index_count]u32 = undefined;
     helpers.sphereMesh(1.2, &sphere_positions, &sphere_normals, &sphere_indices);
     const ball = try renderer.models.create(&.{.{ .positions = &sphere_positions, .normals = &sphere_normals, .indices = &sphere_indices, .material = .{ .base_color = .{ 0.8, 0.8, 0.8, 1 }, .metallic = 0, .roughness = 0.5 } }});
-    _ = try renderer.entities.spawn(scene, .{ .model = ball, .transform = math.translation(.{ 3.5, 1.2, -1.5 }) });
-    _ = try renderer.entities.spawn(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ -3.2, 0.6, 0.4 }), math.scaling(.{ 1.2, 1.2, 1.2 })), .receive_decals = false, .tint = .{ 0.9, 0.5, 0.3 } });
+    _ = try renderer.entities.create(scene, .{ .model = ball, .transform = math.translation(.{ 3.5, 1.2, -1.5 }) });
+    _ = try renderer.entities.create(scene, .{ .model = plaster, .transform = math.mul(math.translation(.{ -3.2, 0.6, 0.4 }), math.scaling(.{ 1.2, 1.2, 1.2 })), .receive_decals = false, .tint = .{ 0.9, 0.5, 0.3 } });
 
     const arrow_image = try drawImage(renderer, arrow);
     const ring_image = try drawImage(renderer, ring);
@@ -95,7 +106,6 @@ pub fn main(init: std.process.Init) !void {
         if (stage.keyPressed(glfw.GLFW_KEY_SPACE)) moving = !moving;
         if (moving) clock += tick.dt;
 
-        var decals: [16]gfx.DecalDesc = undefined;
         var count: usize = 0;
         for (0..5) |index| {
             decals[count] = .{ .transform = project(.{ (@as(f32, @floatFromInt(index)) - 2) * 3.2, 0, 3.2 }, std.math.pi * 0.5, down, .{ 1.0, 1.6 }, 0.5), .image = arrow_image, .color = .{ 0.95, 0.9, 0.75, 0.95 } };
@@ -110,6 +120,16 @@ pub fn main(init: std.process.Init) !void {
         const mark = math.Vec3{ @sin(clock * 0.6) * 6, 0, @cos(clock * 0.6) * 3.5 - 0.5 };
         decals[count] = .{ .transform = project(mark, clock, down, .{ 1.8, 1.8 }, 3.0), .image = ring_image, .color = .{ 1.0, 0.75, 0.1, 1 }, .emissive = 2 };
         count += 1;
+        const side = @max(std.math.sqrt(scatter), 1);
+        for (0..scatter) |index| {
+            const across: f32 = @floatFromInt(index % side);
+            const along: f32 = @floatFromInt(index / side);
+            const spacing = 16.0 / @as(f32, @floatFromInt(side));
+            const at = math.Vec3{ -8 + (across + 0.5) * spacing, 0, -6 + (along + 0.5) * spacing };
+            const hue: f32 = @floatFromInt(index % 7);
+            decals[count] = .{ .transform = project(at, hue, down, .{ spacing * 0.7, spacing * 0.7 }, 0.3), .image = ring_image, .color = .{ 0.3 + hue * 0.1, 0.9 - hue * 0.1, 0.5, 0.9 } };
+            count += 1;
+        }
         try renderer.scenes.setDecals(scene, decals[0..count]);
 
         list.clear();
@@ -123,9 +143,9 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = gfx.Camera.lookAt(eye, .{ 0, 0.8, -1 }),
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
-                .settings = .{ .shadow_distance = 40 },
+                .settings = .{ .shadows = .{ .distance = 40 } },
             }},
             .delta_time = tick.dt,
         }));

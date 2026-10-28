@@ -7,3 +7,5 @@ zig-pkg/
 examples/assets/hair/
 examples/assets/bistro/
 dlss_sdk/
+nrd_sdk/
+/core.[0-9]*

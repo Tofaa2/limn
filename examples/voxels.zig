@@ -334,7 +334,7 @@ const World = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.built.append(self.gpa, result) catch {
-            if (result.model) |model| self.renderer.models.destroy(model) catch {};
+            if (result.model) |model| self.renderer.models.destroy(model);
         };
     }
 
@@ -371,8 +371,8 @@ const World = struct {
     }
 
     fn unload(self: *World, chunk: *Chunk) void {
-        if (chunk.entity) |entity| self.renderer.entities.despawn(entity);
-        if (chunk.model) |model| self.renderer.models.destroy(model) catch {};
+        if (chunk.entity) |entity| self.renderer.entities.destroy(entity);
+        if (chunk.model) |model| self.renderer.models.destroy(model);
         chunk.entity = null;
         chunk.model = null;
         chunk.state = .absent;
@@ -402,7 +402,7 @@ const World = struct {
                 continue;
             };
             chunk.model = model;
-            chunk.entity = try self.renderer.entities.spawn(self.scene, .{ .model = model, .transform = math.translation(chunk.origin()) });
+            chunk.entity = try self.renderer.entities.create(self.scene, .{ .model = model, .transform = math.translation(chunk.origin()) });
             chunk.state = .loaded;
             self.loaded += 1;
             self.triangles += result.triangles;
@@ -462,7 +462,7 @@ pub fn main(init: std.process.Init) !void {
     const renderer = stage.renderer;
     const scene = try renderer.scenes.create();
     const environment = try renderer.environments.createSky(.{ .sun_direction = .{ 0, 1, 0 }, .stars = 40 });
-    renderer.scenes.setEnvironment(scene, environment, 0.6);
+    renderer.scenes.setEnvironment(scene, .{ .environment = environment, .intensity = 0.6 });
 
     var world = try World.create(gpa, init.io, renderer, scene);
     defer world.deinit();
@@ -545,7 +545,7 @@ pub fn main(init: std.process.Init) !void {
             const low = chunk.origin();
             try list.box3d(low, math.add(low, .{ chunk_size, chunk_size, chunk_size }), 1.5, if (chunk.state == .loaded) gfx.Color.rgba(255, 210, 63, 160) else gfx.Color.rgba(255, 90, 90, 220));
         };
-        const stats = renderer.getStats();
+        const stats = stage.stats();
         const voxels = world.buried_voxels + world.counted_voxels;
         try list.rect(.{ .x = 12, .y = 12, .width = 500, .height = 172 }, gfx.Color.rgba(8, 10, 18, 190));
         try list.text(font, if (world.counted_chunks == world.chunks.len)
@@ -570,14 +570,13 @@ pub fn main(init: std.process.Init) !void {
             .views = &.{.{
                 .scene = scene,
                 .camera = .{ .position = eye, .forward = forward, .up = up, .near = 0.5 },
-                .draw_lists = &.{&list},
+                .draw_lists = &.{.{ .list = &list }},
                 .target = stage.target(),
                 .settings = .{
-                    .shadow_distance = 420,
-                    .shadow_softness = 0.25,
-                    .global_illumination = false,
-                    .automatic_exposure = false,
-                    .aerial_perspective = 0.0002,
+                    .shadows = .{ .distance = 420, .softness = 0.25 },
+                    .global_illumination = null,
+                    .post = .{ .automatic_exposure = false },
+                    .shading = .{ .aerial_perspective = 0.0002 },
                     .debug_view = debug_view,
                 },
             }},
