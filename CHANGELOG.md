@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- Developed in the Qaya SDK, github.com/QayaSoftware/sdk, under `libs/limn`; github.com/Tofaa2/limn is a read-only mirror of it.
+- The examples and their assets moved to github.com/QayaSoftware/limn-examples. The build no longer fetches GLFW, its platform headers, the macOS SDK headers or MoltenVK, and cloning no longer needs Git LFS.
+- The test model, panel and fonts are in `testdata/`, outside the package's `.paths`.
+
+### Added
+- `build.zig`: `addShaders` compiles an application's Slang shaders the way limn's are, and `applyAndroidLibc` builds it for Android; the `apk` named lazy path is the APK packer.
+
 ## 0.1.4 
 
 ### Added

@@ -10,7 +10,7 @@ const math = gfx.math;
 const width = 320;
 const height = 180;
 const cache_dir = ".zig-cache/limn-checks";
-const fox_path = "examples/assets/world/Fox.glb";
+const fox_path = "testdata/world/Fox.glb";
 
 pub const std_options: std.Options = .{ .log_level = .info, .logFn = log, .enable_segfault_handler = !@import("builtin").sanitize_thread };
 
@@ -1205,7 +1205,7 @@ fn withoutBlockFormats(gpa: std.mem.Allocator, io: std.Io) !void {
         defer renderer.views.destroyTarget(target);
         const scene = try renderer.scenes.create();
         renderer.scenes.setSun(scene, .{ .direction = .{ -0.2, -0.5, -1 }, .color = .{ 1, 1, 1 }, .intensity = 3 });
-        const model = try renderer.models.load("examples/assets/panel/panel_etc1s.gltf");
+        const model = try renderer.models.load("testdata/panel/panel_etc1s.gltf");
         _ = try renderer.entities.create(scene, .{ .model = model, .transform = math.identity });
         try renderer.waitUntilLoaded();
         const info = renderer.models.info(model) orelse return error.ModelNotLoaded;

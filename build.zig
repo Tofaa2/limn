@@ -2,7 +2,8 @@ const std = @import("std");
 const shader_gen = @import("src/render/core/shader_gen.zig");
 
 const manifest = @import("src/render/shaders/manifest.zig");
-const Shader = manifest.Shader;
+/// A Slang shader entry point to compile, for `addShaders`.
+pub const Shader = manifest.Shader;
 
 /// Arguments every Slang shader is compiled with; `shaders.reload` uses the
 /// same ones.
@@ -10,7 +11,7 @@ const slang_arguments = [_][]const u8{ "-profile", "spirv_1_5", "-target", "spir
 
 const shader_dir = "src/render/shaders";
 
-/// What `zig build cross` builds for; Android gets APKs.
+/// What `zig build cross` builds the library for.
 const cross_targets = [_][]const u8{ "x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-windows-gnu", "x86_64-macos", "aarch64-macos", "aarch64-linux-android" };
 
 /// A program the build runs on the machine doing the build: one the package
@@ -21,9 +22,9 @@ const Tool = union(enum) {
 
     /// A run step that starts the tool through `depfile` (src/depfile.zig),
     /// named for the work it does.
-    fn command(self: Tool, b: *std.Build, depfile: *std.Build.Step.Compile, label: []const u8) *std.Build.Step.Run {
-        const run = b.addRunArtifact(depfile);
-        run.setName(b.fmt("compile {s}", .{label}));
+    fn command(self: Tool, b: *std.Build, depfile: std.Build.LazyPath, label: []const u8) *std.Build.Step.Run {
+        const run = std.Build.Step.Run.create(b, b.fmt("compile {s}", .{label}));
+        run.addFileArg(depfile);
         switch (self) {
             .path => |path| run.addFileArg(path),
             .system => |name| run.addArg(name),
@@ -139,230 +140,6 @@ const glslang_sources = [_][]const u8{
     "StandAlone/StandAlone.cpp",
 };
 
-const Example = struct {
-    name: []const u8,
-    root: []const u8,
-    description: []const u8,
-    windowed: bool,
-    shaders: []const Shader = &.{},
-};
-
-const examples: []const Example = &.{
-    .{
-        .name = "triangle",
-        .root = "examples/triangle/main.zig",
-        .description = "Draw a triangle with the bare RHI",
-        .windowed = true,
-        .shaders = &.{
-            .{ .src = "examples/triangle/triangle.slang", .name = "triangle.vert.spv", .entry = "vertexMain", .stage = "vertex" },
-            .{ .src = "examples/triangle/triangle.slang", .name = "triangle.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-        },
-    },
-    .{
-        .name = "canvas",
-        .root = "examples/canvas.zig",
-        .description = "A 2D-only application: shapes, sprites and text",
-        .windowed = true,
-        .shaders = &.{
-            .{ .src = "examples/shaders/scanlines.slang", .name = "scanlines.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-        },
-    },
-    .{
-        .name = "meadow",
-        .root = "examples/meadow.zig",
-        .description = "An open meadow to walk through: grass, trees, a pond, clouds, sun and sky",
-        .windowed = true,
-    },
-    .{
-        .name = "materials",
-        .root = "examples/materials.zig",
-        .description = "A grid of metals and plastics, glass, lacquer, velvet and wax, lit by a studio photograph",
-        .windowed = true,
-    },
-    .{
-        .name = "lights",
-        .root = "examples/lights.zig",
-        .description = "A hall at night: many drifting lamps, a shadowed spot light and a glowing panel",
-        .windowed = true,
-    },
-    .{
-        .name = "isometric",
-        .root = "examples/isometric.zig",
-        .description = "A terraced diorama through an orthographic camera, with markers drawn into the scene",
-        .windowed = true,
-    },
-    .{
-        .name = "decals",
-        .root = "examples/decals.zig",
-        .description = "Markings, stains and glowing signs projected onto a floor, a wall and a ball",
-        .windowed = true,
-    },
-    .{
-        .name = "text",
-        .root = "examples/text.zig",
-        .description = "Text at any size, ligatures, right-to-left and complex scripts, rich text, text in 3D",
-        .windowed = true,
-    },
-    .{
-        .name = "views",
-        .root = "examples/views.zig",
-        .description = "A split screen, a camera rendered to a texture and a 2D layer in one frame",
-        .windowed = true,
-    },
-    .{
-        .name = "post",
-        .root = "examples/post.zig",
-        .description = "Bloom, depth of field, motion blur, grading and the other effects, one key each",
-        .windowed = true,
-    },
-    .{
-        .name = "shader",
-        .root = "examples/shader.zig",
-        .description = "A material written by the application: molten rock that cools per object",
-        .windowed = true,
-        .shaders = &.{
-            .{ .src = "examples/shaders/lava.slang", .name = "lava.frag.spv", .entry = "fragmentMain", .stage = "fragment" },
-            .{ .src = "examples/shaders/lava.slang", .name = "lava_plain.frag.spv", .defines = &.{"PLAIN"}, .entry = "fragmentMain", .stage = "fragment" },
-        },
-    },
-    .{
-        .name = "rtx",
-        .root = "examples/rtx.zig",
-        .description = "Ray tracing a feature at a time in Sponza: bounce light, reflections, soft shadows, path tracing",
-        .windowed = true,
-    },
-    .{
-        .name = "pathtrace",
-        .root = "examples/pathtrace.zig",
-        .description = "Path tracing by the GPU's ray tracing or by a shader, beside the usual picture",
-        .windowed = true,
-    },
-    .{
-        .name = "particles",
-        .root = "examples/particles.zig",
-        .description = "GPU particle emitters: fire, smoke, a fountain, snow and a moving spark",
-        .windowed = true,
-    },
-    .{
-        .name = "animation",
-        .root = "examples/animation.zig",
-        .description = "Clip cross-fades, masked layers and additive layers on one character",
-        .windowed = true,
-    },
-    .{
-        .name = "instancing",
-        .root = "examples/instancing.zig",
-        .description = "A forest placed as one instance group, with picking",
-        .windowed = true,
-    },
-    .{
-        .name = "lightweight",
-        .root = "examples/lightweight.zig",
-        .description = "Simple 3D at its smallest cost, with a HUD of what each frame records",
-        .windowed = true,
-    },
-    .{
-        .name = "passes",
-        .root = "examples/passes.zig",
-        .description = "The application's own compute, geometry, tone curve and ink lines inside a lit scene",
-        .windowed = true,
-        .shaders = &.{
-            .{ .src = "examples/shaders/passes.slang", .name = "passes_move.comp.spv", .entry = "moveMain", .stage = "compute" },
-            .{ .src = "examples/shaders/passes.slang", .name = "passes_fullscreen.vert.spv", .entry = "fullscreenMain", .stage = "vertex" },
-            .{ .src = "examples/shaders/passes.slang", .name = "passes_blob.frag.spv", .entry = "orbsMain", .stage = "fragment" },
-            .{ .src = "examples/shaders/passes.slang", .name = "passes_copy.frag.spv", .entry = "copyMain", .stage = "fragment" },
-            .{ .src = "examples/shaders/passes.slang", .name = "passes_curve.frag.spv", .entry = "curveMain", .stage = "fragment" },
-            .{ .src = "examples/shaders/passes.slang", .name = "passes_outline.frag.spv", .entry = "outlineMain", .stage = "fragment" },
-            .{ .src = "examples/shaders/passes.slang", .name = "passes_shadow.frag.spv", .entry = "shadowMain", .stage = "fragment" },
-            .{ .src = "examples/shaders/passes.slang", .name = "passes_light_shadow.frag.spv", .entry = "lightShadowMain", .stage = "fragment" },
-        },
-    },
-    .{
-        .name = "reflections",
-        .root = "examples/reflections.zig",
-        .description = "Polished floor, spheres from mirror to rough, metals and lacquer, with reflections",
-        .windowed = true,
-    },
-    .{
-        .name = "clouds",
-        .root = "examples/clouds.zig",
-        .description = "Volumetric clouds over a landscape, with time of day",
-        .windowed = true,
-    },
-    .{
-        .name = "fluid",
-        .root = "examples/fluid.zig",
-        .description = "Simulated smoke and fire, in the scene and as a 2D picture",
-        .windowed = true,
-    },
-    .{
-        .name = "water",
-        .root = "examples/water.zig",
-        .description = "A pool of simulated water with ripples, rain, reflection and refraction",
-        .windowed = true,
-    },
-    .{
-        .name = "liquid",
-        .root = "examples/liquid.zig",
-        .description = "A volume of liquid that pours, sloshes and splashes in a tank",
-        .windowed = true,
-    },
-    .{
-        .name = "world",
-        .root = "examples/world.zig",
-        .description = "Walk a skinned character through Sponza",
-        .windowed = true,
-    },
-    .{
-        .name = "asteroids",
-        .root = "examples/asteroids.zig",
-        .description = "A belt of millions of rocks, culled and drawn by the GPU",
-        .windowed = true,
-    },
-    .{
-        .name = "shadows",
-        .root = "examples/shadows.zig",
-        .description = "Virtual shadow maps beside the sun's cascades, down a long avenue of fine shadows",
-        .windowed = true,
-    },
-    .{
-        .name = "bistro",
-        .root = "examples/bistro.zig",
-        .description = "Amazon Lumberyard Bistro: a full street scene by day and by night",
-        .windowed = true,
-    },
-    .{
-        .name = "upscaling",
-        .root = "examples/upscaling.zig",
-        .description = "Drawing fewer pixels: bicubic, temporal and FidelityFX upscaling, and coarse shading",
-        .windowed = true,
-    },
-    .{
-        .name = "lightmap",
-        .root = "examples/lightmap.zig",
-        .description = "A room whose bounce light is baked into lightmaps by rays while you watch",
-        .windowed = true,
-    },
-    .{
-        .name = "stereo",
-        .root = "examples/stereo.zig",
-        .description = "A stereo pair: the scene once for each eye, side by side",
-        .windowed = true,
-    },
-    .{
-        .name = "hair",
-        .root = "examples/hair.zig",
-        .description = "Ten thousand strands of hair that hang, swing and blow about",
-        .windowed = true,
-    },
-    .{
-        .name = "voxels",
-        .root = "examples/voxels.zig",
-        .description = "Fly round a small planet of fifty million voxels as its chunks stream in",
-        .windowed = true,
-    },
-};
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -387,7 +164,6 @@ pub fn build(b: *std.Build) void {
     const dlss_sdk = b.option([]const u8, "dlss_sdk", "Where NVIDIA's DLSS SDK is (default: dlss_sdk, which `zig build dlss-sdk` fetches)") orelse b.pathFromRoot(dlss_sdk_default);
     const dlss_found = if (b.build_root.handle.access(b.graph.io, b.pathResolve(&.{ dlss_sdk, "include", "nvsdk_ngx.h" }), .{})) |_| true else |_| false;
     const dlss = b.option(bool, "dlss", "Build NVIDIA DLSS upscaling and ray reconstruction in (default: true where the SDK is found)") orelse (dlss_found and native_target and dlssSupported(target) and !thread_sanitizer);
-    const nixos = if (b.build_root.handle.access(b.graph.io, nixos_drivers, .{})) |_| true else |_| false;
     if (dlss and !dlss_found) std.debug.panic("no DLSS SDK at {s}; run `zig build dlss-sdk` or pass -Ddlss_sdk", .{dlss_sdk});
     features.addOption(bool, "dlss", dlss);
     features.addOption([:0]const u8, "dlss_libraries", if (dlss) b.allocator.dupeZ(u8, b.pathResolve(&.{ dlss_sdk, dlssLibraries(target), "rel" })) catch @panic("OOM") else "");
@@ -499,7 +275,21 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    addShaders(b, renderer, manifest.renderer, shaders_step, generated_dir, spirv_readonly, depfile, slangc);
+    const shader_tools: ShaderTools = .{
+        .slangc = slangc,
+        .depfile = depfile.getEmittedBin(),
+        .spirv_readonly = spirv_readonly.getEmittedBin(),
+        .include = b.path(shader_dir),
+        .generated = generated_dir,
+    };
+    compileShaders(b, renderer, manifest.renderer, shader_tools, shaders_step);
+    b.addNamedLazyPath("shader_generated", generated_dir);
+    b.addNamedLazyPath("depfile", shader_tools.depfile);
+    b.addNamedLazyPath("spirv_readonly", shader_tools.spirv_readonly);
+    switch (slangc) {
+        .path => |path| b.addNamedLazyPath("slangc", path),
+        .system => {},
+    }
     const shader_reload = b.option(bool, "shader_reload", "Keep the shader source paths in the library for `shaders.reload` (default: Debug only)") orelse (optimize == .Debug);
     const shader_options = b.addOptions();
     var shader_names: [manifest.renderer.len][]const u8 = undefined;
@@ -533,7 +323,7 @@ pub fn build(b: *std.Build) void {
     }
     renderer.addOptions("shader_sources", shader_options);
     renderer.addImport("build_features", features_module);
-    if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk, depfile, if (system_tools) .{ .system = "glslangValidator" } else glslangCompiler(b) orelse return);
+    if (fidelityfx) addFidelityFx(b, renderer, target, asset_optimize, vulkan_include, volk, shader_tools.depfile, if (system_tools) .{ .system = "glslangValidator" } else glslangCompiler(b) orelse return);
     if (dlss) addDlss(b, renderer, target, asset_optimize, vulkan_include, dlss_sdk);
     if (nrd) addNrd(b, renderer, target, asset_optimize, vulkan_include, nrd_sdk);
 
@@ -559,112 +349,39 @@ pub fn build(b: *std.Build) void {
     }
     docs_step.dependOn(&b.addInstallFile(trimmed_sources, "docs/sources.tar").step);
 
-    const check_step = b.step("check", "Compile the renderer, tests and examples without running them");
+    const check_step = b.step("check", "Compile the renderer, its tests and its tools without running them");
     const tests = b.addTest(.{ .root_module = renderer, .use_llvm = true });
     check_step.dependOn(&tests.step);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = texture_codec })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = font_baker })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = depfile.root_module })).step);
-
-    const glfw_module = if (android) b.createModule(.{ .root_source_file = b.path("examples/android/glfw.zig"), .target = target, .optimize = optimize }) else glfw: {
-        const glfw_source = b.lazyDependency("glfw", .{}) orelse return;
-        const glfw = b.addTranslateC(.{
-            .root_source_file = b.path("examples/glfw_native.h"),
-            .target = target,
-            .optimize = optimize,
-        });
-        glfw.addIncludePath(glfw_source.path("include"));
-        const module = glfw.createModule();
-        if (!addGlfw(b, module, target, glfw_source)) return;
-        break :glfw module;
-    };
     const apk_packer = b.addExecutable(.{
         .name = "apk",
         .root_module = b.createModule(.{ .root_source_file = b.path("src/apk.zig"), .target = b.graph.host, .optimize = .ReleaseSafe }),
     });
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = apk_packer.root_module })).step);
-    const window_module = b.createModule(.{
-        .root_source_file = b.path("examples/window.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    window_module.addImport("limn", renderer);
-    window_module.addImport("glfw", glfw_module);
-    var moltenvk_dir: ?[]const u8 = null;
-    if (target.result.os.tag == .macos) {
-        const moltenvk = b.lazyDependency("moltenvk", .{}) orelse return;
-        const dylib = moltenvk.path("MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib");
-        b.getInstallStep().dependOn(&b.addInstallBinFile(dylib, "libMoltenVK.dylib").step);
-        moltenvk_dir = moltenvk.path("MoltenVK/dynamic/dylib/macOS").getPath(b);
-    }
-
-    var example_exes: std.StringHashMapUnmanaged(*std.Build.Step.Compile) = .empty;
-    var particles_example: ?*std.Build.Step.Compile = null;
-    var animation_example: ?*std.Build.Step.Compile = null;
-    var instancing_example: ?*std.Build.Step.Compile = null;
-    var reflections_example: ?*std.Build.Step.Compile = null;
-    var clouds_example: ?*std.Build.Step.Compile = null;
-    var fluid_example: ?*std.Build.Step.Compile = null;
-    var water_example: ?*std.Build.Step.Compile = null;
-    var liquid_example: ?*std.Build.Step.Compile = null;
-    var pathtrace_example: ?*std.Build.Step.Compile = null;
-    var rtx_example: ?*std.Build.Step.Compile = null;
-    const pictured = [_][]const u8{ "meadow", "materials", "lights", "decals", "text", "views", "post", "shader" };
-    var pictured_examples: [pictured.len]?*std.Build.Step.Compile = @splat(null);
-    for (examples) |example| {
-        const module = b.createModule(.{
-            .root_source_file = b.path(example.root),
-            .target = target,
-            .optimize = optimize,
-            .sanitize_thread = thread_sanitizer,
-        });
-        module.addImport("limn", renderer);
-        if (example.windowed) {
-            module.addImport("glfw", glfw_module);
-            module.addImport("window", window_module);
-        }
-        addShaders(b, module, example.shaders, shaders_step, generated_dir, spirv_readonly, depfile, slangc);
-        if (android) {
-            if (example.windowed) if (addAndroidExample(b, example, module, glfw_module, target, optimize, apk_packer)) |packed_apk| b.getInstallStep().dependOn(packed_apk);
-            continue;
-        }
-        const exe = b.addExecutable(.{ .name = example.name, .root_module = module, .use_llvm = true });
-        example_exes.put(b.allocator, example.name, exe) catch @panic("OOM");
-        b.installArtifact(exe);
-        check_step.dependOn(&exe.step);
-        const run = b.addRunArtifact(exe);
-        if (dlss and nixos) run.setEnvironmentVariable("LD_LIBRARY_PATH", b.fmt("{s}:{s}", .{ b.graph.environ_map.get("LD_LIBRARY_PATH") orelse "", nixos_drivers }));
-        if (moltenvk_dir) |dir| run.setEnvironmentVariable("DYLD_LIBRARY_PATH", dir);
-        if (b.args) |args| run.addArgs(args);
-        b.step(example.name, example.description).dependOn(&run.step);
-        if (std.mem.eql(u8, example.name, "meadow")) b.step("run", example.description).dependOn(&run.step);
-        if (std.mem.eql(u8, example.name, "particles")) particles_example = exe;
-        if (std.mem.eql(u8, example.name, "animation")) animation_example = exe;
-        if (std.mem.eql(u8, example.name, "instancing")) instancing_example = exe;
-        if (std.mem.eql(u8, example.name, "reflections")) reflections_example = exe;
-        if (std.mem.eql(u8, example.name, "clouds")) clouds_example = exe;
-        if (std.mem.eql(u8, example.name, "fluid")) fluid_example = exe;
-        if (std.mem.eql(u8, example.name, "water")) water_example = exe;
-        if (std.mem.eql(u8, example.name, "liquid")) liquid_example = exe;
-        if (std.mem.eql(u8, example.name, "pathtrace")) pathtrace_example = exe;
-        if (std.mem.eql(u8, example.name, "rtx")) rtx_example = exe;
-        for (pictured, &pictured_examples) |name, *slot| {
-            if (std.mem.eql(u8, example.name, name)) slot.* = exe;
-        }
+    b.addNamedLazyPath("apk", apk_packer.getEmittedBin());
+    const test_step = b.step("test", "Run unit tests");
+    for ([_]*std.Build.Step.Compile{
+        tests,
+        b.addTest(.{ .root_module = texture_codec }),
+        b.addTest(.{ .root_module = font_baker }),
+        b.addTest(.{ .root_module = depfile.root_module }),
+        b.addTest(.{ .root_module = apk_packer.root_module }),
+    }) |compile| {
+        const run = b.addRunArtifact(compile);
+        run.setCwd(b.path("."));
+        test_step.dependOn(&run.step);
     }
 
     const format_check = b.addSystemCommand(&.{
-        b.graph.zig_exe, "fmt", "--check", "build.zig", "src", "examples",
+        b.graph.zig_exe, "fmt", "--check", "build.zig", "src",
     });
-    const verify_step = b.step("verify", "Check formatting, run tests and render the examples with validation enabled");
+    format_check.setCwd(b.path("."));
+    const verify_step = b.step("verify", "Check formatting, and run the tests and `checks`");
     verify_step.dependOn(&format_check.step);
     verify_step.dependOn(test_step);
-    const cross_step = b.step("cross", "Build the library and examples for every target, into zig-out/cross/<target>, without running them");
+    const cross_step = b.step("cross", "Build the library for every target, into zig-out/cross/<target>");
     var previous_cross: ?*std.Build.Step = null;
     for (cross_targets) |cross_target| {
         const cross = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "install", b.fmt("-Dtarget={s}", .{cross_target}), "--prefix", b.pathFromRoot(b.fmt("zig-out/cross/{s}", .{cross_target})) });
+        cross.setCwd(b.path("."));
         cross.has_side_effects = true;
         if (previous_cross) |previous| cross.step.dependOn(previous);
         previous_cross = &cross.step;
@@ -681,6 +398,7 @@ pub fn build(b: *std.Build) void {
     checks.rdynamic = thread_sanitizer;
     check_step.dependOn(&checks.step);
     const run_checks = b.addRunArtifact(checks);
+    run_checks.setCwd(b.path("."));
     run_checks.has_side_effects = true;
     if (b.args) |args| run_checks.addArgs(args);
     if (thread_sanitizer) run_checks.setEnvironmentVariable("TSAN_OPTIONS", b.fmt("suppressions={s}", .{b.pathFromRoot("src/tsan.supp")}));
@@ -701,81 +419,7 @@ pub fn build(b: *std.Build) void {
     if (thread_sanitizer) run_costs.setEnvironmentVariable("TSAN_OPTIONS", b.fmt("suppressions={s}", .{b.pathFromRoot("src/tsan.supp")}));
     if (b.args) |args| run_costs.addArgs(args);
     b.step("costs", "Print what frames record as 2D and 3D scenes grow, without a window").dependOn(&run_costs.step);
-    if (android) return applyAndroidLibc(b);
-    const verify_particles = b.addRunArtifact(particles_example.?);
-    verify_particles.has_side_effects = true;
-    verify_particles.addArgs(&.{ "--frames", "90", "--screenshot" });
-    _ = verify_particles.addOutputFileArg("verify_particles.png");
-
-    verify_step.dependOn(&verify_particles.step);
-    for ([_]*std.Build.Step.Compile{ animation_example.?, instancing_example.?, reflections_example.?, clouds_example.?, fluid_example.?, water_example.? }, [_][]const u8{ "verify_animation.png", "verify_instancing.png", "verify_reflections.png", "verify_clouds.png", "verify_fluid.png", "verify_water.png" }) |exe, name| {
-        const run = b.addRunArtifact(exe);
-        run.has_side_effects = true;
-        run.addArgs(&.{ "--frames", "60", "--screenshot" });
-        _ = run.addOutputFileArg(name);
-        verify_step.dependOn(&run.step);
-    }
-    const verify_liquid = b.addRunArtifact(liquid_example.?);
-    verify_liquid.has_side_effects = true;
-    verify_liquid.addArgs(&.{ "--frames", "90", "--screenshot" });
-    _ = verify_liquid.addOutputFileArg("verify_liquid.png");
-    verify_step.dependOn(&verify_liquid.step);
-    for ([_][]const u8{ "shadows", "stereo", "lightmap", "voxels", "asteroids" }) |name| {
-        const run = b.addRunArtifact(example_exes.get(name).?);
-        run.has_side_effects = true;
-        run.addArgs(&.{ "--frames", "30", "--screenshot" });
-        _ = run.addOutputFileArg(b.fmt("verify_{s}.png", .{name}));
-        verify_step.dependOn(&run.step);
-    }
-    const Variant = struct { example: []const u8, name: []const u8, arguments: []const []const u8 };
-    for ([_]Variant{
-        .{ .example = "shadows", .name = "virtual_shadows", .arguments = &.{ "--vsm", "1" } },
-        .{ .example = "upscaling", .name = "fsr2", .arguments = &.{ "--mode", "4" } },
-        .{ .example = "upscaling", .name = "fsr3", .arguments = &.{ "--mode", "5" } },
-        .{ .example = "upscaling", .name = "coarse_shading", .arguments = &.{ "--mode", "2", "--vrs" } },
-    }) |variant| {
-        const run = b.addRunArtifact(example_exes.get(variant.example).?);
-        run.has_side_effects = true;
-        run.addArgs(variant.arguments);
-        run.addArgs(&.{ "--frames", "30", "--screenshot" });
-        _ = run.addOutputFileArg(b.fmt("verify_{s}.png", .{variant.name}));
-        verify_step.dependOn(&run.step);
-    }
-    for (pictured, pictured_examples) |name, example| {
-        const verify_example = b.addRunArtifact(example.?);
-        verify_example.has_side_effects = true;
-        verify_example.addArgs(&.{ "--frames", "60", "--screenshot" });
-        _ = verify_example.addOutputFileArg(b.fmt("verify_{s}.png", .{name}));
-        verify_step.dependOn(&verify_example.step);
-    }
-    for ([_][]const []const u8{ &.{}, &.{ "--path", "1" } }, [_][]const u8{ "verify_rtx.png", "verify_rtx_path.png" }) |extra, picture| {
-        const verify_rtx = b.addRunArtifact(rtx_example.?);
-        verify_rtx.has_side_effects = true;
-        verify_rtx.addArgs(&.{ "--frames", "40" });
-        verify_rtx.addArgs(extra);
-        verify_rtx.addArg("--screenshot");
-        _ = verify_rtx.addOutputFileArg(picture);
-        verify_step.dependOn(&verify_rtx.step);
-    }
-    for ([_][]const []const u8{ &.{}, &.{ "--software", "1" } }, [_][]const u8{ "verify_pathtrace.png", "verify_pathtrace_software.png" }) |extra, picture| {
-        const verify_pathtrace = b.addRunArtifact(pathtrace_example.?);
-        verify_pathtrace.has_side_effects = true;
-        verify_pathtrace.addArgs(&.{ "--frames", "60" });
-        verify_pathtrace.addArgs(extra);
-        verify_pathtrace.addArg("--screenshot");
-        _ = verify_pathtrace.addOutputFileArg(picture);
-        verify_step.dependOn(&verify_pathtrace.step);
-    }
-    const verify_dive = b.addRunArtifact(water_example.?);
-    verify_dive.has_side_effects = true;
-    verify_dive.addArgs(&.{ "--dive", "1", "--frames", "60", "--screenshot" });
-    _ = verify_dive.addOutputFileArg("verify_dive.png");
-    verify_step.dependOn(&verify_dive.step);
-    const verify_storm = b.addRunArtifact(clouds_example.?);
-    verify_storm.has_side_effects = true;
-    verify_storm.addArgs(&.{ "--storm", "1", "--frames", "60", "--screenshot" });
-    _ = verify_storm.addOutputFileArg("verify_storm.png");
-    verify_step.dependOn(&verify_storm.step);
+    if (android) applyAndroidLibc(b);
 }
 
 const ffx_root = "src/third_party/ffx_sdk";
@@ -882,7 +526,7 @@ fn addFidelityFx(
     optimize: std.builtin.OptimizeMode,
     vulkan_include: std.Build.LazyPath,
     volk: *std.Build.Dependency,
-    depfile: *std.Build.Step.Compile,
+    depfile: std.Build.LazyPath,
     glslang: Tool,
 ) void {
     const library = b.addLibrary(.{
@@ -968,59 +612,10 @@ const dlss_sdk_default = "dlss_sdk";
 const nrd_sdk_default = "nrd_sdk";
 /// The NRD release the shim in src/render/nrd is written against.
 const nrd_sdk_version = "v4.9.4";
-/// Where NixOS keeps the GPU driver's libraries, which are on no default path;
-/// DLSS needs them on the library path of what it runs in.
-const nixos_drivers = "/run/opengl-driver/lib";
 const dlss_sdk_version = "v310.9.1";
-
-/// Builds GLFW from source into `module` for `target`, with the platform
-/// headers and macOS frameworks fetched rather than taken from the system.
-/// On Linux it has both X11 and Wayland, and loads their libraries at run
-/// time. Returns false while a dependency is being fetched.
-fn addGlfw(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, source: *std.Build.Dependency) bool {
-    module.link_libc = true;
-    module.addIncludePath(source.path("include"));
-    const common = [_][]const u8{ "context.c", "init.c", "input.c", "monitor.c", "platform.c", "vulkan.c", "window.c", "egl_context.c", "osmesa_context.c", "null_init.c", "null_monitor.c", "null_window.c", "null_joystick.c" };
-    module.addCSourceFiles(.{ .root = source.path("src"), .files = &common, .flags = &.{"-w"} });
-    switch (target.result.os.tag) {
-        .windows => {
-            const files = [_][]const u8{ "win32_init.c", "win32_joystick.c", "win32_module.c", "win32_monitor.c", "win32_thread.c", "win32_time.c", "win32_window.c", "wgl_context.c" };
-            module.addCSourceFiles(.{ .root = source.path("src"), .files = &files, .flags = &.{"-w"} });
-            module.addCMacro("_GLFW_WIN32", "1");
-            for ([_][]const u8{ "gdi32", "user32", "shell32" }) |system| module.linkSystemLibrary(system, .{});
-        },
-        .macos => {
-            const sdk = b.lazyDependency("xcode_frameworks", .{}) orelse return false;
-            module.addSystemFrameworkPath(sdk.path("Frameworks"));
-            module.addSystemIncludePath(sdk.path("include"));
-            module.addLibraryPath(sdk.path("lib"));
-            module.addCMacro("_GLFW_COCOA", "1");
-            module.addCMacro("__kernel_ptr_semantics", "");
-            const files = [_][]const u8{ "cocoa_time.c", "posix_module.c", "posix_thread.c", "cocoa_init.m", "cocoa_joystick.m", "cocoa_monitor.m", "cocoa_window.m", "nsgl_context.m" };
-            module.addCSourceFiles(.{ .root = source.path("src"), .files = &files, .flags = &.{"-w"} });
-            module.linkSystemLibrary("objc", .{});
-            for ([_][]const u8{ "Cocoa", "IOKit", "CoreFoundation", "QuartzCore", "AppKit", "CoreGraphics", "CoreServices", "Foundation", "ApplicationServices", "CFNetwork", "ColorSync", "CoreText", "ImageIO" }) |framework| module.linkFramework(framework, .{});
-        },
-        else => {
-            const x11 = b.lazyDependency("x11_headers", .{}) orelse return false;
-            const wayland = b.lazyDependency("wayland_headers", .{}) orelse return false;
-            module.addSystemIncludePath(x11.path(""));
-            module.addSystemIncludePath(wayland.path("wayland"));
-            module.addSystemIncludePath(wayland.path("wayland-protocols"));
-            module.addCMacro("_GLFW_X11", "1");
-            module.addCMacro("_GLFW_WAYLAND", "1");
-            module.addCMacro("HAVE_MEMFD_CREATE", "1");
-            const files = [_][]const u8{ "linux_joystick.c", "posix_module.c", "posix_poll.c", "posix_thread.c", "posix_time.c", "xkb_unicode.c", "glx_context.c", "x11_init.c", "x11_monitor.c", "x11_window.c", "wl_init.c", "wl_monitor.c", "wl_window.c" };
-            module.addCSourceFiles(.{ .root = source.path("src"), .files = &files, .flags = &.{ "-w", "-Wno-implicit-function-declaration" } });
-        },
-    }
-    return true;
-}
 
 /// The Android API level builds target: Android 10.
 const android_api = 29;
-/// The most asset bytes an APK is packed with; the Bistro scene is left out.
-const android_asset_limit = 1 << 30;
 
 /// Writes a libc file for the fetched NDK's Bionic sysroot for `target`,
 /// which `applyAndroidLibc` hands to the Android compilations. Returns
@@ -1048,7 +643,9 @@ var android_libraries: []const u8 = "";
 
 /// Gives every Android compilation the build can reach, its packages'
 /// included, the NDK's libc; tools built for the build machine keep its own.
-fn applyAndroidLibc(b: *std.Build) void {
+/// An application building for Android calls it last in its own `build`,
+/// once it depends on limn.
+pub fn applyAndroidLibc(b: *std.Build) void {
     var seen: std.AutoHashMapUnmanaged(*std.Build.Step, void) = .empty;
     for (b.top_level_steps.values()) |top| visitAndroidLibc(b, &top.step, &seen);
 }
@@ -1076,79 +673,6 @@ fn visitModule(b: *std.Build, module: *std.Build.Module, modules: *std.AutoHashM
         else => {},
     };
     for (module.import_table.values()) |imported| visitModule(b, imported, modules, seen);
-}
-
-/// Wraps a windowed example as an Android `NativeActivity` and packs it,
-/// with the assets its source names, into zig-out/apk/<name>.apk. Null for
-/// an example whose assets would make the package over `android_asset_limit`.
-fn addAndroidExample(b: *std.Build, example: Example, module: *std.Build.Module, glfw_module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, packer: *std.Build.Step.Compile) ?*std.Build.Step {
-    const assets = exampleAssets(b, example);
-    var bytes: u64 = 0;
-    for (assets) |asset| bytes += if (b.build_root.handle.statFile(b.graph.io, asset, .{})) |stat| stat.size else |_| 0;
-    if (bytes > android_asset_limit) return null;
-    const host = b.createModule(.{ .root_source_file = b.path("examples/android/host.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    host.addImport("example", module);
-    host.addImport("glfw", glfw_module);
-    for ([_][]const u8{ "android", "log", "dl" }) |system| host.linkSystemLibrary(system, .{});
-    const library = b.addLibrary(.{ .name = "main", .linkage = .dynamic, .root_module = host, .use_llvm = true });
-    const pack = b.addRunArtifact(packer);
-    const apk = pack.addOutputFileArg(b.fmt("{s}.apk", .{example.name}));
-    pack.addArgs(&.{ b.fmt("org.limn.{s}", .{example.name}), b.fmt("limn {s}", .{example.name}) });
-    if (target.result.cpu.arch == .x86_64) pack.addPrefixedFileArg("x86_64:", library.getEmittedBin()) else pack.addFileArg(library.getEmittedBin());
-    for (assets) |asset| {
-        pack.addArg(b.fmt("assets/{s}", .{asset}));
-        pack.addFileArg(b.path(asset));
-    }
-    const install = b.addInstallFile(apk, b.fmt("apk/{s}.apk", .{example.name}));
-    return &install.step;
-}
-
-/// The files under examples/assets that an example's source, or a source
-/// file next to it that it imports, names; a named directory gives all of
-/// its files, and so does the folder of a named `.gltf`, for its buffers and
-/// images.
-fn exampleAssets(b: *std.Build, example: Example) []const []const u8 {
-    const io = b.graph.io;
-    var assets: std.ArrayList([]const u8) = .empty;
-    var sources: std.ArrayList([]const u8) = .empty;
-    sources.appendSlice(b.allocator, &.{ example.root, "examples/window.zig" }) catch @panic("OOM");
-    var read: usize = 0;
-    while (read < sources.items.len) : (read += 1) {
-        const text = b.build_root.handle.readFileAlloc(io, sources.items[read], b.allocator, .unlimited) catch continue;
-        var quoted = std.mem.splitScalar(u8, text, '"');
-        var inside = false;
-        while (quoted.next()) |piece| : (inside = !inside) {
-            if (!inside) continue;
-            if (std.mem.endsWith(u8, piece, ".zig") and std.mem.indexOfScalar(u8, piece, '/') == null) {
-                const local = b.fmt("examples/{s}", .{piece});
-                for (sources.items) |known| {
-                    if (std.mem.eql(u8, known, local)) break;
-                } else sources.append(b.allocator, local) catch @panic("OOM");
-                continue;
-            }
-            if (!std.mem.startsWith(u8, piece, "examples/assets/")) continue;
-            const folder = if (std.mem.endsWith(u8, piece, ".gltf")) piece[0 .. std.mem.lastIndexOfScalar(u8, piece, '/').? + 1] else piece;
-            if (!std.mem.endsWith(u8, folder, "/")) {
-                appendNew(b, &assets, piece);
-                continue;
-            }
-            var directory = b.build_root.handle.openDir(io, folder, .{ .iterate = true }) catch continue;
-            defer directory.close(io);
-            var walker = directory.walk(b.allocator) catch @panic("OOM");
-            defer walker.deinit();
-            while (walker.next(io) catch null) |entry| {
-                if (entry.kind == .file) appendNew(b, &assets, b.fmt("{s}{s}", .{ folder, entry.path }));
-            }
-        }
-    }
-    return assets.items;
-}
-
-fn appendNew(b: *std.Build, list: *std.ArrayList([]const u8), item: []const u8) void {
-    for (list.items) |known| {
-        if (std.mem.eql(u8, known, item)) return;
-    }
-    list.append(b.allocator, item) catch @panic("OOM");
 }
 
 /// Whether the DLSS SDK has libraries for `target`.
@@ -1250,18 +774,46 @@ fn volkModule(
     return module;
 }
 
+/// What compiling a shader takes: the compiler, the two programs it runs
+/// through and after, and the directories it includes from.
+const ShaderTools = struct {
+    slangc: Tool,
+    depfile: std.Build.LazyPath,
+    spirv_readonly: std.Build.LazyPath,
+    include: std.Build.LazyPath,
+    generated: std.Build.LazyPath,
+};
+
+/// Compiles an application's own Slang shaders the way limn compiles its
+/// own, and gives `module` each one's SPIR-V as an anonymous import named
+/// after it, for `@embedFile`. `limn` is the application's dependency on
+/// this package; `Shader.src` is relative to the application's build root,
+/// and the shaders can include limn's. Does nothing while limn's own
+/// dependencies are being fetched.
+pub fn addShaders(b: *std.Build, limn: *std.Build.Dependency, module: *std.Build.Module, shaders: []const Shader) void {
+    const paths = limn.builder.named_lazy_paths;
+    const tools: ShaderTools = .{
+        .slangc = if (paths.get("slangc")) |path| .{ .path = path } else .{ .system = "slangc" },
+        .depfile = paths.get("depfile") orelse return,
+        .spirv_readonly = paths.get("spirv_readonly") orelse return,
+        .include = paths.get("shader_include") orelse return,
+        .generated = paths.get("shader_generated") orelse return,
+    };
+    compileShaders(b, module, shaders, tools, null);
+}
+
 /// Compiles each shader with slangc, followed by `spirv_readonly` unless the
 /// shader opts out, and exposes the SPIR-V to `module` as an anonymous
 /// import. Included files are tracked through a depfile, so editing a shared
 /// header rebuilds exactly the shaders that use it.
-fn addShaders(b: *std.Build, module: *std.Build.Module, shaders: []const Shader, shaders_step: *std.Build.Step, generated_dir: std.Build.LazyPath, spirv_readonly: *std.Build.Step.Compile, depfile: *std.Build.Step.Compile, slangc: Tool) void {
+fn compileShaders(b: *std.Build, module: *std.Build.Module, shaders: []const Shader, tools: ShaderTools, shaders_step: ?*std.Build.Step) void {
     for (shaders) |shader| {
-        const command = slangc.command(b, depfile, shader.name);
+        const command = tools.slangc.command(b, tools.depfile, shader.name);
         command.addFileArg(b.path(shader.src));
         command.addArgs(&slang_arguments);
         command.addArgs(&.{ "-stage", shader.stage, "-entry", shader.entry });
-        command.addPrefixedDirectoryArg("-I", b.path(shader_dir));
-        command.addPrefixedDirectoryArg("-I", generated_dir);
+        command.addPrefixedDirectoryArg("-I", tools.include);
+        command.addPrefixedDirectoryArg("-I", tools.generated);
         for (shader.defines) |define| command.addArg(b.fmt("-D{s}", .{define}));
         command.addArg("-depfile");
         _ = command.addDepFileOutputArg(b.fmt("{s}.d", .{shader.name}));
@@ -1269,14 +821,15 @@ fn addShaders(b: *std.Build, module: *std.Build.Module, shaders: []const Shader,
         if (shader.writable_reads) {
             const output = command.addOutputFileArg(shader.name);
             module.addAnonymousImport(shader.name, .{ .root_source_file = output });
-            shaders_step.dependOn(&command.step);
+            if (shaders_step) |step| step.dependOn(&command.step);
             continue;
         }
         const compiled = command.addOutputFileArg(b.fmt("{s}.slang.spv", .{shader.name}));
-        const mark = b.addRunArtifact(spirv_readonly);
+        const mark = std.Build.Step.Run.create(b, b.fmt("mark {s} read-only", .{shader.name}));
+        mark.addFileArg(tools.spirv_readonly);
         mark.addFileArg(compiled);
         const output = mark.addOutputFileArg(shader.name);
         module.addAnonymousImport(shader.name, .{ .root_source_file = output });
-        shaders_step.dependOn(&mark.step);
+        if (shaders_step) |step| step.dependOn(&mark.step);
     }
 }

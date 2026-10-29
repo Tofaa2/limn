@@ -2275,7 +2275,7 @@ fn loadAnimations(gpa: std.mem.Allocator, arena: std.mem.Allocator, data: *gltf.
 test "skinned glTF keeps skins, clips and per-vertex influences" {
     acquireLibraries(std.testing.io);
     defer releaseLibraries(std.testing.io);
-    var model = try load(std.testing.allocator, std.testing.io, "examples/assets/world/Fox.glb", .{});
+    var model = try load(std.testing.allocator, std.testing.io, "testdata/world/Fox.glb", .{});
     defer model.deinit();
     try std.testing.expect(model.skins.len != 0);
     try std.testing.expect(model.animations.len != 0);
@@ -2458,7 +2458,7 @@ test "a cluster hierarchy stays watertight at every cut" {
 
 test "Basis Universal textures are transcoded to BC7" {
     const gpa = std.testing.allocator;
-    for ([_][]const u8{ "examples/assets/panel/panel_etc1s.ktx2", "examples/assets/panel/panel_uastc.ktx2" }) |path| {
+    for ([_][]const u8{ "testdata/panel/panel_etc1s.ktx2", "testdata/panel/panel_uastc.ktx2" }) |path| {
         const bytes = try readFile(gpa, std.testing.io, path);
         defer gpa.free(bytes);
         const texture = try ktx2.read(gpa, bytes, .bc);
@@ -2602,7 +2602,7 @@ test "a weighted joint outside its skin is refused" {
 
 test "Basis Universal textures are transcoded to ASTC or plain texels for GPUs without BC" {
     const gpa = std.testing.allocator;
-    for ([_][]const u8{ "examples/assets/panel/panel_etc1s.ktx2", "examples/assets/panel/panel_uastc.ktx2" }) |path| {
+    for ([_][]const u8{ "testdata/panel/panel_etc1s.ktx2", "testdata/panel/panel_uastc.ktx2" }) |path| {
         const bytes = try readFile(gpa, std.testing.io, path);
         defer gpa.free(bytes);
         const astc = try ktx2.read(gpa, bytes, .astc);

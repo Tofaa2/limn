@@ -25,31 +25,6 @@
             .url = "git+https://github.com/zeux/volk?ref=vulkan-sdk-1.4.357.0#776893306c5d3b22b6185b5d4a258b81d94572bf",
             .hash = "N-V-__8AAOjSCAANGjObWwFC_WINRjtJpVn3GWh0gE8Pty4_",
         },
-        .glfw = .{
-            .url = "git+https://github.com/glfw/glfw?ref=3.4#7b6aead9fb88b3623e3b3725ebb42670cbe4c579",
-            .hash = "N-V-__8AAKE_TAAJO1RHyQ6MPZFPLLCAyHNu7iYXh7n1KEfH",
-            .lazy = true,
-        },
-        .x11_headers = .{
-            .url = "https://github.com/allyourcodebase/x11-headers/archive/947022308236478b13fd39b638bf8a2264725751.zip",
-            .hash = "N-V-__8AAJaARwDVWtryGrmN1iiu2qeZKabbbr9H1GCKrTiN",
-            .lazy = true,
-        },
-        .wayland_headers = .{
-            .url = "https://github.com/allyourcodebase/wayland-headers/archive/1bcb1200b5fa17ef9ff603f66817e72c170342c1.zip",
-            .hash = "N-V-__8AAAVvCwDLr0LianOagXBVKPRDucj7FfMLG9SwJq7S",
-            .lazy = true,
-        },
-        .xcode_frameworks = .{
-            .url = "https://code.hexops.org/hexops/xcode-frameworks/archive/8a1cfb373587ea4c9bb1468b7c986462d8d4e10e.zip",
-            .hash = "N-V-__8AALShqgXkvqYU6f__FrA22SMWmi2TXCJjNTO1m8XJ",
-            .lazy = true,
-        },
-        .moltenvk = .{
-            .url = "https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar",
-            .hash = "N-V-__8AAE_YiwPIE_JJGNssqD-hldlwyTTI7tQDZMXFtb9m",
-            .lazy = true,
-        },
         .android_ndk = .{
             .url = "https://dl.google.com/android/repository/android-ndk-r27c-linux.zip",
             .hash = "N-V-__8AAF6YaXqq7J3pYrhuKflWrACYDDn7GwUCLm0HSLxf",
@@ -95,7 +70,6 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        "examples",
         "README.md",
         "LICENSE",
     },

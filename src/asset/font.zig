@@ -2637,7 +2637,7 @@ test "scripts tested with the repository's own fonts come out as a full shaper g
     var failed: usize = 0;
     for (cases) |case| {
         var path_buffer: [128]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buffer, "examples/assets/fonts/{s}", .{case.font});
+        const path = try std.fmt.bufPrint(&path_buffer, "testdata/fonts/{s}", .{case.font});
         const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .unlimited);
         defer gpa.free(bytes);
         const tables = try Tables.init(bytes);
@@ -2667,7 +2667,7 @@ test "scripts tested with the repository's own fonts come out as a full shaper g
 
 test "a cursive script is spaced and stepped as a full shaper does it" {
     const gpa = std.testing.allocator;
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "examples/assets/fonts/NotoNastaliqUrdu-Regular.ttf", gpa, .unlimited);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "testdata/fonts/NotoNastaliqUrdu-Regular.ttf", gpa, .unlimited);
     defer gpa.free(bytes);
     var font = try load(gpa, bytes, &.{.{ 32, 126 }});
     defer font.deinit();
